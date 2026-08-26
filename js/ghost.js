@@ -1,10 +1,34 @@
 /** WebKit ghost — hunt silent corruption at 255, never 256 (no CE). */
 var GHOST_HIT_COUNT = 0;
 var ghostBaselineFetchMs = 0;
+var ghostPingEnabled = false;
+var ghostPageCheckEnabled = false;
+var ghostPageCheckProbed = false;
 var GHOST_CANARY_KEY = 'webkit_ghost_canary';
 var GHOST_CANARY_VAL = 'ABCD1234GHOST';
 
 var GHOST_WIRE_KEYS = ['safe2554x63', 'safe255Dotted', 'safe255'];
+
+function ghostPingUrl() {
+  if (typeof GHOST_PING_URL !== 'undefined' && GHOST_PING_URL && GHOST_PING_URL.length > 0) {
+    return GHOST_PING_URL + (GHOST_PING_URL.indexOf('?') >= 0 ? '&' : '?') + '_=' + new Date().getTime();
+  }
+  return location.protocol + '//' + location.host + '/ping.txt?_=' + new Date().getTime();
+}
+
+function ghostPageCheckUrl() {
+  if (typeof GHOST_PAGE_CHECK_URL !== 'undefined' && GHOST_PAGE_CHECK_URL && GHOST_PAGE_CHECK_URL.length > 0) {
+    return GHOST_PAGE_CHECK_URL + (GHOST_PAGE_CHECK_URL.indexOf('?') >= 0 ? '&' : '?') + '_=' + new Date().getTime();
+  }
+  var path = location.pathname || '/index-ghost.html';
+  var slash = path.lastIndexOf('/');
+  if (slash >= 0) {
+    path = path.substring(0, slash + 1) + 'index.html';
+  } else {
+    path = '/index.html';
+  }
+  return location.protocol + '//' + location.host + path + '?_=' + new Date().getTime();
+}
 
 function ghostHit(oracle, detail) {
   GHOST_HIT_COUNT++;
@@ -27,20 +51,26 @@ function resetGhostHits() {
 }
 
 function pingUrl() {
-  return location.protocol + '//' + location.host + '/ping.txt?_=' + new Date().getTime();
+  return ghostPingUrl();
 }
 
 function captureBaseline(cb) {
   log('ghost baseline START');
+  ghostPingEnabled = false;
   var t0 = new Date().getTime();
   var x = new XMLHttpRequest();
-  x.open('GET', pingUrl(), true);
+  x.open('GET', ghostPingUrl(), true);
   x.onreadystatechange = function() {
     if (x.readyState === 4) {
       ghostBaselineFetchMs = new Date().getTime() - t0;
+      var body = x.responseText || '';
       log('ghost baseline fetch ms=' + ghostBaselineFetchMs + ' status=' + x.status);
-      if (x.status !== 200) {
-        ghostHit('baseline', 'status=' + x.status);
+      if (x.status === 200 && body.indexOf('OK') >= 0) {
+        ghostPingEnabled = true;
+        log('ghost baseline pc-ping ENABLED');
+      } else {
+        log('ghost baseline pc-ping SKIP (no ping.txt — OK on GitHub Pages)');
+        log('ghost TIP: add ping.txt to repo root, or use local pc_webkit_server.py');
       }
       if (cb) {
         cb();
@@ -50,7 +80,7 @@ function captureBaseline(cb) {
   try {
     x.send(null);
   } catch (e) {
-    ghostHit('baseline', String(e));
+    log('ghost baseline SKIP err=' + e);
     if (cb) {
       cb();
     }
@@ -58,15 +88,22 @@ function captureBaseline(cb) {
 }
 
 function oraclePcPing(tag, cb) {
+  if (!ghostPingEnabled) {
+    log('ghost oracle pc-ping ' + tag + ' SKIP (unavailable)');
+    if (cb) {
+      cb();
+    }
+    return;
+  }
   var t0 = new Date().getTime();
   var x = new XMLHttpRequest();
-  x.open('GET', pingUrl(), true);
+  x.open('GET', ghostPingUrl(), true);
   x.onreadystatechange = function() {
     if (x.readyState === 4) {
       var ms = new Date().getTime() - t0;
       var body = x.responseText || '';
       if (x.status !== 200 || body.indexOf('OK') < 0) {
-        ghostHit('pc-ping-' + tag, 'status=' + x.status + ' body=' + body.substring(0, 40));
+        ghostHit('pc-ping-' + tag, 'status=' + x.status + ' was-OK-before');
       } else if (ghostBaselineFetchMs > 0 && ms > ghostBaselineFetchMs + 4000) {
         ghostHit('pc-ping-slow-' + tag, 'ms=' + ms + ' base=' + ghostBaselineFetchMs);
       } else {
@@ -125,13 +162,42 @@ function oracle255Flip(host, tag) {
 }
 
 function oracleIndexHtml(tag, cb) {
-  var url = location.protocol + '//' + location.host + '/index.html?_=' + new Date().getTime();
+  if (!ghostPageCheckProbed) {
+    ghostPageCheckProbed = true;
+    var probe = new XMLHttpRequest();
+    probe.open('GET', ghostPageCheckUrl(), true);
+    probe.onreadystatechange = function() {
+      if (probe.readyState === 4) {
+        if (probe.status === 200 && (probe.responseText || '').indexOf('WebKit') >= 0) {
+          ghostPageCheckEnabled = true;
+        }
+        oracleIndexHtmlRun(tag, cb);
+      }
+    };
+    try {
+      probe.send(null);
+    } catch (e) {
+      oracleIndexHtmlRun(tag, cb);
+    }
+    return;
+  }
+  oracleIndexHtmlRun(tag, cb);
+}
+
+function oracleIndexHtmlRun(tag, cb) {
+  if (!ghostPageCheckEnabled) {
+    log('ghost oracle index-html ' + tag + ' SKIP (no index.html on host)');
+    if (cb) {
+      cb();
+    }
+    return;
+  }
   var x = new XMLHttpRequest();
-  x.open('GET', url, true);
+  x.open('GET', ghostPageCheckUrl(), true);
   x.onreadystatechange = function() {
     if (x.readyState === 4) {
       if (x.status !== 200 || (x.responseText || '').indexOf('WebKit') < 0) {
-        ghostHit('index-html-' + tag, 'status=' + x.status);
+        ghostHit('index-html-' + tag, 'status=' + x.status + ' was-OK-before');
       } else {
         log('ghost oracle index-html ' + tag + ' PASS');
       }
