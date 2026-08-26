@@ -1,0 +1,59 @@
+body {
+  font-family: sans-serif;
+  max-width: 900px;
+  margin: 1em;
+  background: #111;
+  color: #eee;
+}
+a {
+  color: #6cf;
+}
+.warn {
+  color: #f96;
+  font-weight: bold;
+}
+.ok {
+  color: #6f6;
+}
+.box {
+  background: #222;
+  padding: 1em;
+  margin: 1em 0;
+  border: 1px solid #444;
+}
+button {
+  font-size: 18px;
+  padding: 12px 20px;
+  margin: 6px 6px 6px 0;
+  background: #335;
+  color: #fff;
+  border: 2px solid #66f;
+  cursor: pointer;
+}
+button.danger {
+  background: #522;
+  border-color: #f66;
+}
+button.safe {
+  background: #252;
+  border-color: #6f6;
+}
+#log {
+  min-height: 4em;
+  font-family: monospace;
+  font-size: 14px;
+}
+.btnrow {
+  margin: 0.5em 0;
+}
+.box.safe-box {
+  border-color: #363;
+}
+.box.danger-box {
+  border-color: #633;
+}
+h2 {
+  font-size: 1.1em;
+  margin: 1.2em 0 0.4em;
+  color: #aaa;
+}
