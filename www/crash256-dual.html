@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>dual 256 iframes</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <h1 id="page-title"></h1>
+  <p class="warn">Two simultaneous 256-byte resolves (pair-dual style). Use buttons only.</p>
+
+  <div class="box">
+    <p>Host len: <strong id="host-len"></strong></p>
+    <p id="log"></p>
+    <div class="btnrow">
+      <button class="danger" id="btn-a">iframe A only</button>
+      <button class="danger" id="btn-b">iframe B only</button>
+      <button class="danger" id="btn-both">Both A + B (dual)</button>
+      <button id="btn-clear">Clear log</button>
+    </div>
+  </div>
+
+  <p><a href="index.html">← menu</a></p>
+
+  <script src="js/util.js"></script>
+  <script src="js/vectors.js"></script>
+  <script src="js/hosts.js"></script>
+  <script src="js/dual.js"></script>
+  <script>initDualPage('crash256Dual');</script>
+</body>
+</html>

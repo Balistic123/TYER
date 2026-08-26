@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>CRASH 256 plain</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <h1 id="page-title"></h1>
+  <div class="box">
+    <p>Host length: <strong id="host-len"></strong></p>
+    <p>Host preview: <code id="host-preview"></code></p>
+    <p id="log"></p>
+    <div class="btnrow">
+      <button id="btn-img">1. Image</button>
+      <button id="btn-xhr">2. XHR</button>
+      <button id="btn-iframe">3. iframe</button>
+      <button id="btn-prefetch">4. dns-prefetch</button>
+      <button id="btn-script">5. script src</button>
+    </div>
+    <div class="btnrow">
+      <button id="btn-all">Run all vectors</button>
+      <button id="btn-clear">Clear log</button>
+    </div>
+  </div>
+  <p><a href="index.html">← menu</a></p>
+  <script src="js/util.js"></script>
+  <script src="js/vectors.js"></script>
+  <script src="js/hosts.js"></script>
+  <script src="js/test-page.js"></script>
+  <script>initTestPage('crash256Plain');</script>
+</body>
+</html>
