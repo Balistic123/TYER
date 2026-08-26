@@ -36,9 +36,16 @@ function buildMainIndex() {
 function makeTipsBox() {
   var box = document.createElement('div');
   box.className = 'box';
-  box.innerHTML = '<p><strong>If nothing happens:</strong> WebKit may block flat 256 labels before DNS. '
-    + 'Use <strong>261 dotted → prefetch</strong> or <strong>255 4×63 → DNS both</strong> first.</p>'
-    + '<p>CE = system error CE-36329-3. Log only = blocked upstream.</p>';
+  box.innerHTML = '<p><strong>Reading results:</strong></p>'
+    + '<ul>'
+    + '<li><strong>CE-36329-3</strong> = system crash (BD-J cliff) — what we want to match</li>'
+    + '<li><strong>Can\u2019t connect to this server</strong> = browser tried HTTP, host not found / no route — '
+    + '<em>NOT</em> the same as CE; WebKit likely used a safe error path</li>'
+    + '<li>Address bar showing only <code>cccc…</code> is normal — PS4 truncates display; '
+    + 'full host is 250×C + <code>.local</code> (256 total). Check log <code>tail=</code> line.</li>'
+    + '</ul>'
+    + '<p><strong>Try next:</strong> <strong>261 dotted → prefetch</strong> or '
+    + '<strong>261 iframe (stay on page)</strong> — valid DNS labels, CE on BD-J.</p>';
   return box;
 }
 
@@ -124,12 +131,12 @@ function makeHostBtnRow(spec, host, url, btnClass) {
     btn = document.createElement('button');
     btn.className = btnClass;
     btn.appendChild(document.createTextNode(VECTOR_BUTTONS[i][0]));
-    btn.onclick = (function(h, u, fn) {
+    btn.onclick = (function(h, u, fn, spec) {
       return function() {
-        log('--- ' + spec.label + ' ---');
+        log('--- ' + spec.label + ' ' + describeHost(h) + ' ---');
         fn(h, u);
       };
-    })(host, url, VECTOR_BUTTONS[i][1]);
+    })(host, url, VECTOR_BUTTONS[i][1], spec);
     row.appendChild(btn);
   }
   return row;
@@ -158,22 +165,42 @@ function makeDualSection() {
 function makeAnchorBox() {
   var box = document.createElement('div');
   box.className = 'box danger-box';
-  box.innerHTML = '<p class="warn"><strong>Manual navigate</strong> — sets red link; tap it (leaves page)</p>';
-  var row = document.createElement('div');
-  row.className = 'btnrow';
-  row.appendChild(makeBtn('danger', '261 link', function() {
+  box.innerHTML = '<p class="warn"><strong>Navigate tests</strong> — prefer iframe (stays on page) over red link</p>';
+  var row1 = document.createElement('div');
+  row1.className = 'btnrow';
+  row1.appendChild(makeBtn('danger', '261 iframe', function() {
+    var u = hostUrl(HOSTS.crash256Dotted.host);
+    log('261 iframe ' + describeUrl(u));
+    addDualFrame(u, 'nav261');
+  }));
+  row1.appendChild(makeBtn('danger', '256 iframe', function() {
+    var u = hostUrl(HOSTS.crash256.host);
+    log('256 iframe ' + describeUrl(u));
+    addDualFrame(u, 'nav256');
+  }));
+  row1.appendChild(makeBtn('danger', '255 4×63 iframe', function() {
+    var u = hostUrl(HOSTS.safe2554x63.host);
+    log('255 iframe ' + describeUrl(u));
+    addDualFrame(u, 'nav255');
+  }));
+  box.appendChild(row1);
+
+  var row2 = document.createElement('div');
+  row2.className = 'btnrow';
+  row2.appendChild(makeBtn('danger', '261 red link', function() {
     viaAnchor(hostUrl(HOSTS.crash256Dotted.host), 'manual-nav');
   }));
-  row.appendChild(makeBtn('danger', '256 flat link', function() {
+  row2.appendChild(makeBtn('danger', '256 red link', function() {
     viaAnchor(hostUrl(HOSTS.crash256.host), 'manual-nav');
   }));
-  box.appendChild(row);
+  box.appendChild(row2);
+
   var a = document.createElement('a');
   a.id = 'manual-nav';
   a.className = 'nav-link';
   a.style.display = 'none';
   a.target = '_self';
-  a.appendChild(document.createTextNode('TAP TO NAVIGATE (crash test)'));
+  a.appendChild(document.createTextNode('TAP TO NAVIGATE'));
   box.appendChild(a);
   return box;
 }

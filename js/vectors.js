@@ -49,7 +49,8 @@ function viaWebSocket(host) {
 }
 
 function viaAnchor(url, id) {
-  log('→ anchor href (' + url.length + ' url chars)');
+  log('→ anchor ' + describeUrl(url));
+  log('  PS4 bar may hide tail — check tail ends with .local for flat 256');
   var a = document.getElementById(id);
   if (!a) {
     log('  anchor missing id=' + id);
@@ -57,7 +58,7 @@ function viaAnchor(url, id) {
   }
   a.href = url;
   a.style.display = 'inline-block';
-  log('  TAP the red link below to navigate');
+  log('  TAP red link (cant connect = browser error, NOT same as CE-36329-3)');
 }
 
 function viaLocation(url) {

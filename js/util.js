@@ -31,3 +31,27 @@ function clipHost(host) {
   }
   return host.substring(0, 48) + '…' + host.substring(host.length - 24);
 }
+
+function describeHost(host) {
+  if (!host) {
+    return 'len=0';
+  }
+  var tail = host.length > 12 ? host.substring(host.length - 12) : host;
+  return 'host-len=' + host.length + ' tail=' + tail;
+}
+
+function describeUrl(url) {
+  return 'url-len=' + (url ? url.length : 0) + ' (' + describeHost(extractHostFromUrl(url)) + ')';
+}
+
+function extractHostFromUrl(url) {
+  if (!url || url.indexOf('//') < 0) {
+    return '';
+  }
+  var start = url.indexOf('//') + 2;
+  var end = url.indexOf('/', start);
+  if (end < 0) {
+    end = url.length;
+  }
+  return url.substring(start, end);
+}
