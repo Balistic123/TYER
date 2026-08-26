@@ -2,25 +2,27 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>WebKit DNS256</title>
+  <title>WebKit Ghost255</title>
   <link rel="stylesheet" href="css/style.css">
 </head>
 <body>
-  <h1>WebKit DNS256</h1>
-  <p>PS4 WebKit → 256-byte hostname resolver cliff. <strong>Nothing runs until you tap a button.</strong></p>
-  <p class="warn">Red sections may cause CE-36329-3.</p>
+  <h1>WebKit Ghost255</h1>
+  <p>Hunt <strong>silent corruption at 255</strong> through WebKit — <strong>never 256</strong> (no CE by design).</p>
+  <p class="ok">Different entrance than BD-J: prefetch / Image / XHR at valid-wire 255, then oracles.</p>
+  <p><a href="index.html">← crash cliff tester (256 CE)</a></p>
 
   <div class="box">
     <p id="log"></p>
     <button id="btn-clear">Clear log</button>
   </div>
 
-  <div id="test-hosts"></div>
+  <div id="ghost-panel"></div>
 
   <script src="js/util.js"></script>
   <script src="js/vectors.js"></script>
   <script src="js/hosts.js"></script>
-  <script src="js/index.js"></script>
-  <script>buildIndex();</script>
+  <script src="js/ghost.js"></script>
+  <script src="js/ghost-ui.js"></script>
+  <script>buildGhostIndex();</script>
 </body>
 </html>

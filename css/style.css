@@ -52,8 +52,7 @@ button.safe {
 .box.danger-box {
   border-color: #633;
 }
-h2 {
-  font-size: 1.1em;
-  margin: 1.2em 0 0.4em;
-  color: #aaa;
+.log-hit {
+  color: #f96;
+  font-weight: bold;
 }
