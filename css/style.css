@@ -52,7 +52,21 @@ button.safe {
 .box.danger-box {
   border-color: #633;
 }
-.log-hit {
-  color: #f96;
-  font-weight: bold;
+h2 {
+  font-size: 1.1em;
+  margin: 1.2em 0 0.4em;
+  color: #aaa;
+}
+a.nav-link {
+  display: inline-block;
+  margin-top: 12px;
+  padding: 14px 18px;
+  background: #600;
+  color: #fff;
+  font-size: 20px;
+  text-decoration: none;
+  border: 2px solid #f66;
+}
+code {
+  word-break: break-all;
 }

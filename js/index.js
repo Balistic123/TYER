@@ -1,36 +1,94 @@
-var INDEX_HOST_KEYS = [
-  'safe255',
-  'safe255Dotted',
-  'safe2554x63',
-  'crash256',
-  'crash256Plain',
-  'crash256Dotted'
+var VECTOR_BUTTONS = [
+  ['prefetch', function(h, u) { viaPrefetch(h); }],
+  ['preconnect', function(h, u) { viaPreconnect(h); }],
+  ['DNS both', function(h, u) { runDnsOnly(h); }],
+  ['Image', function(h, u) { viaImg(u); }],
+  ['XHR', function(h, u) { viaXhr(u); }],
+  ['iframe', function(h, u) { viaIframe(u); }],
+  ['script', function(h, u) { viaScript(u); }],
+  ['video', function(h, u) { viaVideo(u); }],
+  ['object', function(h, u) { viaObject(u); }],
+  ['WebSocket', function(h, u) { viaWebSocket(h); }],
+  ['ALL', function(h, u) { runAllVectors(h, u); }]
 ];
 
-function buildIndex() {
-  var root = document.getElementById('test-hosts');
-  var i;
-  var key;
-  var spec;
-  var host;
+function buildMainIndex() {
+  var app = document.getElementById('app');
+  var s;
 
-  for (i = 0; i < INDEX_HOST_KEYS.length; i++) {
-    key = INDEX_HOST_KEYS[i];
-    spec = HOSTS[key];
-    host = spec.host;
-    root.appendChild(makeHostBox(spec, host));
+  app.appendChild(makeTipsBox());
+
+  for (s = 0; s < INDEX_SECTIONS.length; s++) {
+    if (INDEX_SECTIONS[s].oracle) {
+      app.appendChild(makeOracleSection());
+    } else {
+      app.appendChild(makeSection(INDEX_SECTIONS[s]));
+    }
   }
 
-  root.appendChild(makeDualBox());
+  app.appendChild(makeDualSection());
+  app.appendChild(makeAnchorBox());
 
   document.getElementById('btn-clear').onclick = clearLog;
-  log('Ready — tap any button to test. Nothing runs automatically.');
+  log('Ready (GitHub Pages OK). Try 261 dotted prefetch FIRST if flat 256 does nothing.');
 }
 
-function makeHostBox(spec, host) {
+function makeTipsBox() {
   var box = document.createElement('div');
-  box.className = 'box' + (spec.danger ? ' danger-box' : ' safe-box');
+  box.className = 'box';
+  box.innerHTML = '<p><strong>If nothing happens:</strong> WebKit may block flat 256 labels before DNS. '
+    + 'Use <strong>261 dotted → prefetch</strong> or <strong>255 4×63 → DNS both</strong> first.</p>'
+    + '<p>CE = system error CE-36329-3. Log only = blocked upstream.</p>';
+  return box;
+}
+
+function makeOracleSection() {
+  var box = document.createElement('div');
+  box.className = 'box safe-box';
+  var p = document.createElement('p');
+  p.className = 'ok';
+  p.appendChild(document.createElement('strong')).appendChild(
+    document.createTextNode('Ghost255 oracles + storms')
+  );
+  box.appendChild(p);
+  box.appendChild(makeBtnRow('safe', [
+    ['Baseline', function() {
+      resetGhostHits();
+      captureBaseline(function() { runOracleSuite('pre', ghostVerdict); });
+    }],
+    ['Storm 300 4×63', function() {
+      resetGhostHits();
+      captureBaseline(function() {
+        ghostStormThenOracle('safe2554x63', 300, 'prefetch');
+      });
+    }],
+    ['Race 15s', function() {
+      resetGhostHits();
+      startGhostRace('safe2554x63');
+      setTimeout(stopGhostRace, 15000);
+    }],
+    ['Verdict', ghostVerdict]
+  ]));
+  return box;
+}
+
+function makeSection(section) {
+  var wrap = document.createElement('div');
+  var h = document.createElement('h2');
+  h.appendChild(document.createTextNode(section.title));
+  wrap.appendChild(h);
+  var i;
+  for (i = 0; i < section.keys.length; i++) {
+    wrap.appendChild(makeHostBox(HOSTS[section.keys[i]]));
+  }
+  return wrap;
+}
+
+function makeHostBox(spec) {
+  var host = spec.host;
   var url = hostUrl(host);
+  var box = document.createElement('div');
+  box.className = 'box ' + (spec.danger ? 'danger-box' : 'safe-box');
   var btnClass = spec.danger ? 'danger' : 'safe';
 
   var title = document.createElement('p');
@@ -41,61 +99,101 @@ function makeHostBox(spec, host) {
   title.appendChild(document.createTextNode(' — len ' + host.length));
   box.appendChild(title);
 
+  if (spec.note) {
+    var note = document.createElement('p');
+    note.appendChild(document.createTextNode(spec.note));
+    box.appendChild(note);
+  }
+
   var preview = document.createElement('p');
   var code = document.createElement('code');
   code.appendChild(document.createTextNode(clipHost(host)));
   preview.appendChild(code);
   box.appendChild(preview);
 
-  box.appendChild(makeBtnRow(btnClass, [
-    ['Image', function() { viaImg(url); }],
-    ['XHR', function() { viaXhr(url); }],
-    ['iframe', function() { viaIframe(url); }],
-    ['prefetch', function() { viaPrefetch(host); }],
-    ['script', function() { viaScript(url); }],
-    ['All', function() { runAllVectors(host, url); }]
-  ]));
-
+  box.appendChild(makeHostBtnRow(spec, host, url, btnClass));
   return box;
 }
 
-function makeDualBox() {
+function makeHostBtnRow(spec, host, url, btnClass) {
+  var row = document.createElement('div');
+  row.className = 'btnrow';
+  var i;
+  var btn;
+  for (i = 0; i < VECTOR_BUTTONS.length; i++) {
+    btn = document.createElement('button');
+    btn.className = btnClass;
+    btn.appendChild(document.createTextNode(VECTOR_BUTTONS[i][0]));
+    btn.onclick = (function(h, u, fn) {
+      return function() {
+        log('--- ' + spec.label + ' ---');
+        fn(h, u);
+      };
+    })(host, url, VECTOR_BUTTONS[i][1]);
+    row.appendChild(btn);
+  }
+  return row;
+}
+
+function makeDualSection() {
   var spec = HOSTS.crash256Dual;
   var host = spec.host;
   var url = hostUrl(host);
   var box = document.createElement('div');
   box.className = 'box danger-box';
-
-  var title = document.createElement('p');
-  title.className = 'warn';
-  title.appendChild(document.createElement('strong')).appendChild(
-    document.createTextNode('Dual iframe 256+256 (pair-dual / UI hang)')
+  var p = document.createElement('p');
+  p.className = 'warn';
+  p.appendChild(document.createElement('strong')).appendChild(
+    document.createTextNode('Dual iframe 256 (UI hang hunt)')
   );
-  title.appendChild(document.createTextNode(' — len ' + host.length));
-  box.appendChild(title);
-
+  box.appendChild(p);
   box.appendChild(makeBtnRow('danger', [
     ['iframe A', function() { addDualFrame(url, 'A'); }],
     ['iframe B', function() { addDualFrame(url, 'B'); }],
-    ['Both A+B', function() { addDualFrame(url, 'A'); addDualFrame(url, 'B'); }]
+    ['Both', function() { addDualFrame(url, 'A'); addDualFrame(url, 'B'); }]
   ]));
-
   return box;
 }
 
-function makeBtnRow(btnClass, items) {
+function makeAnchorBox() {
+  var box = document.createElement('div');
+  box.className = 'box danger-box';
+  box.innerHTML = '<p class="warn"><strong>Manual navigate</strong> — sets red link; tap it (leaves page)</p>';
+  var row = document.createElement('div');
+  row.className = 'btnrow';
+  row.appendChild(makeBtn('danger', '261 link', function() {
+    viaAnchor(hostUrl(HOSTS.crash256Dotted.host), 'manual-nav');
+  }));
+  row.appendChild(makeBtn('danger', '256 flat link', function() {
+    viaAnchor(hostUrl(HOSTS.crash256.host), 'manual-nav');
+  }));
+  box.appendChild(row);
+  var a = document.createElement('a');
+  a.id = 'manual-nav';
+  a.className = 'nav-link';
+  a.style.display = 'none';
+  a.target = '_self';
+  a.appendChild(document.createTextNode('TAP TO NAVIGATE (crash test)'));
+  box.appendChild(a);
+  return box;
+}
+
+function makeBtnRow(cls, items) {
   var row = document.createElement('div');
   row.className = 'btnrow';
   var j;
-  var btn;
   for (j = 0; j < items.length; j++) {
-    btn = document.createElement('button');
-    btn.className = btnClass;
-    btn.appendChild(document.createTextNode(items[j][0]));
-    btn.onclick = items[j][1];
-    row.appendChild(btn);
+    row.appendChild(makeBtn(cls, items[j][0], items[j][1]));
   }
   return row;
+}
+
+function makeBtn(cls, label, fn) {
+  var btn = document.createElement('button');
+  btn.className = cls;
+  btn.appendChild(document.createTextNode(label));
+  btn.onclick = fn;
+  return btn;
 }
 
 function addDualFrame(url, id) {
@@ -105,5 +203,4 @@ function addDualFrame(url, id) {
   f.style.display = 'none';
   f.src = url;
   document.body.appendChild(f);
-  log('  iframe ' + id + ' appended');
 }
