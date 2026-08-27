@@ -44,7 +44,7 @@
 </head>
 <body>
 <div id="wrap">
-  <div id="state">ready — close browser fully if prior OOM</div>
+  <div id="state">loading JS…</div>
   <div id="groom-bar">
     <span class="bar-label">groom (tap before Start if race keeps missing)</span>
     <button type="button" data-groom="default">default</button>
@@ -94,7 +94,18 @@
 <script>
 window.addEventListener("error", function (e) {
   var s = document.getElementById("state");
-  if (s) { s.textContent = "JS error: " + (e.message || e); s.className = "bad"; }
+  var o = document.getElementById("out");
+  var msg = "JS error: " + (e.message || e);
+  if (s) { s.textContent = msg; s.className = "bad"; }
+  if (o) o.textContent = (o.textContent ? o.textContent + "\n" : "") + msg;
+});
+window.addEventListener("unhandledrejection", function (e) {
+  var s = document.getElementById("state");
+  var o = document.getElementById("out");
+  var r = e.reason;
+  var msg = "load failed: " + (r && r.message ? r.message : r);
+  if (s) { s.textContent = msg; s.className = "bad"; }
+  if (o) o.textContent = (o.textContent ? o.textContent + "\n" : "") + msg;
 });
 </script>
 <script type="module" src="./cal_demo.js"></script>

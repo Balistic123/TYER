@@ -1,7 +1,6 @@
 import { int64 } from "./int64.js";
 import { offsetsFor, offsetsForKey } from "./ps4_offsets_userland.js";
 import { installWindowP, pairStatus } from "./mem.js";
-import { groomBootLine, wireGroomBar } from "./groom_presets.js";
 
 const params = new URLSearchParams(location.search);
 const lines = [];
@@ -29,6 +28,69 @@ const GADGET_CHECKS = [
     ["POP_R9", "wk_POP_R9_RET", [null, 0x59, 0xc3]],
     ["LEAVE", "wk_LEAVE_RET", [0xc9, 0xc3]],
 ];
+
+const GROOM_PRESETS = {
+    default: { g: [] },
+    lite: { g: ["drain:256", "drainsz:32768", "slab:2097152"] },
+    "384": { g: ["drain:384", "drainsz:32768", "slab:2097152"] },
+    "512": { g: ["drain:512", "drainsz:32768", "slab:2097152"] },
+    max: {
+        g: [
+            "drain:512", "drainsz:65536", "slab:4194304",
+            "bfly:528384", "early:458752", "guard:589824",
+            "pred:524288", "final:524288",
+        ],
+    },
+};
+
+function currentGroomKey() {
+    const gs = params.getAll("g");
+    if (gs.length === 0) return "default";
+    for (const key of Object.keys(GROOM_PRESETS)) {
+        if (key === "default") continue;
+        const preset = GROOM_PRESETS[key];
+        if (preset.g.length !== gs.length) continue;
+        let match = true;
+        for (let i = 0; i < preset.g.length; i++) {
+            if (gs[i] !== preset.g[i]) { match = false; break; }
+        }
+        if (match) return key;
+    }
+    return "custom";
+}
+
+function groomBootLine() {
+    const key = currentGroomKey();
+    const gs = params.getAll("g");
+    if (key === "custom") return "groom=custom (" + gs.join(", ") + ")";
+    if (key === "default") return "groom=default (core 384 drain)";
+    return "groom=" + key;
+}
+
+function reloadWithGroomPreset(key) {
+    const preset = GROOM_PRESETS[key];
+    if (!preset) return;
+    const url = new URL(location.href);
+    url.searchParams.delete("g");
+    url.searchParams.delete("slots");
+    for (let i = 0; i < preset.g.length; i++)
+        url.searchParams.append("g", preset.g[i]);
+    location.href = url.toString();
+}
+
+function wireGroomBar() {
+    const key = currentGroomKey();
+    const nodes = document.querySelectorAll("[data-groom]");
+    for (let i = 0; i < nodes.length; i++) {
+        const el = nodes[i];
+        el.classList.toggle("active", el.getAttribute("data-groom") === key);
+        el.addEventListener("click", function () {
+            if (busy) return;
+            const k = el.getAttribute("data-groom");
+            if (k) reloadWithGroomPreset(k);
+        });
+    }
+}
 
 let outEl, stateEl, resultEl, nativeFnEl, baseEl, expm1In;
 let btnStart, btnLite, btnWide, btnVerify, btnCopy, btnClear;
@@ -512,6 +574,25 @@ function runCopy() {
     }
 }
 
+function reportErr(err) {
+    const msg = err && err.message ? err.message : String(err);
+    state("error: " + msg, "bad");
+    mark("ERROR", err && err.stack ? err.stack : msg);
+}
+
+function wireClick(el, fn) {
+    if (!el) return;
+    el.addEventListener("click", function () {
+        try {
+            const r = fn();
+            if (r && typeof r.then === "function")
+                r.catch(reportErr);
+        } catch (err) {
+            reportErr(err);
+        }
+    });
+}
+
 function init() {
     outEl = $("out");
     stateEl = $("state");
@@ -526,19 +607,23 @@ function init() {
     btnCopy = $("btn-copy");
     btnClear = $("btn-clear");
 
-    btnStart.addEventListener("click", () => runStart());
-    btnLite.addEventListener("click", () => runScanStep("lite"));
-    btnWide.addEventListener("click", () => runScanStep("wide"));
-    btnVerify.addEventListener("click", () => runVerifyManual());
-    btnCopy.addEventListener("click", () => runCopy());
-    btnClear.addEventListener("click", () => {
+    if (!outEl || !btnStart) {
+        state("UI missing — open via HTTP(S), not file://", "bad");
+        return;
+    }
+
+    wireClick(btnStart, function () { return runStart(); });
+    wireClick(btnLite, function () { return runScanStep("lite"); });
+    wireClick(btnWide, function () { return runScanStep("wide"); });
+    wireClick(btnVerify, function () { return runVerifyManual(); });
+    wireClick(btnCopy, runCopy);
+    wireClick(btnClear, function () {
         lines.length = 0;
         if (outEl) outEl.textContent = "";
     });
 
-    if (expm1In) {
-        expm1In.addEventListener("input", () => updateResultPanel());
-    }
+    if (expm1In)
+        expm1In.addEventListener("input", function () { updateResultPanel(); });
 
     const cached = loadNativeFnOverride();
     if (cached) mark("BOOT", "cached nativeFn " + cached + " (re-run Start for live)");
@@ -547,10 +632,22 @@ function init() {
     if (pre && expm1In) expm1In.value = pre.replace(/^0x/i, "");
 
     mark("BOOT", "index_cal.html — expm1 finder for 13.52");
-    mark("BOOT", groomBootLine(params));
+    mark("BOOT", groomBootLine());
     mark("BOOT", "lite ±" + liteSpanK() + "×0x4000 around table hint; wide uses ?min=&max=");
-    wireGroomBar(() => busy);
+    wireGroomBar();
     setUi();
+    state("ready — pick groom if needed, then Start", "");
 }
 
-init();
+function bootUi() {
+    try {
+        init();
+    } catch (err) {
+        reportErr(err);
+    }
+}
+
+if (document.readyState === "loading")
+    document.addEventListener("DOMContentLoaded", bootUi);
+else
+    bootUi();
