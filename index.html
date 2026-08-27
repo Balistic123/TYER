@@ -48,11 +48,11 @@
     <button type="button" class="primary" id="btn-establish">1 - get primitive</button>
     <button type="button" id="btn-offsets" disabled>2 - offset tests</button>
     <button type="button" id="btn-calibrate" disabled>3 - calibrate wk</button>
-    <button type="button" id="btn-all">run all (1 then 2)</button>
+    <button type="button" id="btn-all">1 then 3 (calibrate)</button>
     <button type="button" id="btn-clear">clear log</button>
     <button type="button" class="danger" id="btn-lowmem">low-mem reload</button>
   </div>
-  <p id="hint">SSV race is flaky — use <b>3 tries</b>. If OOM: low-mem reload, close browser, try 1 try. giveUp = failed all attempts.</p>
+  <p id="hint">Order: <b>1</b> primitive → <b>3</b> calibrate → <b>2</b> verify. Step 2 alone skips BASES until step 3. OOM? low-mem + close browser.</p>
   <div id="out"></div>
 </div>
 <script>

