@@ -53,7 +53,7 @@
     <button type="button" id="btn-clear">clear log</button>
     <button type="button" class="danger" id="btn-lowmem">low-mem reload</button>
   </div>
-  <p id="hint"><b>Close browser fully</b> before step 1. OOM during step 1? Tap <b>low-mem reload</b> first (lighter groom — keep 12M slots). Order: <b>1 primitive → 3 calibrate → 2 verify</b>. If addrof fails with <code>covered=false</code>, add <code>?carloop=1</code>.</p>
+  <p id="hint"><b>1 primitive → 3 calibrate (tap repeatedly) → 2 verify.</b> Cal = <b>12 tries/tap</b> to avoid OOM. Progress saved — OOM mid-cal? Reload, tap step 3 again. Low-mem before step 1 if needed.</p>
   <div id="out"></div>
 </div>
 <script>

