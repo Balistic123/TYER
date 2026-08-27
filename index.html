@@ -45,7 +45,7 @@
       <option value="1">1</option>
       <option value="6">6</option>
     </select>
-    <button type="button" class="primary" id="btn-establish">1 - primitive + calibrate</button>
+    <button type="button" class="primary" id="btn-establish">1 - get primitive</button>
     <button type="button" id="btn-offsets" disabled>2 - verify</button>
     <button type="button" id="btn-calibrate" disabled>3 - retry cal</button>
     <button type="button" id="btn-calibrate-err" disabled>3b - scan error</button>
@@ -53,7 +53,7 @@
     <button type="button" id="btn-clear">clear log</button>
     <button type="button" class="danger" id="btn-lowmem">low-mem reload</button>
   </div>
-  <p id="hint">Addrof needs <b>12M slots</b> (default). OOM? <b>low-mem</b> lowers groom only — do NOT reduce slots. Logs persist on reload.</p>
+  <p id="hint"><b>Close browser fully</b> before step 1. OOM? <b>low-mem</b> (clears log + lite groom). 12M slots required — never reduce slots. Then step 3 calibrate.</p>
   <div id="out"></div>
 </div>
 <script>
