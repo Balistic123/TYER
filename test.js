@@ -18,8 +18,64 @@ const CORE_LOG = /FAIL|ERROR|THREW|RETRY|ABORT|PASS|GIVE-UP|ATTEMPT|SSV-|AUTO-RE
 const PRIMITIVE_LOUD = /FAIL|ERROR|THREW|RETRY|ABORT|PASS|GIVE-UP/i;
 
 const SCAN_YIELD_EVERY = 8;
-const LOG_MAX = 120;
+const LOG_MAX = 400;
+const STORAGE_KEY = "wk-userland-session-v1";
+const STORAGE_MAX = 500;
 const NARROW_SCAN_RADIUS = 0x80000;
+
+let saveTimer = null;
+
+function renderLog() {
+    if (!outEl) return;
+    outEl.textContent = lines.join("\n");
+    outEl.scrollTop = outEl.scrollHeight;
+}
+
+function saveSession() {
+    try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify({
+            v: 1,
+            ts: Date.now(),
+            lines: lines.slice(-STORAGE_MAX),
+            passCount,
+            failCount,
+            stateMsg: stateEl ? stateEl.textContent : "",
+            stateCls: stateEl ? stateEl.className : "",
+            primitiveDone,
+            calibratedOff,
+        }));
+    } catch (_) { }
+}
+
+function scheduleSave() {
+    if (saveTimer) return;
+    saveTimer = setTimeout(() => {
+        saveTimer = null;
+        saveSession();
+    }, 120);
+}
+
+function loadSession() {
+    try {
+        const raw = localStorage.getItem(STORAGE_KEY);
+        if (!raw) return false;
+        const data = JSON.parse(raw);
+        if (!data || !Array.isArray(data.lines) || data.lines.length === 0)
+            return false;
+        lines.length = 0;
+        lines.push(...data.lines.slice(-STORAGE_MAX));
+        passCount = data.passCount || 0;
+        failCount = data.failCount || 0;
+        primitiveDone = !!data.primitiveDone;
+        calibratedOff = data.calibratedOff || null;
+        renderLog();
+        if (stateEl && data.stateMsg)
+            state(data.stateMsg, data.stateCls || "");
+        return true;
+    } catch (_) {
+        return false;
+    }
+}
 
 function mark(tag, detail) {
     if (!outEl) return;
@@ -27,22 +83,25 @@ function mark(tag, detail) {
     lines.push(line);
     if (lines.length > LOG_MAX)
         lines.splice(0, lines.length - LOG_MAX);
-    const esc = t => String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;");
-    outEl.textContent = lines.join("\n");
-    outEl.scrollTop = outEl.scrollHeight;
+    renderLog();
+    scheduleSave();
 }
 
 function state(msg, cls) {
     if (!stateEl) return;
     stateEl.textContent = msg;
     stateEl.className = cls || "";
+    scheduleSave();
 }
 
 function clearLog() {
     lines.length = 0;
     passCount = 0;
     failCount = 0;
+    calibratedOff = null;
+    primitiveDone = false;
     if (outEl) outEl.textContent = "";
+    try { localStorage.removeItem(STORAGE_KEY); } catch (_) { }
 }
 
 function resolvedOffKey() {
@@ -607,9 +666,22 @@ function init() {
     });
 
     btnLowMem.addEventListener("click", () => {
+        saveSession();
         const url = new URL(location.href);
         url.searchParams.set("g", "drain:384");
         location.href = url.toString();
+    });
+
+    window.addEventListener("beforeunload", () => saveSession());
+    window.addEventListener("error", (e) => {
+        const msg = "JS error: " + (e.message || e);
+        state(msg, "bad");
+        mark("JS-ERROR", msg + " @ " + (e.filename || "") + ":" + (e.lineno || ""));
+    });
+    window.addEventListener("unhandledrejection", (e) => {
+        const msg = "unhandled: " + (e.reason && e.reason.message ? e.reason.message : e.reason);
+        state(msg, "bad");
+        mark("JS-REJECT", msg);
     });
 
     if (params.get("fw") && fwSelect.querySelector('option[value="' + params.get("fw") + '"]'))
@@ -617,8 +689,24 @@ function init() {
     if (params.get("attempts") && attemptsSelect)
         attemptsSelect.value = params.get("attempts");
 
-    state("ready — tap step 1", "");
-    logBootInfo();
+    if (params.get("clear") === "1") {
+        clearLog();
+        state("ready — tap step 1", "");
+        logBootInfo();
+    } else if (loadSession()) {
+        if (!window.p)
+            primitiveDone = false;
+        mark("RELOAD", new Date().toISOString());
+        mark("RESTORE", "lines=" + lines.length
+            + " pass=" + passCount + " fail=" + failCount
+            + " primitiveDone=" + primitiveDone
+            + (calibratedOff ? " calibrated=yes" : ""));
+        if (!stateEl.textContent)
+            state("restored log — re-run step 1 for primitive", primitiveDone ? "warn" : "");
+    } else {
+        state("ready — tap step 1", "");
+        logBootInfo();
+    }
     setUi();
 }
 
