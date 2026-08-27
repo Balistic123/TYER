@@ -1,6 +1,5 @@
 // WebKit (userland) RVAs only — no kernel gadgets, stubs, or patch metadata.
-
-import { webkit_gadgets_1350 as g1350 } from "./webkit_gadgets_1350.js";
+// 13.50 pop RVAs inlined from webkit_gadgets_1350.js (no extra import — PS4 browser).
 
 export const PS4 = {
     "13.00": {
@@ -21,14 +20,14 @@ export const PS4 = {
         k__error:                         0x26420,
         wk_ArrayBuffer_m_impl:            0x10,
         wk_ArrayBuffer_m_contents_m_data: 0x10,
-        wk_POP_RDI_RET:                     g1350.wk_POP_RDI_RET,
-        wk_POP_RSI_RET:                     g1350.wk_POP_RSI_RET,
-        wk_POP_RDX_RET:                     g1350.wk_POP_RDX_RET,
-        wk_POP_RCX_RET:                     g1350.wk_POP_RCX_RET,
-        wk_POP_RAX_RET:                     g1350.wk_POP_RAX_RET,
-        wk_POP_R8_RET:                      g1350.wk_POP_R8_RET,
-        wk_POP_R9_RET:                      g1350.wk_POP_R9_RET,
-        wk_LEAVE_RET:                       g1350.wk_LEAVE_RET,
+        wk_POP_RDI_RET:                     0x5c480,
+        wk_POP_RSI_RET:                     0x6e45e,
+        wk_POP_RDX_RET:                     0x12c5ba,
+        wk_POP_RCX_RET:                     0x1bade,
+        wk_POP_RAX_RET:                     0x10504,
+        wk_POP_R8_RET:                      0x5c47f,
+        wk_POP_R9_RET:                      0x9db883,
+        wk_LEAVE_RET:                       0x182f7,
     },
     "12.50": {
         fw_status: "userland-only — UNTESTED; webkit RVAs from 12.50 module dump",

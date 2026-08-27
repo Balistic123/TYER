@@ -1,17 +1,8 @@
-import { establishPrimitive } from "./core.js";
-import { installWindowP, pairStatus } from "./mem.js";
 import { int64 } from "./int64.js";
 import { offsetsFor, offsetsForKey } from "./ps4_offsets_userland.js";
 
-const outEl = document.getElementById("out");
-const stateEl = document.getElementById("state");
-const fwSelect = document.getElementById("fw-select");
-const btnEstablish = document.getElementById("btn-establish");
-const btnOffsets = document.getElementById("btn-offsets");
-const btnCalibrate = document.getElementById("btn-calibrate");
-const btnAll = document.getElementById("btn-all");
-const btnClear = document.getElementById("btn-clear");
-const btnLowMem = document.getElementById("btn-lowmem");
+let outEl, stateEl, fwSelect;
+let btnEstablish, btnOffsets, btnCalibrate, btnAll, btnClear, btnLowMem;
 
 const params = new URLSearchParams(location.search);
 const lines = [];
@@ -19,10 +10,12 @@ let passCount = 0;
 let failCount = 0;
 let busy = false;
 let primitiveDone = false;
+let exploit = null;
 
 const PRIMITIVE_LOUD = /FAIL|ERROR|THREW|RETRY|ABORT|PASS|GIVE-UP/i;
 
 function mark(tag, detail) {
+    if (!outEl) return;
     const line = tag + (detail == null || detail === "" ? "" : "  " + detail);
     lines.push(line);
     const esc = t => String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;");
@@ -31,6 +24,7 @@ function mark(tag, detail) {
 }
 
 function state(msg, cls) {
+    if (!stateEl) return;
     stateEl.textContent = msg;
     stateEl.className = cls || "";
 }
@@ -39,7 +33,7 @@ function clearLog() {
     lines.length = 0;
     passCount = 0;
     failCount = 0;
-    outEl.innerHTML = "";
+    if (outEl) outEl.innerHTML = "";
 }
 
 function resolvedOffKey() {
@@ -57,6 +51,7 @@ function crossFw(offKey) {
 }
 
 function setUi() {
+    if (!btnEstablish) return;
     const hasP = !!window.p;
     btnEstablish.disabled = busy || primitiveDone;
     btnOffsets.disabled = busy || !hasP;
@@ -76,6 +71,20 @@ async function withBusy(fn) {
         busy = false;
         setUi();
     }
+}
+
+async function loadExploit() {
+    if (exploit) return exploit;
+    mark("LOAD", "importing core.js + mem.js...");
+    const core = await import("./core.js");
+    const mem = await import("./mem.js");
+    exploit = {
+        establishPrimitive: core.establishPrimitive,
+        installWindowP: mem.installWindowP,
+        pairStatus: mem.pairStatus
+    };
+    mark("LOAD-OK", "exploit modules ready");
+    return exploit;
 }
 
 function check(name, ok, detail) {
@@ -213,10 +222,9 @@ function logBootInfo() {
     const detected = offsetsFor(navigator.userAgent);
     mark("UA", navigator.userAgent);
     mark("UA-FW", detected.key || "unknown");
+    mark("BOOT", "UI OK — exploit loads on step 1 only");
     if (params.has("g"))
         mark("BOOT", "groom override: " + params.getAll("g").join(", "));
-    else
-        mark("BOOT", "default groom — use low-mem reload if OOM");
 }
 
 async function runEstablish() {
@@ -224,6 +232,8 @@ async function runEstablish() {
         mark("SKIP", "primitive already established this page");
         return;
     }
+
+    const { establishPrimitive, installWindowP, pairStatus } = await loadExploit();
 
     state("establishing primitive...", "warn");
     mark("STEP", "1 · get primitive");
@@ -360,6 +370,7 @@ async function runCalibrate() {
 }
 
 function wireButton(el, handler) {
+    if (!el) return;
     el.addEventListener("click", () => {
         withBusy(async () => {
             try {
@@ -372,30 +383,54 @@ function wireButton(el, handler) {
     });
 }
 
-wireButton(btnEstablish, runEstablish);
-wireButton(btnOffsets, runOffsetTests);
-wireButton(btnCalibrate, runCalibrate);
-wireButton(btnAll, async () => {
-    await runEstablish();
-    await runOffsetTests();
-});
+function init() {
+    outEl = document.getElementById("out");
+    stateEl = document.getElementById("state");
+    fwSelect = document.getElementById("fw-select");
+    btnEstablish = document.getElementById("btn-establish");
+    btnOffsets = document.getElementById("btn-offsets");
+    btnCalibrate = document.getElementById("btn-calibrate");
+    btnAll = document.getElementById("btn-all");
+    btnClear = document.getElementById("btn-clear");
+    btnLowMem = document.getElementById("btn-lowmem");
 
-btnClear.addEventListener("click", () => {
-    if (busy) return;
-    clearLog();
+    if (!outEl || !btnEstablish) {
+        state("UI missing — host via HTTP, open index.html", "bad");
+        return;
+    }
+
+    wireButton(btnEstablish, runEstablish);
+    wireButton(btnOffsets, runOffsetTests);
+    wireButton(btnCalibrate, runCalibrate);
+    wireButton(btnAll, async () => {
+        await runEstablish();
+        await runOffsetTests();
+    });
+
+    btnClear.addEventListener("click", () => {
+        if (busy) return;
+        clearLog();
+        logBootInfo();
+        state(primitiveDone ? "primitive OK — pick a test" : "ready", primitiveDone ? "ok" : "");
+    });
+
+    btnLowMem.addEventListener("click", () => {
+        const url = new URL(location.href);
+        url.searchParams.set("g", "drain:384");
+        location.href = url.toString();
+    });
+
+    if (params.get("fw") && fwSelect.querySelector('option[value="' + params.get("fw") + '"]'))
+        fwSelect.value = params.get("fw");
+
+    state("ready — tap step 1", "");
     logBootInfo();
-    state(primitiveDone ? "primitive OK — pick a test" : "ready", primitiveDone ? "ok" : "");
-});
+    setUi();
+}
 
-btnLowMem.addEventListener("click", () => {
-    const url = new URL(location.href);
-    url.searchParams.set("g", "drain:384");
-    location.href = url.toString();
-});
-
-if (params.get("fw") && fwSelect.querySelector(`option[value="${params.get("fw")}"]`))
-    fwSelect.value = params.get("fw");
-
-state("ready — tap step 1", "");
-logBootInfo();
-setUi();
+try {
+    init();
+} catch (err) {
+    state("init error: " + err.message, "bad");
+    mark("ERROR", err.stack || err.message);
+}
