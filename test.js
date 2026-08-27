@@ -59,10 +59,10 @@ const STORAGE_MAX = 500;
 const CAL_ALIGN_STEP = 0x4000;
 const CAL_DEFAULT_MIN = 0x1e00000;
 const CAL_DEFAULT_MAX = 0x4500000;
-const CAL_CHUNK_DEFAULT = 12;
-const CAL_YIELD_EVERY = 3;
-const CAL_YIELD_MS = 24;
-const CAL_MAX_CHUNKS_PER_CLICK = 2;
+const CAL_CHUNK_DEFAULT = 4;
+const CAL_YIELD_EVERY = 1;
+const CAL_YIELD_MS = 40;
+const CAL_MAX_CHUNKS_PER_CLICK = 1;
 
 let saveTimer = null;
 
@@ -294,10 +294,24 @@ function parseNativeFnStr(str) {
 }
 
 function preCalTrim() {
-    if (lines.length > 10) {
-        lines.splice(0, lines.length - 10);
+    if (lines.length > 6) {
+        lines.splice(0, lines.length - 6);
         renderLog();
     }
+}
+
+function nativeFnForCalibrate(tableOff) {
+    if (probeCache && probeCache.nativeFn)
+        return probeCache.nativeFn;
+    const cached = parseNativeFnStr(sessionStorage.getItem("wk-nativeFn"));
+    if (cached) {
+        probeCache = {
+            nativeFn: cached,
+            mFunctionOff: tableOff.wk_JSFunction_m_function || 0x28
+        };
+        return cached;
+    }
+    return null;
 }
 
 function captureNativeFn(p, mFunctionOff) {
@@ -399,9 +413,7 @@ async function calibrateOneChunk(p, tableOff, nativeFn, startIdx, chunkSize, cal
     const endIdx = Math.min(startIdx + chunkSize, total);
 
     for (let idx = startIdx; idx < endIdx; idx++) {
-        const n = idx - startIdx;
-        if (n > 0 && (n % CAL_YIELD_EVERY) === 0)
-            await new Promise(r => setTimeout(r, CAL_YIELD_MS));
+        await new Promise(r => setTimeout(r, CAL_YIELD_MS));
 
         const delta = deltaAtIndex(nativeFn, calMin, idx);
         if (delta > calMax) break;
@@ -430,12 +442,17 @@ async function calibrateOffsets(p, tableOff) {
     } finally {
         logQuiet--;
     }
-    saveSession();
+    if (live || calibratedOff)
+        saveSession();
     return live;
 }
 
 async function calibrateOffsetsInner(p, tableOff) {
-    const nativeFn = nativeFnForOff(p, tableOff);
+    let nativeFn = nativeFnForCalibrate(tableOff);
+    if (!nativeFn) {
+        nativeFn = captureNativeFn(p, tableOff.wk_JSFunction_m_function || 0x28);
+        preCalTrim();
+    }
     if (!nativeFn) {
         mark("CAL-FAIL", "nativeFn unreadable");
         return null;
@@ -445,17 +462,7 @@ async function calibrateOffsetsInner(p, tableOff) {
     } catch (_) { }
 
     if (params.get("calreset") === "1") {
-        try {
-            sessionStorage.removeItem("wk-cal-idx");
-            sessionStorage.removeItem("wk-cal-hint");
-        } catch (_) { }
-    }
-
-    if (sessionStorage.getItem("wk-cal-hint") !== "1") {
-        const quick = await tryHintQuick(p, nativeFn, tableOff,
-            tableOff.wk_JSFunction_m_function || 0x28);
-        try { sessionStorage.setItem("wk-cal-hint", "1"); } catch (_) { }
-        if (quick) return quick;
+        try { sessionStorage.removeItem("wk-cal-idx"); } catch (_) { }
     }
 
     const calMin = parseCalHex("calmin", CAL_DEFAULT_MIN);
@@ -473,35 +480,24 @@ async function calibrateOffsetsInner(p, tableOff) {
         startIdx = 0;
     }
 
-    let chunksRun = 0;
-    while (chunksRun < CAL_MAX_CHUNKS_PER_CLICK) {
-        mark("CAL-SCAN", "nativeFn=" + nativeFn
-            + " chunk=" + startIdx + "+" + chunkSize + "/" + total);
+    mark("CAL-SCAN", startIdx + "+" + chunkSize + "/" + total);
 
-        const chunk = await calibrateOneChunk(p, tableOff, nativeFn,
-            startIdx, chunkSize, calMin, calMax, total);
-        if (chunk.hit)
-            return chunk.hit;
+    const chunk = await calibrateOneChunk(p, tableOff, nativeFn,
+        startIdx, chunkSize, calMin, calMax, total);
+    if (chunk.hit)
+        return chunk.hit;
 
-        if (chunk.done) {
-            try { sessionStorage.removeItem("wk-cal-idx"); } catch (_) { }
-            mark("CAL-FAIL", "range exhausted (" + total + " tries)");
-            mark("CAL-NATIVEFN", String(nativeFn));
-            mark("CAL-NEXT", "?calmax=0x5000000&calreset=1");
-            return null;
-        }
-
-        startIdx = chunk.nextIdx;
-        try {
-            sessionStorage.setItem("wk-cal-idx", String(startIdx));
-        } catch (_) { }
-        chunksRun++;
-        if (startIdx >= total) break;
-        preCalTrim();
-        await new Promise(r => setTimeout(r, CAL_YIELD_MS * 2));
+    if (chunk.done) {
+        try { sessionStorage.removeItem("wk-cal-idx"); } catch (_) { }
+        mark("CAL-FAIL", "range exhausted");
+        mark("CAL-NATIVEFN", String(nativeFn));
+        return null;
     }
 
-    mark("CAL-MORE", startIdx + "/" + total + " — tap step 3 again to continue");
+    try {
+        sessionStorage.setItem("wk-cal-idx", String(chunk.nextIdx));
+    } catch (_) { }
+    mark("CAL-MORE", chunk.nextIdx + "/" + total);
     return null;
 }
 
@@ -729,24 +725,18 @@ async function runCalibrate() {
     if (!off) throw new Error("no offset table for fw=" + offKey);
 
     preCalTrim();
-    if (lines.length > 15) {
-        lines.splice(0, lines.length - 15);
-        renderLog();
-    }
 
-    mark("STEP", "3 - calibrate (16 tries/chunk, low memory)");
+    mark("STEP", "3 - calibrate (4 tries/tap)");
     state("calibrating...", "warn");
 
     const live = await calibrateOffsets(p, off);
 
-    saveSession();
-    if (calibratedOff) {
-        state("calibrate OK — run step 2 verify", "ok");
-    } else if (live) {
+    if (calibratedOff || live) {
+        saveSession();
         state("calibrate OK — run step 2 verify", "ok");
     } else {
         const more = sessionStorage.getItem("wk-cal-idx");
-        state(more ? "chunk done — tap step 3 again" : "calibrate failed", "warn");
+        state(more ? "tap step 3 again (" + more + ")" : "calibrate failed", "warn");
     }
     mark("DONE-CALIBRATE", calibratedOff ? "ok" : (sessionStorage.getItem("wk-cal-idx") ? "more" : "fail"));
 }
