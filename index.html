@@ -47,13 +47,13 @@
     </select>
     <button type="button" class="primary" id="btn-establish">1 - get primitive</button>
     <button type="button" id="btn-offsets" disabled>2 - verify</button>
-    <button type="button" id="btn-calibrate" disabled>3 - retry cal</button>
+    <button type="button" id="btn-calibrate" disabled>3 - calibrate</button>
     <button type="button" id="btn-calibrate-err" disabled>3b - libkernel</button>
     <button type="button" id="btn-all">same as step 1</button>
     <button type="button" id="btn-clear">clear log</button>
     <button type="button" class="danger" id="btn-lowmem">low-mem reload</button>
   </div>
-  <p id="hint"><b>Close browser fully</b> before step 1. OOM? <b>low-mem</b>. 12M slots required. Cal scans ~600 aligned deltas for ELF/gadget — <b>no WebKit dump needed</b>. On CAL-FAIL try <code>?calmax=0x5000000</code> or chunked <code>?calchunk=200&caloff=0</code>.</p>
+  <p id="hint"><b>Close browser fully</b> before step 1. OOM during step 1? Tap <b>low-mem reload</b> first (lighter groom — keep 12M slots). Order: <b>1 primitive → 3 calibrate → 2 verify</b>. If addrof fails with <code>covered=false</code>, add <code>?carloop=1</code>.</p>
   <div id="out"></div>
 </div>
 <script>
