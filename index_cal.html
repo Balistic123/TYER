@@ -16,6 +16,13 @@
                     border-radius:4px; padding:10px 14px; font:inherit; cursor:pointer; }
   #toolbar button:disabled { opacity:0.45; cursor:default; }
   #toolbar button.secondary { background:#1a2330; border-color:#2a3544; }
+  #groom-bar { display:flex; flex-wrap:wrap; gap:6px; align-items:center;
+              margin:0 0 10px; padding:8px 12px; background:#0d1117;
+              border:1px solid #1e2732; border-radius:5px; }
+  #groom-bar .bar-label { font-size:12px; color:#9aa3b2; margin-right:4px; }
+  #groom-bar button { background:#151b24; color:#c8ced8; border:1px solid #2a3544;
+                      border-radius:4px; padding:6px 10px; font:12px inherit; cursor:pointer; }
+  #groom-bar button.active { background:#243044; border-color:#4a6a90; color:#e6ebf2; }
   #cal-bar { display:flex; flex-wrap:wrap; gap:10px; align-items:center;
              margin:0 0 10px; padding:10px 12px; background:#0d1117;
              border:1px solid #1e2732; border-radius:5px; font:12px Consolas, monospace; }
@@ -38,6 +45,14 @@
 <body>
 <div id="wrap">
   <div id="state">ready — close browser fully if prior OOM</div>
+  <div id="groom-bar">
+    <span class="bar-label">groom (tap before Start if race keeps missing)</span>
+    <button type="button" data-groom="default">default</button>
+    <button type="button" data-groom="384" class="active">384 drain</button>
+    <button type="button" data-groom="512">512 drain</button>
+    <button type="button" data-groom="max">max groom</button>
+    <button type="button" data-groom="lite">lite (OOM risk)</button>
+  </div>
   <div id="toolbar">
     <button type="button" id="btn-start">1. Start primitive</button>
     <button type="button" class="secondary" id="btn-lite" disabled>2a. Lite scan (1 read/tap)</button>
@@ -65,8 +80,9 @@
     </div>
   </div>
   <p id="hint">
-    <b>Goal:</b> find the correct <code>wk_expm1_builtin</code> for 13.52 retail.
-    After <b>Start</b>, note <code>CAL-NATIVEFN</code> (e.g. <code>813aa2880</code>).
+    <b>Start</b> runs one race session with internal auto-retry until <code>READ-PRIMITIVE-PASS</code>.
+    If the log spammed <code>COMPOSITION-LENGTH-MISS</code>, the race is losing — tap <b>512 drain</b> or <b>max groom</b> above,
+    <b>close the browser fully</b>, reload, then Start again (do not hammer Start on a losing groom).
     <b>Lite scan</b> tries ±8×0x4000 around the stale table hint (17 aligned candidates, 1 ELF read per tap).
     <b>Wide scan</b> walks <code>0x2570000–0x25a0000</code> (override with <code>?min=</code> / <code>?max=</code>).
     Or type a delta (try <code>2582880</code> if hint was <code>2586880</code>) and <b>Verify manual</b> — checks ELF + 8 ROP gadgets + libkernel prologue.

@@ -1,6 +1,7 @@
 import { int64 } from "./int64.js";
 import { offsetsFor, offsetsForKey } from "./ps4_offsets_userland.js";
 import { installWindowP, pairStatus } from "./mem.js";
+import { groomBootLine, wireGroomBar } from "./groom_presets.js";
 
 const params = new URLSearchParams(location.search);
 const lines = [];
@@ -10,11 +11,13 @@ let exploit = null;
 let nativeFn = null;
 let tableOff = null;
 let calibrated = null;
+let raceAttempt = 0;
+let lengthMissStreak = 0;
 
-const LOG_MAX = 250;
+const LOG_MAX = 300;
 const CAL_ALIGN_STEP = 0x4000;
 const ELF_MAGIC = 0x464c457f;
-const CORE_LOG = /FAIL|ERROR|PRIMITIVE|PASS|GIVE-UP|ATTEMPT|SSV-|READ-PRIMITIVE|COMPOSITION|PRIMITIVE-OK|PAIR-STATUS|AUTO-RETRY|ROUND|MISS|CAL-|GADGET|ELF|BASES|LK-|PASTE/i;
+const CORE_LOG = /ADDROF|FAIL|ERROR|PRIMITIVE|PASS|GIVE-UP|ATTEMPT|SETUP|CARRIER|PAIR|SSV-|TRIM-DEBRIS|ADDROF-RELEASE|FAKE-ADDRESS|READ-PRIMITIVE|PLACEMENT|COMPOSITION|NORMAL-CLONE|ZERO-HEADER|VALIDATION|LOAD-THREW|NO-RESULT|PRIMITIVE-OK|AUTO-RETRY|CORE-GIVE-UP|CAL-|GADGET|ELF|BASES|LK-|PASTE|HINT-GROOM/i;
 
 const GADGET_CHECKS = [
     ["POP_RDI", "wk_POP_RDI_RET", [0x5f, 0xc3]],
@@ -330,27 +333,38 @@ function attemptCap() {
     return n > 0 ? n : 0;
 }
 
-async function establishUntilOk(establishPrimitive) {
-    const cap = attemptCap();
-    let round = 0;
-    for (;;) {
-        round++;
-        if (round > 1) mark("ROUND", String(round));
-        state(cap === 0
-            ? "race attempt " + round + " (until success)…"
-            : "race round " + round + "…", "warn");
-        try {
-            return await establishPrimitive({
-                maxAttempts: cap,
-                onEvent: (t, d, a) => (CORE_LOG.test(t) ? mark : () => {})
-                    (t, (a != null ? "[" + a + "] " : "") + (d || ""))
-            });
-        } catch (err) {
-            mark("MISS", String(err.message || err));
-            if (cap > 0 && round >= 3) throw err;
-            await new Promise(r => setTimeout(r, 900));
-        }
+function onRaceEvent(tag, detail) {
+    if (!CORE_LOG.test(tag)) return;
+    mark(tag, detail || "");
+
+    if (tag === "ATTEMPT-START") {
+        raceAttempt++;
+        state("race attempt " + raceAttempt + "…", "warn");
+        if (raceAttempt === 15 || raceAttempt === 30 || raceAttempt === 50)
+            mark("HINT-GROOM", "still missing? close browser fully → reload → tap 512 or max groom");
     }
+
+    if (/COMPOSITION-LENGTH-MISS|SSV-PLACEMENT-MISS|ZERO-HEADER-MISS/.test(tag)) {
+        lengthMissStreak++;
+        if (lengthMissStreak === 8 || lengthMissStreak === 20)
+            mark("HINT-GROOM", "COMPOSITION-LENGTH-MISS = race lost — tap 512 drain or max groom above, close browser, reload");
+    }
+
+    if (tag === "READ-PRIMITIVE-PASS" || tag === "PRIMITIVE-OK")
+        lengthMissStreak = 0;
+}
+
+async function establishOnce(establishPrimitive) {
+    raceAttempt = 0;
+    lengthMissStreak = 0;
+    const cap = attemptCap();
+    mark("ATTEMPTS", cap > 0 ? String(cap) + " per page load" : "unlimited (single run)");
+    mark("NOTE", "close browser fully before Start if prior OOM or long retry session");
+
+    return establishPrimitive({
+        maxAttempts: cap,
+        onEvent: (t, d, a) => onRaceEvent(t, (a != null ? "[" + a + "] " : "") + (d || ""))
+    });
 }
 
 async function runStart() {
@@ -368,7 +382,15 @@ async function runStart() {
 
     try {
         const { establishPrimitive, installWindowP: installP } = await loadExploit();
-        const carrier = await establishUntilOk(establishPrimitive);
+        let carrier;
+        try {
+            carrier = await establishOnce(establishPrimitive);
+        } catch (err) {
+            if (/gave up/i.test(String(err.message))) {
+                mark("HINT-GROOM", "race lost — close browser fully, reload, tap 512 or max groom, Start again");
+            }
+            throw err;
+        }
         installP(carrier, { promote: params.get("promote") === "1" });
         const p = window.p;
         if (!p) throw new Error("window.p missing");
@@ -525,7 +547,9 @@ function init() {
     if (pre && expm1In) expm1In.value = pre.replace(/^0x/i, "");
 
     mark("BOOT", "index_cal.html — expm1 finder for 13.52");
+    mark("BOOT", groomBootLine(params));
     mark("BOOT", "lite ±" + liteSpanK() + "×0x4000 around table hint; wide uses ?min=&max=");
+    wireGroomBar(() => busy);
     setUi();
 }
 
