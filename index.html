@@ -63,7 +63,7 @@
     <button type="button" id="btn-offsets" disabled>2 - verify</button>
     <button type="button" id="btn-rw-only" disabled>2a - rw only</button>
     <button type="button" id="btn-calibrate" disabled>3 - lite cal</button>
-    <button type="button" id="btn-calibrate-err" disabled>3b - libkernel</button>
+    <button type="button" id="btn-calibrate-err" disabled>3b - lk lite</button>
     <button type="button" id="btn-all">same as step 1</button>
     <button type="button" id="btn-clear">clear log</button>
   </div>
@@ -81,7 +81,7 @@
     <button type="button" id="btn-expm1-set">set expm1</button>
     <button type="button" data-cal="reset" id="btn-cal-reset">lite reset</button>
   </div>
-  <p id="hint"><b>Step 3 lite cal</b> = 1 read4 per tap (~5 tries near table hint). OOM? Skip scan — type <b>expm1</b> hex + <b>set expm1</b> (0 reads). Step 2 verify works for ArrayBuffer either way; BASES needs expm1.</p>
+  <p id="hint"><b>Step 3 lite cal</b> = 1 read/tap. <b>3b lk lite</b> = 1 read/tap × 3 (IAT → prologue → verify) — tap 3b until <code>LK-OK</code>. OOM? Use <b>set expm1</b> (0 reads). Step 2 skips libkernel reads.</p>
   <div id="out"></div>
 </div>
 <script>

