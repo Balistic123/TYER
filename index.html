@@ -45,15 +45,15 @@
       <option value="1">1</option>
       <option value="6">6</option>
     </select>
-    <button type="button" class="primary" id="btn-establish">1 - get primitive</button>
-    <button type="button" id="btn-offsets" disabled>2 - offset tests</button>
-    <button type="button" id="btn-calibrate" disabled>3 - calibrate base</button>
+    <button type="button" class="primary" id="btn-establish">1 - primitive + calibrate</button>
+    <button type="button" id="btn-offsets" disabled>2 - verify</button>
+    <button type="button" id="btn-calibrate" disabled>3 - retry cal</button>
     <button type="button" id="btn-calibrate-err" disabled>3b - scan error</button>
-    <button type="button" id="btn-all">1 then 3 (calibrate)</button>
+    <button type="button" id="btn-all">same as step 1</button>
     <button type="button" id="btn-clear">clear log</button>
     <button type="button" class="danger" id="btn-lowmem">low-mem reload</button>
   </div>
-  <p id="hint">Order: <b>1</b> → <b>3</b> → <b>2</b>. Step 3 skips promote (OOM at pair-up). Logs persist on reload. <code>?calpromote=1</code> only if you want to retry promote.</p>
+  <p id="hint">Calibrate runs <b>inside step 1</b> (~4 reads, no scan/promote). Then step 2. Logs persist on reload. CAL-FAIL? try FW dropdown or <code>?narrow=1</code>.</p>
   <div id="out"></div>
 </div>
 <script>
