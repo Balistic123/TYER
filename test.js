@@ -1,7 +1,7 @@
 import { int64 } from "./int64.js";
 import { offsetsFor, offsetsForKey } from "./ps4_offsets_userland.js";
 
-let outEl, stateEl, fwSelect;
+let outEl, stateEl, fwSelect, attemptsSelect;
 let btnEstablish, btnOffsets, btnCalibrate, btnAll, btnClear, btnLowMem;
 
 const params = new URLSearchParams(location.search);
@@ -13,6 +13,7 @@ let primitiveDone = false;
 let exploit = null;
 
 const PRIMITIVE_LOUD = /FAIL|ERROR|THREW|RETRY|ABORT|PASS|GIVE-UP/i;
+const CORE_LOG = /FAIL|ERROR|THREW|RETRY|ABORT|PASS|GIVE-UP|ATTEMPT|SSV-|AUTO-RETRY|CORE-GIVE|COMPOSITION|PRIMITIVE/i;
 
 function mark(tag, detail) {
     if (!outEl) return;
@@ -315,6 +316,13 @@ function logBootInfo() {
         mark("BOOT", "groom override: " + params.getAll("g").join(", "));
 }
 
+function maxAttemptsPick() {
+    const fromUrl = parseInt(params.get("attempts") || "", 10);
+    if (fromUrl > 0) return fromUrl;
+    if (attemptsSelect) return parseInt(attemptsSelect.value, 10) || 3;
+    return 3;
+}
+
 async function runEstablish() {
     if (primitiveDone) {
         mark("SKIP", "primitive already established this page");
@@ -322,15 +330,26 @@ async function runEstablish() {
     }
 
     const { establishPrimitive, installWindowP, pairStatus } = await loadExploit();
+    const maxAttempts = maxAttemptsPick();
 
     state("establishing primitive...", "warn");
-    mark("STEP", "1 · get primitive");
+    mark("STEP", "1 - get primitive");
+    mark("ATTEMPTS", String(maxAttempts));
 
-    const carrier = await establishPrimitive({
-        maxAttempts: 1,
-        onEvent: (t, d, a) => (PRIMITIVE_LOUD.test(t) ? mark : () => {})
-            (t, (a != null ? "[" + a + "] " : "") + (d || ""))
-    });
+    let carrier;
+    try {
+        carrier = await establishPrimitive({
+            maxAttempts,
+            onEvent: (t, d, a) => (CORE_LOG.test(t) ? mark : () => {})
+                (t, (a != null ? "[" + a + "] " : "") + (d || ""))
+        });
+    } catch (err) {
+        if (/gave up/i.test(String(err.message))) {
+            mark("HINT", "race lost — close browser fully, reopen, tries=3 or low-mem");
+            mark("HINT", "OOM with 6 tries? use 1 try + low-mem reload");
+        }
+        throw err;
+    }
 
     installWindowP(carrier, {
         promote: false,
@@ -488,6 +507,7 @@ function init() {
     outEl = document.getElementById("out");
     stateEl = document.getElementById("state");
     fwSelect = document.getElementById("fw-select");
+    attemptsSelect = document.getElementById("attempts-select");
     btnEstablish = document.getElementById("btn-establish");
     btnOffsets = document.getElementById("btn-offsets");
     btnCalibrate = document.getElementById("btn-calibrate");
@@ -523,6 +543,8 @@ function init() {
 
     if (params.get("fw") && fwSelect.querySelector('option[value="' + params.get("fw") + '"]'))
         fwSelect.value = params.get("fw");
+    if (params.get("attempts") && attemptsSelect)
+        attemptsSelect.value = params.get("attempts");
 
     state("ready — tap step 1", "");
     logBootInfo();

@@ -39,6 +39,12 @@
       <option value="13.00">13.00</option>
       <option value="12.50">12.50</option>
     </select>
+    <label for="attempts-select">tries</label>
+    <select id="attempts-select">
+      <option value="3" selected>3</option>
+      <option value="1">1</option>
+      <option value="6">6</option>
+    </select>
     <button type="button" class="primary" id="btn-establish">1 - get primitive</button>
     <button type="button" id="btn-offsets" disabled>2 - offset tests</button>
     <button type="button" id="btn-calibrate" disabled>3 - calibrate wk</button>
@@ -46,7 +52,7 @@
     <button type="button" id="btn-clear">clear log</button>
     <button type="button" class="danger" id="btn-lowmem">low-mem reload</button>
   </div>
-  <p id="hint">Serve this folder over HTTP. Only file you need is index.html in the URL (no redirects).</p>
+  <p id="hint">SSV race is flaky — use <b>3 tries</b>. If OOM: low-mem reload, close browser, try 1 try. giveUp = failed all attempts.</p>
   <div id="out"></div>
 </div>
 <script>
