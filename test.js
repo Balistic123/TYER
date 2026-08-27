@@ -573,7 +573,9 @@ function logBootInfo() {
     const detected = offsetsFor(navigator.userAgent);
     mark("UA", navigator.userAgent);
     mark("UA-FW", detected.key || "unknown");
-    mark("BOOT", "step 1 auto-calibrates (4 reads) — step 2 verifies");
+    mark("BOOT", "step 1 auto-calibrates — default slots=8M (chunked fill)");
+    if (params.has("slots"))
+        mark("BOOT", "slots=" + params.get("slots"));
     if (params.has("g"))
         mark("BOOT", "groom override: " + params.getAll("g").join(", "));
 }
@@ -784,7 +786,8 @@ function init() {
     btnLowMem.addEventListener("click", () => {
         saveSession();
         const url = new URL(location.href);
-        url.searchParams.set("g", "drain:384");
+        url.searchParams.set("g", "drain:256");
+        url.searchParams.set("slots", "6000000");
         location.href = url.toString();
     });
 
