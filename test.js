@@ -573,9 +573,7 @@ function logBootInfo() {
     const detected = offsetsFor(navigator.userAgent);
     mark("UA", navigator.userAgent);
     mark("UA-FW", detected.key || "unknown");
-    mark("BOOT", "step 1 auto-calibrates — default slots=8M (chunked fill)");
-    if (params.has("slots"))
-        mark("BOOT", "slots=" + params.get("slots"));
+    mark("BOOT", "addrof needs 12M slots — if OOM use ?g=drain:256 (not lower slots)");
     if (params.has("g"))
         mark("BOOT", "groom override: " + params.getAll("g").join(", "));
 }
@@ -787,7 +785,7 @@ function init() {
         saveSession();
         const url = new URL(location.href);
         url.searchParams.set("g", "drain:256");
-        url.searchParams.set("slots", "6000000");
+        url.searchParams.delete("slots");
         location.href = url.toString();
     });
 
