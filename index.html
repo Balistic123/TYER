@@ -47,12 +47,13 @@
     </select>
     <button type="button" class="primary" id="btn-establish">1 - get primitive</button>
     <button type="button" id="btn-offsets" disabled>2 - offset tests</button>
-    <button type="button" id="btn-calibrate" disabled>3 - calibrate wk</button>
+    <button type="button" id="btn-calibrate" disabled>3 - calibrate base</button>
+    <button type="button" id="btn-calibrate-err" disabled>3b - scan error</button>
     <button type="button" id="btn-all">1 then 3 (calibrate)</button>
     <button type="button" id="btn-clear">clear log</button>
     <button type="button" class="danger" id="btn-lowmem">low-mem reload</button>
   </div>
-  <p id="hint">Order: <b>1</b> primitive → <b>3</b> calibrate → <b>2</b> verify. Step 2 alone skips BASES until step 3. OOM? low-mem + close browser.</p>
+  <p id="hint">Order: <b>1</b> primitive → <b>3</b> calibrate base → <b>2</b> verify. Step 3 promotes (frees ~137MB) then checks table hint — no full scan unless hint misses. OOM? low-mem reload first.</p>
   <div id="out"></div>
 </div>
 <script>

