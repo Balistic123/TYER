@@ -58,8 +58,13 @@ PS4["12.52"] = Object.assign({}, PS4["12.50"], {
     fw_status: "userland-only — shares 12.50 webkit RVAs (no 12.52 dump)",
 });
 
-// 13.52: add wk_* from your libSceNKWebKit.sprx dump before running BASES check.
-// PS4["13.52"] = { ... };
+// Kernel RVAs from PS4_KernelOffset.java — WebKit wk_* still shares 13.00 until
+// webkit-userland calibrate replaces them on your hardware.
+PS4["13.52"] = Object.assign({}, PS4["13.00"], {
+    fw_status: "userland-only — webkit=13.00 UNVERIFIED; kernel JMP_RSI/KL_LOCK from Java",
+    k_jmp_rsi: 0x4d6d0,
+    k_kl_lock: 0xe6c60,
+});
 
 export function offsetsFor(uaString) {
     const m = (uaString || "").match(/PlayStation\s+4[\/ ](\d+)\.(\d+)/);
