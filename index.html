@@ -20,10 +20,21 @@
   #toolbar button:disabled { opacity:0.45; cursor:default; }
   #toolbar button.primary { background:#1e3a2f; border-color:#3a6b54; }
   #toolbar button.danger { background:#3a2220; border-color:#6b3a3a; }
+  #groom-bar, #cal-bar { display:flex; flex-wrap:wrap; gap:6px; align-items:center;
+             margin:0 0 10px; padding:8px 12px; background:#0d1117;
+             border:1px solid #1e2732; border-radius:5px; }
+  #groom-bar .bar-label, #cal-bar .bar-label { font-size:12px; color:#9aa3b2;
+             margin-right:6px; min-width:52px; }
+  #groom-bar button, #cal-bar button { background:#151b24; color:#c8ced8;
+             border:1px solid #2a3544; border-radius:4px; padding:6px 10px;
+             font:12px/1.2 inherit; cursor:pointer; }
+  #groom-bar button.active, #cal-bar button.active { background:#243044;
+             border-color:#4a6a8a; color:#e6ebf2; }
+  #groom-bar button:disabled, #cal-bar button:disabled { opacity:0.45; cursor:default; }
   #hint { font-size:12px; color:#9aa3b2; margin:0 0 8px; line-height:1.4; }
   #out { white-space:pre-wrap; font:12px/1.45 Consolas, monospace;
          background:#11151b; border:1px solid #1e2732; border-radius:5px;
-         padding:10px 12px; height:calc(100vh - 200px); overflow-y:auto; }
+         padding:10px 12px; height:calc(100vh - 280px); overflow-y:auto; }
   .ok { color:#7fd0a0; } .bad { color:#d08a7f; } .warn { color:#d8c07f; }
 </style>
 </head>
@@ -41,9 +52,9 @@
     </select>
     <label for="attempts-select">tries</label>
     <select id="attempts-select">
-      <option value="3" selected>3</option>
+      <option value="6" selected>6</option>
+      <option value="3">3</option>
       <option value="1">1</option>
-      <option value="6">6</option>
     </select>
     <button type="button" class="primary" id="btn-establish">1 - get primitive</button>
     <button type="button" id="btn-offsets" disabled>2 - verify</button>
@@ -51,9 +62,23 @@
     <button type="button" id="btn-calibrate-err" disabled>3b - libkernel</button>
     <button type="button" id="btn-all">same as step 1</button>
     <button type="button" id="btn-clear">clear log</button>
-    <button type="button" class="danger" id="btn-lowmem">low-mem reload</button>
   </div>
-  <p id="hint"><b>Close browser fully</b> before step 1. Failures? Check last tag: <code>ADDROF-FAIL</code> / <code>SSV-PLACEMENT-MISS</code> / <code>READ-PRIMITIVE-MISMATCH</code>. OOM? <b>low-mem reload</b> then retry. Then step 3 cal → step 2 verify.</p>
+  <div id="groom-bar">
+    <span class="bar-label">groom</span>
+    <button type="button" data-groom="default" id="btn-groom-default">default</button>
+    <button type="button" data-groom="lite" id="btn-groom-lite">lite (OOM)</button>
+    <button type="button" data-groom="384" id="btn-groom-384">384 drain</button>
+    <button type="button" data-groom="512" id="btn-groom-512">512 drain</button>
+    <button type="button" data-groom="max" id="btn-groom-max">max groom</button>
+  </div>
+  <div id="cal-bar">
+    <span class="bar-label">cal</span>
+    <button type="button" data-cal="default" id="btn-cal-default">cal default</button>
+    <button type="button" data-cal="chunk8" id="btn-cal-chunk8">chunk 8</button>
+    <button type="button" data-cal="wide" id="btn-cal-wide">wide range</button>
+    <button type="button" data-cal="reset" id="btn-cal-reset">cal reset</button>
+  </div>
+  <p id="hint"><b>Close browser fully</b> before step 1. Pick a <b>groom</b> preset then reload — active preset highlighted. <code>COMPOSITION-LENGTH-MISS</code> → try <b>512 drain</b> or <b>max groom</b>. OOM → <b>lite</b>.</p>
   <div id="out"></div>
 </div>
 <script>

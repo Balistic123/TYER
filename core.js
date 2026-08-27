@@ -1,4 +1,4 @@
-let DRAIN_COUNT = 256;
+let DRAIN_COUNT = 384;
 const AUTO_RETRY_DELAY_MS = 50;
 
 const K = 2;
@@ -1098,7 +1098,7 @@ function beginComposition() {
     emit("FAKE-ADDRESS", `host=${hex(hostAddress)}-fake=${hex(fakeAddress)}`
         + "-delta=0x10");
     releaseAddrofScaffolding();
-    setTimeout(runGroomAndLoad, 48);
+    runGroomAndLoad();
 }
 
 function reportComposition() {
@@ -1120,16 +1120,18 @@ function reportComposition() {
     }
 
     if (compositionState === 3) {
-        emit(identityResult === -1 ? "CARRIER-IDENTITY-FAIL"
+        const missTag = identityResult === -1 ? "CARRIER-IDENTITY-FAIL"
             : (zeroHeaderMiss ? "ZERO-HEADER-MISS"
                 : (retrySafe ? "COMPOSITION-LENGTH-MISS"
-                    : "VALIDATION-MISMATCH")),
-            `rw=${rwHeaderOK}-holder=${holderHeaderOK}`
+                    : "VALIDATION-MISMATCH"));
+        emit(missTag,
+            `len=${compositionLength}-want=${EXPECTED_LENGTH}`
+            + `-rw=${rwHeaderOK}-holder=${holderHeaderOK}`
             + `-function=${functionHeaderOK}`
             + `-native-executable=${nativeExecutableHeaderOK}`
             + `-repeat=${pointersRepeated}-retry-safe=${retrySafe}`
             + `-identity=${identityResult}`
-            + `-hex=${dumpHex(rwHeader, CELL_BYTES)}`);
+            + (missTag === "COMPOSITION-LENGTH-MISS" ? "" : `-hex=${dumpHex(rwHeader, CELL_BYTES)}`));
         if (!retrySafe)
             failed();
         else

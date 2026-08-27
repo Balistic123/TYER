@@ -3,7 +3,41 @@ import { offsetsFor, offsetsForKey } from "./ps4_offsets_userland.js";
 import { installWindowP, pairStatus } from "./mem.js";
 
 let outEl, stateEl, fwSelect, attemptsSelect;
-let btnEstablish, btnOffsets, btnCalibrate, btnCalibrateErr, btnAll, btnClear, btnLowMem;
+let btnEstablish, btnOffsets, btnCalibrate, btnCalibrateErr, btnAll, btnClear;
+
+const GROOM_PRESETS = {
+    default: {
+        label: "default",
+        g: [],
+    },
+    lite: {
+        label: "lite",
+        g: ["drain:256", "drainsz:32768", "slab:2097152"],
+    },
+    "384": {
+        label: "384",
+        g: ["drain:384", "drainsz:32768", "slab:2097152"],
+    },
+    "512": {
+        label: "512",
+        g: ["drain:512", "drainsz:32768", "slab:2097152"],
+    },
+    max: {
+        label: "max",
+        g: [
+            "drain:512", "drainsz:65536", "slab:4194304",
+            "bfly:528384", "early:458752", "guard:589824",
+            "pred:524288", "final:524288",
+        ],
+    },
+};
+
+const CAL_PRESETS = {
+    default: { calchunk: null, calmax: null, calreset: false },
+    chunk8: { calchunk: "8", calmax: null, calreset: false },
+    wide: { calchunk: null, calmax: "5000000", calreset: false },
+    reset: { calchunk: null, calmax: null, calreset: true },
+};
 
 const params = new URLSearchParams(location.search);
 const lines = [];
@@ -538,9 +572,12 @@ function logBootInfo() {
     const detected = offsetsFor(navigator.userAgent);
     mark("UA", navigator.userAgent);
     mark("UA-FW", detected.key || "unknown");
-    mark("BOOT", "addrof needs 12M slots — OOM? low-mem btn (never reduce slots)");
-    if (params.has("g"))
-        mark("BOOT", "groom override: " + params.getAll("g").join(", "));
+    const gkey = currentGroomKey();
+    mark("BOOT", "groom=" + gkey + (gkey === "custom" ? " (" + params.getAll("g").join(", ") + ")" : ""));
+    if (params.has("calchunk")) mark("BOOT", "calchunk=" + params.get("calchunk"));
+    if (params.has("calmax")) mark("BOOT", "calmax=0x" + params.get("calmax"));
+    if (params.get("calreset") === "1") mark("BOOT", "calreset=1");
+    mark("BOOT", "addrof needs 12M slots — never reduce slots");
 }
 
 function maxAttemptsPick() {
@@ -746,6 +783,69 @@ async function runLibkernelCheck() {
     }
 }
 
+function currentGroomKey() {
+    const gs = params.getAll("g");
+    if (gs.length === 0) return "default";
+    for (const key of Object.keys(GROOM_PRESETS)) {
+        if (key === "default") continue;
+        const preset = GROOM_PRESETS[key];
+        if (preset.g.length !== gs.length) continue;
+        let match = true;
+        for (let i = 0; i < preset.g.length; i++) {
+            if (gs[i] !== preset.g[i]) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return key;
+    }
+    return "custom";
+}
+
+function highlightGroomButtons() {
+    const key = currentGroomKey();
+    document.querySelectorAll("[data-groom]").forEach(el => {
+        el.classList.toggle("active", el.getAttribute("data-groom") === key);
+    });
+}
+
+function reloadWithGroomPreset(key) {
+    const preset = GROOM_PRESETS[key];
+    if (!preset) return;
+    saveSession();
+    const url = new URL(location.href);
+    url.searchParams.set("clear", "1");
+    url.searchParams.delete("g");
+    url.searchParams.delete("slots");
+    for (const item of preset.g)
+        url.searchParams.append("g", item);
+    location.href = url.toString();
+}
+
+function reloadWithCalPreset(key) {
+    const preset = CAL_PRESETS[key];
+    if (!preset) return;
+    saveSession();
+    const url = new URL(location.href);
+    url.searchParams.delete("calchunk");
+    url.searchParams.delete("calmax");
+    url.searchParams.delete("calreset");
+    if (preset.calchunk) url.searchParams.set("calchunk", preset.calchunk);
+    if (preset.calmax) url.searchParams.set("calmax", preset.calmax);
+    if (preset.calreset) url.searchParams.set("calreset", "1");
+    location.href = url.toString();
+}
+
+function wirePresetBar(selector, reloadFn) {
+    document.querySelectorAll(selector).forEach(el => {
+        el.addEventListener("click", () => {
+            if (busy) return;
+            const key = el.getAttribute(selector === "[data-groom]" ? "data-groom" : "data-cal");
+            if (key) reloadFn(key);
+        });
+    });
+}
+
 function wireButton(el, handler) {
     if (!el) return;
     el.addEventListener("click", () => {
@@ -794,7 +894,6 @@ function init() {
     btnCalibrateErr = document.getElementById("btn-calibrate-err");
     btnAll = document.getElementById("btn-all");
     btnClear = document.getElementById("btn-clear");
-    btnLowMem = document.getElementById("btn-lowmem");
 
     if (!outEl || !btnEstablish) {
         state("UI missing — host via HTTP, open index.html", "bad");
@@ -815,17 +914,9 @@ function init() {
         state(primitiveDone ? "primitive OK — pick a test" : "ready", primitiveDone ? "ok" : "");
     });
 
-    btnLowMem.addEventListener("click", () => {
-        saveSession();
-        const url = new URL(location.href);
-        url.searchParams.set("clear", "1");
-        url.searchParams.delete("slots");
-        url.searchParams.delete("g");
-        url.searchParams.append("g", "drain:192");
-        url.searchParams.append("g", "drainsz:32768");
-        url.searchParams.append("g", "slab:2097152");
-        location.href = url.toString();
-    });
+    wirePresetBar("[data-groom]", reloadWithGroomPreset);
+    wirePresetBar("[data-cal]", reloadWithCalPreset);
+    highlightGroomButtons();
 
     window.addEventListener("beforeunload", () => saveSession());
     window.addEventListener("error", (e) => {
@@ -876,6 +967,7 @@ function init() {
             logBootInfo();
         }
     }
+    highlightGroomButtons();
     setUi();
 }
 
