@@ -58,10 +58,10 @@ function scheduleSave() {
 function loadSession() {
     try {
         const raw = localStorage.getItem(STORAGE_KEY);
-        if (!raw) return false;
+        if (!raw) return null;
         const data = JSON.parse(raw);
         if (!data || !Array.isArray(data.lines) || data.lines.length === 0)
-            return false;
+            return null;
         lines.length = 0;
         lines.push(...data.lines.slice(-STORAGE_MAX));
         passCount = data.passCount || 0;
@@ -71,10 +71,24 @@ function loadSession() {
         renderLog();
         if (stateEl && data.stateMsg)
             state(data.stateMsg, data.stateCls || "");
-        return true;
+        return {
+            savedPrimitive: !!data.primitiveDone,
+            savedCalibrated: !!data.calibratedOff,
+            savedAt: data.ts || 0,
+        };
     } catch (_) {
-        return false;
+        return null;
     }
+}
+
+function lastMeaningfulLine() {
+    for (let i = lines.length - 1; i >= 0; i--) {
+        const l = lines[i];
+        if (l.startsWith("RELOAD") || l.startsWith("RESTORE") || l.startsWith("HINT-RESTORE"))
+            continue;
+        return l;
+    }
+    return "";
 }
 
 function mark(tag, detail) {
@@ -145,34 +159,27 @@ async function breathe(i) {
         await new Promise(r => setTimeout(r, 16));
 }
 
-async function sweepAfterPromote(cycles, mbPerCycle, msPerCycle) {
-    mark("SWEEP", "cycles=" + cycles + " mb=" + mbPerCycle);
-    for (let i = 0; i < cycles; i++) {
-        let junk = [];
-        for (let k = 0; k < mbPerCycle; k++)
-            junk.push(new ArrayBuffer(0x100000));
-        junk.length = 0;
-        junk = null;
-        await new Promise(r => setTimeout(r, msPerCycle));
-    }
-}
-
 async function ensureMemoryForScan() {
+    if (params.get("calpromote") !== "1") {
+        mark("PROMOTE-SKIP", "table-hint only — promote OOMs on PS4 (?calpromote=1 to try)");
+        return;
+    }
     if (pairStatus.promoted) {
         mark("PROMOTE", "already promoted");
         return;
     }
-    mark("PROMOTE", "releasing groom (~137MB) before calibrate...");
+    mark("PROMOTE", "calpromote=1 — releasing groom...");
     try {
         promoteToRealPair((t, d) => mark(t, d || ""));
         if (pairStatus.promoted) {
             mark("PROMOTE-OK", "stage=" + pairStatus.stage);
-            await sweepAfterPromote(3, 4, 50);
+            saveSession();
+            await new Promise(r => setTimeout(r, 200));
         } else {
             mark("PROMOTE-SKIP", "state=" + pairStatus.state);
         }
     } catch (err) {
-        mark("PROMOTE-WARN", (err.message || String(err)) + " — table-hint may still work");
+        mark("PROMOTE-WARN", (err.message || String(err)) + " — continuing table-hint");
     }
 }
 
@@ -389,10 +396,10 @@ function bufAddr(p, off, ab) {
 
 async function calibrateOffsets(p, tableOff, opts) {
     const scanError = opts && opts.scanError;
-    mark("CALIBRATE", scanError ? "error-import scan" : "base only (no heavy scan)");
+    mark("CALIBRATE", scanError ? "error-import scan" : "base only (table-hint, no promote)");
 
     await ensureMemoryForScan();
-    await new Promise(r => setTimeout(r, 0));
+    saveSession();
 
     const mFunctionOff = tableOff.wk_JSFunction_m_function || 0x28;
     let wk = null;
@@ -693,19 +700,30 @@ function init() {
         clearLog();
         state("ready — tap step 1", "");
         logBootInfo();
-    } else if (loadSession()) {
-        if (!window.p)
-            primitiveDone = false;
-        mark("RELOAD", new Date().toISOString());
-        mark("RESTORE", "lines=" + lines.length
-            + " pass=" + passCount + " fail=" + failCount
-            + " primitiveDone=" + primitiveDone
-            + (calibratedOff ? " calibrated=yes" : ""));
-        if (!stateEl.textContent)
-            state("restored log — re-run step 1 for primitive", primitiveDone ? "warn" : "");
     } else {
-        state("ready — tap step 1", "");
-        logBootInfo();
+        const restored = loadSession();
+        if (restored) {
+            const savedPrimitive = restored.savedPrimitive;
+            if (!window.p)
+                primitiveDone = false;
+            mark("RELOAD", new Date().toISOString());
+            mark("RESTORE", "lines=" + lines.length
+                + " pass=" + passCount + " fail=" + failCount
+                + " savedPrimitive=" + savedPrimitive
+                + " livePrimitive=" + !!window.p
+                + (restored.savedCalibrated ? " savedCalibrated=yes" : ""));
+            const tail = lastMeaningfulLine();
+            if (tail)
+                mark("LAST-LOG", tail);
+            if (savedPrimitive && !window.p)
+                mark("HINT-RESTORE", "step 1 worked last time — re-run 1, then 3 (calibrate)");
+            else if (passCount >= 2 && !savedPrimitive)
+                mark("HINT-RESTORE", "pass=2 but primitive not saved — OOM during step 1 checks?");
+            state("restored log — scroll up for crash point", savedPrimitive ? "warn" : "");
+        } else {
+            state("ready — tap step 1", "");
+            logBootInfo();
+        }
     }
     setUi();
 }

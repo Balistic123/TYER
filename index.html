@@ -53,7 +53,7 @@
     <button type="button" id="btn-clear">clear log</button>
     <button type="button" class="danger" id="btn-lowmem">low-mem reload</button>
   </div>
-  <p id="hint">Logs persist across reload (localStorage). Order: <b>1</b> → <b>3</b> → <b>2</b>. Add <code>?clear=1</code> to wipe. OOM? low-mem reload keeps log.</p>
+  <p id="hint">Order: <b>1</b> → <b>3</b> → <b>2</b>. Step 3 skips promote (OOM at pair-up). Logs persist on reload. <code>?calpromote=1</code> only if you want to retry promote.</p>
   <div id="out"></div>
 </div>
 <script>
