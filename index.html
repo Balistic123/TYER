@@ -48,12 +48,12 @@
     <button type="button" class="primary" id="btn-establish">1 - get primitive</button>
     <button type="button" id="btn-offsets" disabled>2 - verify</button>
     <button type="button" id="btn-calibrate" disabled>3 - retry cal</button>
-    <button type="button" id="btn-calibrate-err" disabled>3b - scan error</button>
+    <button type="button" id="btn-calibrate-err" disabled>3b - libkernel</button>
     <button type="button" id="btn-all">same as step 1</button>
     <button type="button" id="btn-clear">clear log</button>
     <button type="button" class="danger" id="btn-lowmem">low-mem reload</button>
   </div>
-  <p id="hint"><b>Close browser fully</b> before step 1. OOM? <b>low-mem</b> (clears log + lite groom). 12M slots required — never reduce slots. Then step 3 calibrate.</p>
+  <p id="hint"><b>Close browser fully</b> before step 1. OOM? <b>low-mem</b> (clears log + lite groom). 12M slots required — never reduce slots. Step 1 includes nano-cal (~29 ELF reads). Step 3 retries if CAL-FAIL; paste CAL-NATIVEFN or use <code>?expm1=0x...</code>.</p>
   <div id="out"></div>
 </div>
 <script>
