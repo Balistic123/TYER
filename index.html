@@ -31,6 +31,9 @@
   #groom-bar button.active, #cal-bar button.active { background:#243044;
              border-color:#4a6a8a; color:#e6ebf2; }
   #groom-bar button:disabled, #cal-bar button:disabled { opacity:0.45; cursor:default; }
+  #expm1-in { background:#0b0d10; color:#c8ced8; border:1px solid #2a3544;
+              border-radius:4px; padding:6px 8px; font:12px Consolas, monospace;
+              width:110px; }
   #hint { font-size:12px; color:#9aa3b2; margin:0 0 8px; line-height:1.4; }
   #out { white-space:pre-wrap; font:12px/1.45 Consolas, monospace;
          background:#11151b; border:1px solid #1e2732; border-radius:5px;
@@ -58,7 +61,8 @@
     </select>
     <button type="button" class="primary" id="btn-establish">1 - get primitive</button>
     <button type="button" id="btn-offsets" disabled>2 - verify</button>
-    <button type="button" id="btn-calibrate" disabled>3 - calibrate</button>
+    <button type="button" id="btn-rw-only" disabled>2a - rw only</button>
+    <button type="button" id="btn-calibrate" disabled>3 - lite cal</button>
     <button type="button" id="btn-calibrate-err" disabled>3b - libkernel</button>
     <button type="button" id="btn-all">same as step 1</button>
     <button type="button" id="btn-clear">clear log</button>
@@ -72,13 +76,12 @@
     <button type="button" data-groom="max" id="btn-groom-max">max groom</button>
   </div>
   <div id="cal-bar">
-    <span class="bar-label">cal</span>
-    <button type="button" data-cal="default" id="btn-cal-default">cal default</button>
-    <button type="button" data-cal="chunk8" id="btn-cal-chunk8">chunk 8</button>
-    <button type="button" data-cal="wide" id="btn-cal-wide">wide range</button>
-    <button type="button" data-cal="reset" id="btn-cal-reset">cal reset</button>
+    <span class="bar-label">expm1</span>
+    <input type="text" id="expm1-in" placeholder="2582880" autocomplete="off">
+    <button type="button" id="btn-expm1-set">set expm1</button>
+    <button type="button" data-cal="reset" id="btn-cal-reset">lite reset</button>
   </div>
-  <p id="hint"><b>Close browser fully</b> before step 1. Pick a <b>groom</b> preset then reload — active preset highlighted. <code>COMPOSITION-LENGTH-MISS</code> → try <b>512 drain</b> or <b>max groom</b>. OOM → <b>lite</b>.</p>
+  <p id="hint"><b>Step 3 lite cal</b> = 1 read4 per tap (~5 tries near table hint). OOM? Skip scan — type <b>expm1</b> hex + <b>set expm1</b> (0 reads). Step 2 verify works for ArrayBuffer either way; BASES needs expm1.</p>
   <div id="out"></div>
 </div>
 <script>
