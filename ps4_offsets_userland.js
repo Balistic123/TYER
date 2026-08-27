@@ -76,9 +76,9 @@ PS4["12.52"] = Object.assign({}, PS4["12.50"], {
     fw_status: "userland-only — shares 12.50 webkit RVAs (no 12.52 dump)",
 });
 
-// 13.52: wk_expm1_builtin from 13.00 row is WRONG on retail 13.52 — harness micro-scans ELF
+// 13.52: table wk_expm1_builtin is a stale hint — harness scans aligned ELF on hardware
 PS4["13.52"] = Object.assign({}, PS4["13.50"], {
-    fw_status: "13.50 gadgets; wk_expm1_builtin auto-fixed on HW via micro-ELF scan",
+    fw_status: "13.50 gadgets; wk_expm1_builtin found on HW via aligned ELF scan",
     wk_expm1_builtin:                 0x2586880,
     k_jmp_rsi: 0x4d6d0,
     k_kl_lock: 0xe6c60,

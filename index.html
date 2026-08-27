@@ -53,7 +53,7 @@
     <button type="button" id="btn-clear">clear log</button>
     <button type="button" class="danger" id="btn-lowmem">low-mem reload</button>
   </div>
-  <p id="hint"><b>Close browser fully</b> before step 1. OOM? <b>low-mem</b> (clears log + lite groom). 12M slots required — never reduce slots. Step 1 includes nano-cal (~29 ELF reads). Step 3 retries if CAL-FAIL; paste CAL-NATIVEFN or use <code>?expm1=0x...</code>.</p>
+  <p id="hint"><b>Close browser fully</b> before step 1. OOM? <b>low-mem</b>. 12M slots required. Cal scans ~600 aligned deltas for ELF/gadget — <b>no WebKit dump needed</b>. On CAL-FAIL try <code>?calmax=0x5000000</code> or chunked <code>?calchunk=200&caloff=0</code>.</p>
   <div id="out"></div>
 </div>
 <script>
