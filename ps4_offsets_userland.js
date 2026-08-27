@@ -1,5 +1,6 @@
 // WebKit (userland) RVAs only — no kernel gadgets, stubs, or patch metadata.
-// Copied from webkit/ps4_offsets.js. Kernel half of the full chain is omitted.
+
+import { webkit_gadgets_1350 as g1350 } from "./webkit_gadgets_1350.js";
 
 export const PS4 = {
     "13.00": {
@@ -10,6 +11,24 @@ export const PS4 = {
         k__error:                         0x26420,
         wk_ArrayBuffer_m_impl:            0x10,
         wk_ArrayBuffer_m_contents_m_data: 0x10,
+    },
+    "13.50": {
+        fw_status: "pop gadgets from webkit_gadgets_1350.js (radare2); "
+            + "anchor/imp assumed 13.00 — run calibrate on 13.52 hardware",
+        wk_expm1_builtin:                 0x2586880,
+        wk_JSFunction_m_function:         0x28,
+        wk___imp___error:                 0x3cb8cc8,
+        k__error:                         0x26420,
+        wk_ArrayBuffer_m_impl:            0x10,
+        wk_ArrayBuffer_m_contents_m_data: 0x10,
+        wk_POP_RDI_RET:                     g1350.wk_POP_RDI_RET,
+        wk_POP_RSI_RET:                     g1350.wk_POP_RSI_RET,
+        wk_POP_RDX_RET:                     g1350.wk_POP_RDX_RET,
+        wk_POP_RCX_RET:                     g1350.wk_POP_RCX_RET,
+        wk_POP_RAX_RET:                     g1350.wk_POP_RAX_RET,
+        wk_POP_R8_RET:                      g1350.wk_POP_R8_RET,
+        wk_POP_R9_RET:                      g1350.wk_POP_R9_RET,
+        wk_LEAVE_RET:                       g1350.wk_LEAVE_RET,
     },
     "12.50": {
         fw_status: "userland-only — UNTESTED; webkit RVAs from 12.50 module dump",
@@ -58,12 +77,16 @@ PS4["12.52"] = Object.assign({}, PS4["12.50"], {
     fw_status: "userland-only — shares 12.50 webkit RVAs (no 12.52 dump)",
 });
 
-// Kernel RVAs from PS4_KernelOffset.java — WebKit wk_* still shares 13.00 until
-// webkit-userland calibrate replaces them on your hardware.
-PS4["13.52"] = Object.assign({}, PS4["13.00"], {
-    fw_status: "userland-only — webkit=13.00 UNVERIFIED; kernel JMP_RSI/KL_LOCK from Java",
+// 13.52: 13.50 WebKit row + kernel deltas from PS4_KernelOffset.java
+PS4["13.52"] = Object.assign({}, PS4["13.50"], {
+    fw_status: "13.50 webkit gadgets + kernel JMP_RSI/KL_LOCK from Java — calibrate anchor on HW",
     k_jmp_rsi: 0x4d6d0,
     k_kl_lock: 0xe6c60,
+});
+
+PS4["13.04"] = Object.assign({}, PS4["13.50"], {
+    alias_of: "13.50",
+    fw_status: "userland-only — shares 13.50 webkit (BinDiff to 13.04 if gadgets moved)",
 });
 
 export function offsetsFor(uaString) {
