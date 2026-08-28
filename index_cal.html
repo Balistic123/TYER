@@ -99,8 +99,8 @@
     </div>
   </div>
   <p id="hint">
-    <b>Best base leak:</b> tap <b>2e. Find base (vtable)</b> after Start — textarea → WebCore vtable → walk back until <code>CAL-ELF-HIT</code> (first tap leaks vtable, then 1 read/tap).
-    <b>0xcccccccc?</b> expm1 path is wrong — use 2e, not Assume.
+    <b>2e runs automatically</b> after Start — textarea vtable → walk back until <code>CAL-ELF-HIT</code>.
+    Re-run with button <b>2e</b> if needed. Disable auto with <code>?vtable=0</code>.
   </p>
   <h2>Log</h2>
   <div id="out"></div>

