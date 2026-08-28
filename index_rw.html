@@ -77,12 +77,15 @@
   <div class="gadget-bar" id="gadget-pop">
     <span class="bar-label">pop gadgets (13.52 HW scan)</span>
   </div>
+  <div class="gadget-bar" id="gadget-g5">
+    <span class="bar-label">G5 candidates — tap to set + verify</span>
+  </div>
   <div class="gadget-bar" id="gadget-pivot">
-    <span class="bar-label">pivot G0-G4 OK — G5: G5 probe or Scan pivot (chunked, cluster-only)</span>
+    <span class="bar-label">pivot G0-G4 OK — use G5 bar above for candidates</span>
   </div>
   <p id="hint"><b>Pop gadgets OK on 13.52.</b> Pivot RVAs from 13.00 are wrong — Native call with them crashes/OOMs.
-    Flow: Cal Accept → groom → <b>Start</b> → <b>Save bases</b> → tap pivot buttons (expect GADGET-BAD at 13.00 hints)
-    → <b>Scan pivot (auto)</b> runs until done — tap <b>Stop scan</b> to cancel → <b>Verify pivot</b> → <b>Native call</b>.
+    Flow: Cal Accept → groom → <b>Start</b> → <b>Save bases</b> → tap <b>G5 +0x2411ac</b> (or probe / full scan)
+    → <b>Verify pivot</b> → <b>Native call</b>. Use <b>Clear pivot</b> to reset saved G5.
     <code>?restorelog=1</code> after crash.</p>
   <h2>Known pointers (this process)</h2>
   <table id="map">

