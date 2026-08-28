@@ -417,6 +417,8 @@ async function calibrateLiteAnchor(p, tableOff) {
     }
 
     mark("CAL-MORE", "tap step 3 (" + (i + 1) + "/" + deltas.length + ")");
+    if (i + 1 >= 3)
+        mark("HINT", "arb rw needs NO cal — use 2a rw only; stop cal if OOM");
     return null;
 }
 

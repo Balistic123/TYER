@@ -16,6 +16,13 @@
                     border-radius:4px; padding:10px 16px; font:inherit; cursor:pointer; }
   #toolbar button:disabled { opacity:0.45; cursor:default; }
   #toolbar button.secondary { background:#1a2330; border-color:#2a3544; }
+  #groom-bar { display:flex; flex-wrap:wrap; gap:6px; align-items:center;
+              margin:0 0 10px; padding:8px 12px; background:#0d1117;
+              border:1px solid #1e2732; border-radius:5px; }
+  #groom-bar .bar-label { font-size:12px; color:#9aa3b2; margin-right:4px; }
+  #groom-bar button { background:#151b24; color:#c8ced8; border:1px solid #2a3544;
+                      border-radius:4px; padding:6px 10px; font:12px inherit; cursor:pointer; }
+  #groom-bar button.active { background:#243044; border-color:#4a6a90; color:#e6ebf2; }
   #peek-bar { display:flex; flex-wrap:wrap; gap:8px; align-items:center;
               margin:0 0 10px; padding:8px 12px; background:#0d1117;
               border:1px solid #1e2732; border-radius:5px; }
@@ -42,13 +49,24 @@
 </head>
 <body>
 <div id="wrap">
-  <div id="state">ready — close browser fully if prior OOM</div>
+  <div id="state">loading JS…</div>
+  <div id="groom-bar">
+    <span class="bar-label">groom (tap before Start if race keeps missing)</span>
+    <button type="button" data-groom="default">default</button>
+    <button type="button" data-groom="384" class="active">384 drain</button>
+    <button type="button" data-groom="512">512 drain</button>
+    <button type="button" data-groom="max">max groom</button>
+    <button type="button" data-groom="lite">lite (OOM risk)</button>
+  </div>
   <div id="toolbar">
     <button type="button" id="btn-start">Start arbitrary R/W</button>
+    <button type="button" class="secondary" id="btn-native" disabled>Native call (getpid)</button>
     <button type="button" class="secondary" id="btn-refresh" disabled>Refresh map</button>
     <button type="button" class="secondary" id="btn-clear">Clear log</button>
   </div>
-  <p id="hint"><b>Start</b> retries the SSV race until <code>PRIMITIVE-OK</code> (no give-up). Then logs every leaked pointer as <code>ADDR</code> lines + table. <b>Scope:</b> WebKit browser process only.</p>
+  <p id="hint"><b>Start</b> runs one race session until <code>PRIMITIVE-OK</code>.
+    After cal (<code>index_cal.html</code> Accept offsets), tap <b>Native call (getpid)</b> for poops-style syscall via Math.expm1 pivot.
+    Use same groom if race keeps missing. <b>Scope:</b> WebKit browser process only.</p>
   <h2>Known pointers (this process)</h2>
   <table id="map">
     <thead><tr><th>label</th><th>address</th><th>note</th></tr></thead>
@@ -67,7 +85,18 @@
 <script>
 window.addEventListener("error", function (e) {
   var s = document.getElementById("state");
-  if (s) { s.textContent = "JS error: " + (e.message || e); s.className = "bad"; }
+  var o = document.getElementById("out");
+  var msg = "JS error: " + (e.message || e);
+  if (s) { s.textContent = msg; s.className = "bad"; }
+  if (o) o.textContent = (o.textContent ? o.textContent + "\n" : "") + msg;
+});
+window.addEventListener("unhandledrejection", function (e) {
+  var s = document.getElementById("state");
+  var o = document.getElementById("out");
+  var r = e.reason;
+  var msg = "load failed: " + (r && r.message ? r.message : r);
+  if (s) { s.textContent = msg; s.className = "bad"; }
+  if (o) o.textContent = (o.textContent ? o.textContent + "\n" : "") + msg;
 });
 </script>
 <script type="module" src="./rw_demo.js"></script>

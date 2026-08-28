@@ -81,7 +81,7 @@
     <button type="button" id="btn-expm1-set">set expm1</button>
     <button type="button" data-cal="reset" id="btn-cal-reset">lite reset</button>
   </div>
-  <p id="hint"><b>Step 3 lite cal</b> = 1 read/tap. <b>3b lk lite</b> = 1 read/tap × 3 (IAT → prologue → verify) — tap 3b until <code>LK-OK</code>. OOM? Use <b>set expm1</b> (0 reads). Step 2 skips libkernel reads.</p>
+  <p id="hint"><b>Arb R/W needs NO bases</b> — step <b>2a rw only</b> is enough. Lite cal / expm1 are only for module BASES (webkit/libkernel names). OOM on cal? <b>Skip step 3</b> — use 2a only, or <b>set expm1</b> (0 reads) if you already have the hex.</p>
   <div id="out"></div>
 </div>
 <script>
