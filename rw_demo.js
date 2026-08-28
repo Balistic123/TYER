@@ -32,7 +32,7 @@ import {
 } from "./libkernel_resolve.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250828v";
+const BUILD_ID = "rw-20250828w";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const RESTORE_LOG = params.get("restorelog") === "1";
@@ -109,7 +109,7 @@ let scanPivotAuto = false;
 let scanPivotStop = false;
 let scanQuiet = false;
 let scanRenderPending = 0;
-const SCAN_MARK_TAGS = /^(SCAN-|G5-|PIVOT-)/;
+const SCAN_MARK_TAGS = /^(SCAN-|G5-|PIVOT-|LK-|NATIVE-)/;
 const _scanBytes = new Array(8);
 const _win16 = new Array(16);
 
@@ -407,7 +407,12 @@ function runManualTest(testId) {
             return;
         }
         if (testId === "scan-iat") {
-            runScanIat();
+            runScanIat().catch(function (err) {
+                mark("LK-FAIL", err.message || String(err));
+                busy = false;
+                setUi();
+                renderOut();
+            });
             return;
         }
         if (testId === "stub20") {
@@ -1649,7 +1654,7 @@ async function runScanIat() {
     const off = loadEffectiveOff();
     const { webkitBase } = basesFromSession(off);
     if (!webkitBase) {
-        mark("LK-SKIP", "no webkitBase");
+        mark("LK-SKIP", "no webkitBase — Save bases first");
         return;
     }
     if (iatScanState && !iatScanState.done) {
@@ -1658,24 +1663,28 @@ async function runScanIat() {
         return;
     }
     busy = true;
-    scanQuiet = true;
     setUi();
     iatScanState = null;
-    mark("LK-SCAN", "ELF DT_PLTGOT → GOT slots → PLT xrefs (no brute sweep)");
+    mark("LK-SCAN", "ELF DT_PLTGOT → GOT slots → PLT xrefs");
+    scanState("IAT scan…");
+    let ticks = 0;
+    const maxTicks = 60000;
     try {
-        while (true) {
+        while (ticks++ < maxTicks) {
             const chunk = scanErrorIatChunk(p, webkitBase, off, iatScanState);
             iatScanState = chunk.state;
             if (chunk.phase === "elf-hit")
                 mark("LK-ELF", "DT_PLTGOT +0x" + chunk.gotPlt.toString(16));
             else if (chunk.phase === "elf-miss")
-                mark("LK-PHASE", "no DT_PLTGOT in mapped ELF — PLT xrefs");
+                mark("LK-PHASE", "no DT_PLTGOT — PLT xrefs in .text");
             else if (chunk.phase === "gotplt-miss")
-                mark("LK-PHASE", "GOT walk miss — PLT xrefs in .text");
-            else if (chunk.phase === "code" && !scanQuiet)
-                scanState("PLT xref @+0x" + chunk.cursor.toString(16)
+                mark("LK-PHASE", "GOT walk miss — PLT xrefs");
+            else if (chunk.phase === "gotplt")
+                scanState("GOT slot " + chunk.gotIdx + "/384");
+            else if (chunk.phase === "code")
+                scanState("PLT xref +0x" + chunk.cursor.toString(16)
                     + " q=" + chunk.queued);
-            else if (chunk.phase === "verify" && !scanQuiet)
+            else if (chunk.phase === "verify")
                 scanState("verify GOT " + chunk.left + " left");
             if (chunk.done && chunk.lk) {
                 mark("LK-OK", chunk.lk + " IAT +0x" + chunk.iatRva.toString(16)
@@ -1688,13 +1697,22 @@ async function runScanIat() {
                 state("IAT scan miss", "bad");
                 break;
             }
+            if ((ticks & 31) === 0)
+                renderOut();
             await new Promise(r => setTimeout(r, 0));
         }
+        if (ticks >= maxTicks) {
+            mark("LK-FAIL", "IAT scan timeout — reload and retry");
+            state("IAT scan timeout", "bad");
+        }
+    } catch (err) {
+        mark("LK-FAIL", err.message || String(err));
+        state("IAT scan error", "bad");
     } finally {
-        scanQuiet = false;
         busy = false;
         iatScanState = null;
         setUi();
+        renderOut();
     }
 }
 

@@ -227,21 +227,39 @@ export function scanErrorIatChunk(p, webkitBase, off, state) {
     }
 
     if (state.phase === "gotplt") {
-        const hit = scanGotPltSlots(p, webkitBase, off, state.gotPlt, { maxSlots: 384 });
-        if (hit) {
-            saveLibkernelSession(hit.lk, hit.iatRva);
-            state.done = true;
-            state.best = hit;
-            return {
-                done: true,
-                lk: hit.lk,
-                iatRva: hit.iatRva,
-                source: "got-plt",
-                state,
-            };
+        const maxSlots = 384;
+        if (state.gotSlot == null) state.gotSlot = 0;
+        let checks = 0;
+        while (state.gotSlot < maxSlots && checks < 24) {
+            const rva = state.gotPlt + state.gotSlot * 8;
+            state.gotSlot++;
+            checks++;
+            if (!iatRvaAllowed(rva, off)) break;
+            const hit = lkFromIatSlot(p, webkitBase, rva, off, read8p);
+            if (hit) {
+                saveLibkernelSession(hit.lk, hit.iatRva);
+                state.done = true;
+                state.best = hit;
+                return {
+                    done: true,
+                    lk: hit.lk,
+                    iatRva: hit.iatRva,
+                    source: "got-plt+" + (state.gotSlot - 1),
+                    state,
+                };
+            }
         }
-        state.phase = "code";
-        return { done: false, state, phase: "gotplt-miss" };
+        if (state.gotSlot >= maxSlots
+            || !iatRvaAllowed(state.gotPlt + state.gotSlot * 8, off)) {
+            state.phase = "code";
+            return { done: false, state, phase: "gotplt-miss" };
+        }
+        return {
+            done: false,
+            state,
+            phase: "gotplt",
+            gotIdx: state.gotSlot,
+        };
     }
 
     if (state.phase === "code") {
