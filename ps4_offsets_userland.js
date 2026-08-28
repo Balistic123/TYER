@@ -89,7 +89,7 @@ const LIBKERNEL_1300 = {
 };
 
 PS4["13.52"] = Object.assign({}, PS4["13.50"], LIBKERNEL_1300, {
-    fw_status: "13.52 HW pop + pivot G0-G4 — G5 pending",
+    fw_status: "13.52 HW pop + pivot G0-G5 (7/7)",
     wk_expm1_builtin:                 0xeb6350,
     wk_POP_RDI_RET:                     0x4be55,
     wk_POP_RSI_RET:                     0x7acb3,
@@ -105,6 +105,7 @@ PS4["13.52"] = Object.assign({}, PS4["13.50"], LIBKERNEL_1300, {
     wk_PUSH_RBP_MOV_RBP_RSP_10:         0x1ff70,
     wk_MOV_RDI_RAX_8_CALL_20:           0x16e02,
     wk_MOV_RDX_RAX_18_CALL_10:          0x589c1,
+    wk_PUSH_RDX_POP_RSP_RET:            0x13ec77a,
     pivot_view_sp:                      0x38,
     k_jmp_rsi: 0x4d6d0,
     k_kl_lock: 0xe6c60,

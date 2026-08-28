@@ -23,13 +23,13 @@ export const PIVOT_HW_1352 = {
     wk_PUSH_RBP_MOV_RBP_RSP_10:   0x1ff70,
     wk_MOV_RDI_RAX_8_CALL_20:     0x16e02,
     wk_MOV_RDX_RAX_18_CALL_10:    0x589c1,
-    // G5 wk_PUSH_RDX_POP_RSP_RET — still scan (low .text only)
+    wk_PUSH_RDX_POP_RSP_RET:      0x13ec77a,
 };
 
 /** Stable G5−G0 offset in libSceNKWebKit (11.50–13.00 decrypted modules) */
 export const G5_DELTA_FROM_G0 = 0x15d362;
 
-/** G5 − expm1 on 13.00 decrypted module (scan hint on 13.52 low .text) */
+/** G5 − expm1 — stable on 13.00/13.52 (HW G5 @ expm1+this on 13.52) */
 export const G5_EXPM1_DELTA = 0x53642a;
 
 export const WEBKIT_RVA_PAD = 0x100000;
@@ -95,7 +95,6 @@ export function g5DerivedHint(found) {
 
 export function pivotHint(key) {
     if (PIVOT_HW_1352[key] != null) return PIVOT_HW_1352[key];
-    /** G5 13.00 hint (+0x2abccaa) is wrong and OOMs on 13.52 — never use */
     if (key === "wk_PUSH_RDX_POP_RSP_RET") return 0;
     return PIVOT_HINTS_1300[key] || 0;
 }
