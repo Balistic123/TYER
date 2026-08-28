@@ -82,6 +82,7 @@ export const G5_PATTERNS = [
     { pat: [0x52, 0x5c, 0xc3], kind: "push rdx; pop rsp; ret" },
     { pat: [0x41, 0x52, 0x5c, 0xc3], kind: "rex push rdx; pop rsp; ret" },
     { pat: [0x48, 0x89, 0xd4, 0xc3], kind: "mov rsp, rdx; ret" },
+    { pat: [0x48, 0x87, 0xe2, 0xc3], kind: "xchg rsp, rdx; ret" },
 ];
 
 export function checkG5Bytes(read1, base, rva) {
@@ -154,6 +155,8 @@ export function mergeScannedPivot(off, scanned) {
     const out = Object.assign({}, off, PIVOT_HW_1352);
     for (let i = 0; i < PIVOT_KEYS.length; i++) {
         const key = PIVOT_KEYS[i];
+        /** HW-confirmed RVAs must not be replaced by stale scan false-positives */
+        if (PIVOT_HW_1352[key] != null) continue;
         if (scanned[key] != null) out[key] = scanned[key];
     }
     if (scanned.pivot_view_sp != null)
@@ -161,6 +164,33 @@ export function mergeScannedPivot(off, scanned) {
     else if (out.pivot_view_sp == null)
         out.pivot_view_sp = PIVOT_HINTS_1300.pivot_view_sp;
     return out;
+}
+
+/** Drop HW keys from session — scan used to poison G0-G4 with wrong hits */
+export function sanitizeScannedPivotStorage() {
+    try {
+        const raw = sessionStorage.getItem("wk-scanned-pivot");
+        if (!raw) return false;
+        const scanned = JSON.parse(raw);
+        if (!scanned || typeof scanned !== "object") return false;
+        let dirty = false;
+        for (const key of Object.keys(scanned)) {
+            if (PIVOT_HW_1352[key] != null) {
+                delete scanned[key];
+                dirty = true;
+            }
+        }
+        if (!Object.keys(scanned).length) {
+            sessionStorage.removeItem("wk-scanned-pivot");
+            sessionStorage.removeItem("wk-scanned-pivot-base");
+            return true;
+        }
+        if (dirty)
+            sessionStorage.setItem("wk-scanned-pivot", JSON.stringify(scanned));
+        return dirty;
+    } catch (_) {
+        return false;
+    }
 }
 
 export function loadScannedPivot() {
@@ -173,9 +203,30 @@ export function loadScannedPivot() {
     }
 }
 
+/** Persist only non-HW keys (G5) — never store scan hits over G0-G4 */
 export function saveScannedPivot(base, found) {
+    const slim = {};
+    if (found && typeof found === "object") {
+        for (let i = 0; i < PIVOT_KEYS.length; i++) {
+            const key = PIVOT_KEYS[i];
+            if (found[key] == null) continue;
+            if (PIVOT_HW_1352[key] != null) continue;
+            slim[key] = found[key];
+        }
+    }
     try {
-        sessionStorage.setItem("wk-scanned-pivot", JSON.stringify(found));
-        sessionStorage.setItem("wk-scanned-pivot-base", String(base));
+        const prev = loadScannedPivot() || {};
+        const merged = Object.assign({}, prev);
+        for (const key of Object.keys(slim))
+            merged[key] = slim[key];
+        for (const key of Object.keys(PIVOT_HW_1352))
+            delete merged[key];
+        if (Object.keys(merged).length) {
+            sessionStorage.setItem("wk-scanned-pivot", JSON.stringify(merged));
+            if (base) sessionStorage.setItem("wk-scanned-pivot-base", String(base));
+        } else {
+            sessionStorage.removeItem("wk-scanned-pivot");
+            sessionStorage.removeItem("wk-scanned-pivot-base");
+        }
     } catch (_) { }
 }

