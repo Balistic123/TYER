@@ -31,6 +31,24 @@ export function pivotHint(key) {
     return PIVOT_HINTS_1300[key] || 0;
 }
 
+/** Pick scan hint for hit selection — prefer HW/low, else cluster of known pivot RVAs */
+export function pivotScanHint(key, found, lowMax) {
+    const hw = PIVOT_HW_1352[key];
+    if (hw != null && hw < lowMax) return hw;
+    const table = pivotHint(key);
+    if (table > 0 && table < lowMax) return table;
+    const known = [];
+    for (let i = 0; i < PIVOT_ROWS.length; i++) {
+        const k = PIVOT_ROWS[i][1];
+        if (k === key) continue;
+        const r = (found && found[k] != null) ? found[k] : PIVOT_HW_1352[k];
+        if (r != null) known.push(r);
+    }
+    if (known.length === 0) return 0;
+    known.sort((a, b) => a - b);
+    return known[Math.floor(known.length / 2)];
+}
+
 /** Rows: [label, offsetKey, bytePattern] */
 export const PIVOT_ROWS = [
     ["MOV_RDI_RAX", "wk_MOV_QWORD_PTR_RDI_RAX_RET", [0x48, 0x89, 0x07, 0xc3]],
