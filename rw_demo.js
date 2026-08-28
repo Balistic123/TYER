@@ -37,7 +37,7 @@ import {
 } from "./libkernel_resolve.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250829l";
+const BUILD_ID = "rw-20250829m";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const RESTORE_LOG = params.get("restorelog") === "1";
@@ -1786,7 +1786,7 @@ async function runScanIat() {
         while (ticks++ < maxTicks) {
             const chunk = scanLibkernelChunk(p, webkitBase, off, iatScanState, scanOpts);
             iatScanState = chunk.state;
-            else if (chunk.phase === "lite-start")
+            if (chunk.phase === "lite-start")
                 mark("LK-LITE", "poops path build=" + BUILD_ID
                     + " — PLT→nearlk→ring→leak→guess");
             else if (chunk.phase === "nearlk-next")
