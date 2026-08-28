@@ -4,7 +4,7 @@ import { installWindowP, pairStatus } from "./mem.js";
 import { groomBootLine, wireGroomBar } from "./groom_presets.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250827l";
+const BUILD_ID = "rw-20250827m";
 /** opt-in only — release triggers JSC GC; chain_poops uses ?pair=1 (default off) */
 const PROMOTE_PAIR = params.get("promote") === "1";
 /** Skip heavy pointer map on Start unless ?rwproof=1 (saves memory for native call) */
@@ -39,7 +39,7 @@ const SS_LOG = "wk-rw-log";
 const SS_STATE = "wk-rw-state";
 const SS_LOG_BUILD = "wk-rw-log-build";
 /** Only persist milestones — not every ATTEMPT line (sessionStorage churn OOMs) */
-const PERSIST_TAGS = /^(PRIMITIVE|PAIR|NATIVE|BOOT|START-LITE|ERROR|FAIL|PROMOTE|TRIM|UA-FW|LOAD|GIVE-UP|HINT-GROOM|LOG-CLEAR|ATTEMPT-START|READ-PRIMITIVE)/;
+const PERSIST_TAGS = /^(PRIMITIVE|PAIR|NATIVE|PROOF|PASS|FAIL|WARN|BOOT|START-LITE|ERROR|PROMOTE|TRIM|UA-FW|LOAD|GIVE-UP|HINT-GROOM|LOG-CLEAR|ATTEMPT-START|READ-PRIMITIVE|WEBKIT|LIBKERNEL|GETPID|WRITE|LEAK)/;
 const CORE_LOG = /ADDROF|FAIL|ERROR|PRIMITIVE|PASS|GIVE-UP|ATTEMPT|SETUP|CARRIER|PAIR|SSV-|TRIM-DEBRIS|ADDROF-RELEASE|FAKE-ADDRESS|READ-PRIMITIVE|PLACEMENT|COMPOSITION|NORMAL-CLONE|ZERO-HEADER|VALIDATION|LOAD-THREW|NO-RESULT|PRIMITIVE-OK|AUTO-RETRY|CORE-GIVE-UP|HINT-GROOM/i;
 
 let persistBuf = null;
@@ -47,7 +47,7 @@ let raceMode = false;
 const raceBuf = [];
 
 let outEl, stateEl, mapBody, hexEl, pickPtr, addrIn;
-let btnStart, btnRefresh, btnNative, btnPeek, btnClear;
+let btnStart, btnRefresh, btnNative, btnProof, btnPeek, btnClear;
 let nativeChain = null;
 let nativeAllowed = false;
 
@@ -165,6 +165,7 @@ function setUi() {
     if (btnStart) btnStart.disabled = busy || ready;
     if (btnRefresh) btnRefresh.disabled = busy || !ready;
     if (btnNative) btnNative.disabled = busy || !ready || !nativeAllowed;
+    if (btnProof) btnProof.disabled = busy || !ready;
     if (btnPeek) btnPeek.disabled = busy || !ready;
     if (pickPtr) pickPtr.disabled = busy || !ready;
     if (addrIn) addrIn.disabled = busy || !ready;
@@ -447,6 +448,29 @@ function seedNativeSession(p, off) {
     return fn;
 }
 
+async function runChainProof() {
+    if (busy || !ready || !window.p) return;
+    busy = true;
+    setUi();
+    try {
+        mark("PROOF-TRY", "chain verify — reads only + one 8-byte write");
+        const { runChainProof } = await import("./chain_proof.js");
+        const result = runChainProof(window.p, loadEffectiveOff(), { log: mark });
+        if (result.ok) {
+            state("PROOF-OK — chain verified (no syscall)", "ok");
+            flushPersistMilestones();
+        } else {
+            state("proof failed — see log", "bad");
+        }
+    } catch (err) {
+        mark("PROOF-FAIL", err.message || String(err));
+        state("proof error", "bad");
+    } finally {
+        busy = false;
+        setUi();
+    }
+}
+
 async function runNativeCall() {
     if (busy || !ready || !window.p) return;
     busy = true;
@@ -719,6 +743,7 @@ function init() {
     btnStart = $("btn-start");
     btnRefresh = $("btn-refresh");
     btnNative = $("btn-native");
+    btnProof = $("btn-proof");
     btnPeek = $("btn-peek");
     btnClear = $("btn-clear");
 
@@ -730,6 +755,7 @@ function init() {
     wireClick(btnStart, function () { return runStart(); });
     wireClick(btnRefresh, refreshMap);
     wireClick(btnNative, function () { return runNativeCall(); });
+    wireClick(btnProof, function () { return runChainProof(); });
     wireClick(btnClear, function () {
         lines.length = 0;
         clearPersistedLog();
@@ -753,8 +779,7 @@ function init() {
     if (params.get("clearlog") === "1") clearPersistedLog();
     else if (RESTORE_LOG && restorePersistedLog()) renderOut();
 
-    mark("BOOT", "build=" + BUILD_ID + " — cal-lean race (no log IO during primitive)");
-    mark("BOOT", "skipTrimDebris + ?restorelog=1 after OOM to read saved log");
+    mark("BOOT", "build=" + BUILD_ID + " — use Verify chain (OOM-safe proof)");
     mark("BOOT", groomBootLine(params));
     window.addEventListener("beforeunload", function () {
         if (stateEl) persistState(stateEl.textContent, stateEl.className);
