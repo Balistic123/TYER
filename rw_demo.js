@@ -33,7 +33,7 @@ import {
 } from "./libkernel_resolve.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250829d";
+const BUILD_ID = "rw-20250829e";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const RESTORE_LOG = params.get("restorelog") === "1";
@@ -1683,16 +1683,29 @@ async function runScanIat() {
     busy = true;
     setUi();
     iatScanState = null;
-    mark("LK-SCAN", "PSFree PLT → GOT → prologue → stub");
+    mark("LK-SCAN", "ELF module hunt → PSFree PLT → GOT → stub");
     scanState("libkernel scan…");
     let ticks = 0;
-    const maxTicks = 60000;
+    const maxTicks = 80000;
     const scanOpts = { nativeFn, log: mark };
     try {
         while (ticks++ < maxTicks) {
             const chunk = scanLibkernelChunk(p, webkitBase, off, iatScanState, scanOpts);
             iatScanState = chunk.state;
-            if (chunk.phase === "psfree-start")
+            if (chunk.phase === "elf-start")
+                mark("LK-ELF", "scanning ±512MB for ELF modules (no dump needed)");
+            else if (chunk.phase === "elf-anchor")
+                mark("LK-ELF", "anchor#" + chunk.anchor + " modules=" + chunk.modules);
+            else if (chunk.phase === "elf")
+                scanState("ELF @" + chunk.at + " pages=" + chunk.pages
+                    + " modules=" + chunk.modules);
+            else if (chunk.phase === "elf-score")
+                scanState("ELF score " + chunk.scored + "/" + chunk.total
+                    + " best=" + (chunk.best ? chunk.best.score : 0));
+            else if (chunk.phase === "psfree-next")
+                mark("LK-PSFREE", "ELF miss modules=" + (chunk.modules || 0)
+                    + " best=" + (chunk.bestScore || 0) + " — trying PLT");
+            else if (chunk.phase === "psfree-start")
                 mark("LK-PSFREE", "trying low PLT imports (__stack_chk_fail class)");
             else if (chunk.phase === "psfree" || chunk.phase === "psfree-region")
                 scanState("PSFree PLT +0x" + chunk.cursor.toString(16)
@@ -1749,10 +1762,13 @@ async function runScanIat() {
             }
             if (chunk.done) {
                 mark("LK-MISS", "all phases miss"
+                    + (chunk.pages ? " elf-pages=" + chunk.pages : "")
+                    + (chunk.modules != null ? " modules=" + chunk.modules : "")
+                    + (chunk.bestScore != null ? " best=" + chunk.bestScore : "")
                     + (chunk.refs ? " plt=" + chunk.refs : "")
                     + (chunk.slots ? " got=" + chunk.slots : "")
                     + (chunk.probes ? " stub=" + chunk.probes : "")
-                    + " — paste base in hex box");
+                    + " — peek external ptr, paste base");
                 state("libkernel miss", "bad");
                 break;
             }
@@ -1782,7 +1798,7 @@ async function ensureLibkernel(p, off, webkitBase) {
     mark("NATIVE-STEP", "libkernel scan (GOT + stub)…");
     let state = null;
     let ticks = 0;
-    while (ticks++ < 60000) {
+    while (ticks++ < 80000) {
         const chunk = scanLibkernelChunk(p, webkitBase, off, state, { nativeFn });
         state = chunk.state;
         if (chunk.done && chunk.lk) {

