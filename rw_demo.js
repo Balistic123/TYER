@@ -30,13 +30,14 @@ import {
     scanLibkernelChunk,
     diagnoseWebkitDynamic,
     estimateLibkernelCandidates,
+    probeLibkernelGuesses,
     verifyManualLibkernelFromPtr,
     isGetpidStub as lkIsGetpidStub,
     verifyManualLibkernel,
 } from "./libkernel_resolve.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250829k";
+const BUILD_ID = "rw-20250829l";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const RESTORE_LOG = params.get("restorelog") === "1";
@@ -93,7 +94,7 @@ const SS_LOG = "wk-rw-log";
 const SS_STATE = "wk-rw-state";
 const SS_LOG_BUILD = "wk-rw-log-build";
 /** Only persist milestones — not every ATTEMPT line (sessionStorage churn OOMs) */
-const PERSIST_TAGS = /^(PRIMITIVE|PAIR|NATIVE|GADGET|PASS|FAIL|WARN|BOOT|ERROR|PROMOTE|TRIM|UA-FW|LOAD|GIVE-UP|HINT-GROOM|LOG-CLEAR|ATTEMPT-START|READ-PRIMITIVE|WEBKIT|LIBKERNEL|GETPID|BASE|ELF|CODE|SAVE|SCAN)/;
+const PERSIST_TAGS = /^(PRIMITIVE|PAIR|NATIVE|GADGET|PASS|FAIL|WARN|BOOT|ERROR|PROMOTE|TRIM|UA-FW|LOAD|GIVE-UP|HINT-GROOM|LOG-CLEAR|ATTEMPT-START|READ-PRIMITIVE|WEBKIT|LIBKERNEL|GETPID|BASE|ELF|CODE|SAVE|SCAN|LK-)/;
 const CORE_LOG = /ADDROF|FAIL|ERROR|PRIMITIVE|PASS|GIVE-UP|ATTEMPT|SETUP|CARRIER|PAIR|SSV-|TRIM-DEBRIS|ADDROF-RELEASE|FAKE-ADDRESS|READ-PRIMITIVE|PLACEMENT|COMPOSITION|NORMAL-CLONE|ZERO-HEADER|VALIDATION|LOAD-THREW|NO-RESULT|PRIMITIVE-OK|AUTO-RETRY|CORE-GIVE-UP|HINT-GROOM/i;
 
 let persistBuf = null;
@@ -338,6 +339,7 @@ const MANUAL_TESTS = [
     { id: "elf", group: "base", label: "ELF @ base" },
     { id: "native", group: "base", label: "nativeFn code" },
     { id: "scan-iat", group: "base", label: "Scan libkernel" },
+    { id: "probe-lk", group: "base", label: "Probe guesses" },
     { id: "paste-lk", group: "base", label: "Paste libkernel" },
     { id: "libkernel", group: "base", label: "libkernel" },
     { id: "stub20", group: "base", label: "getpid stub" },
@@ -435,6 +437,15 @@ function runManualTest(testId) {
         }
         if (testId === "scan-iat") {
             runScanIat().catch(function (err) {
+                mark("LK-FAIL", err.message || String(err));
+                busy = false;
+                setUi();
+                renderOut();
+            });
+            return;
+        }
+        if (testId === "probe-lk") {
+            runProbeLkGuesses().catch(function (err) {
                 mark("LK-FAIL", err.message || String(err));
                 busy = false;
                 setUi();
@@ -1675,6 +1686,67 @@ function resolveLibkernelBase(p, off, webkitBase) {
 
 let iatScanState = null;
 
+function logLibkernelMissSummary(chunk, scanStateObj, webkitBase, nativeFn) {
+    const st = scanStateObj || {};
+    const ps = st.pltStats || {};
+    const path = st.poopsLite ? "lite" : "full";
+    const ff25 = chunk.ff25 != null ? chunk.ff25 : (ps.ff25 || 0);
+    const gotHigh = chunk.gotHigh != null ? chunk.gotHigh : (ps.gotHigh || 0);
+    const e8ext = chunk.e8ext != null ? chunk.e8ext : (ps.e8ext || 0);
+    const ring = chunk.ringProbes != null ? chunk.ringProbes : (st.ringProbes || 0);
+    const leak = chunk.leakTried != null ? chunk.leakTried : (st.leakTried || 0);
+    const guess = chunk.guessTried != null ? chunk.guessTried : 0;
+    mark("LK-SUMMARY", "build=" + BUILD_ID + " path=" + path + " phase=" + (chunk.phase || "?")
+        + " wk=" + webkitBase
+        + " ff25=" + ff25 + " gotHigh=" + gotHigh + " e8ext=" + e8ext
+        + " ring=" + ring + " leak=" + leak + " guess=" + guess
+        + (chunk.dynTried != null ? " dyn=" + chunk.dynTried : "")
+        + (chunk.refs ? " plt=" + chunk.refs : "")
+        + (chunk.slots ? " got=" + chunk.slots : "")
+        + (chunk.probes ? " stub=" + chunk.probes : ""));
+    const cands = estimateLibkernelCandidates(webkitBase, nativeFn);
+    for (let ci = 0; ci < Math.min(cands.length, 6); ci++)
+        mark("LK-GUESS", cands[ci].hex + " (" + cands[ci].why + ")");
+    mark("LK-HINT", "tap Probe guesses OR paste LK-GUESS / cal vtable ptr");
+    if (stateEl) {
+        stateEl.textContent = "libkernel miss path=" + path
+            + " ff25=" + ff25 + " ring=" + ring + " — tap Probe guesses";
+        stateEl.className = "bad";
+    }
+}
+
+async function runProbeLkGuesses() {
+    if (!ready || !window.p || busy) return;
+    const p = window.p;
+    const off = loadEffectiveOff();
+    const { nativeFn, webkitBase } = basesFromSession(off);
+    if (!webkitBase) {
+        mark("LK-SKIP", "no webkitBase — Save bases first");
+        return;
+    }
+    busy = true;
+    setUi();
+    mark("LK-PROBE-RUN", "build=" + BUILD_ID + " wk=" + webkitBase + " — 12 guesses, 2 reads each");
+    try {
+        const r = probeLibkernelGuesses(p, webkitBase, nativeFn, mark);
+        if (r.ok) {
+            mark("LK-OK", "probe hit " + r.lk + " (" + r.why + ")");
+            state("libkernel probe OK", "ok");
+        } else {
+            mark("LK-PROBE-DONE", "no prologue hit — check UNREAD lines (OOM?) vs w0/w1");
+            state("probe miss — paste cal vtable ptr", "bad");
+        }
+    } catch (err) {
+        mark("LK-FAIL", err.message || String(err));
+        state("probe error", "bad");
+    } finally {
+        busy = false;
+        setUi();
+        renderOut();
+        flushPersistMilestones();
+    }
+}
+
 async function runScanIat() {
     if (!ready || !window.p || busy) return;
     const p = window.p;
@@ -1692,7 +1764,7 @@ async function runScanIat() {
     busy = true;
     setUi();
     iatScanState = null;
-    mark("LK-SCAN", "lite=poops → low PLT only; else dyn→rw→elf");
+    mark("LK-SCAN", "build=" + BUILD_ID + " — poops lite or dyn→elf full path");
     const dynProbe = diagnoseWebkitDynamic(p, webkitBase, off, { deep: false });
     mark("LK-PROBE", dynProbe.reason
         + " kind=" + (dynProbe.kind || "?")
@@ -1714,8 +1786,9 @@ async function runScanIat() {
         while (ticks++ < maxTicks) {
             const chunk = scanLibkernelChunk(p, webkitBase, off, iatScanState, scanOpts);
             iatScanState = chunk.state;
-            if (chunk.phase === "lite-start")
-                mark("LK-LITE", "poops base — PSFree PLT + low .text only (OOM-safe)");
+            else if (chunk.phase === "lite-start")
+                mark("LK-LITE", "poops path build=" + BUILD_ID
+                    + " — PLT→nearlk→ring→leak→guess");
             else if (chunk.phase === "nearlk-next")
                 mark("LK-NEAR", "PLT miss ff25=" + (chunk.ff25 || 0)
                     + " gotHigh=" + (chunk.gotHigh || 0)
@@ -1745,18 +1818,8 @@ async function runScanIat() {
                 mark("LK-GUESS", "prologue check n=" + chunk.total);
             else if (chunk.phase === "guess")
                 scanState("guess " + chunk.tried + "/" + chunk.total);
-            else if (chunk.phase === "lite-miss") {
-                mark("LK-MISS", "ff25=" + (chunk.ff25 || 0)
-                    + " gotHigh=" + (chunk.gotHigh || 0)
-                    + " e8ext=" + (chunk.e8ext || 0)
-                    + " ring=" + (chunk.ringProbes || 0)
-                    + " leak=" + (chunk.leakTried || 0)
-                    + " guess=" + (chunk.guessTried || 0));
-                const cands = estimateLibkernelCandidates(webkitBase, nativeFn);
-                for (let ci = 0; ci < Math.min(cands.length, 6); ci++)
-                    mark("LK-GUESS", cands[ci].hex + " (" + cands[ci].why + ")");
-                mark("LK-HINT", "paste LK-GUESS or any cal vtable ext ptr into hex box");
-            }
+            else if (chunk.phase === "lite-miss")
+                logLibkernelMissSummary(chunk, iatScanState, webkitBase, nativeFn);
             else if (chunk.phase === "dyn-start")
                 mark("LK-DYN", "inCap " + chunk.slots + "/" + chunk.total
                     + " jmprel=+0x" + (chunk.jmprel || 0).toString(16)
@@ -1858,16 +1921,7 @@ async function runScanIat() {
                     state("libkernel miss", "bad");
                     break;
                 }
-                mark("LK-MISS", "all phases miss"
-                    + (chunk.dynTried != null ? " dyn=" + chunk.dynTried : "")
-                    + (chunk.dynSlots != null ? "/" + chunk.dynSlots : "")
-                    + (chunk.pages ? " elf-pages=" + chunk.pages : "")
-                    + (chunk.modules != null ? " modules=" + chunk.modules : "")
-                    + (chunk.bestScore != null ? " best=" + chunk.bestScore : "")
-                    + (chunk.refs ? " plt=" + chunk.refs : "")
-                    + (chunk.slots ? " got=" + chunk.slots : "")
-                    + (chunk.probes ? " stub=" + chunk.probes : "")
-                    + " — peek external ptr, paste base");
+                logLibkernelMissSummary(chunk, iatScanState, webkitBase, nativeFn);
                 state("libkernel miss", "bad");
                 break;
             }
