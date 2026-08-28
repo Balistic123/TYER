@@ -15,6 +15,16 @@ export const PIVOT_HINTS_1300 = {
     pivot_view_sp:                0x38,
 };
 
+/** 13.52 retail — HW-confirmed pivot RVAs (add as found) */
+export const PIVOT_HW_1352 = {
+    wk_MOV_QWORD_PTR_RDI_RAX_RET: 0x1f9bb,
+};
+
+export function pivotHint(key) {
+    if (PIVOT_HW_1352[key] != null) return PIVOT_HW_1352[key];
+    return PIVOT_HINTS_1300[key] || 0;
+}
+
 /** Rows: [label, offsetKey, bytePattern] */
 export const PIVOT_ROWS = [
     ["MOV_RDI_RAX", "wk_MOV_QWORD_PTR_RDI_RAX_RET", [0x48, 0x89, 0x07, 0xc3]],
@@ -77,7 +87,7 @@ export function verifyPivotSet(read1, base, off) {
 
 export function mergeScannedPivot(off, scanned) {
     if (!scanned || typeof scanned !== "object") return off;
-    const out = Object.assign({}, off);
+    const out = Object.assign({}, off, PIVOT_HW_1352);
     for (let i = 0; i < PIVOT_KEYS.length; i++) {
         const key = PIVOT_KEYS[i];
         if (scanned[key] != null) out[key] = scanned[key];

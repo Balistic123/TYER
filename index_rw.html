@@ -78,11 +78,11 @@
     <span class="bar-label">pop gadgets (13.52 HW scan)</span>
   </div>
   <div class="gadget-bar" id="gadget-pivot">
-    <span class="bar-label">pivot / call gadgets — 13.00 hints WRONG on 13.52; Scan pivot until Verify passes</span>
+    <span class="bar-label">pivot — MOV +0x1f9bb OK; Scan = low .text first (tap per chunk, per gadget)</span>
   </div>
   <p id="hint"><b>Pop gadgets OK on 13.52.</b> Pivot RVAs from 13.00 are wrong — Native call with them crashes/OOMs.
     Flow: Cal Accept → groom → <b>Start</b> → <b>Save bases</b> → tap pivot buttons (expect GADGET-BAD at 13.00 hints)
-    → <b>Scan pivot (1 chunk)</b> repeatedly → <b>Verify pivot</b> → <b>Native call</b>.
+    → <b>Scan pivot</b> one tap = one small chunk (G0 scans low .text first, not 13.00 +0x295f…) → <b>Verify pivot</b> → <b>Native call</b>.
     <code>?restorelog=1</code> after crash.</p>
   <h2>Known pointers (this process)</h2>
   <table id="map">

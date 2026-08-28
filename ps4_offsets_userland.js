@@ -89,7 +89,7 @@ const LIBKERNEL_1300 = {
 };
 
 PS4["13.52"] = Object.assign({}, PS4["13.50"], LIBKERNEL_1300, {
-    fw_status: "13.52 HW pop — pivot/call RVAs must be scanned (13.00 hints wrong on HW)",
+    fw_status: "13.52 HW pop + MOV_RDI_RAX pivot — G0-G5 still need scan",
     wk_expm1_builtin:                 0xeb6350,
     wk_POP_RDI_RET:                     0x4be55,
     wk_POP_RSI_RET:                     0x7acb3,
@@ -99,6 +99,7 @@ PS4["13.52"] = Object.assign({}, PS4["13.50"], LIBKERNEL_1300, {
     wk_POP_R8_RET:                      0x5d185,
     wk_POP_R9_RET:                      0x9b288b,
     wk_LEAVE_RET:                       0xf195b,
+    wk_MOV_QWORD_PTR_RDI_RAX_RET:       0x1f9bb,
     pivot_view_sp:                      0x38,
     k_jmp_rsi: 0x4d6d0,
     k_kl_lock: 0xe6c60,
