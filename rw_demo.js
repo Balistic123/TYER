@@ -33,7 +33,7 @@ import {
 } from "./libkernel_resolve.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250829b";
+const BUILD_ID = "rw-20250829c";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const RESTORE_LOG = params.get("restorelog") === "1";
@@ -1683,30 +1683,44 @@ async function runScanIat() {
     busy = true;
     setUi();
     iatScanState = null;
-    mark("LK-SCAN", "RELRO GOT + stub ±128MB (webkit"
-        + (nativeFn ? "+nativeFn" : "") + ")");
+    mark("LK-SCAN", "PLT→GOT + RELRO + prologue ±256MB + stub");
     scanState("libkernel scan…");
     let ticks = 0;
-    const maxTicks = 40000;
+    const maxTicks = 60000;
     const scanOpts = { nativeFn };
     try {
         while (ticks++ < maxTicks) {
             const chunk = scanLibkernelChunk(p, webkitBase, off, iatScanState, scanOpts);
             iatScanState = chunk.state;
-            if (chunk.phase === "got-start" || chunk.phase === "rw-start")
+            if (chunk.phase === "plt-start")
+                mark("LK-PLT", "scan .text xrefs spans=" + chunk.spans);
+            else if (chunk.phase === "plt-region")
+                mark("LK-PHASE", "PLT " + chunk.region + " @+0x"
+                    + chunk.cursor.toString(16) + " refs=" + chunk.refs);
+            else if (chunk.phase === "plt")
+                scanState("PLT +0x" + chunk.cursor.toString(16) + " refs=" + chunk.refs);
+            else if (chunk.phase === "got-next")
+                mark("LK-GOT", "PLT miss refs=" + (chunk.refs || 0) + " — RELRO brute");
+            else if (chunk.phase === "got-start" || chunk.phase === "rw-start")
                 mark("LK-GOT", "segments: " + chunk.ranges);
             else if (chunk.phase === "got-region" || chunk.phase === "rw-region")
                 mark("LK-PHASE", chunk.region + " @+0x" + chunk.cursor.toString(16));
             else if (chunk.phase === "got" || chunk.phase === "rw")
                 scanState("GOT +0x" + chunk.cursor.toString(16)
-                    + "…+0x" + chunk.end.toString(16)
-                    + " tried=" + chunk.slots);
+                    + "…+0x" + chunk.end.toString(16) + " tried=" + chunk.slots);
             else if (chunk.phase === "no-got" || chunk.phase === "no-rw")
-                mark("LK-MISS", "no RELRO/RW ELF segment — stub scan next");
+                mark("LK-MISS", "no RELRO segment");
+            else if (chunk.phase === "base-next")
+                mark("LK-BASE", "GOT miss got=" + (chunk.slots || 0)
+                    + " — prologue hunt ±256MB");
+            else if (chunk.phase === "base-start" || chunk.phase === "base-anchor")
+                mark("LK-BASE", "anchor#" + chunk.anchor + " "
+                    + chunk.from + "…" + chunk.to);
+            else if (chunk.phase === "base")
+                scanState("prologue a#" + chunk.anchor + " @" + chunk.at
+                    + " probes=" + chunk.probes);
             else if (chunk.phase === "stub-next")
-                mark("LK-STUB", "GOT miss"
-                    + (chunk.slots ? " (" + chunk.slots + " slots)" : "")
-                    + " — hunting getpid stub");
+                mark("LK-STUB", "base miss — getpid stub hunt");
             else if (chunk.phase === "stub-start" || chunk.phase === "stub-anchor")
                 mark("LK-STUB", "anchor#" + chunk.anchor + " "
                     + chunk.from + "…" + chunk.to);
@@ -1721,12 +1735,13 @@ async function runScanIat() {
                         + (chunk.stubOff != null ? "+0x" + chunk.stubOff.toString(16) : "")
                     : "";
                 mark("LK-OK", chunk.lk + iat + extra
-                    + " (" + (chunk.source || "?") + ")");
+                    + " (" + (chunk.source || chunk.phase || "?") + ")");
                 state("libkernel OK", "ok");
                 break;
             }
             if (chunk.done) {
-                mark("LK-MISS", "GOT + stub miss"
+                mark("LK-MISS", "all phases miss"
+                    + (chunk.refs ? " plt=" + chunk.refs : "")
                     + (chunk.slots ? " got=" + chunk.slots : "")
                     + (chunk.probes ? " stub=" + chunk.probes : "")
                     + " — paste base in hex box");
@@ -1759,7 +1774,7 @@ async function ensureLibkernel(p, off, webkitBase) {
     mark("NATIVE-STEP", "libkernel scan (GOT + stub)…");
     let state = null;
     let ticks = 0;
-    while (ticks++ < 40000) {
+    while (ticks++ < 60000) {
         const chunk = scanLibkernelChunk(p, webkitBase, off, state, { nativeFn });
         state = chunk.state;
         if (chunk.done && chunk.lk) {
