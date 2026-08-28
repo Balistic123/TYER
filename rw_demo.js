@@ -28,12 +28,13 @@ import {
 import {
     resolveLibkernel,
     scanLibkernelChunk,
+    diagnoseWebkitDynamic,
     isGetpidStub as lkIsGetpidStub,
     verifyManualLibkernel,
 } from "./libkernel_resolve.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250829f";
+const BUILD_ID = "rw-20250829g";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const RESTORE_LOG = params.get("restorelog") === "1";
@@ -1683,7 +1684,18 @@ async function runScanIat() {
     busy = true;
     setUi();
     iatScanState = null;
-    mark("LK-SCAN", "PT_DYNAMIC GOT → ELF hunt → PSFree PLT → GOT → stub");
+    mark("LK-SCAN", "PT_DYNAMIC GOT → RW ptr → ELF hunt → PLT → stub");
+    const dynProbe = diagnoseWebkitDynamic(p, webkitBase, off);
+    mark("LK-PROBE", dynProbe.reason
+        + " hint=" + dynProbe.hint
+        + " loadBase=" + dynProbe.loadBase
+        + " magic=" + dynProbe.magic
+        + (dynProbe.header ? " hdr=" + dynProbe.header : "")
+        + (dynProbe.total != null ? " got=" + dynProbe.inCap + "/" + dynProbe.total : "")
+        + (dynProbe.jmprel ? " jmprel=" + dynProbe.jmprel : "")
+        + (dynProbe.pltgot ? " pltgot=" + dynProbe.pltgot : "")
+        + (dynProbe.minRva ? " rva=" + dynProbe.minRva + ".." + dynProbe.maxRva : "")
+        + " cap=" + dynProbe.cap);
     scanState("libkernel scan…");
     let ticks = 0;
     const maxTicks = 80000;
@@ -1693,20 +1705,33 @@ async function runScanIat() {
             const chunk = scanLibkernelChunk(p, webkitBase, off, iatScanState, scanOpts);
             iatScanState = chunk.state;
             if (chunk.phase === "dyn-start")
-                mark("LK-DYN", "computed " + chunk.slots + " GOT slots"
+                mark("LK-DYN", "inCap " + chunk.slots + "/" + chunk.total
                     + " jmprel=+0x" + (chunk.jmprel || 0).toString(16)
                     + " pltgot=+0x" + (chunk.pltgot || 0).toString(16));
+            else if (chunk.phase === "dyn-done") {
+                const d = chunk.detail || {};
+                mark("LK-DYN", (chunk.prev || "?") + ": " + (d.reason || "?")
+                    + (chunk.dynTotal ? " got=" + (chunk.dynSlots || 0) + "/" + chunk.dynTotal : "")
+                    + (d.loadBase ? " loadBase=" + d.loadBase : "")
+                    + (d.magic ? " magic=" + d.magic : "")
+                    + (d.jmprel ? " jmprel=" + d.jmprel : "")
+                    + (d.pltgot ? " pltgot=" + d.pltgot : "")
+                    + (d.minRva ? " rva=" + d.minRva + ".." + d.maxRva : "")
+                    + " cap=" + (d.cap || "?"));
+            } else if (chunk.phase === "rwptr-start")
+                mark("LK-RWPTR", "scan mapped RW segments n=" + chunk.ranges);
+            else if (chunk.phase === "rwptr" || chunk.phase === "rwptr-region")
+                scanState("RW ptr +0x" + chunk.cursor.toString(16)
+                    + " tried=" + chunk.tried);
+            else if (chunk.phase === "elf-next")
+                mark("LK-ELF", "rwptr miss tried=" + (chunk.rwptrTried || 0) + " — ELF hunt");
             else if (chunk.phase === "dyn-bad")
                 mark("LK-DYN", "PT_DYNAMIC parse failed — ELF hunt");
             else if (chunk.phase === "dyn-empty")
-                mark("LK-DYN", "no GOT slots (jmprel=+0x" + (chunk.jmprel || 0).toString(16)
-                    + ") — ELF hunt");
+                mark("LK-DYN", "no inCap GOT slots — ELF hunt");
             else if (chunk.phase === "dyn")
                 scanState("dyn GOT " + chunk.idx + "/" + chunk.total
                     + " tried=" + chunk.tried);
-            else if (chunk.phase === "elf-next")
-                mark("LK-DYN", "dynamic miss tried=" + (chunk.dynTried || 0)
-                    + " slots=" + (chunk.dynSlots || 0) + " — ELF hunt");
             else if (chunk.phase === "elf-start")
                 mark("LK-ELF", "scanning ±512MB for ELF modules (no dump needed)");
             else if (chunk.phase === "elf-anchor")
@@ -2244,7 +2269,7 @@ function init() {
     if (params.get("clearlog") === "1") clearPersistedLog();
     else if (RESTORE_LOG && restorePersistedLog()) renderOut();
 
-    mark("BOOT", "build=" + BUILD_ID + " — libkernel: dynamic GOT scan or paste base");
+    mark("BOOT", "build=" + BUILD_ID + " — LK-PROBE line shows dynamic parse status");
     mark("BOOT", groomBootLine(params));
     window.addEventListener("beforeunload", function () {
         stopPivotScanQuiet();
