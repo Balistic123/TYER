@@ -3,7 +3,8 @@ import { offsetsFor, offsetsForKey } from "./ps4_offsets_userland.js";
 import { installWindowP, pairStatus } from "./mem.js";
 import { initNativeCall } from "./native_call.js";
 
-const BUILD_ID = "rw-20250827b";
+const params = new URLSearchParams(location.search);
+const BUILD_ID = "rw-20250827c";
 /** Skip heavy pointer map on Start unless ?rwproof=1 (saves memory for native call) */
 const SKIP_RW_PROOF = params.get("rwproof") !== "1";
 const HW_GADGETS_1352 = {
@@ -18,7 +19,6 @@ const HW_GADGETS_1352 = {
     wk_expm1_builtin: 0xeb6350,
 };
 
-const params = new URLSearchParams(location.search);
 const lines = [];
 const retained = [];
 const pointers = [];
