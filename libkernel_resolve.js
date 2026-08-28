@@ -6,7 +6,22 @@ import { int64 } from "./int64.js";
 import { webkitRvaMax } from "./pivot_gadgets.js";
 
 const ELF_MAGIC = 0x464c457f;
+const SCE_MAGIC = 0x1d3d154f;
+const SCE_ELF_OFF = 0x160;
 const PT_LOAD = 1;
+const PT_DYNAMIC = 2;
+const DT_PLTGOT = 3;
+const DT_PLTRELSZ = 2;
+const DT_RELA = 7;
+const DT_RELASZ = 8;
+const DT_RELAENT = 9;
+const DT_JMPREL = 23;
+const DT_SCE_PLTGOT = 0x61000027;
+const DT_SCE_JMPREL = 0x61000029;
+const DT_SCE_PLTRELSZ = 0x6100002d;
+const DT_SCE_RELA = 0x6100002f;
+const DT_SCE_RELASZ = 0x61000031;
+const DT_SCE_RELAENT = 0x61000033;
 const PF_R = 4;
 const PF_W = 2;
 const PF_X = 1;
@@ -52,7 +67,7 @@ function iatCap(off) {
 }
 
 function rvaAllowed(rva, off) {
-    return rva >= 0x10000 && rva <= iatCap(off);
+    return rva >= 0x1000 && rva <= iatCap(off);
 }
 
 export function isSyscallStub(v, num) {
@@ -100,8 +115,16 @@ function lkFromStubAddr(p, stubAddr, off) {
 /** Cheap prologue check — two reads (mov eax, imm; syscall). */
 export function isLibkernelPrologue(p, lk) {
     if (!lk || lk.hi < 0x8) return false;
-    const w0 = read4p(p, lk);
-    const w1 = read4p(p, lk.add32(4));
+    if (checkPrologueAt(p, lk)) return true;
+    if (read4p(p, lk) === SCE_MAGIC)
+        return checkPrologueAt(p, lk.add32(SCE_ELF_OFF));
+    return false;
+}
+
+function checkPrologueAt(p, addr) {
+    if (!addr) return false;
+    const w0 = read4p(p, addr);
+    const w1 = read4p(p, addr.add32(4));
     if (w0 == null || w1 == null) return false;
     return (w0 & 0xff) === 0xb8 && (w1 & 0xffff) === 0x050f;
 }
@@ -208,12 +231,6 @@ function scoreSyscallStubs(p, base, maxOff, step) {
     return stubs;
 }
 
-function looksLikeLibkernelModule(p, base) {
-    if (!base) return false;
-    if (isLibkernelPrologue(p, base)) return true;
-    return scoreSyscallStubs(p, base) >= 8;
-}
-
 function scoreModuleAsLibkernel(p, base) {
     const prologue = isLibkernelPrologue(p, base);
     const stubs = scoreSyscallStubs(p, base);
@@ -225,7 +242,126 @@ function pageAlignDown(addr, align) {
     return new int64((addr.low >>> 0) & ~(align - 1), addr.hi >>> 0);
 }
 
-/** PSFree find_base — walk back pages until ELF magic (16KB then 4KB pages). */
+/** PS4 module may be SCE header @ base, ELF @ +0x160. */
+function elfImageBase(p, base) {
+    if (!base) return null;
+    const w = read4p(p, base);
+    if (w === ELF_MAGIC) return base;
+    if (w === SCE_MAGIC) return base.add32(SCE_ELF_OFF);
+    return null;
+}
+
+function isModuleMagic(w) {
+    return w === ELF_MAGIC || w === SCE_MAGIC;
+}
+
+function u64Lo(w) {
+    if (!w) return null;
+    return Number(u64FromRead8(w) & 0xffffffffn);
+}
+
+/** Parse PT_DYNAMIC from webkit in memory — vaddrs are RVAs from SCE load base. */
+function parseDynamicMeta(p, webkitBase) {
+    const loadBase = webkitBase;
+    const img = elfImageBase(p, webkitBase);
+    if (!img) return null;
+    if (read2p(p, img.add32(0x12)) !== 0x3e) return null;
+
+    const ePhoff = u64Lo(read8p(p, img.add32(0x20)));
+    const ePhnum = read2p(p, img.add32(0x38));
+    const ePhentsize = read2p(p, img.add32(0x36));
+    if (ePhoff == null || !ePhnum || !ePhentsize) return null;
+
+    let dynVaddr = null;
+    let dynMemsz = 0;
+    for (let i = 0; i < ePhnum; i++) {
+        const ph = ePhoff + i * ePhentsize;
+        if (read4p(p, img.add32(ph)) !== PT_DYNAMIC) continue;
+        dynVaddr = u64Lo(read8p(p, img.add32(ph + 0x10)));
+        dynMemsz = u64Lo(read8p(p, img.add32(ph + 0x28))) || 0;
+        break;
+    }
+    if (dynVaddr == null || dynMemsz < 16) return null;
+
+    const meta = { loadBase, img, dynVaddr, dynMemsz };
+    for (let off = 0; off + 16 <= dynMemsz; off += 16) {
+        const tag = u64Lo(read8p(p, loadBase.add32(dynVaddr + off)));
+        const val = u64Lo(read8p(p, loadBase.add32(dynVaddr + off + 8)));
+        if (tag == null || val == null) break;
+        if (tag === 0) break;
+        if (tag === DT_PLTGOT || tag === DT_SCE_PLTGOT) meta.pltgot = val;
+        else if (tag === DT_PLTRELSZ || tag === DT_SCE_PLTRELSZ) meta.pltrelsz = val;
+        else if (tag === DT_RELA || tag === DT_SCE_RELA) meta.rela = val;
+        else if (tag === DT_RELASZ || tag === DT_SCE_RELASZ) meta.relasz = val;
+        else if (tag === DT_RELAENT || tag === DT_SCE_RELAENT) meta.relaent = val;
+        else if (tag === DT_JMPREL || tag === DT_SCE_JMPREL) meta.jmprel = val;
+    }
+    return meta;
+}
+
+/** Calculate GOT slot RVAs from DT_JMPREL / DT_RELA (mapped cap only). */
+function collectDynamicGotRvas(p, meta, cap) {
+    const base = meta.loadBase;
+    const seen = {};
+    const slots = [];
+
+    function add(rva) {
+        if (rva == null || rva < 8) return;
+        if (cap && rva > cap) return;
+        const k = rva.toString(16);
+        if (seen[k]) return;
+        seen[k] = 1;
+        slots.push(rva);
+    }
+
+    if (meta.jmprel && meta.pltrelsz) {
+        const ent = 24;
+        const n = Math.min(Math.floor(meta.pltrelsz / ent), 8192);
+        for (let i = 0; i < n; i++) {
+            add(u64Lo(read8p(p, base.add32(meta.jmprel + i * ent))));
+        }
+    }
+
+    if (meta.rela && meta.relasz) {
+        const ent = meta.relaent || 24;
+        const n = Math.min(Math.floor(meta.relasz / ent), 8192);
+        for (let i = 0; i < n; i++) {
+            const relOff = meta.rela + i * ent;
+            const rva = u64Lo(read8p(p, base.add32(relOff)));
+            const info = u64Lo(read8p(p, base.add32(relOff + 8)));
+            if (info == null) continue;
+            const rType = info & 0xff;
+            if (rType === 6 || rType === 8 || rType === 0x103) add(rva);
+        }
+    }
+
+    if (meta.pltgot) {
+        for (let i = 0; i < 256; i++)
+            add(meta.pltgot + i * 8);
+    }
+
+    slots.sort((a, b) => a - b);
+    return slots;
+}
+
+function scoreModuleAt(p, base) {
+    let best = scoreModuleAsLibkernel(p, base);
+    if (read4p(p, base) === SCE_MAGIC) {
+        const elf = base.add32(SCE_ELF_OFF);
+        const sc2 = scoreModuleAsLibkernel(p, elf);
+        if (sc2.score > best.score) best = sc2;
+    }
+    return best;
+}
+
+function looksLikeLibkernelModule(p, base) {
+    if (!base) return false;
+    return scoreModuleAt(p, base).score >= 8
+        || isLibkernelPrologue(p, base)
+        || isLibkernelPrologue(p, base.add32(SCE_ELF_OFF));
+}
+
+/** PSFree find_base — walk back until ELF or SCE magic. */
 function findModuleBaseBackward(p, addr, maxPages) {
     if (!addr || addr.hi < 0x8) return null;
     const limit = maxPages || 512;
@@ -234,7 +370,7 @@ function findModuleBaseBackward(p, addr, maxPages) {
         let page = pageAlignDown(addr, align);
         for (let i = 0; i < limit; i++) {
             const magic = read4p(p, page);
-            if (magic === ELF_MAGIC) return page;
+            if (isModuleMagic(magic)) return page;
             if (magic == null) break;
             const prev = page.sub32(align);
             if (!prev || prev.hi < 0x8) break;
@@ -568,25 +704,26 @@ function scanLibkernelStubChunk(p, webkitBase, off, sub, anchors) {
 /** PT_LOAD readable non-exec within cap — RELRO .got + writable data. */
 export function elfMappedGotRanges(p, webkitBase, off) {
     const cap = iatCap(off);
-    if (read4p(p, webkitBase) !== ELF_MAGIC) return [];
-    if (read2p(p, webkitBase.add32(0x12)) !== 0x3e) return [];
+    const img = elfImageBase(p, webkitBase);
+    if (!img) return [];
+    if (read2p(p, img.add32(0x12)) !== 0x3e) return [];
 
-    const ePhoff = read4p(p, webkitBase.add32(0x20));
-    const ePhnum = read2p(p, webkitBase.add32(0x38));
-    const ePhentsize = read2p(p, webkitBase.add32(0x36));
+    const ePhoff = u64Lo(read8p(p, img.add32(0x20)));
+    const ePhnum = read2p(p, img.add32(0x38));
+    const ePhentsize = read2p(p, img.add32(0x36));
     if (ePhoff == null || !ePhnum || !ePhentsize) return [];
 
     const ranges = [];
     for (let i = 0; i < ePhnum; i++) {
         const ph = ePhoff + i * ePhentsize;
-        const pType = read4p(p, webkitBase.add32(ph));
+        const pType = read4p(p, img.add32(ph));
         if (pType !== PT_LOAD) continue;
-        const pFlags = read4p(p, webkitBase.add32(ph + 4));
+        const pFlags = read4p(p, img.add32(ph + 4));
         if ((pFlags & PF_R) === 0) continue;
         if ((pFlags & PF_X) !== 0) continue;
 
-        const wVaddr = read8p(p, webkitBase.add32(ph + 0x10));
-        const wMemsz = read8p(p, webkitBase.add32(ph + 0x28));
+        const wVaddr = read8p(p, img.add32(ph + 0x10));
+        const wMemsz = read8p(p, img.add32(ph + 0x28));
         if (!wVaddr || !wMemsz) continue;
 
         const lo = Number(u64FromRead8(wVaddr) & 0xffffffffn);
@@ -609,24 +746,25 @@ export function elfMappedRwRanges(p, webkitBase, off) {
 /** PT_LOAD executable segments within mapped cap. */
 export function elfMappedTextRanges(p, webkitBase, off) {
     const cap = iatCap(off);
-    if (read4p(p, webkitBase) !== ELF_MAGIC) return [];
-    if (read2p(p, webkitBase.add32(0x12)) !== 0x3e) return [];
+    const img = elfImageBase(p, webkitBase);
+    if (!img) return [];
+    if (read2p(p, img.add32(0x12)) !== 0x3e) return [];
 
-    const ePhoff = read4p(p, webkitBase.add32(0x20));
-    const ePhnum = read2p(p, webkitBase.add32(0x38));
-    const ePhentsize = read2p(p, webkitBase.add32(0x36));
+    const ePhoff = u64Lo(read8p(p, img.add32(0x20)));
+    const ePhnum = read2p(p, img.add32(0x38));
+    const ePhentsize = read2p(p, img.add32(0x36));
     if (ePhoff == null || !ePhnum || !ePhentsize) return [];
 
     const ranges = [];
     for (let i = 0; i < ePhnum; i++) {
         const ph = ePhoff + i * ePhentsize;
-        const pType = read4p(p, webkitBase.add32(ph));
+        const pType = read4p(p, img.add32(ph));
         if (pType !== PT_LOAD) continue;
-        const pFlags = read4p(p, webkitBase.add32(ph + 4));
+        const pFlags = read4p(p, img.add32(ph + 4));
         if ((pFlags & PF_X) === 0) continue;
 
-        const wVaddr = read8p(p, webkitBase.add32(ph + 0x10));
-        const wMemsz = read8p(p, webkitBase.add32(ph + 0x28));
+        const wVaddr = read8p(p, img.add32(ph + 0x10));
+        const wMemsz = read8p(p, img.add32(ph + 0x28));
         if (!wVaddr || !wMemsz) continue;
 
         const lo = Number(u64FromRead8(wVaddr) & 0xffffffffn);
@@ -741,6 +879,118 @@ export function scanErrorIatChunk(p, webkitBase, off, state) {
 }
 
 /**
+ * Parse webkit PT_DYNAMIC, compute GOT RVAs, resolve libkernel — no binary/dump.
+ */
+export function resolveLibkernelDynamic(p, webkitBase, off, opts) {
+    opts = opts || {};
+    const log = opts.log || (() => {});
+    const cap = iatCap(off);
+    const meta = parseDynamicMeta(p, webkitBase);
+    if (!meta) {
+        log("LK-DYN", "PT_DYNAMIC parse failed");
+        return { ok: false, error: "no PT_DYNAMIC" };
+    }
+    const slots = collectDynamicGotRvas(p, meta, cap);
+    log("LK-DYN", "computed " + slots.length + " GOT slots"
+        + " jmprel=+0x" + (meta.jmprel || 0).toString(16)
+        + " pltgot=+0x" + (meta.pltgot || 0).toString(16));
+    for (let i = 0; i < slots.length; i++) {
+        const hit = safeVerifyGotSlot(p, webkitBase, off, slots[i]);
+        if (hit) {
+            saveLibkernelSession(hit.lk, hit.iatRva);
+            log("LK-DYN-OK", "got+0x" + slots[i].toString(16) + " → " + hit.lk
+                + " (" + hit.via + ")");
+            return {
+                ok: true,
+                lk: hit.lk,
+                iatRva: hit.iatRva,
+                source: "dyn-got+" + slots[i].toString(16),
+            };
+        }
+    }
+    return { ok: false, error: "dynamic GOT had no libkernel import", slots: slots.length };
+}
+
+function scanDynamicGotChunk(p, webkitBase, off, state) {
+    if (!state) {
+        const cap = iatCap(off);
+        const meta = parseDynamicMeta(p, webkitBase);
+        if (!meta) {
+            return { done: true, lk: null, state: null, phase: "dyn-bad" };
+        }
+        const slots = collectDynamicGotRvas(p, meta, cap);
+        if (!slots.length) {
+            return {
+                done: true,
+                lk: null,
+                state: null,
+                phase: "dyn-empty",
+                jmprel: meta.jmprel,
+                pltgot: meta.pltgot,
+            };
+        }
+        state = {
+            slots,
+            idx: 0,
+            tried: 0,
+            meta: {
+                jmprel: meta.jmprel,
+                pltgot: meta.pltgot,
+                count: slots.length,
+            },
+        };
+        return {
+            done: false,
+            state,
+            phase: "dyn-start",
+            slots: slots.length,
+            jmprel: meta.jmprel,
+            pltgot: meta.pltgot,
+        };
+    }
+
+    let batch = 0;
+    while (state.idx < state.slots.length && batch < 16) {
+        const rva = state.slots[state.idx++];
+        state.tried++;
+        const hit = safeVerifyGotSlot(p, webkitBase, off, rva);
+        if (hit) {
+            saveLibkernelSession(hit.lk, hit.iatRva);
+            return {
+                done: true,
+                lk: hit.lk,
+                iatRva: hit.iatRva,
+                source: "dyn-got+" + rva.toString(16) + "/" + hit.via,
+                state,
+                phase: "dyn-hit",
+                tried: state.tried,
+            };
+        }
+        batch++;
+    }
+
+    if (state.idx >= state.slots.length) {
+        return {
+            done: true,
+            lk: null,
+            state,
+            phase: "dyn-miss",
+            tried: state.tried,
+            slots: state.slots.length,
+        };
+    }
+
+    return {
+        done: false,
+        state,
+        phase: "dyn",
+        idx: state.idx,
+        total: state.slots.length,
+        tried: state.tried,
+    };
+}
+
+/**
  * PSFree method: __stack_chk_fail PLT in low .text → resolve_import → find_base.
  * Does NOT touch wk___imp___error @ +0x3cb8cc8 (unmapped on 13.52).
  */
@@ -808,7 +1058,8 @@ function scanElfModulesChunk(p, webkitBase, off, sub, anchors) {
             const addr = bigToPtr(sub.cursor);
             if (addr.hi >= 0x8) {
                 sub.pages++;
-                if (read4p(p, addr) === ELF_MAGIC) {
+                const magic = read4p(p, addr);
+                if (magic != null && isModuleMagic(magic)) {
                     const key = ptrBig(addr).toString(16);
                     if (!sub.seen[key] && !isSameWebkitModule(addr, webkitBase, off)) {
                         sub.seen[key] = 1;
@@ -1014,7 +1265,7 @@ export function scanLibkernelChunk(p, webkitBase, off, state, opts) {
     opts = opts || {};
     if (!state) {
         state = {
-            stage: "elf",
+            stage: "dyn",
             sub: null,
             gotSlots: 0,
             pltRefs: 0,
@@ -1031,6 +1282,31 @@ export function scanLibkernelChunk(p, webkitBase, off, state, opts) {
             const wb = ptrBig(webkitBase);
             if (nb !== wb) state.anchors.push(opts.nativeFn);
         }
+    }
+
+    if (state.stage === "dyn") {
+        const c = scanDynamicGotChunk(p, webkitBase, off, state.sub);
+        state.sub = c.state;
+        if (c.done && c.lk) {
+            return Object.assign({ state }, c);
+        }
+        if (c.done) {
+            state.stage = "elf";
+            state.sub = null;
+            state.dynTried = c.tried;
+            state.dynSlots = c.slots;
+            return {
+                done: false,
+                state,
+                phase: "elf-next",
+                prev: c.phase,
+                dynSlots: c.slots,
+                dynTried: c.tried,
+                jmprel: c.jmprel,
+                pltgot: c.pltgot,
+            };
+        }
+        return Object.assign({ state }, c);
     }
 
     if (state.stage === "elf") {
@@ -1170,6 +1446,8 @@ export function scanLibkernelChunk(p, webkitBase, off, state, opts) {
                 probes: c.probes,
                 slots: state.gotSlots,
                 refs: state.pltRefs,
+                dynTried: state.dynTried,
+                dynSlots: state.dynSlots,
             };
         }
         return Object.assign({ state }, c);
@@ -1208,12 +1486,16 @@ export function resolveLibkernel(p, webkitBase, off, opts) {
         }
     }
 
+    const dyn = resolveLibkernelDynamic(p, webkitBase, off, opts);
+    if (dyn.ok)
+        return dyn;
+
     const psf = resolveLibkernelPsfree(p, webkitBase, off, opts);
     if (psf.ok)
         return psf;
 
-    log("LK-BLOCK", "fast paths miss — tap Scan libkernel (ELF hunt, no dump needed)");
-    return { ok: false, error: "Scan libkernel (runtime ELF hunt) or paste base" };
+    log("LK-BLOCK", "dyn+PSFree miss — Scan libkernel for ELF hunt");
+    return { ok: false, error: "Scan libkernel (dynamic GOT + ELF hunt)" };
 }
 
 /** Validate user-pasted libkernel base (1 read). */
