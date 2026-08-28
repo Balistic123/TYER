@@ -4,13 +4,13 @@ import { installWindowP, pairStatus } from "./mem.js";
 import { groomBootLine, wireGroomBar } from "./groom_presets.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250827i";
+const BUILD_ID = "rw-20250827j";
 /** opt-in only — release triggers JSC GC; chain_poops uses ?pair=1 (default off) */
 const PROMOTE_PAIR = params.get("promote") === "1";
 /** Skip heavy pointer map on Start unless ?rwproof=1 (saves memory for native call) */
 const SKIP_RW_PROOF = params.get("rwproof") !== "1";
-/** lite Start runs getpid inline unless ?native=0 */
-const AUTO_NATIVE = SKIP_RW_PROOF && params.get("native") !== "0";
+/** getpid only when ?native=1 — auto after primitive OOMs on PS4 (96MB carrier still pinned) */
+const AUTO_NATIVE = params.get("native") === "1";
 const JSVALUE_UNDEFINED = new int64(0x0a, 0xfffffff7);
 const SYS_GETPID = 20;
 const HW_GADGETS_1352 = {
@@ -39,7 +39,12 @@ const PERSIST_MAX = 150;
 const SS_LOG = "wk-rw-log";
 const SS_STATE = "wk-rw-state";
 const SS_LOG_BUILD = "wk-rw-log-build";
+/** Only persist milestones — not every ATTEMPT line (sessionStorage churn OOMs) */
+const PERSIST_TAGS = /^(PRIMITIVE|PAIR|NATIVE|BOOT|RUN-START|START-LITE|ERROR|FAIL|PROMOTE|TRIM|YIELD|SWEEP|UA-FW|LOAD|GIVE-UP|HINT-GROOM|LOG-CLEAR|SCOPE|ATTEMPTS|NOTE|RESTORED|LAST)/;
+const RENDER_EAGER = /^(PRIMITIVE|PAIR|NATIVE|BOOT|RUN-START|START-LITE|ERROR|FAIL|PASS|GIVE-UP|ATTEMPT-START|READ-PRIMITIVE|PRIMITIVE-OK|LOAD|UA-FW|LOG-CLEAR)/;
 const CORE_LOG = /ADDROF|FAIL|ERROR|PRIMITIVE|PASS|GIVE-UP|ATTEMPT|SETUP|CARRIER|PAIR|SSV-|TRIM-DEBRIS|ADDROF-RELEASE|FAKE-ADDRESS|READ-PRIMITIVE|PLACEMENT|COMPOSITION|NORMAL-CLONE|ZERO-HEADER|VALIDATION|LOAD-THREW|NO-RESULT|PRIMITIVE-OK|AUTO-RETRY|CORE-GIVE-UP|HINT-GROOM/i;
+
+let persistBuf = null;
 
 let outEl, stateEl, mapBody, hexEl, pickPtr, addrIn;
 let btnStart, btnRefresh, btnNative, btnPeek, btnClear;
@@ -55,17 +60,23 @@ function renderOut() {
     outEl.scrollTop = outEl.scrollHeight;
 }
 
-function persistLine(line) {
+function persistLine(tag, line) {
+    if (!PERSIST_TAGS.test(tag)) return;
     try {
-        const arr = (sessionStorage.getItem(SS_LOG) || "").split("\n").filter(Boolean);
-        arr.push(line);
-        while (arr.length > PERSIST_MAX) arr.shift();
-        sessionStorage.setItem(SS_LOG, arr.join("\n"));
+        if (!persistBuf) {
+            persistBuf = (sessionStorage.getItem(SS_LOG) || "")
+                .split("\n").filter(Boolean);
+            while (persistBuf.length > PERSIST_MAX) persistBuf.shift();
+        }
+        persistBuf.push(line);
+        while (persistBuf.length > PERSIST_MAX) persistBuf.shift();
+        sessionStorage.setItem(SS_LOG, persistBuf.join("\n"));
         sessionStorage.setItem(SS_LOG_BUILD, BUILD_ID);
     } catch (_) { }
 }
 
 function persistState(msg, cls) {
+    if (busy && !/OK|FAIL|error|native|primitive|promote|broken/i.test(msg || "")) return;
     try {
         sessionStorage.setItem(SS_STATE, JSON.stringify({
             msg: msg || "",
@@ -77,6 +88,7 @@ function persistState(msg, cls) {
 }
 
 function clearPersistedLog() {
+    persistBuf = null;
     try {
         sessionStorage.removeItem(SS_LOG);
         sessionStorage.removeItem(SS_STATE);
@@ -111,8 +123,8 @@ function mark(tag, detail) {
     const line = tag + (detail == null || detail === "" ? "" : "  " + detail);
     lines.push(line);
     if (lines.length > LOG_MAX) lines.splice(0, lines.length - LOG_MAX);
-    persistLine(line);
-    renderOut();
+    persistLine(tag, line);
+    if (RENDER_EAGER.test(tag) || !busy || (lines.length & 15) === 0) renderOut();
 }
 
 function state(msg, cls) {
@@ -699,6 +711,7 @@ async function runStart() {
             mark("START-LITE", "auto-native=" + AUTO_NATIVE
                 + " promote=" + PROMOTE_PAIR);
             ready = true;
+            state("primitive OK — tap Native call (?native=1 auto)", "ok");
             if (AUTO_NATIVE && nativeAllowed) {
                 try { doNativeCallImmediate(); }
                 catch (err) {
@@ -711,8 +724,6 @@ async function runStart() {
                 }
             } else if (!nativeAllowed) {
                 state("pair broken — reload", "bad");
-            } else {
-                state("primitive OK — tap Native call", "ok");
             }
         } else {
             seedNativeSession(p, off);
@@ -805,8 +816,8 @@ function init() {
     if (params.get("clearlog") === "1") clearPersistedLog();
     else if (restorePersistedLog()) renderOut();
 
-    mark("BOOT", "build=" + BUILD_ID + " — getpid inline, zero delay after primitive");
-    mark("BOOT", "log persists in sessionStorage (survives OOM reload)");
+    mark("BOOT", "build=" + BUILD_ID + " — primitive only; native=?native=1 or button");
+    mark("BOOT", "log persists milestones only (PRIMITIVE/NATIVE/PAIR/ERROR)");
     mark("BOOT", "promote=" + PROMOTE_PAIR + " (opt-in ?promote=1) auto-native=" + AUTO_NATIVE);
     mark("BOOT", groomBootLine(params));
     mark("BOOT", "one establishPrimitive run — internal auto-retry until win");
