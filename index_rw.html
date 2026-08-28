@@ -78,14 +78,14 @@
     <span class="bar-label">pop gadgets (13.52 HW scan)</span>
   </div>
   <div class="gadget-bar" id="gadget-g5">
-    <span class="bar-label">G5: try G5 high scan or Try G5 13.00 (+0x2abccaa) — G0-G4 stayed low, G5 may be high</span>
+    <span class="bar-label">G5: 13.00 high (+0x2abccaa) OOMs on 13.52 — scan upper (+0x800000…) or hunt expm1 (+0x13ec77a)</span>
   </div>
   <div class="gadget-bar" id="gadget-pivot">
     <span class="bar-label">pivot G0-G4 OK — use G5 bar above for candidates</span>
   </div>
-  <p id="hint"><b>Pop gadgets OK on 13.52.</b> Pivot RVAs from 13.00 are wrong — Native call with them crashes/OOMs.
-    Flow: Cal Accept → groom → <b>Start</b> → <b>Save bases</b> → tap <b>G5 +0x2411ac</b> (or probe / full scan)
-    → <b>Verify pivot</b> → <b>Native call</b>. Use <b>Clear pivot</b> to reset saved G5.
+  <p id="hint"><b>Pop gadgets OK on 13.52.</b> Pivot RVAs from 13.00 high .text OOM — never read +0x2abccaa.
+    Flow: Cal Accept → groom → <b>Start</b> → <b>Save bases</b> → <b>G5 scan upper</b> or <b>G5 hunt expm1</b>
+    → <b>Verify pivot</b> → <b>Native call</b>. Optional <b>Probe bound</b> tightens scan cap.
     <code>?restorelog=1</code> after crash.</p>
   <h2>Known pointers (this process)</h2>
   <table id="map">

