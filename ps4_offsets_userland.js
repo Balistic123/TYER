@@ -76,16 +76,9 @@ PS4["12.52"] = Object.assign({}, PS4["12.50"], {
     fw_status: "userland-only — shares 12.50 webkit RVAs (no 12.52 dump)",
 });
 
-// 13.52 retail: expm1 + pop gadgets HW-confirmed; pivot/call + stubs from 13.00 (verify on HW)
-const CALL_CHAIN_1300 = {
-    wk_MOV_QWORD_PTR_RDI_RAX_RET:       0x548b,
-    wk_PUSH_RDX_POP_RSP_RET:            0x2abccaa,
-    wk_MOV_RDI_RSI_30_CALL:             0x295f948,
-    wk_POP_RAX_MOV_RAX_JMP_18:          0x1d989e3,
-    wk_PUSH_RBP_MOV_RBP_RSP_10:         0x25bae0,
-    wk_MOV_RDI_RAX_8_CALL_20:           0x4a0406,
-    wk_MOV_RDX_RAX_18_CALL_10:          0x1ec3ada,
-    pivot_view_sp:                      0x38,
+// 13.52 retail: expm1 + pop gadgets HW-confirmed.
+// libkernel IAT/stubs from 13.00 (verify on HW). Pivot RVAs NOT baked — scan or paste after verify.
+const LIBKERNEL_1300 = {
     wk___imp___error:                   0x3cb8cc8,
     k__error:                           0x26420,
     k_scan_stage1:                      0x40000,
@@ -95,8 +88,8 @@ const CALL_CHAIN_1300 = {
     },
 };
 
-PS4["13.52"] = Object.assign({}, PS4["13.50"], CALL_CHAIN_1300, {
-    fw_status: "13.52 HW pop + 13.00 pivot/stubs (native call — verify pivot on HW)",
+PS4["13.52"] = Object.assign({}, PS4["13.50"], LIBKERNEL_1300, {
+    fw_status: "13.52 HW pop — pivot/call RVAs must be scanned (13.00 hints wrong on HW)",
     wk_expm1_builtin:                 0xeb6350,
     wk_POP_RDI_RET:                     0x4be55,
     wk_POP_RSI_RET:                     0x7acb3,
@@ -106,6 +99,7 @@ PS4["13.52"] = Object.assign({}, PS4["13.50"], CALL_CHAIN_1300, {
     wk_POP_R8_RET:                      0x5d185,
     wk_POP_R9_RET:                      0x9b288b,
     wk_LEAVE_RET:                       0xf195b,
+    pivot_view_sp:                      0x38,
     k_jmp_rsi: 0x4d6d0,
     k_kl_lock: 0xe6c60,
 });
