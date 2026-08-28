@@ -4,13 +4,14 @@ import { installWindowP, pairStatus } from "./mem.js";
 import { groomBootLine, wireGroomBar } from "./groom_presets.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250827f";
+const BUILD_ID = "rw-20250827g";
 /** promote real pair after primitive — frees ~96MB 12M carrier (chain_poops ?pair=1) */
 const PROMOTE_PAIR = params.get("promote") !== "0";
-const SWEEP_CYCLES = params.has("sweep")
-    ? parseInt(params.get("sweep"), 10) : (PROMOTE_PAIR ? 4 : 0);
-const SWEEP_MB = params.has("sweepmb") ? parseInt(params.get("sweepmb"), 10) : 4;
-const SWEEP_MS = params.has("sweepms") ? parseInt(params.get("sweepms"), 10) : 100;
+/** alloc-pressure sweep OOMs on PS4 — off by default; opt-in with ?sweep=3 */
+const SWEEP_CYCLES = params.has("sweep") ? parseInt(params.get("sweep"), 10) : 0;
+const SWEEP_MB = params.has("sweepmb") ? parseInt(params.get("sweepmb"), 10) : 2;
+const SWEEP_MS = params.has("sweepms") ? parseInt(params.get("sweepms"), 10) : 80;
+const SETTLE_MS = params.has("settle") ? parseInt(params.get("settle"), 10) : 250;
 /** Skip heavy pointer map on Start unless ?rwproof=1 (saves memory for native call) */
 const SKIP_RW_PROOF = params.get("rwproof") !== "1";
 /** lite Start runs getpid inline unless ?native=0 */
@@ -400,29 +401,28 @@ function resolveWebkitBase(off, nativeFn) {
     return null;
 }
 
-async function sweepAfterPromote() {
-    if (!PROMOTE_PAIR || !pairStatus.promoted || SWEEP_CYCLES <= 0) {
-        mark("SWEEP-SKIP", "promoted=" + pairStatus.promoted
-            + " cycles=" + SWEEP_CYCLES);
+async function yieldAfterPromote() {
+    if (!pairStatus.promoted) {
+        mark("YIELD-SKIP", "promoted=" + pairStatus.promoted);
         return;
     }
-    mark("SWEEP", "cycles=" + SWEEP_CYCLES + " mb=" + SWEEP_MB
-        + " floor_ms=" + SWEEP_MS);
-    state("sweeping carrier debris…", "warn");
-    const t0 = Date.now();
-    let worst = 0;
-    for (let i = 0; i < SWEEP_CYCLES; i++) {
-        const c0 = Date.now();
-        let junk = [];
-        for (let k = 0; k < SWEEP_MB; k++)
-            junk.push(new ArrayBuffer(0x100000));
-        junk.length = 0;
-        junk = null;
-        await new Promise(r => setTimeout(r, SWEEP_MS));
-        const dt = Date.now() - c0;
-        if (dt > worst) worst = dt;
+    if (SWEEP_CYCLES > 0) {
+        mark("SWEEP", "opt-in alloc cycles=" + SWEEP_CYCLES + " mb=" + SWEEP_MB);
+        state("sweep (opt-in)…", "warn");
+        const t0 = Date.now();
+        for (let i = 0; i < SWEEP_CYCLES; i++) {
+            let junk = [];
+            for (let k = 0; k < SWEEP_MB; k++)
+                junk.push(new ArrayBuffer(0x100000));
+            junk.length = 0;
+            junk = null;
+            await new Promise(r => setTimeout(r, SWEEP_MS));
+        }
+        mark("SWEEP-DONE", "total_ms=" + (Date.now() - t0));
+        return;
     }
-    mark("SWEEP-DONE", "worst_ms=" + worst + " total_ms=" + (Date.now() - t0));
+    mark("YIELD", "settle_ms=" + SETTLE_MS + " (no alloc — sweep OOMs on PS4)");
+    await new Promise(r => setTimeout(r, SETTLE_MS));
 }
 
 async function freeAfterPrimitive() {
@@ -684,7 +684,7 @@ async function runStart() {
             + " promoted=" + pairStatus.promoted);
 
         await freeAfterPrimitive();
-        await sweepAfterPromote();
+        await yieldAfterPromote();
 
         nativeAllowed = !!pairStatus.promoted;
         if (PROMOTE_PAIR && !pairStatus.promoted) {
