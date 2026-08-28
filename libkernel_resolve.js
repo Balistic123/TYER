@@ -242,6 +242,8 @@ function pageAlignDown(addr, align) {
     return new int64((addr.low >>> 0) & ~(align - 1), addr.hi >>> 0);
 }
 
+const POOPS_TEXT_MAGIC = 0xe5894855;
+
 /** PS4 module may be SCE header @ base, ELF @ +0x160. */
 function elfImageBase(p, base) {
     if (!base) return null;
@@ -251,20 +253,73 @@ function elfImageBase(p, base) {
     return null;
 }
 
-/** expm1-derived base may land in .text — walk back to SCE/ELF header. */
-function resolveModuleLoadBase(p, hint) {
-    if (!hint) return null;
-    if (elfImageBase(p, hint)) return hint;
-    const sceBack = hint.sub32(SCE_ELF_OFF);
-    if (elfImageBase(p, sceBack)) return sceBack;
-    let page = pageAlignDown(hint, 0x1000);
-    for (let i = 0; i < 512; i++) {
-        if (elfImageBase(p, page)) return page;
-        const prev = page.sub32(0x1000);
-        if (!prev || prev.hi < 0x8) break;
-        page = prev;
+function classifyModulePage(w) {
+    if (w == null) return null;
+    if (w === ELF_MAGIC) return "elf";
+    if (w === SCE_MAGIC) return "sce";
+    if (w === POOPS_TEXT_MAGIC) return "text";
+    return null;
+}
+
+/** Walk back from poops/text base for SCE or ELF module header (cal_demo / chain_poops). */
+function findHeaderBackward(p, start, maxBack, step) {
+    const aligned = pageAlignDown(start, step);
+    for (let i = 0; i <= maxBack; i++) {
+        const addr = i === 0 ? start : aligned.sub32(i * step);
+        if (!addr || addr.hi < 0x8) break;
+        const w = read4p(p, addr);
+        if (w === ELF_MAGIC) return { hdr: addr, kind: "elf" };
+        if (w === SCE_MAGIC) return { hdr: addr, kind: "sce" };
     }
-    return hint;
+    return null;
+}
+
+/** Resolve code base (RVA origin) + optional ELF img for phdr parse. */
+function resolveModuleLayout(p, hint) {
+    if (!hint) return null;
+    const codeBase = hint;
+    const w0 = read4p(p, codeBase);
+    const kind0 = classifyModulePage(w0);
+    const layout = {
+        codeBase,
+        loadBase: codeBase,
+        kind: kind0 || "unknown",
+        img: null,
+        hdr: null,
+        poops: false,
+    };
+
+    if (kind0 === "elf") {
+        layout.hdr = codeBase;
+        layout.img = codeBase;
+        return layout;
+    }
+    if (kind0 === "sce") {
+        layout.hdr = codeBase;
+        layout.img = codeBase.add32(SCE_ELF_OFF);
+        return layout;
+    }
+
+    let hit = findHeaderBackward(p, codeBase, 2048, 0x4000);
+    if (!hit) hit = findHeaderBackward(p, codeBase, 8192, 0x1000);
+    if (hit) {
+        layout.hdr = hit.hdr;
+        layout.kind = hit.kind;
+        layout.img = hit.kind === "sce" ? hit.hdr.add32(SCE_ELF_OFF) : hit.hdr;
+        layout.elfBack = true;
+        return layout;
+    }
+
+    if (kind0 === "text") {
+        layout.poops = true;
+        layout.kind = "text";
+    }
+    return layout;
+}
+
+function moduleLoadBase(p, hint) {
+    const lay = resolveModuleLayout(p, hint);
+    return lay ? lay.codeBase : hint;
 }
 
 function minLoadVaddr(p, img, ePhoff, ePhnum, ePhentsize) {
@@ -297,11 +352,12 @@ function u64Lo(w) {
     return Number(u64FromRead8(w) & 0xffffffffn);
 }
 
-/** Parse PT_DYNAMIC — vaddrs are linked VAs; memory = loadBase + VA (PS4 PIE). */
+/** Parse PT_DYNAMIC — codeBase = poops/text RVA origin; img may be lower in memory. */
 function parseDynamicMeta(p, webkitBase) {
-    const loadBase = resolveModuleLoadBase(p, webkitBase);
-    const img = elfImageBase(p, loadBase);
-    if (!img) return null;
+    const layout = resolveModuleLayout(p, webkitBase);
+    if (!layout || !layout.img) return null;
+    const loadBase = layout.codeBase;
+    const img = layout.img;
     if (read2p(p, img.add32(0x12)) !== 0x3e) return null;
 
     const ePhoff = u64Lo(read8p(p, img.add32(0x20)));
@@ -350,23 +406,30 @@ function parseDynamicMeta(p, webkitBase) {
 /** Runtime diagnostic — why dynamic GOT produced 0 usable slots. */
 export function diagnoseWebkitDynamic(p, webkitBase, off) {
     const cap = iatCap(off);
-    const loadBase = resolveModuleLoadBase(p, webkitBase);
-    const magic = read4p(p, loadBase);
+    const layout = resolveModuleLayout(p, webkitBase);
+    const magic = read4p(p, webkitBase);
     const out = {
         hint: String(webkitBase),
-        loadBase: String(loadBase),
+        loadBase: String(webkitBase),
         magic: fmtMagic(magic),
         cap: "+0x" + cap.toString(16),
+        kind: layout ? layout.kind : "?",
     };
-    const img = elfImageBase(p, loadBase);
-    if (!img) {
-        out.reason = "no SCE/ELF header @ loadBase (walked back from hint)";
+    if (layout && layout.poops)
+        out.poops = true;
+    if (layout && layout.hdr)
+        out.elfHdr = String(layout.hdr);
+    if (!layout || !layout.img) {
+        if (layout && layout.kind === "text")
+            out.reason = "poops text base (0xe5894855) — no ELF header in mapped mem";
+        else
+            out.reason = "no module header (kind=" + (layout ? layout.kind : "?") + ")";
         return out;
     }
-    out.header = read4p(p, loadBase) === SCE_MAGIC ? "SCE" : "ELF";
+    out.header = read4p(p, layout.hdr) === SCE_MAGIC ? "SCE" : "ELF";
     const meta = parseDynamicMeta(p, webkitBase);
     if (!meta) {
-        out.reason = "PT_DYNAMIC unreadable";
+        out.reason = "PT_DYNAMIC unreadable (elfHdr=" + out.elfHdr + ")";
         return out;
     }
     out.jmprel = "+0x" + (meta.jmprel || 0).toString(16);
@@ -478,10 +541,6 @@ function findModuleBaseBackward(p, addr, maxPages) {
         }
     }
     return null;
-}
-
-function moduleLoadBase(p, hint) {
-    return resolveModuleLoadBase(p, hint);
 }
 
 /** PLT stub @ webkit+pltRva — ff 25 or ff 15 → GOT slot → target fn ptr. */
@@ -668,12 +727,12 @@ function scanPltGotChunk(p, webkitBase, off, state) {
 /** Scan mapped RW/data within cap for external code pointers → libkernel walk-back. */
 function scanMappedExtPtrChunk(p, webkitBase, off, state) {
     if (!state) {
-        const loadBase = resolveModuleLoadBase(p, webkitBase);
-        const ranges = elfMappedGotRanges(p, loadBase, off);
+        const base = moduleLoadBase(p, webkitBase);
+        const ranges = elfMappedGotRanges(p, webkitBase, off);
         if (!ranges.length)
-            return { done: true, lk: null, state: null, phase: "rwptr-empty" };
+            ranges.push(...syntheticRwRanges(off));
         state = {
-            loadBase,
+            loadBase: base,
             ranges,
             rangeIdx: 0,
             cursor: ranges[0].lo,
@@ -901,12 +960,30 @@ function scanLibkernelStubChunk(p, webkitBase, off, sub, anchors) {
     };
 }
 
+function syntheticTextRanges(off) {
+    const cap = iatCap(off);
+    return [{ lo: 0x1000, hi: cap, tag: "tx-poops" }];
+}
+
+function syntheticRwRanges(off) {
+    const cap = iatCap(off);
+    const ranges = [];
+    for (let lo = 0x80000; lo < cap; lo += 0x100000) {
+        const hi = Math.min(lo + 0x100000, cap);
+        if (hi - lo >= 0x1000) ranges.push({ lo, hi, tag: "rw-synth" });
+    }
+    return ranges;
+}
+
 /** PT_LOAD readable non-exec within cap — RELRO .got + writable data. */
 export function elfMappedGotRanges(p, webkitBase, off) {
     const cap = iatCap(off);
-    const loadBase = resolveModuleLoadBase(p, webkitBase);
-    const img = elfImageBase(p, loadBase);
-    if (!img) return [];
+    const layout = resolveModuleLayout(p, webkitBase);
+    const img = layout && layout.img;
+    if (!img) {
+        if (layout && layout.poops) return syntheticRwRanges(off);
+        return [];
+    }
     if (read2p(p, img.add32(0x12)) !== 0x3e) return [];
 
     const ePhoff = u64Lo(read8p(p, img.add32(0x20)));
@@ -945,11 +1022,16 @@ export function elfMappedRwRanges(p, webkitBase, off) {
 }
 
 /** PT_LOAD executable segments within mapped cap. */
+/** Executable PT_LOAD spans within cap (or full poops .text sweep). */
 export function elfMappedTextRanges(p, webkitBase, off) {
     const cap = iatCap(off);
-    const loadBase = resolveModuleLoadBase(p, webkitBase);
-    const img = elfImageBase(p, loadBase);
-    if (!img) return [];
+    const layout = resolveModuleLayout(p, webkitBase);
+    const img = layout && layout.img;
+    if (!img) {
+        if (layout && (layout.poops || layout.kind === "text"))
+            return syntheticTextRanges(off);
+        return [];
+    }
     if (read2p(p, img.add32(0x12)) !== 0x3e) return [];
 
     const ePhoff = u64Lo(read8p(p, img.add32(0x20)));

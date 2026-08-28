@@ -34,7 +34,7 @@ import {
 } from "./libkernel_resolve.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250829g";
+const BUILD_ID = "rw-20250829h";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const RESTORE_LOG = params.get("restorelog") === "1";
@@ -1687,8 +1687,10 @@ async function runScanIat() {
     mark("LK-SCAN", "PT_DYNAMIC GOT → RW ptr → ELF hunt → PLT → stub");
     const dynProbe = diagnoseWebkitDynamic(p, webkitBase, off);
     mark("LK-PROBE", dynProbe.reason
+        + " kind=" + (dynProbe.kind || "?")
+        + (dynProbe.poops ? " poops=1" : "")
         + " hint=" + dynProbe.hint
-        + " loadBase=" + dynProbe.loadBase
+        + (dynProbe.elfHdr ? " elfHdr=" + dynProbe.elfHdr : "")
         + " magic=" + dynProbe.magic
         + (dynProbe.header ? " hdr=" + dynProbe.header : "")
         + (dynProbe.total != null ? " got=" + dynProbe.inCap + "/" + dynProbe.total : "")
