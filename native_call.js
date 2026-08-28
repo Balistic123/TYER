@@ -79,7 +79,7 @@ function seedStubs(p, libkernelBase, off, opts) {
     opts = opts || {};
     const stubAddr = new Map();
     let seeded = 0;
-    const want = [SYS.getpid, SYS.getuid];
+    const want = opts.getpidOnly ? [SYS.getpid] : [SYS.getpid, SYS.getuid];
     if (off.k_stubs) {
         for (let wi = 0; wi < want.length; wi++) {
             const num = want[wi];
