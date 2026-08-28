@@ -99,8 +99,8 @@
     </div>
   </div>
   <p id="hint">
-    <b>2e runs automatically</b> after Start — textarea vtable → walk back until <code>CAL-ELF-HIT</code>.
-    Re-run with button <b>2e</b> if needed. Disable auto with <code>?vtable=0</code>.
+    <b>2e runs automatically</b> after Start (walks up to ~48MB back). Checks ELF + PSFree module headers.
+    If it fails, paste log lines <code>VTABLE-OK</code> and <code>WALK-MISS</code>. Try <code>?backmax=16384</code>.
   </p>
   <h2>Log</h2>
   <div id="out"></div>
