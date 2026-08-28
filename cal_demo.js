@@ -93,7 +93,8 @@ function wireGroomBar() {
 }
 
 let outEl, stateEl, resultEl, nativeFnEl, baseEl, expm1In;
-let btnStart, btnLite, btnWide, btnVerify, btnSetExpm1, btnCopy, btnClear;
+let btnStart, btnLite, btnWide, btnVerify, btnSetExpm1, btnVerify2, btnSetExpm12, btnCopy, btnClear;
+let calBarEl;
 let scanMode = "lite";
 let scanIndex = 0;
 let scanList = [];
@@ -124,15 +125,29 @@ function state(msg, cls) {
     stateEl.className = cls || "";
 }
 
+function setCalButton(el, on) {
+    if (!el) return;
+    el.disabled = !on;
+    el.style.display = "inline-block";
+    el.style.visibility = "visible";
+}
+
 function setUi() {
-    const calReady = ready && nativeFn;
+    const calReady = ready && nativeFn && !busy;
     if (btnStart) btnStart.disabled = busy || ready;
-    if (btnLite) btnLite.disabled = busy || !calReady;
-    if (btnWide) btnWide.disabled = busy || !calReady;
-    if (btnVerify) btnVerify.disabled = busy || !calReady;
-    if (btnSetExpm1) btnSetExpm1.disabled = busy || !calReady;
+    setCalButton(btnLite, calReady);
+    setCalButton(btnWide, calReady);
+    setCalButton(btnVerify, calReady);
+    setCalButton(btnSetExpm1, calReady);
+    setCalButton(btnVerify2, calReady);
+    setCalButton(btnSetExpm12, calReady);
     if (btnCopy) btnCopy.disabled = busy || !calibrated;
-    if (expm1In) expm1In.disabled = busy || !calReady;
+    if (expm1In) expm1In.disabled = busy || !(ready && nativeFn);
+    if (calBarEl) {
+        calBarEl.style.display = "flex";
+        if (ready && nativeFn)
+            calBarEl.style.borderColor = "#3a6b54";
+    }
 }
 
 function preCalTrim() {
@@ -462,7 +477,11 @@ async function runStart() {
         if (pre > 0 && expm1In) expm1In.value = pre.toString(16);
 
         updateResultPanel();
-        state("primitive OK — lite scan or type expm1 + verify", "ok");
+        mark("NEXT", "type 2582880 → tap Set expm1 (toolbar or sticky bar below)");
+        state("primitive OK — Set expm1 enabled in toolbar", "ok");
+        try { if (expm1In) expm1In.focus(); } catch (_) { }
+        if (calBarEl && calBarEl.scrollIntoView)
+            try { calBarEl.scrollIntoView(false); } catch (_) { }
     } catch (err) {
         state("failed: " + err.message, "bad");
         mark("ERROR", err.stack || err.message);
@@ -727,6 +746,9 @@ function init() {
     btnWide = $("btn-wide");
     btnVerify = $("btn-verify");
     btnSetExpm1 = $("btn-set-expm1");
+    btnVerify2 = $("btn-verify-2");
+    btnSetExpm12 = $("btn-set-expm1-2");
+    calBarEl = $("cal-bar");
     btnCopy = $("btn-copy");
     btnClear = $("btn-clear");
 
@@ -739,7 +761,9 @@ function init() {
     wireClick(btnLite, function () { return runScanStep("lite"); });
     wireClick(btnWide, function () { return runScanStep("wide"); });
     wireClick(btnVerify, function () { return runVerifyStep(); });
+    wireClick(btnVerify2, function () { return runVerifyStep(); });
     wireClick(btnSetExpm1, runSetExpm1);
+    wireClick(btnSetExpm12, runSetExpm1);
     wireClick(btnCopy, runCopy);
     wireClick(btnClear, function () {
         lines.length = 0;

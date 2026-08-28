@@ -25,10 +25,18 @@
   #groom-bar button.active { background:#243044; border-color:#4a6a90; color:#e6ebf2; }
   #cal-bar { display:flex; flex-wrap:wrap; gap:10px; align-items:center;
              margin:0 0 10px; padding:10px 12px; background:#0d1117;
-             border:1px solid #1e2732; border-radius:5px; font:12px Consolas, monospace; }
-  #cal-bar label { color:#9aa3b2; }
+             border:1px solid #3a6b54; border-radius:5px; font:12px Consolas, monospace;
+             position:sticky; top:0; z-index:20;
+             box-shadow:0 4px 12px rgba(0,0,0,0.45); }
+  #cal-bar label, #cal-bar .bar-label { color:#9aa3b2; flex:0 0 auto; }
+  #cal-bar button { background:#1e3a2f; color:#e6ebf2; border:1px solid #3a6b54;
+                    border-radius:4px; padding:8px 12px; font:inherit; cursor:pointer;
+                    flex:0 0 auto; min-height:36px; }
+  #cal-bar button:disabled { opacity:0.55; cursor:default; color:#9aa3b2;
+                             background:#151b24; border-color:#2a3544; }
   #expm1-in { width:140px; background:#0b0d10; color:#c8ced8; border:1px solid #2a3544;
-              border-radius:4px; padding:6px 8px; font:inherit; }
+              border-radius:4px; padding:8px; font:inherit; flex:0 0 auto; min-height:36px; }
+  #expm1-in:disabled { opacity:0.55; }
   #summary { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin:0 0 10px; }
   .card { background:#11151b; border:1px solid #1e2732; border-radius:5px; padding:10px 12px; }
   .card h3 { margin:0 0 6px; font-size:11px; color:#9aa3b2; font-weight:600; text-transform:uppercase; }
@@ -55,16 +63,18 @@
   </div>
   <div id="toolbar">
     <button type="button" id="btn-start">1. Start primitive</button>
-    <button type="button" class="secondary" id="btn-lite" disabled>2a. Lite ELF (1 read/tap)</button>
-    <button type="button" class="secondary" id="btn-wide" disabled>2b. Wide ELF (1 read/tap)</button>
-    <button type="button" class="secondary" id="btn-copy" disabled>Copy offsets JSON</button>
+    <button type="button" class="secondary" id="btn-lite" disabled>2a. Lite ELF</button>
+    <button type="button" class="secondary" id="btn-wide" disabled>2b. Wide ELF</button>
+    <button type="button" class="secondary" id="btn-set-expm1" disabled>3. Set expm1</button>
+    <button type="button" class="secondary" id="btn-verify" disabled>4. Verify step</button>
+    <button type="button" class="secondary" id="btn-copy" disabled>Copy JSON</button>
     <button type="button" class="secondary" id="btn-clear">Clear log</button>
   </div>
   <div id="cal-bar">
-    <label for="expm1-in">expm1 delta</label>
+    <span class="bar-label"><b>expm1</b></span>
     <input type="text" id="expm1-in" placeholder="2582880" autocomplete="off" disabled>
-    <button type="button" class="secondary" id="btn-set-expm1" disabled>Set expm1 (0 reads)</button>
-    <button type="button" class="secondary" id="btn-verify" disabled>Verify step (1 read/tap)</button>
+    <button type="button" id="btn-set-expm1-2" disabled>Set expm1 (0 reads)</button>
+    <button type="button" id="btn-verify-2" disabled>Verify step (1 read/tap)</button>
   </div>
   <div id="summary">
     <div class="card">
