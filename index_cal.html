@@ -68,6 +68,7 @@
     <button type="button" class="secondary" id="btn-probe" disabled>2c. Probe ELF</button>
     <button type="button" class="secondary" id="btn-set-expm1" disabled>3. Set expm1</button>
     <button type="button" class="secondary" id="btn-set-base" disabled>3b. Set base</button>
+    <button type="button" id="btn-assume" disabled>Assume expm1 (test)</button>
     <button type="button" class="secondary" id="btn-verify" disabled>4. Verify step</button>
     <button type="button" class="secondary" id="btn-copy" disabled>Copy JSON</button>
     <button type="button" class="secondary" id="btn-clear">Clear log</button>
@@ -96,9 +97,9 @@
     </div>
   </div>
   <p id="hint">
-    <b>Start</b> gets primitive + saves <code>CAL-NATIVEFN</code>.
-    <b>Verify step 1 CAL-FAIL?</b> Type a known <b>base</b> (e.g. from Probe ELF log) → <b>Set base</b>, then Verify step.
-    Or tap <b>2c. Probe ELF</b> (1 read/tap) until <code>CAL-ELF-HIT</code>. Set base derives expm1 from nativeFn − base.
+    <b>Quick test:</b> Start → <b>Assume expm1 (test)</b> uses <code>2582880</code> with no verify (or add <code>?trust=1</code> to auto after Start).
+    <code>0x464c457f</code> is ELF magic from a memory <b>read</b> — never type it into expm1/base.
+    Optional: Set base for manual override; Verify step checks ELF/gadgets (1 read/tap).
   </p>
   <h2>Log</h2>
   <div id="out"></div>

