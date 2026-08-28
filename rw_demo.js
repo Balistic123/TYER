@@ -34,7 +34,7 @@ import {
 } from "./libkernel_resolve.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250829h";
+const BUILD_ID = "rw-20250829i";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const RESTORE_LOG = params.get("restorelog") === "1";
@@ -1684,8 +1684,8 @@ async function runScanIat() {
     busy = true;
     setUi();
     iatScanState = null;
-    mark("LK-SCAN", "PT_DYNAMIC GOT → RW ptr → ELF hunt → PLT → stub");
-    const dynProbe = diagnoseWebkitDynamic(p, webkitBase, off);
+    mark("LK-SCAN", "lite=poops → low PLT only; else dyn→rw→elf");
+    const dynProbe = diagnoseWebkitDynamic(p, webkitBase, off, { deep: false });
     mark("LK-PROBE", dynProbe.reason
         + " kind=" + (dynProbe.kind || "?")
         + (dynProbe.poops ? " poops=1" : "")
@@ -1706,7 +1706,13 @@ async function runScanIat() {
         while (ticks++ < maxTicks) {
             const chunk = scanLibkernelChunk(p, webkitBase, off, iatScanState, scanOpts);
             iatScanState = chunk.state;
-            if (chunk.phase === "dyn-start")
+            if (chunk.phase === "lite-start")
+                mark("LK-LITE", "poops base — PSFree PLT + low .text only (OOM-safe)");
+            else if (chunk.phase === "lite-miss")
+                mark("LK-MISS", "lite scan miss tried=" + (chunk.tried || 0)
+                    + " plt=" + (chunk.refs || 0)
+                    + " — paste external ptr or libkernel base");
+            else if (chunk.phase === "dyn-start")
                 mark("LK-DYN", "inCap " + chunk.slots + "/" + chunk.total
                     + " jmprel=+0x" + (chunk.jmprel || 0).toString(16)
                     + " pltgot=+0x" + (chunk.pltgot || 0).toString(16));
@@ -1735,7 +1741,7 @@ async function runScanIat() {
                 scanState("dyn GOT " + chunk.idx + "/" + chunk.total
                     + " tried=" + chunk.tried);
             else if (chunk.phase === "elf-start")
-                mark("LK-ELF", "scanning ±512MB for ELF modules (no dump needed)");
+                mark("LK-ELF", "scanning ±64MB for ELF modules");
             else if (chunk.phase === "elf-anchor")
                 mark("LK-ELF", "anchor#" + chunk.anchor + " modules=" + chunk.modules);
             else if (chunk.phase === "elf")
@@ -1803,6 +1809,10 @@ async function runScanIat() {
                 break;
             }
             if (chunk.done) {
+                if (chunk.phase === "lite-miss") {
+                    state("libkernel miss", "bad");
+                    break;
+                }
                 mark("LK-MISS", "all phases miss"
                     + (chunk.dynTried != null ? " dyn=" + chunk.dynTried : "")
                     + (chunk.dynSlots != null ? "/" + chunk.dynSlots : "")
@@ -1816,9 +1826,12 @@ async function runScanIat() {
                 state("libkernel miss", "bad");
                 break;
             }
-            if ((ticks & 31) === 0)
+            if ((ticks & 7) === 0)
                 renderOut();
-            await new Promise(r => setTimeout(r, 0));
+            if ((ticks & 15) === 0)
+                await new Promise(r => setTimeout(r, 2));
+            else
+                await new Promise(r => setTimeout(r, 0));
         }
         if (ticks >= maxTicks) {
             mark("LK-FAIL", "libkernel scan timeout — reload and retry");
