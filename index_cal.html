@@ -66,6 +66,8 @@
     <button type="button" class="secondary" id="btn-lite" disabled>2a. Lite ELF</button>
     <button type="button" class="secondary" id="btn-wide" disabled>2b. Wide ELF</button>
     <button type="button" class="secondary" id="btn-probe" disabled>2c. Probe ELF</button>
+    <button type="button" class="secondary" id="btn-find-base" disabled>2d. Find base</button>
+    <button type="button" class="secondary" id="btn-find-base-vtable" disabled>2e. Find base (vtable)</button>
     <button type="button" class="secondary" id="btn-set-expm1" disabled>3. Set expm1</button>
     <button type="button" class="secondary" id="btn-set-base" disabled>3b. Set base</button>
     <button type="button" id="btn-assume" disabled>Assume expm1 (test)</button>
@@ -88,7 +90,7 @@
       <div class="val" id="native-fn">—</div>
     </div>
     <div class="card">
-      <h3>webkitBase (= nativeFn − expm1)</h3>
+      <h3>webkitBase</h3>
       <div class="val" id="webkit-base">—</div>
     </div>
     <div class="card" style="grid-column:1/-1">
@@ -97,9 +99,8 @@
     </div>
   </div>
   <p id="hint">
-    <b>Quick test:</b> Start → <b>Assume expm1 (test)</b> uses <code>2582880</code> with no verify (or add <code>?trust=1</code> to auto after Start).
-    <code>0x464c457f</code> is ELF magic from a memory <b>read</b> — never type it into expm1/base.
-    Optional: Set base for manual override; Verify step checks ELF/gadgets (1 read/tap).
+    <b>Best base leak:</b> tap <b>2e. Find base (vtable)</b> after Start — textarea → WebCore vtable → walk back until <code>CAL-ELF-HIT</code> (first tap leaks vtable, then 1 read/tap).
+    <b>0xcccccccc?</b> expm1 path is wrong — use 2e, not Assume.
   </p>
   <h2>Log</h2>
   <div id="out"></div>
