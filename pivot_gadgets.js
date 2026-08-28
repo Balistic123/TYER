@@ -81,6 +81,7 @@ export const PIVOT_ROWS = [
 export const G5_PATTERNS = [
     { pat: [0x52, 0x5c, 0xc3], kind: "push rdx; pop rsp; ret" },
     { pat: [0x41, 0x52, 0x5c, 0xc3], kind: "rex push rdx; pop rsp; ret" },
+    { pat: [0x4d, 0x52, 0x5c, 0xc3], kind: "rex.wrb push rdx; pop rsp; ret" },
     { pat: [0x48, 0x89, 0xd4, 0xc3], kind: "mov rsp, rdx; ret" },
     { pat: [0x48, 0x87, 0xe2, 0xc3], kind: "xchg rsp, rdx; ret" },
 ];
