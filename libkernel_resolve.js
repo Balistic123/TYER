@@ -221,27 +221,61 @@ export function scanGotPltSlots(p, webkitBase, off, gotRva, opts) {
     return null;
 }
 
-function queueGotRva(state, gotRva, cap, off) {
-    if (!iatRvaAllowed(gotRva, off)) return;
+function queueAndVerifyGot(p, webkitBase, off, state, gotRva) {
+    if (!iatRvaAllowed(gotRva, off)) return null;
     const key = gotRva.toString(16);
-    if (state.gotSeen[key]) return;
+    if (state.gotSeen[key]) return null;
     state.gotSeen[key] = 1;
     if (state.gotQueue.length < 512)
         state.gotQueue.push(gotRva);
+    if (state.gotVerifyIdx == null) state.gotVerifyIdx = 0;
+    const hit = lkFromIatSlot(p, webkitBase, gotRva, off, read8p);
+    state.gotVerifyIdx = state.gotQueue.length;
+    return hit;
 }
 
-function scanXrefsInWindow(state, baseRva, buf, cap, off) {
+function iatHitReturn(state, hit, source) {
+    saveLibkernelSession(hit.lk, hit.iatRva);
+    state.done = true;
+    state.best = hit;
+    return {
+        done: true,
+        lk: hit.lk,
+        iatRva: hit.iatRva,
+        source: source + (hit.via ? "/" + hit.via : ""),
+        state,
+    };
+}
+
+function scanXrefsInWindow(p, webkitBase, state, baseRva, buf, cap, off) {
     for (let start = 0; start <= 8; start++) {
         if (buf[start] === 0xff && buf[start + 1] === 0x15) {
             const disp = i32At(buf, start + 2);
-            queueGotRva(state, baseRva + start + 6 + disp, cap, off);
+            const hit = queueAndVerifyGot(p, webkitBase, off, state,
+                baseRva + start + 6 + disp);
+            if (hit) return hit;
         }
         if (start <= 7 && buf[start] === 0x48 && buf[start + 1] === 0x8b
             && (buf[start + 2] === 0x3d || buf[start + 2] === 0x05)) {
             const disp = i32At(buf, start + 3);
-            queueGotRva(state, baseRva + start + 7 + disp, cap, off);
+            const hit = queueAndVerifyGot(p, webkitBase, off, state,
+                baseRva + start + 7 + disp);
+            if (hit) return hit;
         }
     }
+    return null;
+}
+
+function verifyPendingGot(p, webkitBase, off, state, maxChecks) {
+    if (state.gotVerifyIdx == null) state.gotVerifyIdx = 0;
+    let checks = 0;
+    while (state.gotVerifyIdx < state.gotQueue.length && checks < maxChecks) {
+        const rva = state.gotQueue[state.gotVerifyIdx++];
+        const hit = lkFromIatSlot(p, webkitBase, rva, off, read8p);
+        if (hit) return hit;
+        checks++;
+    }
+    return null;
 }
 
 /**
@@ -288,18 +322,8 @@ export function scanErrorIatChunk(p, webkitBase, off, state) {
             checks++;
             if (!iatRvaAllowed(rva, off)) break;
             const hit = lkFromIatSlot(p, webkitBase, rva, off, read8p);
-            if (hit) {
-                saveLibkernelSession(hit.lk, hit.iatRva);
-                state.done = true;
-                state.best = hit;
-                return {
-                    done: true,
-                    lk: hit.lk,
-                    iatRva: hit.iatRva,
-                    source: "got-plt+" + (state.gotSlot - 1),
-                    state,
-                };
-            }
+            if (hit)
+                return iatHitReturn(state, hit, "got-plt+" + (state.gotSlot - 1));
         }
         if (state.gotSlot >= maxSlots
             || !iatRvaAllowed(state.gotPlt + state.gotSlot * 8, off)) {
@@ -316,19 +340,26 @@ export function scanErrorIatChunk(p, webkitBase, off, state) {
     }
 
     if (state.phase === "code") {
+        const absCap = webkitRvaMax(off);
         let steps = 0;
-        while (state.cursor < state.maxRva && steps < state.chunk) {
+        while (state.cursor < state.maxRva && state.cursor < absCap && steps < state.chunk) {
             const w0 = read8p(p, webkitBase.add32(state.cursor));
             if (w0) {
                 bytesFromRead8(w0, state.win16, 0);
                 const w1 = read8p(p, webkitBase.add32(state.cursor + 8));
                 if (w1) bytesFromRead8(w1, state.win16, 8);
-                scanXrefsInWindow(state, state.cursor, state.win16, cap, off);
+                const live = scanXrefsInWindow(p, webkitBase, state,
+                    state.cursor, state.win16, cap, off);
+                if (live)
+                    return iatHitReturn(state, live, "live");
             }
             state.cursor += state.step;
             steps++;
         }
-        if (state.cursor >= state.maxRva) {
+        const pending = verifyPendingGot(p, webkitBase, off, state, 16);
+        if (pending)
+            return iatHitReturn(state, pending, "pending");
+        if (state.cursor >= state.maxRva || state.cursor >= absCap) {
             const nextIdx = (state.regionIdx || 0) + 1;
             const skipMid = state.gotQueue.length >= 48
                 && state.regionTag === "low"
@@ -353,7 +384,7 @@ export function scanErrorIatChunk(p, webkitBase, off, state) {
                 };
             }
             state.phase = "verify";
-            state.gotIdx = 0;
+            state.gotIdx = state.gotVerifyIdx || 0;
             return {
                 done: false,
                 state,
@@ -369,29 +400,15 @@ export function scanErrorIatChunk(p, webkitBase, off, state) {
             queued: state.gotQueue.length,
             region: state.regionTag || "code",
             end: state.maxRva,
+            verified: state.gotVerifyIdx || 0,
         };
     }
 
     if (state.phase === "verify") {
-        let checks = 0;
-        while (state.gotIdx < state.gotQueue.length && checks < 48) {
-            const rva = state.gotQueue[state.gotIdx++];
-            const hit = lkFromIatSlot(p, webkitBase, rva, off, read8p);
-            if (hit) {
-                saveLibkernelSession(hit.lk, hit.iatRva);
-                state.done = true;
-                state.best = hit;
-                return {
-                    done: true,
-                    lk: hit.lk,
-                    iatRva: hit.iatRva,
-                    source: "plt-xref" + (hit.via ? "/" + hit.via : ""),
-                    state,
-                };
-            }
-            checks++;
-        }
-        if (state.gotIdx >= state.gotQueue.length) {
+        const hit = verifyPendingGot(p, webkitBase, off, state, 48);
+        if (hit)
+            return iatHitReturn(state, hit, "plt-xref");
+        if ((state.gotVerifyIdx || 0) >= state.gotQueue.length) {
             state.done = true;
             if (state.best) {
                 saveLibkernelSession(state.best.lk, state.best.iatRva);
@@ -417,7 +434,12 @@ export function scanErrorIatChunk(p, webkitBase, off, state) {
             }
             return { done: true, state, lk: null };
         }
-        return { done: false, state, phase: "verify", left: state.gotQueue.length - state.gotIdx };
+        return {
+            done: false,
+            state,
+            phase: "verify",
+            left: state.gotQueue.length - (state.gotVerifyIdx || 0),
+        };
     }
 
     state.done = true;

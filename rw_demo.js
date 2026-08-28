@@ -32,7 +32,7 @@ import {
 } from "./libkernel_resolve.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250828x";
+const BUILD_ID = "rw-20250828y";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const RESTORE_LOG = params.get("restorelog") === "1";
@@ -1692,7 +1692,8 @@ async function runScanIat() {
             else if (chunk.phase === "code")
                 scanState("code " + (chunk.region || "?") + " +0x"
                     + chunk.cursor.toString(16) + "…+0x"
-                    + (chunk.end || 0).toString(16) + " q=" + chunk.queued);
+                    + (chunk.end || 0).toString(16)
+                    + " q=" + chunk.queued + " v=" + (chunk.verified || 0));
             else if (chunk.phase === "verify")
                 scanState("verify GOT " + chunk.left + " left");
             if (chunk.done && chunk.lk) {
