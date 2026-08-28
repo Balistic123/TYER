@@ -34,9 +34,9 @@
                     flex:0 0 auto; min-height:36px; }
   #cal-bar button:disabled { opacity:0.55; cursor:default; color:#9aa3b2;
                              background:#151b24; border-color:#2a3544; }
-  #expm1-in { width:140px; background:#0b0d10; color:#c8ced8; border:1px solid #2a3544;
+  #expm1-in, #base-in { width:140px; background:#0b0d10; color:#c8ced8; border:1px solid #2a3544;
               border-radius:4px; padding:8px; font:inherit; flex:0 0 auto; min-height:36px; }
-  #expm1-in:disabled { opacity:0.55; }
+  #expm1-in:disabled, #base-in:disabled { opacity:0.55; }
   #summary { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin:0 0 10px; }
   .card { background:#11151b; border:1px solid #1e2732; border-radius:5px; padding:10px 12px; }
   .card h3 { margin:0 0 6px; font-size:11px; color:#9aa3b2; font-weight:600; text-transform:uppercase; }
@@ -67,6 +67,7 @@
     <button type="button" class="secondary" id="btn-wide" disabled>2b. Wide ELF</button>
     <button type="button" class="secondary" id="btn-probe" disabled>2c. Probe ELF</button>
     <button type="button" class="secondary" id="btn-set-expm1" disabled>3. Set expm1</button>
+    <button type="button" class="secondary" id="btn-set-base" disabled>3b. Set base</button>
     <button type="button" class="secondary" id="btn-verify" disabled>4. Verify step</button>
     <button type="button" class="secondary" id="btn-copy" disabled>Copy JSON</button>
     <button type="button" class="secondary" id="btn-clear">Clear log</button>
@@ -75,6 +76,9 @@
     <span class="bar-label"><b>expm1</b></span>
     <input type="text" id="expm1-in" placeholder="2582880" autocomplete="off" disabled>
     <button type="button" id="btn-set-expm1-2" disabled>Set expm1 (0 reads)</button>
+    <span class="bar-label"><b>base</b></span>
+    <input type="text" id="base-in" placeholder="8325b0000" autocomplete="off" disabled>
+    <button type="button" id="btn-set-base-2" disabled>Set base (0 reads)</button>
     <button type="button" id="btn-verify-2" disabled>Verify step (1 read/tap)</button>
   </div>
   <div id="summary">
@@ -93,7 +97,8 @@
   </div>
   <p id="hint">
     <b>Start</b> gets primitive + saves <code>CAL-NATIVEFN</code>.
-    <b>Verify step 1 CAL-FAIL?</b> <code>2582880</code> is only a guess. Tap <b>2c. Probe ELF</b> (1 read/tap, scans 0x2200000–0x2800000) until <code>CAL-ELF-HIT</code>, then Set expm1 + Verify step.
+    <b>Verify step 1 CAL-FAIL?</b> Type a known <b>base</b> (e.g. from Probe ELF log) → <b>Set base</b>, then Verify step.
+    Or tap <b>2c. Probe ELF</b> (1 read/tap) until <code>CAL-ELF-HIT</code>. Set base derives expm1 from nativeFn − base.
   </p>
   <h2>Log</h2>
   <div id="out"></div>
