@@ -15,9 +15,15 @@ export const PIVOT_HINTS_1300 = {
     pivot_view_sp:                0x38,
 };
 
-/** 13.52 retail — HW-confirmed pivot RVAs (add as found) */
+/** 13.52 retail — HW-confirmed pivot RVAs */
 export const PIVOT_HW_1352 = {
     wk_MOV_QWORD_PTR_RDI_RAX_RET: 0x1f9bb,
+    wk_MOV_RDI_RSI_30_CALL:       0xe3e4a,
+    wk_POP_RAX_MOV_RAX_JMP_18:    0x4b330,
+    wk_PUSH_RBP_MOV_RBP_RSP_10:   0x1ff70,
+    wk_MOV_RDI_RAX_8_CALL_20:     0x16e02,
+    wk_MOV_RDX_RAX_18_CALL_10:    0x589c1,
+    // G5 wk_PUSH_RDX_POP_RSP_RET — still scan (low .text only)
 };
 
 export function pivotHint(key) {
