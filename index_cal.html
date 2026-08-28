@@ -92,13 +92,8 @@
   </div>
   <p id="hint">
     <b>Start</b> gets primitive + saves <code>CAL-NATIVEFN</code>.
-    <b>Lite ELF</b> = exactly <b>1 read per tap</b> (ELF magic only — no gadget burst).
-    On <code>CAL-ELF-HIT</code>, either tap <b>Set expm1 (0 reads)</b> if you trust it, or <b>Verify step</b> (1 read/tap × ~12 for gadgets + libkernel).
-    OOM? Use <b>Set expm1</b> with <code>2582880</code> from your nativeFn — zero reads.
-    <b>Lite scan</b> tries ±8×0x4000 around the stale table hint (17 aligned candidates, 1 ELF read per tap).
-    <b>Wide scan</b> walks <code>0x2570000–0x25a0000</code> (override with <code>?min=</code> / <code>?max=</code>).
-    Or type a delta (try <code>2582880</code> if hint was <code>2586880</code>) and <b>Verify manual</b> — checks ELF + 8 ROP gadgets + libkernel prologue.
-    Success → <code>CAL-OK</code> + <code>PASTE-OFFSETS</code> JSON for <code>ps4_offsets_userland.js</code>.
+    <b>Lite ELF exhausted?</b> Normal on 13.52 — ignore it. After Start, box prefills <code>2582880</code>.
+    Tap <b>3. Set expm1</b> (0 reads) → base = nativeFn − expm1. Optional: <b>Verify step</b> once for ELF check.
   </p>
   <h2>Log</h2>
   <div id="out"></div>

