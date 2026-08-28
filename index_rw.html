@@ -83,9 +83,8 @@
   <div class="gadget-bar" id="gadget-pivot">
     <span class="bar-label">pivot G0-G5 HW — Verify pivot then Native call</span>
   </div>
-  <p id="hint"><b>Pivot 7/7 on 13.52.</b> Native call needs libkernel — tap <b>Scan IAT</b> once
-    (13.00 IAT +0x3cb8cc8 OOMs). Then <b>Verify pivot</b> → <b>Native call</b>.
-    <code>?restorelog=1</code> after crash.</p>
+  <p id="hint"><b>Pivot 7/7 on 13.52.</b> Tap <b>Scan IAT</b> once (ELF + PLT xrefs — not brute GOT).
+    Then <b>Verify pivot</b> → <b>Native call</b>. <code>?restorelog=1</code> after crash.</p>
   <h2>Known pointers (this process)</h2>
   <table id="map">
     <thead><tr><th>label</th><th>address</th><th>note</th></tr></thead>

@@ -32,7 +32,7 @@ import {
 } from "./libkernel_resolve.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250828u";
+const BUILD_ID = "rw-20250828v";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const RESTORE_LOG = params.get("restorelog") === "1";
@@ -1661,23 +1661,33 @@ async function runScanIat() {
     scanQuiet = true;
     setUi();
     iatScanState = null;
-    mark("LK-SCAN", "chunked GOT scan +0x800000…+0x"
-        + webkitRvaMax(off).toString(16) + " (never +0x3cb8cc8)");
+    mark("LK-SCAN", "ELF DT_PLTGOT → GOT slots → PLT xrefs (no brute sweep)");
     try {
         while (true) {
             const chunk = scanErrorIatChunk(p, webkitBase, off, iatScanState);
             iatScanState = chunk.state;
+            if (chunk.phase === "elf-hit")
+                mark("LK-ELF", "DT_PLTGOT +0x" + chunk.gotPlt.toString(16));
+            else if (chunk.phase === "elf-miss")
+                mark("LK-PHASE", "no DT_PLTGOT in mapped ELF — PLT xrefs");
+            else if (chunk.phase === "gotplt-miss")
+                mark("LK-PHASE", "GOT walk miss — PLT xrefs in .text");
+            else if (chunk.phase === "code" && !scanQuiet)
+                scanState("PLT xref @+0x" + chunk.cursor.toString(16)
+                    + " q=" + chunk.queued);
+            else if (chunk.phase === "verify" && !scanQuiet)
+                scanState("verify GOT " + chunk.left + " left");
             if (chunk.done && chunk.lk) {
-                mark("LK-OK", chunk.lk + " IAT +0x" + chunk.iatRva.toString(16));
+                mark("LK-OK", chunk.lk + " IAT +0x" + chunk.iatRva.toString(16)
+                    + " (" + (chunk.source || "?") + ")");
                 state("libkernel OK", "ok");
                 break;
             }
             if (chunk.done) {
-                mark("LK-MISS", "no __imp___error in mapped webkit");
+                mark("LK-MISS", "no __imp___error via ELF/PLT");
                 state("IAT scan miss", "bad");
                 break;
             }
-            scanState("IAT @+0x" + iatScanState.cursor.toString(16));
             await new Promise(r => setTimeout(r, 0));
         }
     } finally {
@@ -1691,7 +1701,7 @@ async function runScanIat() {
 async function ensureLibkernel(p, off, webkitBase) {
     let r = resolveLibkernel(p, webkitBase, off, { log: mark, read8: read8p });
     if (r.ok) return r.lk;
-    mark("NATIVE-STEP", "IAT scan (13.00 +0x3cb8cc8 blocked)…");
+    mark("NATIVE-STEP", "libkernel (ELF/PLT — not brute GOT)…");
     let state = null;
     while (true) {
         const chunk = scanErrorIatChunk(p, webkitBase, off, state);
@@ -2120,7 +2130,7 @@ function init() {
     if (params.get("clearlog") === "1") clearPersistedLog();
     else if (RESTORE_LOG && restorePersistedLog()) renderOut();
 
-    mark("BOOT", "build=" + BUILD_ID + " — pivot 7/7; libkernel via IAT scan (not +0x3cb8cc8)");
+    mark("BOOT", "build=" + BUILD_ID + " — IAT via ELF/PLT xref (not brute GOT)");
     mark("BOOT", groomBootLine(params));
     window.addEventListener("beforeunload", function () {
         stopPivotScanQuiet();
