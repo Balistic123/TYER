@@ -4,7 +4,7 @@ import { installWindowP, pairStatus } from "./mem.js";
 import { groomBootLine, wireGroomBar } from "./groom_presets.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250827j";
+const BUILD_ID = "rw-20250827k";
 /** opt-in only — release triggers JSC GC; chain_poops uses ?pair=1 (default off) */
 const PROMOTE_PAIR = params.get("promote") === "1";
 /** Skip heavy pointer map on Start unless ?rwproof=1 (saves memory for native call) */
@@ -513,10 +513,7 @@ async function freeBeforeNative() {
     stripUiForNative();
     retained.length = 0;
     pointers.length = 0;
-    mark("NATIVE-PREP", "ui trimmed — log kept in sessionStorage");
-    if (trimDebrisFn) {
-        try { trimDebrisFn(); } catch (_) { }
-    }
+    mark("NATIVE-PREP", "ui trimmed — groom stays pinned");
     exploit = null;
 }
 
@@ -595,10 +592,11 @@ async function establishOnce(establishPrimitive) {
     lengthMissStreak = 0;
     const cap = attemptCap();
     mark("ATTEMPTS", cap > 0 ? String(cap) + " per page load" : "unlimited (single run)");
-    mark("NOTE", "close browser fully before Start if prior OOM or long retry session");
+    mark("NOTE", "pinned groom profile — skipTrimDebris (TRIM-DEBRIS OOMs on PS4)");
 
     return establishPrimitive({
         maxAttempts: cap,
+        skipTrimDebris: true,
         onEvent: (t, d, a) => onRaceEvent(t, (a != null ? "[" + a + "] " : "") + (d || ""))
     });
 }
@@ -816,8 +814,7 @@ function init() {
     if (params.get("clearlog") === "1") clearPersistedLog();
     else if (restorePersistedLog()) renderOut();
 
-    mark("BOOT", "build=" + BUILD_ID + " — primitive only; native=?native=1 or button");
-    mark("BOOT", "log persists milestones only (PRIMITIVE/NATIVE/PAIR/ERROR)");
+    mark("BOOT", "build=" + BUILD_ID + " — skipTrimDebris (pinned groom, chain_poops profile)");
     mark("BOOT", "promote=" + PROMOTE_PAIR + " (opt-in ?promote=1) auto-native=" + AUTO_NATIVE);
     mark("BOOT", groomBootLine(params));
     mark("BOOT", "one establishPrimitive run — internal auto-retry until win");

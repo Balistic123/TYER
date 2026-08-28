@@ -85,6 +85,7 @@ let criticalBarrier = null;
 let settleResolve = null;
 let settleReject = null;
 let running = false;
+let skipTrimOnSuccess = false;
 
 let referenceTarget = null;
 let rwBuffer = null;
@@ -1187,7 +1188,11 @@ function reportComposition() {
 
     try { history.replaceState(null, ""); } catch { }
 
-    trimExploitDebris();
+    if (skipTrimOnSuccess) {
+        emit("TRIM-SKIP", "groom kept pinned — skipTrimDebris (no JSC sweep)");
+    } else {
+        trimExploitDebris();
+    }
 
     stopped = true;
     running = false;
@@ -1272,6 +1277,7 @@ export function establishPrimitive(options) {
         ensureBarrierNode();
     attemptCeiling = typeof opts.maxAttempts === "number" && opts.maxAttempts > 0
         ? opts.maxAttempts : 0;
+    skipTrimOnSuccess = opts.skipTrimDebris === true;
 
     running = true;
     stopped = false;
