@@ -33,7 +33,7 @@ import {
 } from "./libkernel_resolve.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250829c";
+const BUILD_ID = "rw-20250829d";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const RESTORE_LOG = params.get("restorelog") === "1";
@@ -1683,16 +1683,24 @@ async function runScanIat() {
     busy = true;
     setUi();
     iatScanState = null;
-    mark("LK-SCAN", "PLT→GOT + RELRO + prologue ±256MB + stub");
+    mark("LK-SCAN", "PSFree PLT → GOT → prologue → stub");
     scanState("libkernel scan…");
     let ticks = 0;
     const maxTicks = 60000;
-    const scanOpts = { nativeFn };
+    const scanOpts = { nativeFn, log: mark };
     try {
         while (ticks++ < maxTicks) {
             const chunk = scanLibkernelChunk(p, webkitBase, off, iatScanState, scanOpts);
             iatScanState = chunk.state;
-            if (chunk.phase === "plt-start")
+            if (chunk.phase === "psfree-start")
+                mark("LK-PSFREE", "trying low PLT imports (__stack_chk_fail class)");
+            else if (chunk.phase === "psfree" || chunk.phase === "psfree-region")
+                scanState("PSFree PLT +0x" + chunk.cursor.toString(16)
+                    + " tried=" + chunk.tried);
+            else if (chunk.phase === "plt-next")
+                mark("LK-PLT", "PSFree miss tried=" + (chunk.tried || 0)
+                    + " — full PLT→GOT scan");
+            else if (chunk.phase === "plt-start")
                 mark("LK-PLT", "scan .text xrefs spans=" + chunk.spans);
             else if (chunk.phase === "plt-region")
                 mark("LK-PHASE", "PLT " + chunk.region + " @+0x"

