@@ -693,9 +693,6 @@ export function scanErrorIatChunk(p, webkitBase, off, state) {
     return { done: true, lk: null, state };
 }
 
-    return { done: true, lk: null, state };
-}
-
 /**
  * PSFree method: __stack_chk_fail PLT in low .text → resolve_import → find_base.
  * Does NOT touch wk___imp___error @ +0x3cb8cc8 (unmapped on 13.52).
