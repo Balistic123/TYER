@@ -55,15 +55,16 @@
   </div>
   <div id="toolbar">
     <button type="button" id="btn-start">1. Start primitive</button>
-    <button type="button" class="secondary" id="btn-lite" disabled>2a. Lite scan (1 read/tap)</button>
-    <button type="button" class="secondary" id="btn-wide" disabled>2b. Wide scan (1 read/tap)</button>
+    <button type="button" class="secondary" id="btn-lite" disabled>2a. Lite ELF (1 read/tap)</button>
+    <button type="button" class="secondary" id="btn-wide" disabled>2b. Wide ELF (1 read/tap)</button>
     <button type="button" class="secondary" id="btn-copy" disabled>Copy offsets JSON</button>
     <button type="button" class="secondary" id="btn-clear">Clear log</button>
   </div>
   <div id="cal-bar">
     <label for="expm1-in">expm1 delta</label>
     <input type="text" id="expm1-in" placeholder="2582880" autocomplete="off" disabled>
-    <button type="button" class="secondary" id="btn-verify" disabled>Verify manual (0 scan)</button>
+    <button type="button" class="secondary" id="btn-set-expm1" disabled>Set expm1 (0 reads)</button>
+    <button type="button" class="secondary" id="btn-verify" disabled>Verify step (1 read/tap)</button>
   </div>
   <div id="summary">
     <div class="card">
@@ -80,9 +81,10 @@
     </div>
   </div>
   <p id="hint">
-    <b>Start</b> runs one race session with internal auto-retry until <code>READ-PRIMITIVE-PASS</code>.
-    If the log spammed <code>COMPOSITION-LENGTH-MISS</code>, the race is losing — tap <b>512 drain</b> or <b>max groom</b> above,
-    <b>close the browser fully</b>, reload, then Start again (do not hammer Start on a losing groom).
+    <b>Start</b> gets primitive + saves <code>CAL-NATIVEFN</code>.
+    <b>Lite ELF</b> = exactly <b>1 read per tap</b> (ELF magic only — no gadget burst).
+    On <code>CAL-ELF-HIT</code>, either tap <b>Set expm1 (0 reads)</b> if you trust it, or <b>Verify step</b> (1 read/tap × ~12 for gadgets + libkernel).
+    OOM? Use <b>Set expm1</b> with <code>2582880</code> from your nativeFn — zero reads.
     <b>Lite scan</b> tries ±8×0x4000 around the stale table hint (17 aligned candidates, 1 ELF read per tap).
     <b>Wide scan</b> walks <code>0x2570000–0x25a0000</code> (override with <code>?min=</code> / <code>?max=</code>).
     Or type a delta (try <code>2582880</code> if hint was <code>2586880</code>) and <b>Verify manual</b> — checks ELF + 8 ROP gadgets + libkernel prologue.
