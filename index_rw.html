@@ -53,9 +53,9 @@
   <div id="groom-bar">
     <span class="bar-label">groom (tap before Start if race keeps missing)</span>
     <button type="button" data-groom="default">default</button>
-    <button type="button" data-groom="384">384 drain</button>
+    <button type="button" data-groom="384" class="active">384 drain</button>
     <button type="button" data-groom="512">512 drain</button>
-    <button type="button" data-groom="max" class="active">max groom</button>
+    <button type="button" data-groom="max">max groom</button>
     <button type="button" data-groom="lite">lite (OOM risk)</button>
   </div>
   <div id="toolbar">
@@ -64,7 +64,8 @@
     <button type="button" class="secondary" id="btn-refresh" disabled>Refresh map</button>
     <button type="button" class="secondary" id="btn-clear">Clear log</button>
   </div>
-  <p id="hint"><b>max groom</b> selected by default (same as cal). Tap groom before Start if race misses.
+  <p id="hint"><b>384 drain</b> is the cal default — tap groom before Start if the race keeps missing.
+    Try <b>512</b> or <b>max</b> only if 384 fails after a full browser restart.
     Start skips the pointer map by default — tap <b>Native call (getpid)</b> after cal Accept.
     Add <code>?rwproof=1</code> for full R/W proof map. <b>Scope:</b> WebKit browser process only.</p>
   <h2>Known pointers (this process)</h2>
