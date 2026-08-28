@@ -71,7 +71,7 @@
     <button type="button" class="secondary" id="btn-set-expm1" disabled>3. Set expm1</button>
     <button type="button" class="secondary" id="btn-set-base" disabled>3b. Set base</button>
     <button type="button" id="btn-assume" disabled>Assume expm1 (test)</button>
-    <button type="button" class="secondary" id="btn-scan-gadgets" disabled>4b. Check gadgets</button>
+    <button type="button" class="secondary" id="btn-scan-gadgets" disabled>4b. Accept offsets (0 reads)</button>
     <button type="button" class="secondary" id="btn-verify" disabled>4. Verify all</button>
     <button type="button" class="secondary" id="btn-copy" disabled>Copy JSON</button>
     <button type="button" class="secondary" id="btn-clear">Clear log</button>
@@ -100,8 +100,9 @@
     </div>
   </div>
   <p id="hint">
-    <b>2e runs automatically</b> after Start — scans textarea cell for WebCore+m_wrapped (0x8–0x58), validates vtable (2+ code entries, mapped pages behind it), then walks for module base.
-    Paste <code>CELL-SCAN</code> + <code>VTABLE-CAND</code> lines if it still fails.
+    <b>If you already have base+expm1</b>, use
+    <code>?base=805018530&amp;expm1=eb6350&amp;vtable=0</code> to skip the walk (saves memory).
+    Then tap <b>4b Accept offsets (0 reads)</b> — no scan, no verify needed.
   </p>
   <h2>Log</h2>
   <div id="out"></div>
