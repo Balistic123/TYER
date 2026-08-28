@@ -32,7 +32,7 @@ import {
 } from "./libkernel_resolve.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250828w";
+const BUILD_ID = "rw-20250828x";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const RESTORE_LOG = params.get("restorelog") === "1";
@@ -1681,9 +1681,18 @@ async function runScanIat() {
                 mark("LK-PHASE", "GOT walk miss — PLT xrefs");
             else if (chunk.phase === "gotplt")
                 scanState("GOT slot " + chunk.gotIdx + "/384");
+            else if (chunk.phase === "code-region")
+                mark("LK-PHASE", "code " + chunk.region + " @+0x"
+                    + chunk.cursor.toString(16) + " q=" + chunk.queued
+                    + (chunk.note || ""));
+            else if (chunk.phase === "code-done")
+                mark("LK-PHASE", "code done — verify " + chunk.queued + " GOT slots");
+            else if (chunk.phase === "code-retry-mid")
+                mark("LK-PHASE", "verify miss — scan mid .text");
             else if (chunk.phase === "code")
-                scanState("PLT xref +0x" + chunk.cursor.toString(16)
-                    + " q=" + chunk.queued);
+                scanState("code " + (chunk.region || "?") + " +0x"
+                    + chunk.cursor.toString(16) + "…+0x"
+                    + (chunk.end || 0).toString(16) + " q=" + chunk.queued);
             else if (chunk.phase === "verify")
                 scanState("verify GOT " + chunk.left + " left");
             if (chunk.done && chunk.lk) {
