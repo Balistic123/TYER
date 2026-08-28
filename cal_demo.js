@@ -16,10 +16,12 @@ let calibrated = null;
 let manualBase = null;
 let raceAttempt = 0;
 let lengthMissStreak = 0;
+let raceMode = false;
+const raceBuf = [];
 const calRetain = [];
 
-const LOG_MAX = 500;
-const BUILD_ID = "cal-20250827k";
+const LOG_MAX = 300;
+const BUILD_ID = "cal-20250829a";
 const CAL_ALIGN_STEP = 0x4000;
 const ELF_MAGIC = 0x464c457f;
 /** 13.52 retail test anchor — assumed correct unless cal proves otherwise */
@@ -50,8 +52,8 @@ const FIND_FWD_MAX_STEPS = parseInt(params.get("fwdmax") || "512", 10);
 /** 0 = run full vtable walk as fast as possible; yield to UI every N steps */
 const WALK_YIELD_EVERY = parseInt(params.get("walkyield") || "512", 10);
 const WALK_LOG_EVERY = parseInt(params.get("walklog") || "1024", 10);
-/** auto vtable walk after Start unless ?vtable=0 or base+expm1 already set */
-const AUTO_VTABLE_WALK = params.get("vtable") !== "0"
+/** Manual 2e vtable walk — auto after Start OOMs on 13.52 (DOM churn during race). */
+const AUTO_VTABLE_WALK = params.get("vtable") === "1"
     && !params.get("base") && !params.get("expm1");
 const CORE_LOG = /ADDROF|FAIL|ERROR|PRIMITIVE|PASS|GIVE-UP|ATTEMPT|SETUP|CARRIER|PAIR|SSV-|TRIM-DEBRIS|ADDROF-RELEASE|FAKE-ADDRESS|READ-PRIMITIVE|PLACEMENT|COMPOSITION|NORMAL-CLONE|ZERO-HEADER|VALIDATION|LOAD-THREW|NO-RESULT|PRIMITIVE-OK|AUTO-RETRY|CORE-GIVE-UP|CAL-|GADGET|ELF|BASES|LK-|PASTE|HINT-GROOM/i;
 /** Chunked gadget scan — one tap = SCAN_CHUNK read8 steps (OOM-safe on PS4) */
@@ -263,6 +265,20 @@ function renderOut() {
 
 function mark(tag, detail) {
     const line = tag + (detail == null || detail === "" ? "" : "  " + detail);
+    if (raceMode) {
+        raceBuf.push(line);
+        if (raceBuf.length > 48) raceBuf.shift();
+        if (/FAIL|ERROR|GIVE-UP|READ-PRIMITIVE|TRIM|ATTEMPT-START|PRIMITIVE/i.test(tag)) {
+            lines.push(line);
+            if (lines.length > LOG_MAX) lines.splice(0, lines.length - LOG_MAX);
+            if (outEl) {
+                outEl.textContent = (pinnedLines.length ? pinnedLines.join("\n") + "\n--- walk log ---\n" : "")
+                    + lines.join("\n");
+                outEl.scrollTop = outEl.scrollHeight;
+            }
+        }
+        return;
+    }
     if (PIN_TAGS.test(tag)) {
         pinnedLines.push(line);
         if (pinnedLines.length > 40) pinnedLines.splice(0, pinnedLines.length - 40);
@@ -1472,14 +1488,34 @@ function onRaceEvent(tag, detail) {
 async function establishOnce(establishPrimitive) {
     raceAttempt = 0;
     lengthMissStreak = 0;
+    raceBuf.length = 0;
+    raceMode = true;
     const cap = attemptCap();
     mark("ATTEMPTS", cap > 0 ? String(cap) + " per page load" : "unlimited (single run)");
     mark("NOTE", "close browser fully before Start if prior OOM or long retry session");
-
-    return establishPrimitive({
-        maxAttempts: cap,
-        onEvent: (t, d, a) => onRaceEvent(t, (a != null ? "[" + a + "] " : "") + (d || ""))
-    });
+    try {
+        return await establishPrimitive({
+            maxAttempts: cap,
+            skipTrimDebris: true,
+            onEvent: (t, d, a) => onRaceEvent(t, (a != null ? "[" + a + "] " : "") + (d || ""))
+        });
+    } finally {
+        raceMode = false;
+        for (let i = 0; i < raceBuf.length; i++) {
+            const line = raceBuf[i];
+            const tag = line.split(/\s/)[0];
+            if (/FAIL|ERROR|GIVE-UP|READ-PRIMITIVE|TRIM|PRIMITIVE|PAIR|HINT/i.test(tag)) {
+                let dup = false;
+                for (let j = 0; j < lines.length; j++) {
+                    if (lines[j] === line) { dup = true; break; }
+                }
+                if (!dup) lines.push(line);
+            }
+        }
+        raceBuf.length = 0;
+        if (lines.length > LOG_MAX) lines.splice(0, lines.length - LOG_MAX);
+        renderOut();
+    }
 }
 
 async function runStart() {
@@ -1555,7 +1591,7 @@ async function runStart() {
             return;
         }
 
-        mark("HINT-CAL", "vtable base walk runs automatically after Start");
+        mark("HINT-CAL", "tap 2e Find base (vtable) when ready — not auto (OOM-safe)");
         prefillSuggestedExpm1(nativeFn, tableOff);
 
         const pre = parseExpm1(params.get("expm1"));
@@ -1568,10 +1604,10 @@ async function runStart() {
             await walkVtableForBase();
             await freeCalMemory();
         } else {
-            mark("NEXT", "Set base+expm1 then 4b Accept offsets (0 reads)");
+            mark("NEXT", "tap 2e Find base (vtable) OR set base+expm1 then 4b Accept");
             if (manualBase || params.get("base"))
                 await freeCalMemory();
-            state("primitive OK — set base, tap Accept", "ok");
+            state("primitive OK — 2e vtable or set base", "ok");
         }
         try { if (expm1In) expm1In.focus(); } catch (_) { }
         if (calBarEl && calBarEl.scrollIntoView)
@@ -2095,10 +2131,10 @@ function init() {
         if (manualBase && baseIn) baseIn.value = ptrNum(manualBase).toString(16);
     }
 
-    mark("BOOT", "build=" + BUILD_ID + " — look for this line to confirm deploy");
-    mark("BOOT", "index_cal.html — expm1 finder for 13.52");
+    mark("BOOT", "build=" + BUILD_ID + " — race log throttled (same as index_rw)");
+    mark("BOOT", "index_cal.html — expm1 / vtable for 13.52");
     mark("BOOT", groomBootLine());
-    mark("BOOT", "2e auto walk: PSFree ELF+text+data magic, backmax=" + FIND_BASE_MAX_STEPS);
+    mark("BOOT", "2e vtable: manual button or ?vtable=1 (not auto — OOM)");
     wireGroomBar();
     setUi();
     state("ready — pick groom if needed, then Start", "");

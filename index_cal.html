@@ -101,8 +101,9 @@
   </div>
   <p id="hint">
     <b>If you already have base+expm1</b>, use
-    <code>?base=805018530&amp;expm1=eb6350&amp;vtable=0</code> to skip the walk (saves memory).
-    Then tap <b>4b Accept offsets (0 reads)</b> — no scan, no verify needed.
+    <code>?base=805018530&amp;expm1=eb6350</code> then <b>4b Accept offsets (0 reads)</b>.
+    Vtable walk is <b>manual</b> — tap <b>2e Find base (vtable)</b> after Start (auto walk OOMs on 13.52).
+    If cal keeps OOMing, use <b>index_rw</b> → Leak scan LK instead.
   </p>
   <h2>Log</h2>
   <div id="out"></div>
@@ -124,6 +125,6 @@ window.addEventListener("unhandledrejection", function (e) {
   if (o) o.textContent = (o.textContent ? o.textContent + "\n" : "") + msg;
 });
 </script>
-<script type="module" src="./cal_demo.js"></script>
+<script type="module" src="./cal_demo.js?v=20250829a"></script>
 </body>
 </html>
