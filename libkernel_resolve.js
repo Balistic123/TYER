@@ -1741,11 +1741,14 @@ function scanKnownExtPtrChunk(p, webkitBase, off, state, opts) {
     opts = opts || {};
     if (!state) {
         let ptrs = (opts.knownExtPtrs) || [];
-        const maxN = opts.knownMax != null ? opts.knownMax : (opts.lite ? 2 : ptrs.length);
-        if (maxN > 0 && ptrs.length > maxN) ptrs = ptrs.slice(0, maxN);
+        const maxN = opts.knownMax != null ? opts.knownMax : (opts.lite ? 0 : ptrs.length);
+        if (maxN <= 0 || opts.skipKnown) {
+            return { done: true, lk: null, state: null, phase: "known-skip", n: 0 };
+        }
+        if (ptrs.length > maxN) ptrs = ptrs.slice(0, maxN);
         state = { ptrs: ptrs, idx: 0 };
         if (!ptrs.length)
-            return { done: true, lk: null, state: null, phase: "known-skip" };
+            return { done: true, lk: null, state: null, phase: "known-skip", n: 0 };
         return { done: false, state, phase: "known-start", n: ptrs.length };
     }
 
@@ -2491,6 +2494,11 @@ export function resolveLibkernelRelroChunk(p, webkitBase, off, state, opts) {
     if (!state.stage) state.stage = "known";
 
     if (state.stage === "known") {
+        if (opts.knownMax === 0 || opts.skipKnown) {
+            state.stage = "vt";
+            state.sub = null;
+            return { done: false, state, phase: "known-skip", n: 0 };
+        }
         const c = scanKnownExtPtrChunk(p, webkitBase, off, state.sub, opts);
         state.sub = c.state;
         if (c.done && c.lk) {
