@@ -83,8 +83,8 @@
   <div class="gadget-bar" id="gadget-pivot">
     <span class="bar-label">pivot G0-G5 HW — Verify pivot then Native call</span>
   </div>
-  <p id="hint"><b>Pivot 7/7 on 13.52.</b> Flow: Start → <b>Save bases</b> (preps native) → Force lk → Native call.
-    libkernel: Load cal ptr → Force lk. Logs auto-restore. <code>?clearlog=1</code> to wipe.</p>
+  <p id="hint"><b>13.52 flow:</b> Start → <b>Force lk</b> → <b>Save bases</b> (auto getpid if lk set).
+    Fallback: tap <b>Native</b> twice (stage, then fire). Reload fresh each try.</p>
   <h2>Known pointers (this process)</h2>
   <table id="map">
     <thead><tr><th>label</th><th>address</th><th>note</th></tr></thead>
@@ -128,6 +128,6 @@ window.addEventListener("unhandledrejection", function (e) {
   persistCrashLine("wk-rw-log", msg);
 });
 </script>
-<script type="module" src="./rw_demo.js?v=20250829y"></script>
+<script type="module" src="./rw_demo.js?v=20250830a"></script>
 </body>
 </html>

