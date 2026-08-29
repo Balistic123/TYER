@@ -36,13 +36,14 @@ import {
     verifyManualLibkernelFromPtrLite,
     checkPrologueAt,
     saveLibkernelSession,
+    loadForcedLibkernel,
     isGetpidStub as lkIsGetpidStub,
     verifyManualLibkernel,
 } from "./libkernel_resolve.js";
 import { createCrashLog } from "./log_persist.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250829u";
+const BUILD_ID = "rw-20250829v";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const SCAN_PIVOT_MIN = 0x10000;
@@ -415,7 +416,7 @@ function runManualTest(testId) {
             } catch (_) { }
             lkQuiet = false;
             if (w != null) {
-                saveLibkernelSession(lk, null);
+                saveLibkernelSession(lk, null, { forced: true });
                 mark("LK-OK", "peek " + fmtHex32(w) + " @ " + lk + " — saved unverified");
                 state("libkernel saved (1 peek)", "ok");
             } else {
@@ -434,7 +435,7 @@ function runManualTest(testId) {
                 mark("LK-SKIP", "enter libkernel base hex, then Force lk (0 reads)");
                 return;
             }
-            saveLibkernelSession(lk, null);
+            saveLibkernelSession(lk, null, { forced: true });
             mark("LK-OK", "forced " + lk + " (0 reads — unverified)");
             state("libkernel forced", "warn");
             renderOut();
@@ -2021,16 +2022,14 @@ async function runScanIat() {
 }
 
 async function ensureLibkernel(p, off, webkitBase) {
+    const forced = loadForcedLibkernel();
+    if (forced) {
+        mark("LK-CACHE", "forced " + forced + " (native, 0 reads)");
+        return forced;
+    }
     const r = resolveLibkernel(p, webkitBase, off, { log: mark, read8: read8p });
     if (r.ok) return r.lk;
-    try {
-        const raw = sessionStorage.getItem("wk-libkernelBase");
-        if (raw) {
-            const lk = parseCalPtr(raw);
-            if (lk && checkPrologueAt(p, lk)) return lk;
-        }
-    } catch (_) { }
-    throw new Error("libkernel unknown — Try cal ptr or paste base in hex box");
+    throw new Error("libkernel unknown — Load cal ptr → Force lk");
 }
 
 function stripUiForNative() {

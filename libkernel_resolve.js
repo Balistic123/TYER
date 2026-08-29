@@ -36,6 +36,7 @@ const LK_HDR_BACK_COARSE = 64;
 const LK_HDR_BACK_FINE = 256;
 
 const SS_LK_BASE = "wk-libkernelBase";
+const SS_LK_FORCED = "wk-libkernelForced";
 const SS_IAT_RVA = "wk-imp-error-rva";
 
 function read8p(p, addr) {
@@ -143,11 +144,27 @@ export function isLibkernelPrologue(p, lk) {
     return false;
 }
 
-export function saveLibkernelSession(lk, iatRva) {
+export function saveLibkernelSession(lk, iatRva, opts) {
+    opts = opts || {};
     try {
         if (lk) sessionStorage.setItem(SS_LK_BASE, String(lk));
         if (iatRva != null) sessionStorage.setItem(SS_IAT_RVA, iatRva.toString(16));
+        if (opts.forced)
+            sessionStorage.setItem(SS_LK_FORCED, "1");
+        else if (opts.forced === false)
+            sessionStorage.removeItem(SS_LK_FORCED);
     } catch (_) { }
+}
+
+export function loadForcedLibkernel() {
+    try {
+        if (sessionStorage.getItem(SS_LK_FORCED) !== "1") return null;
+        const raw = sessionStorage.getItem(SS_LK_BASE);
+        if (!raw) return null;
+        return parseAddrSync(raw);
+    } catch (_) {
+        return null;
+    }
 }
 
 function loadSessionIatRva() {
@@ -2356,15 +2373,25 @@ export function resolveLibkernel(p, webkitBase, off, opts) {
         return { ok: false, error: "missing offsets" };
 
     try {
+        const forced = sessionStorage.getItem(SS_LK_FORCED) === "1";
         const rawLk = sessionStorage.getItem(SS_LK_BASE);
         if (rawLk) {
             const lk = parseAddrSync(rawLk);
+            if (lk && forced) {
+                log("LK-CACHE", "libkernel " + lk + " (forced, 0 reads)");
+                return { ok: true, lk, source: "forced" };
+            }
             if (lk && isLibkernelPrologue(p, lk)) {
                 log("LK-CACHE", "libkernel " + lk);
                 return { ok: true, lk, source: "cache" };
             }
-            log("LK-CACHE-BAD", "stale " + rawLk + " — cleared");
-            sessionStorage.removeItem(SS_LK_BASE);
+            if (!forced) {
+                log("LK-CACHE-BAD", "stale " + rawLk + " — cleared");
+                sessionStorage.removeItem(SS_LK_BASE);
+            } else if (lk) {
+                log("LK-CACHE", "libkernel " + lk + " (forced, skip prologue)");
+                return { ok: true, lk, source: "forced" };
+            }
         }
     } catch (_) { }
 
