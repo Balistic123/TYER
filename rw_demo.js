@@ -44,7 +44,7 @@ import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, fireGetpid } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830e";
+const BUILD_ID = "rw-20250830f";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const SCAN_PIVOT_MIN = 0x10000;
@@ -108,7 +108,7 @@ let raceMode = false;
 const raceBuf = [];
 
 let outEl, stateEl, mapBody, hexEl, pickPtr, addrIn;
-let btnStart, btnSaveBases, btnRwProof, btnNative, btnPeek, btnClear;
+let btnStart, btnSaveBases, btnRwProof, btnNative, btnLoadCal, btnForceLk, btnPeek, btnClear;
 let btnVerifyPivot, btnScanPivot;
 let gadgetBtns = [];
 let g5BarBtns = [];
@@ -210,9 +210,11 @@ function setUi() {
             btnNative.title = "expm1 pivot — zero alloc, one tap";
         } else {
             btnNative.textContent = "Arm getpid";
-            btnNative.title = "Start preps slab — Force lk auto-arms, then Fire getpid";
+            btnNative.title = "Force lk auto-arms — or tap Arm, then Fire";
         }
     }
+    if (btnLoadCal) btnLoadCal.disabled = busy || !ready;
+    if (btnForceLk) btnForceLk.disabled = busy || !ready;
     if (btnPeek) btnPeek.disabled = busy || !ready;
     if (pickPtr) pickPtr.disabled = busy || !ready;
     if (addrIn) addrIn.disabled = busy || !ready;
@@ -2055,19 +2057,18 @@ async function ensureLibkernel(p, off, webkitBase) {
     throw new Error("libkernel unknown — Load cal ptr → Force lk");
 }
 
-function stripUiForNative() {
-    /* Hide heavy DOM only — keep gadget bars (Force lk, Load cal ptr). */
-    for (const id of ["groom-bar", "peek-bar", "map"]) {
+function ensureUiVisible() {
+    for (const id of ["groom-bar", "toolbar", "gadget-base", "gadget-pop",
+        "gadget-g5", "gadget-pivot", "peek-bar", "hint", "map", "hex"]) {
         const el = document.getElementById(id);
-        if (el) el.style.display = "none";
+        if (el) el.style.display = "";
     }
     const mapTable = document.getElementById("map");
     if (mapTable && mapTable.previousElementSibling)
-        mapTable.previousElementSibling.style.display = "none";
-    const hexTitle = document.getElementById("hex");
-    if (hexTitle && hexTitle.previousElementSibling)
-        hexTitle.previousElementSibling.style.display = "none";
-    if (hexTitle) hexTitle.style.display = "none";
+        mapTable.previousElementSibling.style.display = "";
+    const hexEl = document.getElementById("hex");
+    if (hexEl && hexEl.previousElementSibling)
+        hexEl.previousElementSibling.style.display = "";
 }
 
 function resolveWebkitBase(off, nativeFn) {
@@ -2170,7 +2171,6 @@ function runFireGetpid() {
     retained.length = 0;
     pointers.length = 0;
     if (outEl) outEl.textContent = "Fire getpid…";
-    stripUiForNative();
 
     let pid = -1;
     let errMsg = null;
@@ -2209,7 +2209,6 @@ async function doNativeCallImmediate() {
 }
 
 async function freeBeforeNative() {
-    stripUiForNative();
     retained.length = 0;
     pointers.length = 0;
     raceBuf.length = 0;
@@ -2438,7 +2437,8 @@ async function runStart() {
         mark("PAIR-STATUS", "state=" + pairStatus.state
             + " promoted=" + pairStatus.promoted);
         ready = true;
-        state("primitive OK — tap Save bases, then test gadgets", "ok");
+        ensureUiVisible();
+        state("primitive OK — Load cal ptr → Force lk → Fire getpid", "ok");
     } catch (err) {
         state("failed: " + err.message, "bad");
         mark("ERROR", err.stack || err.message);
@@ -2482,6 +2482,8 @@ function init() {
     btnSaveBases = $("btn-save-bases");
     btnRwProof = $("btn-rw-proof");
     btnNative = $("btn-native");
+    btnLoadCal = $("btn-load-cal");
+    btnForceLk = $("btn-force-lk");
     btnVerifyPivot = $("btn-verify-pivot");
     btnScanPivot = $("btn-scan-pivot");
     btnPeek = $("btn-peek");
@@ -2494,12 +2496,15 @@ function init() {
 
     wireGadgetBars();
     wireG5Bar();
+    ensureUiVisible();
     wireClick(btnStart, function () { return runStart(); });
     wireClick(btnSaveBases, saveBasesManual);
     wireClick(btnRwProof, function () { return runRwProofManual(); });
     wireClick(btnVerifyPivot, verifyPivotManual);
     wireClick(btnScanPivot, function () { return runPivotScanAuto(); });
     wireClick(btnNative, function () { return runNativeCall(); });
+    wireClick(btnLoadCal, function () { runManualTest("try-cal-ptrs"); });
+    wireClick(btnForceLk, function () { runManualTest("force-lk"); });
     wireClick(btnClear, function () {
         lines.length = 0;
         clearPersistedLog();
