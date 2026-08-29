@@ -58,7 +58,7 @@ import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, firePivotSmoke } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250832k";
+const BUILD_ID = "rw-20250832m";
 /** native=usleep | smoke | getpid | off — fire at PRIMITIVE-OK when lk in session (Okage paste OK) */
 const NATIVE_MODE = (params.get("native") || "usleep").toLowerCase();
 const NATIVE_FIRE_USLEEP = NATIVE_MODE === "usleep";
@@ -174,9 +174,10 @@ function mark(tag, detail) {
         return;
     }
     if (nativeQuiet) {
-        if (/^NATIVE-|^PIVOT-|^BASES|^STUBS|^ERROR/.test(tag)) {
+        if (/^NATIVE-|^PIVOT-|^BASES|^STUBS|^ERROR|^HINT/.test(tag)) {
             lines.push(line);
             if (lines.length > 24) lines.splice(0, lines.length - 24);
+            renderOut();
         }
         return;
     }
@@ -238,7 +239,10 @@ function setUi() {
         }
     }
     if (btnLoadCal) btnLoadCal.disabled = busy || !ready;
-    if (btnForceLk) btnForceLk.disabled = busy || !ready;
+    if (btnForceLk) {
+        btnForceLk.disabled = busy;
+        btnForceLk.textContent = "Accept lk";
+    }
     if (btnTryBillZaiLk) btnTryBillZaiLk.disabled = busy || !ready;
     if (btnGuessLk) {
         btnGuessLk.disabled = !ready || (busy && !huntLkAuto);
@@ -258,7 +262,7 @@ function setUi() {
     }
     if (btnPeek) btnPeek.disabled = busy || !ready;
     if (pickPtr) pickPtr.disabled = busy || !ready;
-    if (addrIn) addrIn.disabled = busy || !ready;
+    if (addrIn) addrIn.disabled = busy;
     for (let i = 0; i < gadgetBtns.length; i++)
         gadgetBtns[i].disabled = busy || !ready;
     for (let i = 0; i < g5BarBtns.length; i++)
@@ -595,6 +599,17 @@ const MANUAL_TESTS = [
 ];
 
 function runManualTest(testId) {
+    const preStartOk = testId === "verify-lk" || testId === "force-lk" || testId === "paste-lk";
+    if (preStartOk) {
+        if (testId === "verify-lk") {
+            runVerifyLk();
+            return;
+        }
+        if (testId === "force-lk" || testId === "paste-lk") {
+            acceptLkFromHex(null);
+            return;
+        }
+    }
     if (!ready || !window.p) return;
     if (busy && testId !== "verify-lk" && testId !== "force-lk" && testId !== "paste-lk"
         && testId !== "try-billzai-lk") {
@@ -2041,75 +2056,71 @@ function runTryCalPtrs() {
     } catch (_) { }
 }
 
+function acceptLkFromHex(hexOverride) {
+    const off = loadEffectiveOff();
+    let hex = hexOverride != null ? String(hexOverride).trim().replace(/^0x/i, "") : "";
+    if (!hex && addrIn && addrIn.value)
+        hex = addrIn.value.trim().replace(/^0x/i, "");
+    if (!hex) {
+        mark("LK-SKIP", "paste Okage lk in hex (e.g. 83f33ac30) — no cal ext ptr needed");
+        state("paste lk …c30 in hex box", "bad");
+        renderOut();
+        return false;
+    }
+    const ptr = parseAddr(hex);
+    if (!ptr) {
+        mark("LK-SKIP", "bad hex");
+        state("bad hex", "bad");
+        renderOut();
+        return false;
+    }
+
+    const asBase = verifyLibkernelZeroRead(ptr, off, { via: "okage" });
+    if (asBase.ok) {
+        saveLibkernelSession(ptr, null, { forced: true });
+        if (addrIn) addrIn.value = String(ptr);
+        mark("LK-OK", String(ptr) + " Okage accepted (0 reads) — reload → Start");
+        state("lk saved — reload then Start", "ok");
+        renderOut();
+        try {
+            crashLog.append("ACCEPT OK okage " + hex, "LK-VERIFY");
+            crashLog.flushSync();
+        } catch (_) { }
+        return true;
+    }
+
+    const rvaHits = calcLkFromFnPtrZeroRead(ptr, off);
+    if (rvaHits.length) {
+        const h = rvaHits[0];
+        saveLibkernelSession(h.lk, null, { forced: true });
+        if (addrIn) addrIn.value = String(h.lk);
+        mark("LK-OK", String(h.lk) + " = fn−" + h.key
+            + "+0x" + h.rva.toString(16) + " (0 reads) — reload → Start");
+        state("lk saved — reload then Start", "ok");
+        renderOut();
+        try {
+            crashLog.append("ACCEPT OK fn " + hex + " → " + h.lk, "LK-VERIFY");
+            crashLog.flushSync();
+        } catch (_) { }
+        return true;
+    }
+
+    mark("LK-VERIFY-MISS", hex + " — " + (asBase.error || "?"));
+    mark("LK-HINT", "Okage base must end …c30 (e.g. 83f33ac30)");
+    state("accept failed", "bad");
+    renderOut();
+    try { crashLog.append("ACCEPT FAIL " + hex, "LK-VERIFY"); crashLog.flushSync(); } catch (_) { }
+    return false;
+}
+
 function runVerifyLk() {
-    if (!ready || !window.p) return;
     if (findLkAuto) {
         mark("LK-SKIP", "Scan GOT still running — Stop find first");
         renderOut();
         return;
     }
     mark("LK-VERIFY", "0-read accept build=" + BUILD_ID);
-    renderOut();
-
-    const off = loadEffectiveOff();
-    let hex = addrIn && addrIn.value ? addrIn.value.trim().replace(/^0x/i, "") : "";
-    if (!hex) {
-        hex = loadExtPtrAt(0) || "";
-        if (hex && addrIn) addrIn.value = hex;
-    }
-    if (!hex) {
-        mark("LK-SKIP", "hex empty — Calc lk (0 read) from cal ext ptr first");
-        renderOut();
-        return;
-    }
-    const ptr = parseAddr(hex);
-    if (!ptr) {
-        mark("LK-SKIP", "bad hex");
-        renderOut();
-        return;
-    }
-
-    try {
-        const asBase = verifyLibkernelZeroRead(ptr, off, { via: "base" });
-        if (asBase.ok) {
-            saveLibkernelSession(ptr, null, { forced: true });
-            mark("LK-VERIFY-OK", String(ptr) + " (0 reads — reload → Start auto-fires)");
-            state("lk accepted — reload → Start", "ok");
-            renderOut();
-            crashLog.append("ACCEPT OK base " + hex, "LK-VERIFY");
-            crashLog.flushSync();
-            return;
-        }
-
-        const rvaHits = calcLkFromFnPtrZeroRead(ptr, off);
-        if (rvaHits.length) {
-            const h = rvaHits[0];
-            saveLibkernelSession(h.lk, null, { forced: true });
-            if (addrIn) addrIn.value = String(h.lk);
-            mark("LK-VERIFY-OK", String(h.lk) + " = fn−" + h.key
-                + "+0x" + h.rva.toString(16) + " (0 reads — reload → Start)");
-            state("lk accepted — reload → Start", "ok");
-            renderOut();
-            crashLog.append("ACCEPT OK fn " + hex + " → " + h.lk, "LK-VERIFY");
-            crashLog.flushSync();
-            return;
-        }
-
-        mark("LK-VERIFY-MISS", hex + " — " + (asBase.error || "?")
-            + "; need cal EXT-PTR (libkernel fn) or lk …"
-            + (off.lk_base_tag != null ? off.lk_base_tag.toString(16) : "c30"));
-        cycleExtPtrInHex();
-        mark("LK-HINT", "Calc lk (0 read) → Accept lk — skip peek (OOM on poops)");
-        state("RVA miss — next cal ptr", "bad");
-        renderOut();
-        crashLog.append("ACCEPT FAIL " + hex, "LK-VERIFY");
-        crashLog.flushSync();
-    } catch (err) {
-        mark("LK-VERIFY-ERR", err.message || String(err));
-        state("accept error", "bad");
-        renderOut();
-        crashLog.flushSync();
-    }
+    acceptLkFromHex(null);
 }
 
 let extResolveIdx = 0;
@@ -3100,6 +3111,8 @@ function tryNativeFireAtStart(p, off) {
     pinNativeRetain();
     try {
         if (NATIVE_MODE === "smoke") {
+            mark("NATIVE-FIRE", "smoke @ PRIMITIVE-OK build=" + BUILD_ID);
+            renderOut();
             firePivotSmoke(p, nativePrep);
             mark("NATIVE-OK", "pivot smoke @ Start (webkit only, no lk) build=" + BUILD_ID);
             state("pivot smoke OK — chain works", "ok");
@@ -3120,10 +3133,14 @@ function tryNativeFireAtStart(p, off) {
         }
         if (addrIn) addrIn.value = String(lk);
         if (NATIVE_MODE === "getpid") {
+            mark("NATIVE-FIRE", "getpid @ PRIMITIVE-OK lk=" + lk);
+            renderOut();
             stageGetpid(p, nativePrep, lk, off);
             fireNativeCall(p, nativePrep);
             mark("NATIVE-OK", "getpid @ Start lk=" + lk + " build=" + BUILD_ID);
         } else {
+            mark("NATIVE-FIRE", "usleep @ PRIMITIVE-OK lk=" + lk);
+            renderOut();
             fireUsleep(p, nativePrep, lk, off, 1000);
             mark("NATIVE-OK", "usleep @ Start lk=" + lk + " (Okage/same-boot) build=" + BUILD_ID);
         }
@@ -3139,6 +3156,7 @@ function tryNativeFireAtStart(p, off) {
     } finally {
         nativeQuiet = false;
         lkQuiet = false;
+        renderOut();
     }
 }
 
@@ -3186,21 +3204,11 @@ function runTryBillZaiLk() {
     renderOut();
 }
 
-/** Force lk — 0 reads, session only. Arm + Fire are separate taps. */
+/** Force lk — 0 reads, session only. Works before Start (Okage paste). */
 function runForceLkOnly(lk) {
-    if (busy || !ready) return;
-    const lkWarn = validateLkBase(lk);
-    if (lkWarn) mark("LK-WARN", lkWarn);
-    const off = loadEffectiveOff();
-    const { stub, stubOff } = getpidStubAddr(lk, off);
-    saveLibkernelSession(lk, null, { forced: true });
-    mark("LK-OK", "forced " + lk + " (0 reads) stub=" + stub + " lk+" + stubOff.toString(16));
-    state("lk forced — tap Arm getpid", "warn");
-    renderOut();
-    try {
-        crashLog.append("LK-OK forced " + lk + " stub=" + stub, "LK-OK");
-        crashLog.flushSync();
-    } catch (_) { }
+    if (busy) return;
+    if (lk) acceptLkFromHex(String(lk).replace(/^0x/i, ""));
+    else acceptLkFromHex(null);
 }
 
 function runArmGetpid() {
@@ -3499,12 +3507,13 @@ async function runStart() {
         const off = loadEffectiveOff();
         try {
             ensureNativePrep(p, off);
-            mark("NATIVE-PREP", "slab ready @ Start build=" + BUILD_ID);
+            mark("NATIVE-PREP", "slab ready @ Start build=" + BUILD_ID + " native=" + NATIVE_MODE);
             tryNativeFireAtStart(p, off);
         } catch (prepErr) {
             mark("NATIVE-PREP-SKIP", prepErr.message || String(prepErr));
         }
-        mark("HINT", "Okage: Accept lk → reload → Start (auto-fire). Bisect: ?native=smoke");
+        renderOut();
+        mark("HINT", "Okage: hex 83f33ac30 → Accept lk → reload → Start. Bisect: ?native=smoke");
         mark("PAIR-STATUS", "state=" + pairStatus.state
             + " promoted=" + pairStatus.promoted);
         ready = true;
@@ -3580,7 +3589,7 @@ function init() {
     wireClick(btnScanPivot, function () { return runPivotScanAuto(); });
     wireClick(btnNative, function () { return runNativeCall(); });
     wireClick(btnLoadCal, function () { runTryCalPtrs(); });
-    wireClick(btnForceLk, function () { runManualTest("force-lk"); });
+    wireClick(btnForceLk, function () { acceptLkFromHex(null); });
     wireClick(btnTryBillZaiLk, function () { runManualTest("try-billzai-lk"); });
     wireClick(btnGuessLk, function () { runGuessLk(); });
     wireClick(btnPsfreeLite, function () { return runFindLkAuto(FIND_LK_LITE); });
@@ -3627,11 +3636,27 @@ function init() {
         }
     }
 
+    const lkParam = params.get("lk");
+    if (lkParam) {
+        if (addrIn) addrIn.value = lkParam.replace(/^0x/i, "");
+        acceptLkFromHex(lkParam.replace(/^0x/i, ""));
+    } else {
+        try {
+            const saved = loadForcedLibkernel();
+            if (saved && addrIn) addrIn.value = String(saved);
+            else {
+                const raw = sessionStorage.getItem("wk-libkernelBase");
+                const parsed = raw ? parseAddr(String(raw).replace(/^0x/i, "")) : null;
+                if (parsed && addrIn) addrIn.value = String(parsed);
+            }
+        } catch (_) { }
+    }
+
     if (params.get("clearlog") === "1") clearPersistedLog();
     else crashLog.restoreInto(lines);
 
     crashLog.startAutoFlush();
-    mark("BOOT", "build=" + BUILD_ID + " — logs persist across reload/crash");
+    mark("BOOT", "build=" + BUILD_ID + " native=" + NATIVE_MODE + " — logs persist across reload/crash");
     mark("BOOT", "LK-PROBE line shows dynamic parse status");
     mark("BOOT", groomBootLine(params));
     replayHuntTrace();
@@ -3644,7 +3669,7 @@ function init() {
     wireGroomBar(() => busy);
     setUi();
     renderOut();
-    state("ready — Start → Save bases → scan/verify pivot → Native call", "");
+    state("paste Okage lk → Accept lk → reload → Start (?native=smoke to bisect)", "");
 }
 
 function bootUi() {
