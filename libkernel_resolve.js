@@ -2165,191 +2165,21 @@ function findModuleBaseBeforeCode(p, fnPtr, webkitBase, off, maxPages) {
 }
 
 /**
- * Dump-free: walk back from ext fn ptr for SCE/ELF, score syscall stubs.
- * No k__error, no PLT, no fnPtr code read — poops-safe.
+ * Dump-free module hunt — ≤12 header pages + ≤10 stub samples. No fnPtr code read.
  */
 export function resolveExtModuleHunt(p, fnPtr, webkitBase, off, maxPages) {
     if (!fnPtr || fnPtr.hi < 0x8) return null;
-    maxPages = maxPages != null ? maxPages : 128;
+    maxPages = maxPages != null ? Math.min(maxPages, 16) : 12;
 
     const hdr = findModuleBaseBeforeCode(p, fnPtr, webkitBase, off, maxPages);
-    if (hdr) {
-        const sc = scoreModuleAsLibkernel(p, hdr);
-        if (sc.score >= 4 || (sc.prologue && sc.stubs >= 2))
-            return { lk: hdr, via: "mod-hunt", stubs: sc.stubs, score: sc.score, fnPtr };
-        if (sc.stubs >= 1)
-            return { lk: hdr, via: "mod-hunt-weak", stubs: sc.stubs, score: sc.score, fnPtr, weak: true };
-    }
+    if (!hdr) return null;
 
-    let page = pageAlignDown(fnPtr, 0x4000);
-    let best = null;
-    const ringMax = Math.min(maxPages, 48);
-    for (let i = 0; i < ringMax; i++) {
-        if (!page || !plausibleLkBeforeRead(page, fnPtr, webkitBase, off)) break;
-        if (checkPrologueAt(p, page)) {
-            const stubs = liteSyscallStubScore(p, page);
-            if (!best || stubs > best.stubs)
-                best = { lk: page, via: "stub-ring", stubs, score: stubs, fnPtr };
-            if (stubs >= 4)
-                return best;
-        }
-        const magic = read4p(p, page);
-        if (magic == null) break;
-        page = page.sub32(0x4000);
-    }
-    if (best && best.stubs >= 2) return best;
+    const stubs = liteSyscallStubScore(p, hdr);
+    if (stubs >= 2)
+        return { lk: hdr, via: "mod-hunt", stubs, fnPtr };
+    if (stubs >= 1 && checkPrologueAt(p, hdr))
+        return { lk: hdr, via: "mod-hunt-weak", stubs, fnPtr, weak: true };
     return null;
-}
-
-/** One ext ptr per tick — pick highest stub-score module (libkernel.sprx). */
-function scanExtModuleHuntChunk(p, webkitBase, off, state, extList, opts) {
-    opts = opts || {};
-    if (!extList || !extList.length)
-        return { done: true, lk: null, state: null, phase: "elf-ext-skip" };
-
-    if (!state) {
-        state = { idx: 0, best: null, tried: 0 };
-        return { done: false, state, phase: "elf-ext-start", total: extList.length };
-    }
-
-    const pages = opts.modHuntPages != null ? opts.modHuntPages : 128;
-    if (state.idx < extList.length) {
-        const raw = extList[state.idx].ptr != null ? extList[state.idx].ptr : extList[state.idx];
-        state.idx++;
-        state.tried++;
-        const fnPtr = parseAddrSync(String(raw).replace(/^0x/i, ""));
-        if (fnPtr) {
-            const hit = resolveExtModuleHunt(p, fnPtr, webkitBase, off, pages);
-            if (hit) {
-                const sc = hit.score != null ? hit.score : (hit.stubs || 0);
-                const prev = state.best ? (state.best.score != null ? state.best.score : (state.best.stubs || 0)) : -1;
-                if (!state.best || sc > prev)
-                    state.best = Object.assign({ from: String(raw) }, hit);
-                if (sc >= 6 && !hit.weak) {
-                    saveLibkernelSession(hit.lk, null);
-                    return {
-                        done: true,
-                        ok: true,
-                        lk: hit.lk,
-                        source: "elf-ext+" + raw + "/" + hit.via,
-                        state,
-                        phase: "elf-ext-hit",
-                        tried: state.tried,
-                        stubs: hit.stubs,
-                    };
-                }
-            }
-        }
-    }
-
-    if (state.idx >= extList.length) {
-        if (state.best && ((state.best.stubs || 0) >= 2 || (state.best.score || 0) >= 2)) {
-            saveLibkernelSession(state.best.lk, null);
-            return {
-                done: true,
-                ok: true,
-                lk: state.best.lk,
-                source: "elf-ext-best/" + state.best.from + "/" + state.best.via,
-                state,
-                phase: "elf-ext-best",
-                tried: state.tried,
-                stubs: state.best.stubs,
-            };
-        }
-        return { done: true, lk: null, state, phase: "elf-ext-miss", tried: state.tried };
-    }
-
-    return {
-        done: false,
-        state,
-        phase: "elf-ext",
-        idx: state.idx,
-        total: extList.length,
-        tried: state.tried,
-    };
-}
-
-function poopsRelroScanRanges(p, webkitBase, off, opts) {
-    const w0 = read4p(p, webkitBase);
-    if (w0 === POOPS_TEXT_MAGIC || isPoopsTextBase(p, webkitBase))
-        return poopsRelroRanges(off, opts && opts.lite);
-    return relroScanRanges(p, webkitBase, off, opts);
-}
-
-/** Poops RELRO GOT slots → module hunt (no k__error). */
-function scanPoopsRelroHuntChunk(p, webkitBase, off, state, opts) {
-    opts = opts || {};
-    if (!state) {
-        const ranges = poopsRelroScanRanges(p, webkitBase, off, opts);
-        if (!ranges.length)
-            return { done: true, lk: null, state: null, phase: "relro-poops-skip" };
-        const base = moduleLoadBase(p, webkitBase);
-        state = {
-            loadBase: base,
-            ranges,
-            rangeIdx: 0,
-            cursor: ranges[0].lo,
-            endRva: ranges[0].hi,
-            tried: 0,
-            slots: 0,
-        };
-        return {
-            done: false,
-            state,
-            phase: "relro-poops-start",
-            ranges: ranges.length,
-            span: ranges.map(function (r) {
-                return r.tag + ":0x" + r.lo.toString(16) + "-0x" + r.hi.toString(16);
-            }).join(" "),
-        };
-    }
-
-    const batchMax = opts.relroBatch != null ? opts.relroBatch : 8;
-    const huntPages = opts.modHuntPages != null ? opts.modHuntPages : 96;
-    let batch = 0;
-    while (state.cursor < state.endRva && batch < batchMax) {
-        const rva = state.cursor;
-        state.cursor += 8;
-        state.tried++;
-        state.slots++;
-        batch++;
-        const fnPtr = read8p(p, state.loadBase.add32(rva));
-        if (!fnPtr || !plausibleExtPtr(fnPtr, state.loadBase, off)) continue;
-        const hit = resolveExtModuleHunt(p, fnPtr, webkitBase, off, huntPages);
-        if (hit && ((hit.stubs || 0) >= 2 || (hit.score || 0) >= 4)) {
-            saveLibkernelSession(hit.lk, hit.iatRva);
-            return {
-                done: true,
-                ok: true,
-                lk: hit.lk,
-                iatRva: rva,
-                source: "relro-poops+" + rva.toString(16) + "/" + hit.via,
-                state,
-                phase: "relro-poops-hit",
-                tried: state.tried,
-                stubs: hit.stubs,
-            };
-        }
-    }
-
-    if (state.cursor >= state.endRva) {
-        const next = state.rangeIdx + 1;
-        if (next < state.ranges.length) {
-            state.rangeIdx = next;
-            state.cursor = state.ranges[next].lo;
-            state.endRva = state.ranges[next].hi;
-            return { done: false, state, phase: "relro-poops-region", tried: state.tried };
-        }
-        return { done: true, lk: null, state, phase: "relro-poops-miss", tried: state.tried, slots: state.slots };
-    }
-
-    return {
-        done: false,
-        state,
-        phase: "relro-poops",
-        cursor: state.cursor,
-        tried: state.tried,
-    };
 }
 
 function addrFromNum(n) {
@@ -3023,20 +2853,16 @@ export function resolveLibkernelRelroChunk(p, webkitBase, off, state, opts) {
             state.diag.cells = c.cells != null ? c.cells : state.diag.cells;
             state.diag.vtables = c.vtCount != null ? c.vtCount : state.diag.vtables;
             state.diag.vtExt = state.extList.length;
-            if (opts.lite || opts.safeOnly) {
-                state.stage = "elf-ext";
-                state.sub = null;
-                return {
-                    done: false,
-                    state,
-                    phase: "vt-done",
+            if (opts.collectOnly || opts.deferResolve || opts.lite || opts.safeOnly) {
+                return lkFinalMiss(state, {
                     prev: c.phase,
-                    vtable: state.vtableAbs ? String(state.vtableAbs) : "?",
-                    ext: state.extList.length,
-                    cells: state.diag.cells,
-                    vtCount: state.diag.vtables,
-                    error: c.error,
-                };
+                    lite: true,
+                    error: "ext collected — use Verify lk",
+                    cellDbg: c.cellDbg,
+                    cells: c.cells,
+                    vtCount: c.vtCount,
+                    extList: state.extList,
+                });
             }
             state.stage = "abs";
             state.sub = null;
@@ -3052,47 +2878,6 @@ export function resolveLibkernelRelroChunk(p, webkitBase, off, state, opts) {
                 vtCount: state.diag.vtables,
                 error: c.error,
             };
-        }
-        return lkChunkOut(state, c, false);
-    }
-
-    if (state.stage === "elf-ext") {
-        const c = scanExtModuleHuntChunk(p, webkitBase, off, state.sub, state.extList, opts);
-        state.sub = c.state;
-        if (c.done && c.lk) {
-            return lkChunkOut(state, c, true);
-        }
-        if (c.done) {
-            state.stage = "relro-poops";
-            state.sub = null;
-            return {
-                done: false,
-                state,
-                phase: "elf-ext-done",
-                prev: c.phase,
-                tried: c.tried,
-                ext: state.extList.length,
-            };
-        }
-        return lkChunkOut(state, c, false);
-    }
-
-    if (state.stage === "relro-poops") {
-        const c = scanPoopsRelroHuntChunk(p, webkitBase, off, state.sub, opts);
-        state.sub = c.state;
-        if (c.done && c.lk) {
-            return lkChunkOut(state, c, true);
-        }
-        if (c.done) {
-            return lkFinalMiss(state, {
-                prev: c.phase,
-                lite: true,
-                error: "poops: no libkernel via stub hunt",
-                cellDbg: state.cellDbg,
-                cells: state.diag.cells,
-                vtCount: state.diag.vtables,
-                extList: state.extList,
-            });
         }
         return lkChunkOut(state, c, false);
     }
