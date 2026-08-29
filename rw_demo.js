@@ -54,7 +54,7 @@ import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, fireGetpid } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250831o";
+const BUILD_ID = "rw-20250831p";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const SCAN_PIVOT_MIN = 0x10000;
@@ -473,26 +473,30 @@ const FIND_LK_LITE = {
     label: "lite",
     lite: true,
     safeOnly: true,
+    collectOnly: true,
+    deferResolve: true,
     maxWalkPages: 0,
     knownMax: 0,
     knownWalkPages: 0,
     knownBatch: 1,
     vtableEntries: 8,
     vtBatch: 1,
-    walkPages: 256,
+    walkPages: 64,
     cellMax: 2,
 };
 const FIND_LK_NORM = {
     label: "norm",
     lite: false,
     safeOnly: true,
+    collectOnly: true,
+    deferResolve: true,
     maxWalkPages: 0,
     knownMax: 0,
     knownWalkPages: 0,
     knownBatch: 1,
     vtableEntries: 12,
-    vtBatch: 2,
-    walkPages: 256,
+    vtBatch: 1,
+    walkPages: 96,
     cellMax: 3,
 };
 
@@ -2036,7 +2040,7 @@ function tryResolveExtList(p, off, webkitBase, ext, opts) {
         if (h) hexes.push(h);
     }
     if (hexes.length >= 2) {
-        const voteOpts = Object.assign({ walkPages: opts.walkPages || 256 }, opts);
+        const voteOpts = Object.assign({ walkPages: opts.walkPages || 64 }, opts);
         const voted = resolveExtListVote(p, hexes, off, webkitBase, voteOpts);
         if (voted) {
             return {
@@ -2140,7 +2144,9 @@ function finishFindLkChunk(chunk) {
             const p = window.p;
             const off = loadEffectiveOff();
             const { webkitBase } = basesFromSession(off);
-            const resolved = tryResolveExtList(p, off, webkitBase, ext, { walkPages: 256 });
+            const resolved = tryResolveExtList(p, off, webkitBase, ext, {
+                walkPages: findLkPreset ? findLkPreset.walkPages : 64,
+            });
             if (resolved) {
                 saveLibkernelSession(resolved.hit.lk, resolved.hit.iatRva);
                 if (addrIn) addrIn.value = String(resolved.hit.lk);
@@ -2229,8 +2235,9 @@ async function runFindLkAuto(preset) {
                 mark("LK-GOT", "vtable " + chunk.vtable
                     + " n=" + (chunk.vtCount || 1) + " cells=" + (chunk.cells || "?")
                     + " " + (chunk.label || "")
+                    + " — collect ext only"
                     + (chunk.cellDbg && chunk.cellDbg.length
-                        ? " dbg=" + chunk.cellDbg.join(" | ").slice(0, 120) : ""));
+                        ? " dbg=" + chunk.cellDbg.join(" | ").slice(0, 80) : ""));
             else if (chunk.phase === "vt-miss" && chunk.cellDbg && chunk.cellDbg.length)
                 mark("LK-CELL-DBG", chunk.cellDbg.join(" | ").slice(0, 240));
             else if (chunk.phase === "vt-done")

@@ -235,7 +235,7 @@ function weakLibkernelBaseHit(p, page, magic, ctx) {
 
 /** Walk aligned pages below fn ptr — no fnPtr read, skip short unmapped runs. */
 function resolveExtPtrPageWalk(p, fnPtr, webkitBase, off, maxPages) {
-    maxPages = maxPages != null ? maxPages : 256;
+    maxPages = maxPages != null ? maxPages : 64;
     const ctx = { fnPtr, webkitBase, off };
     let page = pageAlignDown(fnPtr, 0x4000);
     let nullStreak = 0;
@@ -269,7 +269,7 @@ function resolveExtPtrPageWalk(p, fnPtr, webkitBase, off, maxPages) {
 export function resolveExtListVote(p, extHexList, off, webkitBase, opts) {
     opts = opts || {};
     if (!p || !extHexList || !extHexList.length) return null;
-    const maxPages = opts.walkPages != null ? opts.walkPages : 256;
+    const maxPages = opts.walkPages != null ? opts.walkPages : 64;
     const votes = new Map();
 
     for (let ei = 0; ei < extHexList.length; ei++) {
@@ -2124,7 +2124,7 @@ export function resolveExtPtrSafe(p, fnPtr, off, webkitBase, opts) {
         const kOff = Number(ptrBig(fnPtr) - ptrBig(pageBase));
         return { lk: pageBase, iatRva: null, fnPtr, via: "page+k=" + kOff.toString(16), k__error: kOff };
     }
-    return resolveExtPtrPageWalk(p, fnPtr, webkitBase, off, opts.walkPages != null ? opts.walkPages : 256);
+    return resolveExtPtrPageWalk(p, fnPtr, webkitBase, off, opts.walkPages != null ? opts.walkPages : 64);
 }
 
 /** Resolve ext code ptr → libkernel base — never reads fnPtr (code page OOM on poops). */
@@ -2173,7 +2173,7 @@ function resolveExtPtrToLibkernel(p, fnPtr, off, webkitBase, iatRva, opts) {
         }
     }
 
-    const walked = resolveExtPtrPageWalk(p, fnPtr, webkitBase, off, opts.walkPages != null ? opts.walkPages : 256);
+    const walked = resolveExtPtrPageWalk(p, fnPtr, webkitBase, off, opts.walkPages != null ? opts.walkPages : 64);
     if (walked) {
         return Object.assign({ iatRva, strong: false }, walked);
     }
@@ -2551,6 +2551,11 @@ function scanTextareaRelroChunk(p, webkitBase, off, state, opts) {
             const fnPtr = read8p(p, cur.vtable.add32(idx * 8));
             if (!fnPtr) continue;
             if (!plausibleExtPtr(fnPtr, webkitBase, off)) continue;
+            if (opts.collectOnly || opts.deferResolve || opts.safeOnly) {
+                if (state.extList.length < 16)
+                    state.extList.push({ ptr: String(fnPtr), idx: idx, vt: cur.label });
+                continue;
+            }
             const hit = resolveExtPtrToLibkernel(p, fnPtr, off, webkitBase, null, opts);
             if (hit) {
                 saveLibkernelSession(hit.lk, hit.iatRva);
