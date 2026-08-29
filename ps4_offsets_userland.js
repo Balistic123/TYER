@@ -76,19 +76,28 @@ PS4["12.52"] = Object.assign({}, PS4["12.50"], {
     fw_status: "userland-only — shares 12.50 webkit RVAs (no 12.52 dump)",
 });
 
-// 13.52 libkernel RVAs — Suchi HW dump (NOT 13.00).
+// 13.52 libkernel_sys.sprx — firmware 13.52 (HW-confirmed via eboot GOT usleep anchor).
+// lk_base = DEREF(GOT_usleep) - 0x013b20  (same RVAs in WebKit process)
 const LIBKERNEL_1352 = {
-    k__error:                           0x1bb0,
+    /** Primary anchor — Okage/mast1c0re use this */
     k_usleep:                           0x13b20,
+    k__error:                           0x1bb0,
     k_open:                             0x148d0,
     k_close:                            0x14900,
     k_read:                             0x14870,
     k_write:                            0x148a0,
     k_stat:                             0x15310,
+    k_pread:                            0x15460,
+    k_pwrite:                           0x15490,
+    k_lseek:                            0x154f0,
+    k_unlink:                           0x14930,
     k_notify:                           0x19320,
     k_socket:                           0x45f0,
     k_connect:                          0xc990,
+    k_connect_alt:                      0xc970,
     k_mmap:                             0x114e0,
+    k_jitshm_create:                    0x510,
+    k_jitshm_alias:                     0x530,
     /** Okage HW — lk_base low 12 bits on 13.52 retail */
     lk_base_tag:                        0xc30,
     /** Suchi dump: mov rax,20 @ +0x4f0 — fire ROP at +0xa (mov r10,rcx;syscall) */
@@ -102,7 +111,7 @@ const LIBKERNEL_1352 = {
 };
 
 PS4["13.52"] = Object.assign({}, PS4["13.50"], LIBKERNEL_1352, {
-    fw_status: "13.52 HW pop + pivot G0-G5 (7/7). lk RVAs from Suchi 13.52 dump",
+    fw_status: "13.52 HW pop + pivot G0-G5 (7/7). lk RVAs HW-confirmed 13.52 libkernel_sys",
     /** Low .text PLT stub RVAs — fill from ghidra_analysis/scripts/find_webkit_plt.py on poops dump */
     wk_plt_stack_chk_fail: null,
     wk_plt___error: null,
