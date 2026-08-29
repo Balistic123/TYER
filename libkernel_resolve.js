@@ -1770,6 +1770,39 @@ function lkDiagSnapshot(state) {
     };
 }
 
+function lkChunkOut(parentState, c, hit) {
+    const out = {
+        done: !!c.done,
+        state: parentState,
+        phase: c.phase,
+    };
+    if (hit || c.ok) out.ok = true;
+    if (c.lk) out.lk = c.lk;
+    if (c.iatRva != null) out.iatRva = c.iatRva;
+    if (c.source) out.source = c.source;
+    if (c.tried != null) out.tried = c.tried;
+    if (c.pages != null) out.pages = c.pages;
+    if (c.hits != null) out.hits = c.hits;
+    if (c.cursor != null) out.cursor = c.cursor;
+    if (c.at != null) out.at = c.at;
+    if (c.cells != null) out.cells = c.cells;
+    if (c.vtCount != null) out.vtCount = c.vtCount;
+    if (c.error) out.error = c.error;
+    if (c.extList) out.extList = c.extList;
+    if (c.n != null) out.n = c.n;
+    if (c.slots != null) out.slots = c.slots;
+    if (c.hdr) out.hdr = c.hdr;
+    if (c.span) out.span = c.span;
+    if (c.from != null) out.from = c.from;
+    if (c.to != null) out.to = c.to;
+    if (c.label) out.label = c.label;
+    if (c.vtList) out.vtList = c.vtList;
+    if (c.idx != null) out.idx = c.idx;
+    if (c.vtableAbs) out.vtableAbs = c.vtableAbs;
+    if (c.prev) out.prev = c.prev;
+    return out;
+}
+
 function lkFinalMiss(state, extra) {
     extra = extra || {};
     const snap = lkDiagSnapshot(state);
@@ -2373,25 +2406,27 @@ export function resolveLibkernelRelroChunk(p, webkitBase, off, state, opts) {
         }
     }
 
+    if (!state.stage) state.stage = "known";
+
     if (state.stage === "known") {
         const c = scanKnownExtPtrChunk(p, webkitBase, off, state.sub, opts);
         state.sub = c.state;
         if (c.done && c.lk) {
-            return Object.assign({ ok: true, state }, c);
+            return lkChunkOut(state, c, true);
         }
         if (c.done) {
             state.stage = "vt";
             state.sub = null;
-            state.diag.known = c.tried || 0;
+            state.diag.known = c.tried || (opts.knownExtPtrs ? opts.knownExtPtrs.length : 0);
             return {
                 done: false,
                 state,
                 phase: "known-done",
-                tried: c.tried,
+                tried: state.diag.known,
                 prev: c.phase,
             };
         }
-        return Object.assign({ state }, c);
+        return lkChunkOut(state, c, false);
     }
 
     if (state.stage === "vt") {
@@ -2401,7 +2436,7 @@ export function resolveLibkernelRelroChunk(p, webkitBase, off, state, opts) {
         if (c.extList && c.extList.length)
             state.extList = c.extList;
         if (c.done && c.lk) {
-            return Object.assign({ ok: true, state }, c);
+            return lkChunkOut(state, c, true);
         }
         if (c.done) {
             state.stage = "abs";
@@ -2417,12 +2452,12 @@ export function resolveLibkernelRelroChunk(p, webkitBase, off, state, opts) {
                 prev: c.phase,
                 vtable: state.vtableAbs ? String(state.vtableAbs) : "?",
                 ext: state.extList.length,
-                cells: c.cells,
-                vtCount: c.vtCount,
+                cells: state.diag.cells,
+                vtCount: state.diag.vtables,
                 error: c.error,
             };
         }
-        return Object.assign({ state }, c);
+        return lkChunkOut(state, c, false);
     }
 
     if (state.stage === "abs") {
@@ -2430,7 +2465,7 @@ export function resolveLibkernelRelroChunk(p, webkitBase, off, state, opts) {
         const c = scanAbsRelroChunk(p, webkitBase, off, state.sub, opts);
         state.sub = c.state;
         if (c.done && c.lk) {
-            return Object.assign({ ok: true, state }, c);
+            return lkChunkOut(state, c, true);
         }
         if (c.done) {
             state.stage = "nearlk";
@@ -2445,14 +2480,14 @@ export function resolveLibkernelRelroChunk(p, webkitBase, off, state, opts) {
                 slots: c.slots,
             };
         }
-        return Object.assign({ state }, c);
+        return lkChunkOut(state, c, false);
     }
 
     if (state.stage === "nearlk") {
         const c = scanNearLibkernelChunk(p, webkitBase, off, state.sub, state.anchors, opts);
         state.sub = c.state;
         if (c.done && c.lk) {
-            return Object.assign({ ok: true, state }, c);
+            return lkChunkOut(state, c, true);
         }
         if (c.done) {
             state.stage = "below";
@@ -2468,14 +2503,14 @@ export function resolveLibkernelRelroChunk(p, webkitBase, off, state, opts) {
                 hits: c.hits,
             };
         }
-        return Object.assign({ state }, c);
+        return lkChunkOut(state, c, false);
     }
 
     if (state.stage === "below") {
         const c = scanBelowWebkitChunk(p, webkitBase, off, state.sub, opts);
         state.sub = c.state;
         if (c.done && c.lk) {
-            return Object.assign({ ok: true, state }, c);
+            return lkChunkOut(state, c, true);
         }
         if (c.done) {
             state.stage = "hdr";
@@ -2489,7 +2524,7 @@ export function resolveLibkernelRelroChunk(p, webkitBase, off, state, opts) {
                 pages: c.pages,
             };
         }
-        return Object.assign({ state }, c);
+        return lkChunkOut(state, c, false);
     }
 
     if (state.stage === "hdr") {
@@ -2508,14 +2543,14 @@ export function resolveLibkernelRelroChunk(p, webkitBase, off, state, opts) {
             state.sub = null;
             return { done: false, state, phase: "hdr-skip", prev: c.phase };
         }
-        return Object.assign({ state }, c);
+        return lkChunkOut(state, c, false);
     }
 
     if (state.stage === "dyn") {
         const c = scanDynamicGotChunk(p, webkitBase, off, state.sub);
         state.sub = c.state;
         if (c.done && c.lk) {
-            return Object.assign({ ok: true, state }, c);
+            return lkChunkOut(state, c, true);
         }
         if (c.done) {
             state.stage = "relro";
@@ -2531,7 +2566,7 @@ export function resolveLibkernelRelroChunk(p, webkitBase, off, state, opts) {
                 slots: c.slots || c.inCap,
             };
         }
-        return Object.assign({ state }, c);
+        return lkChunkOut(state, c, false);
     }
 
     if (state.stage === "relro") {
@@ -2539,15 +2574,15 @@ export function resolveLibkernelRelroChunk(p, webkitBase, off, state, opts) {
         const c = scanRelroSlotsChunk(p, webkitBase, off, state.sub, opts);
         state.sub = c.state;
         if (c.done && c.lk) {
-            return Object.assign({ ok: true, state }, c);
+            return lkChunkOut(state, c, true);
         }
         if (c.done) {
             return lkFinalMiss(state, { tried: c.tried, prev: c.phase });
         }
-        return Object.assign({ state }, c);
+        return lkChunkOut(state, c, false);
     }
 
-    return lkFinalMiss(state, { error: "unknown stage " + state.stage });
+    return lkFinalMiss(state, { error: "unknown stage " + String(state.stage) });
 }
 
 /** Hunt libkernel prologue in pages below webkit (OOM-safe, no gap scan). */

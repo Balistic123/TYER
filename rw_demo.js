@@ -51,7 +51,7 @@ import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, fireGetpid } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250831e";
+const BUILD_ID = "rw-20250831f";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const SCAN_PIVOT_MIN = 0x10000;
@@ -2041,10 +2041,7 @@ function finishFindLkChunk(chunk) {
             + " nearPages=" + (chunk.nearPages != null ? chunk.nearPages : 0)
             + " belowPages=" + (chunk.belowPages != null ? chunk.belowPages : 0)
             + (chunk.vtable ? " vt=" + chunk.vtable : " vt=none"));
-        mark("LK-GOT-MISS", (chunk.error || chunk.phase || "miss")
-            + (chunk.extList && chunk.extList.length
-                ? " ext=" + chunk.extList.map(function (e) { return e.ptr; }).join(",") : "")
-            + " build=" + BUILD_ID);
+        mark("LK-GOT-MISS", (chunk.error || chunk.phase || "miss") + " build=" + BUILD_ID);
         mark("LK-HINT", chunk.cells === 0
             ? "no textarea cell — re-run Start"
             : (chunk.vtCount === 0
