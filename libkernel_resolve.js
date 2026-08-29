@@ -2499,6 +2499,7 @@ export function resolveLibkernelRelroChunk(p, webkitBase, off, state, opts) {
                     cellDbg: c.cellDbg,
                     cells: c.cells,
                     vtCount: c.vtCount,
+                    extList: state.extList,
                 });
             }
             state.stage = "abs";

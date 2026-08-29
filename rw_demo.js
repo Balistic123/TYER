@@ -52,7 +52,7 @@ import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, fireGetpid } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250831j";
+const BUILD_ID = "rw-20250831k";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const SCAN_PIVOT_MIN = 0x10000;
@@ -152,7 +152,7 @@ function clearPersistedLog() {
 function mark(tag, detail) {
     const line = tag + (detail == null || detail === "" ? "" : "  " + detail);
     if (lkQuiet) {
-        if (/^LK-(OK|FAIL|SKIP|CAL|HINT|CAL-MISS|CAL-DONE|GUESS|PSFREE|GOT|FIND)/.test(tag)) {
+        if (/^LK-(OK|FAIL|SKIP|CAL|HINT|CAL-MISS|CAL-DONE|GUESS|PSFREE|GOT|FIND|TRACE|MISS|EXT|CELL|FINISH|VERIFY)/.test(tag)) {
             lines.push(line);
             if (lines.length > 40) lines.splice(0, lines.length - 40);
             renderOut();
@@ -2010,6 +2010,29 @@ function runVerifyLk() {
     crashLog.flushSync();
 }
 
+function extPtrHex(entry) {
+    if (!entry) return "";
+    const raw = entry.ptr != null ? entry.ptr : entry;
+    return String(raw).replace(/^0x/i, "").trim();
+}
+
+function saveExtPtrsSession(extList) {
+    if (!extList || !extList.length) return;
+    try {
+        const arr = [];
+        for (let i = 0; i < extList.length && i < 16; i++) {
+            const hex = extPtrHex(extList[i]);
+            if (!hex) continue;
+            arr.push({
+                label: extList[i].vt || ("vt[" + (extList[i].idx != null ? extList[i].idx : i) + "]"),
+                ptr: hex,
+            });
+        }
+        if (arr.length)
+            sessionStorage.setItem(SS_CAL_EXT_PTRS, JSON.stringify(arr));
+    } catch (_) { }
+}
+
 function finishFindLkChunk(chunk) {
     if (chunk.ok && chunk.lk) {
         findLkState = null;
@@ -2031,41 +2054,55 @@ function finishFindLkChunk(chunk) {
         crashLog.flushSync();
         return true;
     }
-    if (chunk.done && chunk.phase === "got-scan-miss") {
-        findLkState = null;
-        findLkAuto = false;
-        findLkStop = false;
-        mark("LK-GOT-TRACE", "known=" + (chunk.known != null ? chunk.known : 0)
+    const isMiss = chunk.done && (
+        chunk.phase === "got-scan-miss" || chunk.phase === "vt-miss");
+    if (!isMiss) return false;
+
+    findLkState = null;
+    findLkAuto = false;
+    findLkStop = false;
+
+    const ext = Array.isArray(chunk.extList) ? chunk.extList : [];
+    const extN = chunk.vtExt != null ? chunk.vtExt : ext.length;
+    try {
+        mark("LK-TRACE", "known=" + (chunk.known != null ? chunk.known : 0)
             + " cells=" + (chunk.cells != null ? chunk.cells : 0)
             + " vtables=" + (chunk.vtCount != null ? chunk.vtCount : 0)
-            + " vtExt=" + (chunk.vtExt != null ? chunk.vtExt : 0)
-            + " nearPages=" + (chunk.nearPages != null ? chunk.nearPages : 0)
-            + " belowPages=" + (chunk.belowPages != null ? chunk.belowPages : 0)
-            + (chunk.vtable ? " vt=" + chunk.vtable : " vt=none"));
-        mark("LK-GOT-MISS", (chunk.error || chunk.phase || "miss") + " build=" + BUILD_ID);
-        if (chunk.cellDbg && chunk.cellDbg.length)
-            mark("LK-CELL-DBG", chunk.cellDbg.join(" | "));
-        if (chunk.known > 0 && chunk.vtExt === 0 && chunk.cells === 0) {
-            mark("LK-HINT", "known=" + chunk.known
-                + " hardcoded cal ptrs — cells=0 was hi<0x8 filter bug (fixed 31i)");
-        } else {
-            mark("LK-HINT", chunk.cells === 0
-                ? "no textarea cell — re-run Start; check LK-CELL-DBG"
-                : (chunk.vtCount === 0
-                    ? "no vtable chain — try cal index for CELL-SCAN lines"
-                    : "ext ptrs found but no lk base — paste LK-EXT to hex + Verify lk"));
-        }
-        if (chunk.extList && chunk.extList.length) {
-            for (let ei = 0; ei < chunk.extList.length; ei++)
-                mark("LK-EXT", (chunk.extList[ei].vt || "?")
-                    + "[" + (chunk.extList[ei].idx != null ? chunk.extList[ei].idx : "?") + "] → "
-                    + chunk.extList[ei].ptr);
-        }
-        state("Scan GOT miss — see LK-GOT-TRACE", "bad");
+            + " ext=" + extN
+            + (chunk.vtable ? " vtab=" + String(chunk.vtable).slice(0, 20) : ""));
+        renderOut();
         crashLog.flushSync();
-        return true;
+
+        mark("LK-MISS", (chunk.error || chunk.phase || "miss") + " build=" + BUILD_ID);
+
+        if (chunk.cellDbg && chunk.cellDbg.length)
+            mark("LK-CELL-DBG", String(chunk.cellDbg.join(" | ").slice(0, 240)));
+
+        if (ext.length) {
+            const hexes = [];
+            for (let ei = 0; ei < ext.length && ei < 4; ei++) {
+                const h = extPtrHex(ext[ei]);
+                if (h) hexes.push(h);
+            }
+            mark("LK-EXT", "n=" + ext.length + (hexes.length ? " " + hexes.join(" ") : ""));
+            saveExtPtrsSession(ext);
+            if (addrIn && hexes[0]) addrIn.value = hexes[0];
+            mark("LK-HINT", "hex filled — tap Verify lk or Force lk → Arm → Fire");
+        } else if (chunk.cells === 0) {
+            mark("LK-HINT", "no cells — re-run Start");
+        } else if ((chunk.vtCount || 0) === 0) {
+            mark("LK-HINT", "no vtable — check LK-CELL-DBG");
+        } else {
+            mark("LK-HINT", "no ext ptrs in vtable slots");
+        }
+    } catch (err) {
+        mark("LK-FINISH-ERR", err.message || String(err));
     }
-    return false;
+
+    state("Scan GOT miss — see LK-TRACE", "bad");
+    renderOut();
+    crashLog.flushSync();
+    return true;
 }
 
 function stopFindLk() {
@@ -2092,10 +2129,7 @@ async function runFindLkAuto(preset) {
     findLkStop = false;
     busy = true;
     setUi();
-    mark("LK-GOT", "auto " + findLkPreset.label
-        + " hdr=" + findLkPreset.hdrCoarse
-        + (findLkPreset.hdrFine ? "+" + findLkPreset.hdrFine : "")
-        + " build=" + BUILD_ID);
+    mark("LK-GOT", "auto " + findLkPreset.label + " build=" + BUILD_ID);
     renderOut();
 
     const opts = Object.assign({
@@ -2106,9 +2140,10 @@ async function runFindLkAuto(preset) {
         knownExtPtrs: knownExtPtrsForLk(),
     }, findLkPreset);
     let loops = 0;
+    const loopMax = 120;
 
     try {
-        while (findLkAuto && !findLkStop) {
+        while (findLkAuto && !findLkStop && loops < loopMax) {
             const chunk = resolveLibkernelRelroChunk(p, webkitBase, off, findLkState, opts);
             findLkState = chunk.state;
             if (chunk.phase === "got-scan-start")
@@ -2123,9 +2158,9 @@ async function runFindLkAuto(preset) {
                     + " n=" + (chunk.vtCount || 1) + " cells=" + (chunk.cells || "?")
                     + " " + (chunk.label || "")
                     + (chunk.cellDbg && chunk.cellDbg.length
-                        ? " dbg=" + chunk.cellDbg.join(" | ") : ""));
+                        ? " dbg=" + chunk.cellDbg.join(" | ").slice(0, 120) : ""));
             else if (chunk.phase === "vt-miss" && chunk.cellDbg && chunk.cellDbg.length)
-                mark("LK-CELL-DBG", chunk.cellDbg.join(" | "));
+                mark("LK-CELL-DBG", chunk.cellDbg.join(" | ").slice(0, 240));
             else if (chunk.phase === "vt-done")
                 mark("LK-GOT", "vtable done ext=" + (chunk.ext || 0)
                     + " cells=" + (chunk.cells != null ? chunk.cells : "?")
@@ -2162,20 +2197,21 @@ async function runFindLkAuto(preset) {
                     + (chunk.at != null ? " @" + chunk.at : "")
                     + (chunk.tried != null ? " tried=" + chunk.tried : "")
                     + (chunk.pages != null ? " pages=" + chunk.pages : ""), "warn");
-            if (finishFindLkChunk(chunk)) {
+            if (chunk.done && finishFindLkChunk(chunk)) {
                 renderOut();
                 return;
             }
             loops++;
-            if (loops % 8 === 0) {
+            if (loops % 4 === 0) {
                 mark("LK-GOT", findLkPreset.label + " " + (chunk.phase || "?")
-                    + (chunk.pages != null ? " pages=" + chunk.pages : "")
                     + (chunk.tried != null ? " tried=" + chunk.tried : ""));
                 crashLog.flushSync();
                 renderOut();
             }
             await new Promise(function (r) { setTimeout(r, findLkPreset.lite ? 48 : 24); });
         }
+        if (loops >= loopMax)
+            mark("LK-GOT-ABORT", "loop cap " + loopMax + " — partial, re-tap Scan GOT lite");
         if (findLkStop)
             mark("LK-FIND", "stopped");
     } catch (err) {
