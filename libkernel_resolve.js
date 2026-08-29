@@ -1999,6 +1999,39 @@ export function probeLibkernelGuesses(p, webkitBase, nativeFn, log) {
     return showLibkernelGuesses(webkitBase, nativeFn, log);
 }
 
+/** ≤2 reads — 13.52 usleep/__error prologue (Suchi dump + BillZai game base trial). */
+export function verifyLibkernelUsleep1352(p, lk, off) {
+    off = off || {};
+    if (!p || !lk) return { ok: false, error: "no address" };
+    const usleepOff = off.k_usleep != null ? off.k_usleep : 0x13b20;
+    const errOff = off.k__error != null ? off.k__error : 0x1bb0;
+    const wUsleep = read4p(p, lk.add32(usleepOff));
+    if (wUsleep == null)
+        return { ok: false, error: "UNMAPPED @ usleep+" + usleepOff.toString(16) };
+    const usleepOk = checkPrologueAt(p, lk.add32(usleepOff))
+        || (wUsleep >>> 0) === 0x554889e5;
+    if (!usleepOk)
+        return {
+            ok: false,
+            error: "usleep prologue miss raw=0x" + (wUsleep >>> 0).toString(16),
+            wUsleep,
+            usleepOff,
+        };
+    const wErr = read4p(p, lk.add32(errOff));
+    const errOk = wErr != null && (checkPrologueAt(p, lk.add32(errOff))
+        || (wErr >>> 0) === 0x554889e5);
+    return {
+        ok: true,
+        strong: errOk,
+        lk,
+        usleepOff,
+        errOff,
+        wUsleep,
+        wErr,
+        warn: errOk ? null : "__error prologue miss @ +" + errOff.toString(16),
+    };
+}
+
 /** ≤6 reads — prologue + optional getpid stub (no module walk). */
 export function verifyLibkernelBase(p, lk, off, opts) {
     opts = opts || {};

@@ -76,20 +76,23 @@ PS4["12.52"] = Object.assign({}, PS4["12.50"], {
     fw_status: "userland-only — shares 12.50 webkit RVAs (no 12.52 dump)",
 });
 
-// 13.52 retail: expm1 + pop gadgets HW-confirmed.
-// libkernel IAT/stubs from 13.00 (verify on HW). Pivot RVAs NOT baked — scan or paste after verify.
-const LIBKERNEL_1300 = {
-    wk___imp___error:                   0x3cb8cc8,
-    k__error:                           0x26420,
-    k_scan_stage1:                      0x40000,
+// 13.52 libkernel RVAs — Suchi HW dump (NOT 13.00).
+const LIBKERNEL_1352 = {
+    k__error:                           0x1bb0,
+    k_usleep:                           0x13b20,
+    k_open:                             0x148d0,
+    k_read:                             0x14870,
+    k_write:                            0x148a0,
+    /** BillZaiD game process — trial only, verify before use */
+    billzai_lk_base:                    "0x80a67c000",
     k_stubs: {
         20: 0x2cb70,
         24: 0x2d5e0,
     },
 };
 
-PS4["13.52"] = Object.assign({}, PS4["13.50"], LIBKERNEL_1300, {
-    fw_status: "13.52 HW pop + pivot G0-G5 (7/7). libkernel via PSFree low PLT — NOT wk___imp___error",
+PS4["13.52"] = Object.assign({}, PS4["13.50"], LIBKERNEL_1352, {
+    fw_status: "13.52 HW pop + pivot G0-G5 (7/7). lk RVAs from Suchi 13.52 dump",
     /** Low .text PLT stub RVAs — fill from ghidra_analysis/scripts/find_webkit_plt.py on poops dump */
     wk_plt_stack_chk_fail: null,
     wk_plt___error: null,
