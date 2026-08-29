@@ -89,8 +89,8 @@
   <div class="gadget-bar" id="gadget-pivot">
     <span class="bar-label">pivot G0-G5 HW — Verify pivot then Native call</span>
   </div>
-  <p id="hint"><b>13.52 poops:</b> Start → <b>Scan GOT lite</b> (ELF hdr → dynamic GOT → RELRO → vtable)
-    → <b>Verify lk</b> → Force lk → Arm → Fire. No cal ptr needed.</p>
+  <p id="hint"><b>13.52 poops:</b> Start → <b>Scan GOT lite</b> (vtable → abs RELRO → nearlk)
+    → <b>Verify lk</b> → Force lk → Arm → Fire.</p>
   <h2>Known pointers (this process)</h2>
   <table id="map">
     <thead><tr><th>label</th><th>address</th><th>note</th></tr></thead>
@@ -134,6 +134,6 @@ window.addEventListener("unhandledrejection", function (e) {
   persistCrashLine("wk-rw-log", msg);
 });
 </script>
-<script type="module" src="./rw_demo.js?v=20250831b"></script>
+<script type="module" src="./rw_demo.js?v=20250831c"></script>
 </body>
 </html>
