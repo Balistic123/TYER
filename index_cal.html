@@ -67,7 +67,7 @@
     <button type="button" class="secondary" id="btn-wide" disabled>2b. Wide ELF</button>
     <button type="button" class="secondary" id="btn-probe" disabled>2c. Probe ELF</button>
     <button type="button" class="secondary" id="btn-find-base" disabled>2d. Find base</button>
-    <button type="button" class="secondary" id="btn-find-base-vtable" disabled>2e. Find base (vtable)</button>
+    <button type="button" class="secondary" id="btn-find-base-vtable" disabled>2e Leak vtable ptrs</button>
     <button type="button" class="secondary" id="btn-set-expm1" disabled>3. Set expm1</button>
     <button type="button" class="secondary" id="btn-set-base" disabled>3b. Set base</button>
     <button type="button" id="btn-assume" disabled>Assume expm1 (test)</button>
@@ -102,8 +102,9 @@
   <p id="hint">
     <b>If you already have base+expm1</b>, use
     <code>?base=805018530&amp;expm1=eb6350</code> then <b>4b Accept offsets (0 reads)</b>.
-    Vtable walk is <b>manual</b> — tap <b>2e Find base (vtable)</b> after Start (auto walk OOMs on 13.52).
-    If cal keeps OOMing, use <b>index_rw</b> → Leak scan LK instead.
+    Vtable leak is <b>chunked</b> — tap <b>2e Leak vtable ptrs</b> repeatedly (32 pages/tap).
+    Copy <b>EXT-PTR</b> lines into index_rw → Paste libkernel.
+    Or use index_rw → <b>Leak+vtable LK</b> directly (no cal needed).
   </p>
   <h2>Log</h2>
   <div id="out"></div>
@@ -125,6 +126,6 @@ window.addEventListener("unhandledrejection", function (e) {
   if (o) o.textContent = (o.textContent ? o.textContent + "\n" : "") + msg;
 });
 </script>
-<script type="module" src="./cal_demo.js?v=20250829a"></script>
+<script type="module" src="./cal_demo.js?v=20250829b"></script>
 </body>
 </html>

