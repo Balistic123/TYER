@@ -368,6 +368,40 @@ export function tryWebkitNearLibkernel(p, webkitBase, off) {
     return null;
 }
 
+/** OOM-safe verify resolve — pass 0: k__error×8, 1: page×2, 2: walk16. No fnPtr code read. */
+export function resolveExtPtrVerifyBounded(p, fnPtr, off, webkitBase, pass) {
+    if (!fnPtr || fnPtr.hi < 0x8) return null;
+    pass = pass != null ? pass : 0;
+    const ctx = { fnPtr, webkitBase, off };
+
+    if (pass === 0) {
+        const errs = kErrorCandidates(off);
+        for (let i = 0; i < errs.length; i++) {
+            const lk = fnPtr.sub32(errs[i]);
+            if (!plausibleLkBeforeRead(lk, fnPtr, webkitBase, off)) continue;
+            if (!isLibkernelPrologue(p, lk, ctx)) continue;
+            return { lk, via: "error+" + errs[i].toString(16), k__error: errs[i], fnPtr };
+        }
+        return null;
+    }
+
+    if (pass === 1) {
+        const pageBase = pageAlignDown(fnPtr, 0x4000);
+        for (let d = 0; d < 2; d++) {
+            const pg = d === 0 ? pageBase : pageBase.sub32(0x4000);
+            if (!plausibleLkBeforeRead(pg, fnPtr, webkitBase, off)) continue;
+            const mag = read4p(p, pg);
+            if (weakLibkernelBaseHit(p, pg, mag, ctx)) {
+                const kOff = Number(ptrBig(fnPtr) - ptrBig(pg));
+                return { lk: pg, via: "page+k=" + kOff.toString(16), k__error: kOff, fnPtr };
+            }
+        }
+        return null;
+    }
+
+    return resolveExtPtrPageWalk(p, fnPtr, webkitBase, off, 16);
+}
+
 /** k__error subtract then page-align — 13.52 imports rarely land aligned raw. */
 export function resolveExtAlignedKError(p, fnPtr, off, webkitBase, opts) {
     opts = opts || {};

