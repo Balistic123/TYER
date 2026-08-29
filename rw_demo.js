@@ -55,7 +55,7 @@ import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, fireGetpid } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250832c";
+const BUILD_ID = "rw-20250832d";
 const SS_HUNT_TRACE = "wk-hunt-trace";
 const SS_HUNT_STATE = "wk-hunt-state";
 /** opt-in only — release triggers JSC GC */
@@ -2451,22 +2451,23 @@ async function runHuntLkBelow() {
     } else {
         clearHuntState();
         try { sessionStorage.removeItem(SS_HUNT_TRACE + "-log"); } catch (_) { }
-        mark("LK-HUNT", "webkit=" + webkitBase + " 8×1read build=" + BUILD_ID);
+        mark("LK-HUNT", "webkit=" + webkitBase + " 1probe/click build=" + BUILD_ID);
         huntTracePush("START wk=" + webkitBase);
     }
     renderOut();
     crashLog.flushSync();
 
     let ticks = 0;
+    let stepped = false;
     try {
-        while (huntLkAuto && ticks++ < 12) {
+        while (huntLkAuto && ticks++ < 4) {
             const pre = huntProbePreLine(huntLkState);
             if (pre) {
                 mark("LK-HUNT-PROBE", pre);
                 huntTracePush("PROBE " + pre);
                 renderOut();
                 crashLog.flushSync();
-                await new Promise(function (r) { setTimeout(r, 32); });
+                await new Promise(function (r) { setTimeout(r, 48); });
             }
 
             const chunk = huntLibkernelCandidatesChunk(p, webkitBase, off, huntLkState, {
@@ -2475,12 +2476,14 @@ async function runHuntLkBelow() {
             huntLkState = chunk.state;
 
             if (chunk.phase === "cand-start") {
-                mark("LK-HUNT", "targets=" + chunk.total + " (UNMAPPED=null read, mapped=good)");
+                mark("LK-HUNT", "targets=" + chunk.total + " (1 probe per click)");
                 huntTracePush("TARGETS " + chunk.total);
                 renderOut();
                 crashLog.flushSync();
                 continue;
             }
+
+            stepped = true;
 
             if (chunk.probe) {
                 const post = huntProbePostLine(chunk.probe);
@@ -2516,7 +2519,7 @@ async function runHuntLkBelow() {
                 }
                 mark("LK-HUNT-MISS", summary);
                 huntTracePush("MISS " + summary);
-                state("hunt miss — mapped≠SCE; re-click Hunt lk to resume if partial", "bad");
+                state("hunt miss — mapped≠SCE", "bad");
                 break;
             }
 
@@ -2526,9 +2529,17 @@ async function runHuntLkBelow() {
             } else if (chunk.phase === "cand-null-cliff") {
                 mark("LK-HUNT", "null cliff after " + (chunk.nulls || 0) + " unmapped — stop");
                 huntTracePush("CLIFF nulls=" + (chunk.nulls || 0));
+            } else if (huntLkState) {
+                const left = huntLkState.addrs.length - huntLkState.idx;
+                mark("LK-HUNT", "paused " + huntLkState.idx + "/" + huntLkState.addrs.length
+                    + " — click Hunt lk again (" + left + " left)");
+                huntTracePush("PAUSE " + huntLkState.idx + "/" + huntLkState.addrs.length);
+                state("hunt @" + huntLkState.idx + "/" + huntLkState.addrs.length + " — click Hunt lk", "");
             }
-
-            await new Promise(function (r) { setTimeout(r, 96); });
+            break;
+        }
+        if (!stepped && huntLkState && huntLkState.idx >= huntLkState.addrs.length) {
+            clearHuntState();
         }
     } catch (err) {
         mark("LK-HUNT-ERR", err.message || String(err));

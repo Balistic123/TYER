@@ -2222,8 +2222,8 @@ function microStubScore(p, base) {
     return stubs;
 }
 
-/** Poops HW: wk-1800000 read OOMs even when neighboring probes map. */
-const LK_HUNT_TOXIC_DELTAS = new Set([0x1800000]);
+/** Poops HW: these wk- offsets OOM on read even when neighbors map. */
+const LK_HUNT_TOXIC_DELTAS = new Set([0x1800000, 0x2000000]);
 
 function classifyProbeMagic(w, addr, webkitBase, off) {
     if (w == null) return "UNMAPPED";
@@ -2244,8 +2244,8 @@ export function huntLibkernelCandidatesChunk(p, webkitBase, off, state, opts) {
     if (!state) {
         const wb = ptrBig(webkitBase) & ~0x3fffn;
         const deltas = [
-            0x400000, 0x800000, 0x1000000, 0x1400000,
-            0x2000000, 0x2800000, 0x3000000, 0x3800000,
+            0x400000, 0x800000, 0x1000000, 0x1400000, 0x1c00000,
+            0x2800000, 0x3000000, 0x3800000,
         ];
         const addrs = [];
         for (let i = 0; i < deltas.length; i++) {
