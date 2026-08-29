@@ -1,6 +1,7 @@
 import { int64 } from "./int64.js";
 import { offsetsFor, offsetsForKey } from "./ps4_offsets_userland.js";
 import { installWindowP, pairStatus } from "./mem.js";
+import { createCrashLog } from "./log_persist.js";
 
 const params = new URLSearchParams(location.search);
 const lines = [];
@@ -22,7 +23,14 @@ let walkQuiet = false;
 const calRetain = [];
 
 const LOG_MAX = 300;
-const BUILD_ID = "cal-20250829b";
+const BUILD_ID = "cal-20250829c";
+const crashLog = createCrashLog({
+    ssLog: "wk-cal-log",
+    ssState: "wk-cal-state",
+    ssBuild: "wk-cal-log-build",
+    buildId: BUILD_ID,
+    maxLines: 200,
+});
 const CAL_ALIGN_STEP = 0x4000;
 const ELF_MAGIC = 0x464c457f;
 /** 13.52 retail test anchor — assumed correct unless cal proves otherwise */
@@ -167,6 +175,8 @@ function state(msg, cls) {
     if (!stateEl) return;
     stateEl.textContent = msg;
     stateEl.className = cls || "";
+    if (!raceMode || /OK|FAIL|error|native|primitive|promote|broken|cal/i.test(msg || ""))
+        crashLog.persistState(msg, cls);
 }
 
 function setCalButton(el, on) {
@@ -267,12 +277,18 @@ function renderOut() {
     outEl.scrollTop = outEl.scrollHeight;
 }
 
+function clearPersistedLog() {
+    crashLog.clear();
+}
+
 function mark(tag, detail) {
     const line = tag + (detail == null || detail === "" ? "" : "  " + detail);
+    const raceCritical = /FAIL|ERROR|GIVE-UP|READ-PRIMITIVE|TRIM|ATTEMPT-START|PRIMITIVE/i.test(tag);
     if (raceMode) {
         raceBuf.push(line);
-        if (raceBuf.length > 48) raceBuf.shift();
-        if (/FAIL|ERROR|GIVE-UP|READ-PRIMITIVE|TRIM|ATTEMPT-START|PRIMITIVE/i.test(tag)) {
+        if (raceBuf.length > 64) raceBuf.shift();
+        crashLog.append(line, tag);
+        if (raceCritical) {
             lines.push(line);
             if (lines.length > LOG_MAX) lines.splice(0, lines.length - LOG_MAX);
             if (outEl) {
@@ -283,14 +299,17 @@ function mark(tag, detail) {
         }
         return;
     }
-    if (walkQuiet && !PIN_TAGS.test(tag) && !/^EXT-PTR|^VTABLE-OK|^VTABLE-FAIL|^WALK-|^MODULE-HIT/.test(tag))
+    if (walkQuiet && !PIN_TAGS.test(tag) && !/^EXT-PTR|^VTABLE-OK|^VTABLE-FAIL|^WALK-|^MODULE-HIT/.test(tag)) {
+        crashLog.append(line, tag);
         return;
+    }
     if (PIN_TAGS.test(tag)) {
         pinnedLines.push(line);
         if (pinnedLines.length > 40) pinnedLines.splice(0, pinnedLines.length - 40);
     }
     lines.push(line);
     if (lines.length > LOG_MAX) lines.splice(0, lines.length - LOG_MAX);
+    crashLog.append(line, tag);
     renderOut();
 }
 
@@ -1568,8 +1587,10 @@ async function establishOnce(establishPrimitive) {
                 if (!dup) lines.push(line);
             }
         }
+        crashLog.appendMany(raceBuf);
         raceBuf.length = 0;
         if (lines.length > LOG_MAX) lines.splice(0, lines.length - LOG_MAX);
+        crashLog.flushSync();
         renderOut();
     }
 }
@@ -1578,8 +1599,7 @@ async function runStart() {
     if (busy || ready) return;
     busy = true;
     setUi();
-    lines.length = 0;
-    pinnedLines.length = 0;
+    crashLog.sessionMarker("START");
     calibrated = null;
     clearGadgetScanState();
 
@@ -2221,7 +2241,10 @@ function init() {
     wireClick(btnCopy, runCopy);
     wireClick(btnClear, function () {
         lines.length = 0;
+        pinnedLines.length = 0;
+        crashLog.clear();
         if (outEl) outEl.textContent = "";
+        mark("LOG-CLEAR", "sessionStorage log cleared");
     });
 
     if (expm1In)
@@ -2245,13 +2268,22 @@ function init() {
         if (manualBase && baseIn) baseIn.value = ptrNum(manualBase).toString(16);
     }
 
-    mark("BOOT", "build=" + BUILD_ID + " — race log throttled (same as index_rw)");
+    crashLog.startAutoFlush();
+    if (params.get("clearlog") === "1") clearPersistedLog();
+    else crashLog.restoreInto(lines);
+
+    mark("BOOT", "build=" + BUILD_ID + " — logs persist across reload/crash");
     mark("BOOT", "index_cal.html — expm1 / vtable for 13.52");
     mark("BOOT", groomBootLine());
     mark("BOOT", "2e vtable: manual button or ?vtable=1 (not auto — OOM)");
     wireGroomBar();
     setUi();
+    renderOut();
     state("ready — pick groom if needed, then Start", "");
+    window.addEventListener("beforeunload", function () {
+        if (stateEl) crashLog.persistState(stateEl.textContent, stateEl.className, true);
+        crashLog.flushSync();
+    });
 }
 
 function bootUi() {

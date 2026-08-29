@@ -83,9 +83,9 @@
   <div class="gadget-bar" id="gadget-pivot">
     <span class="bar-label">pivot G0-G5 HW — Verify pivot then Native call</span>
   </div>
-  <p id="hint"><b>Pivot 7/7 on 13.52.</b> libkernel: <b>Scan libkernel</b> finds ELF modules in live memory (no dump).
-    Or peek any external code pointer → paste as base. Cal/+0x3cb8cc8 broken on 13.52.</p>
-    Then <b>getpid stub</b> → <b>Native call</b>. <code>?restorelog=1</code> after crash.</p>
+  <p id="hint"><b>Pivot 7/7 on 13.52.</b> libkernel: <b>Try cal ptr</b> or paste base.
+    Cal/+0x3cb8cc8 broken on 13.52. Logs auto-restore after reload/crash.
+    <code>?clearlog=1</code> to wipe saved log.</p>
   <h2>Known pointers (this process)</h2>
   <table id="map">
     <thead><tr><th>label</th><th>address</th><th>note</th></tr></thead>
@@ -102,22 +102,33 @@
   <div id="out"></div>
 </div>
 <script>
+function persistCrashLine(key, line) {
+  try {
+    var prev = sessionStorage.getItem(key) || "";
+    var buf = prev ? prev.split("\n") : [];
+    buf.push(line);
+    while (buf.length > 200) buf.shift();
+    sessionStorage.setItem(key, buf.join("\n"));
+  } catch (_) {}
+}
 window.addEventListener("error", function (e) {
   var s = document.getElementById("state");
   var o = document.getElementById("out");
-  var msg = "JS error: " + (e.message || e);
+  var msg = "ERROR  JS error: " + (e.message || e);
   if (s) { s.textContent = msg; s.className = "bad"; }
   if (o) o.textContent = (o.textContent ? o.textContent + "\n" : "") + msg;
+  persistCrashLine("wk-rw-log", msg);
 });
 window.addEventListener("unhandledrejection", function (e) {
   var s = document.getElementById("state");
   var o = document.getElementById("out");
   var r = e.reason;
-  var msg = "load failed: " + (r && r.message ? r.message : r);
+  var msg = "ERROR  load failed: " + (r && r.message ? r.message : r);
   if (s) { s.textContent = msg; s.className = "bad"; }
   if (o) o.textContent = (o.textContent ? o.textContent + "\n" : "") + msg;
+  persistCrashLine("wk-rw-log", msg);
 });
 </script>
-<script type="module" src="./rw_demo.js?v=20250829q"></script>
+<script type="module" src="./rw_demo.js?v=20250829t"></script>
 </body>
 </html>

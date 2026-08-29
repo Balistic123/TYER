@@ -127,20 +127,20 @@ function lkFromStubAddr(p, stubAddr, off) {
 }
 
 /** Cheap prologue check — two reads (mov eax, imm; syscall). */
+export function checkPrologueAt(p, addr) {
+    if (!addr) return false;
+    const w0 = read4p(p, addr);
+    const w1 = read4p(p, addr.add32(4));
+    if (w0 == null || w1 == null) return false;
+    return (w0 & 0xff) === 0xb8 && (w1 & 0xffff) === 0x050f;
+}
+
 export function isLibkernelPrologue(p, lk) {
     if (!lk || lk.hi < 0x8) return false;
     if (checkPrologueAt(p, lk)) return true;
     if (read4p(p, lk) === SCE_MAGIC)
         return checkPrologueAt(p, lk.add32(SCE_ELF_OFF));
     return false;
-}
-
-function checkPrologueAt(p, addr) {
-    if (!addr) return false;
-    const w0 = read4p(p, addr);
-    const w1 = read4p(p, addr.add32(4));
-    if (w0 == null || w1 == null) return false;
-    return (w0 & 0xff) === 0xb8 && (w1 & 0xffff) === 0x050f;
 }
 
 export function saveLibkernelSession(lk, iatRva) {
@@ -610,48 +610,19 @@ function moduleBaseIsLibkernel(p, base) {
 }
 
 function lkFromStubAddrLite(p, stubAddr, off) {
-    const offs = getpidStubOffsets(off);
-    for (let i = 0; i < offs.length; i++) {
-        const lk = stubAddr.sub32(offs[i]);
-        if (lkAligned(lk) && isLibkernelPrologue(p, lk))
-            return { lk, stubOff: offs[i] };
-    }
-    let page = new int64((stubAddr.low >>> 0) & ~0x3fff, stubAddr.hi >>> 0);
-    for (let back = 0x4000; back <= 0xc000; back += 0x4000) {
-        const lk = page.sub32(back);
-        if (lkAligned(lk) && isLibkernelPrologue(p, lk))
-            return { lk, stubOff: Number(ptrBig(stubAddr) - ptrBig(lk)) };
-    }
+    const o = (off.k_stubs && off.k_stubs[20]) || 0x2cb70;
+    const lk = stubAddr.sub32(o);
+    if (lkAligned(lk) && checkPrologueAt(p, lk))
+        return { lk, stubOff: o };
     return null;
 }
 
-/** ≤20 reads — no scoreSyscallStubs sweep (OOM on 13.52). */
+/** ≤2 reads at fnPtr page — no far-offset or walk-back (unmapped reads OOM). */
 function lkFromFnPtrLite(p, fnPtr, off) {
-    if (!fnPtr) return null;
-
-    if (isGetpidStub(fnPtr)) {
-        const hit = lkFromStubAddrLite(p, fnPtr, off);
-        if (hit)
-            return { lk: hit.lk, iatRva: null, via: "getpid+" + hit.stubOff.toString(16) };
-    }
-
-    if (read1p(p, fnPtr) === 0xb8) {
-        const errs = kErrorCandidates(off);
-        for (let i = 0; i < errs.length; i++) {
-            const lk = fnPtr.sub32(errs[i]);
-            if (lkAligned(lk) && isLibkernelPrologue(p, lk))
-                return { lk, iatRva: null, via: "error+" + errs[i].toString(16) };
-        }
-    }
-
+    if (!fnPtr || fnPtr.hi < 0x8) return null;
     const pageBase = new int64((fnPtr.low >>> 0) & ~0x3fff, fnPtr.hi >>> 0);
-    if (lkAligned(pageBase) && isLibkernelPrologue(p, pageBase))
+    if (lkAligned(pageBase) && checkPrologueAt(p, pageBase))
         return { lk: pageBase, iatRva: null, via: "page" };
-
-    const walked = findModuleBaseBackward(p, fnPtr, 8);
-    if (walked && moduleBaseIsLibkernel(p, walked))
-        return { lk: walked, iatRva: null, via: "elf-walk-lite" };
-
     return null;
 }
 
@@ -1223,14 +1194,10 @@ function scanGuessCandidatesChunk(p, webkitBase, nativeFn, sub) {
     return { done: false, state: sub, phase: "guess", tried: sub.idx, total: sub.cands.length };
 }
 
-/** Paste libkernel base OR code ptr — lite path for cal EXT-PTR (≤25 reads). */
+/** Paste libkernel base OR code ptr — ≤8 reads, no walk-back. */
 export function verifyManualLibkernelFromPtrLite(p, raw, off) {
     const ptr = typeof raw === "string" ? parseAddrSync(raw) : raw;
     if (!ptr) return { ok: false, error: "bad address" };
-    if (isLibkernelPrologue(p, ptr)) {
-        saveLibkernelSession(ptr, null);
-        return { ok: true, lk: ptr, via: "prologue@paste" };
-    }
     const hit = lkFromFnPtrLite(p, ptr, off);
     if (hit) {
         saveLibkernelSession(hit.lk, hit.iatRva);
@@ -1241,23 +1208,7 @@ export function verifyManualLibkernelFromPtrLite(p, raw, off) {
 
 /** Paste libkernel base OR any code pointer inside libkernel. */
 export function verifyManualLibkernelFromPtr(p, raw, off) {
-    const ptr = typeof raw === "string" ? parseAddrSync(raw) : raw;
-    if (!ptr) return { ok: false, error: "bad address" };
-    if (isLibkernelPrologue(p, ptr)) {
-        saveLibkernelSession(ptr, null);
-        return { ok: true, lk: ptr, via: "prologue@paste" };
-    }
-    const hit = lkFromFnPtrLite(p, ptr, off);
-    if (hit) {
-        saveLibkernelSession(hit.lk, hit.iatRva);
-        return { ok: true, lk: hit.lk, via: hit.via };
-    }
-    const walked = findModuleBaseBackward(p, ptr, 24);
-    if (walked && moduleBaseIsLibkernel(p, walked)) {
-        saveLibkernelSession(walked, null);
-        return { ok: true, lk: walked, via: "walk-back" };
-    }
-    return { ok: false, error: "not libkernel" };
+    return verifyManualLibkernelFromPtrLite(p, raw, off);
 }
 
 /** Scan mapped RW/data within cap for external code pointers → libkernel walk-back. */

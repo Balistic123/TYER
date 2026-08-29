@@ -105,27 +105,39 @@
     Vtable leak is <b>chunked</b> — tap <b>2e Leak vtable ptrs</b> repeatedly (32 pages/tap).
     Copy <b>EXT-PTR</b> lines into index_rw → Paste libkernel.
     Or use index_rw → <b>Leak+vtable LK</b> directly (no cal needed).
+    Logs auto-restore after reload/crash. <code>?clearlog=1</code> to wipe.
   </p>
   <h2>Log</h2>
   <div id="out"></div>
 </div>
 <script>
+function persistCrashLine(key, line) {
+  try {
+    var prev = sessionStorage.getItem(key) || "";
+    var buf = prev ? prev.split("\n") : [];
+    buf.push(line);
+    while (buf.length > 200) buf.shift();
+    sessionStorage.setItem(key, buf.join("\n"));
+  } catch (_) {}
+}
 window.addEventListener("error", function (e) {
   var s = document.getElementById("state");
   var o = document.getElementById("out");
-  var msg = "JS error: " + (e.message || e);
+  var msg = "ERROR  JS error: " + (e.message || e);
   if (s) { s.textContent = msg; s.className = "bad"; }
   if (o) o.textContent = (o.textContent ? o.textContent + "\n" : "") + msg;
+  persistCrashLine("wk-cal-log", msg);
 });
 window.addEventListener("unhandledrejection", function (e) {
   var s = document.getElementById("state");
   var o = document.getElementById("out");
   var r = e.reason;
-  var msg = "load failed: " + (r && r.message ? r.message : r);
+  var msg = "ERROR  load failed: " + (r && r.message ? r.message : r);
   if (s) { s.textContent = msg; s.className = "bad"; }
   if (o) o.textContent = (o.textContent ? o.textContent + "\n" : "") + msg;
+  persistCrashLine("wk-cal-log", msg);
 });
 </script>
-<script type="module" src="./cal_demo.js?v=20250829b"></script>
+<script type="module" src="./cal_demo.js?v=20250829c"></script>
 </body>
 </html>
