@@ -44,7 +44,7 @@ import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, fireGetpid } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830d";
+const BUILD_ID = "rw-20250830e";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const SCAN_PIVOT_MIN = 0x10000;
@@ -2056,8 +2056,8 @@ async function ensureLibkernel(p, off, webkitBase) {
 }
 
 function stripUiForNative() {
-    for (const id of ["groom-bar", "peek-bar", "hint", "map",
-        "gadget-base", "gadget-pop", "gadget-pivot"]) {
+    /* Hide heavy DOM only — keep gadget bars (Force lk, Load cal ptr). */
+    for (const id of ["groom-bar", "peek-bar", "map"]) {
         const el = document.getElementById(id);
         if (el) el.style.display = "none";
     }
@@ -2067,6 +2067,7 @@ function stripUiForNative() {
     const hexTitle = document.getElementById("hex");
     if (hexTitle && hexTitle.previousElementSibling)
         hexTitle.previousElementSibling.style.display = "none";
+    if (hexTitle) hexTitle.style.display = "none";
 }
 
 function resolveWebkitBase(off, nativeFn) {
@@ -2169,6 +2170,7 @@ function runFireGetpid() {
     retained.length = 0;
     pointers.length = 0;
     if (outEl) outEl.textContent = "Fire getpid…";
+    stripUiForNative();
 
     let pid = -1;
     let errMsg = null;
@@ -2427,7 +2429,6 @@ async function runStart() {
         try {
             ensureNativePrep(p, off);
             mark("NATIVE-PREP", "slab ready @ Start");
-            stripUiForNative();
         } catch (prepErr) {
             mark("NATIVE-PREP-SKIP", prepErr.message || String(prepErr));
         }
