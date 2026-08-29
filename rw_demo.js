@@ -363,16 +363,9 @@ function validateLkBase(lk) {
     if (!lk) return "missing libkernel base";
     if (lk.hi === 0) return "base hi=0 — need full 64-bit ptr";
     const off = loadEffectiveOff();
-    const tag = off && off.lk_base_tag != null ? (off.lk_base_tag & 0xfff) : null;
-    if (tag != null) {
-        if (((lk.low >>> 0) & 0xfff) !== tag)
-            return "expected lk …" + tag.toString(16) + " — got low12=0x"
-                + ((lk.low >>> 0) & 0xfff).toString(16);
-        return null;
-    }
-    if ((lk.low & 0x3fff) !== 0)
-        return "not 16KB-aligned — Calc lk from cal ext ptr (fn−RVA)";
-    return null;
+    const v = verifyLibkernelZeroRead(lk, off);
+    if (v.ok) return null;
+    return v.error || "not lk base";
 }
 
 function fmtHex32(v) {
@@ -3280,8 +3273,8 @@ function runTryBillZaiLk() {
         const v = verifyLibkernelZeroRead(lk, off, { via: "billzai" });
         if (v.ok) {
             saveLibkernelSession(lk, null, { forced: true });
-            mark("LK-BILLZAI-OK", String(lk) + " (0 reads — game-process trial base)");
-            state("BillZai accepted — Arm → Fire", "warn");
+            mark("LK-BILLZAI-OK", String(lk) + " (0 reads — 16KB-aligned lk, S.init/BillZai style)");
+            state("BillZai lk accepted — reload → usleep Start", "ok");
         } else {
             mark("LK-BILLZAI-MISS", v.error || "tag miss");
             state("BillZai base rejected", "bad");

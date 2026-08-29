@@ -2047,12 +2047,14 @@ function lkBaseTag(off) {
     return off && off.lk_base_tag != null ? (off.lk_base_tag & 0xfff) : null;
 }
 
-/** 13.52 lk_base ends in …c30 — not always 16KB page aligned. */
+/** 13.52 lk: Okage …c30 OR 16KB-aligned (e.g. BillZai/WebKit @ 0x80a67c000). */
 function looksLikeLkBase(lk, off) {
-    if (!lk || lk.hi < 0x8) return false;
+    if (!lk || lk.hi < 0x8 || lk.hi > 0x12) return false;
     const tag = lkBaseTag(off);
-    if (tag != null) return ((lk.low >>> 0) & 0xfff) === tag;
-    return lkAligned(lk);
+    if (tag != null && ((lk.low >>> 0) & 0xfff) === tag) return true;
+    if ((lk.low & 0x3fff) === 0) return true;
+    if (tag == null) return lkAligned(lk);
+    return false;
 }
 
 /**
@@ -2163,7 +2165,7 @@ export function verifyLibkernelZeroRead(lk, off, opts) {
         return {
             ok: false,
             error: tag != null
-                ? "want lk …" + tag.toString(16) + " got …" + lo12.toString(16)
+                ? "want …" + tag.toString(16) + " or 16KB-aligned, got …" + lo12.toString(16)
                 : "not lk-aligned",
         };
     }
