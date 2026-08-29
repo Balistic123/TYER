@@ -51,7 +51,7 @@ import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, fireGetpid } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250831f";
+const BUILD_ID = "rw-20250831g";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const SCAN_PIVOT_MIN = 0x10000;
@@ -469,26 +469,27 @@ let findLkPreset = null;
 const FIND_LK_LITE = {
     label: "lite",
     lite: true,
-    hdrCoarse: 32,
-    hdrFine: 0,
-    relroBatch: 8,
-    vtableEntries: 48,
-    absSpan: 0x8000,
-    absBatch: 12,
-    nearRadius: 0x800000,
-    maxPages: 64,
+    safeOnly: true,
+    maxWalkPages: 0,
+    knownMax: 2,
+    knownBatch: 1,
+    vtableEntries: 16,
 };
 const FIND_LK_NORM = {
     label: "norm",
     lite: false,
-    hdrCoarse: 64,
-    hdrFine: 128,
-    relroBatch: 16,
-    vtableEntries: 64,
-    absSpan: 0x20000,
-    absBatch: 16,
-    nearRadius: 0x2000000,
-    maxPages: 256,
+    safeOnly: false,
+    maxWalkPages: 24,
+    knownMax: 7,
+    knownBatch: 1,
+    vtableEntries: 32,
+    absSpan: 0x4000,
+    absBatch: 8,
+    nearRadius: 0x200000,
+    maxPages: 32,
+    hdrCoarse: 16,
+    hdrFine: 0,
+    relroBatch: 8,
 };
 
 function parseCalPtr(raw) {
@@ -2098,7 +2099,7 @@ async function runFindLkAuto(preset) {
             const chunk = resolveLibkernelRelroChunk(p, webkitBase, off, findLkState, opts);
             findLkState = chunk.state;
             if (chunk.phase === "got-scan-start")
-                mark("LK-GOT", "phase known-cal → vt → abs → nearlk (build=" + BUILD_ID + ")");
+                mark("LK-GOT", "lite=safe-only known+vtable (no blind scan) build=" + BUILD_ID);
             else if (chunk.phase === "known-start")
                 mark("LK-GOT", "known ext ptrs n=" + chunk.n);
             else if (chunk.phase === "known-done")
@@ -2155,7 +2156,7 @@ async function runFindLkAuto(preset) {
                 crashLog.flushSync();
                 renderOut();
             }
-            await new Promise(function (r) { setTimeout(r, 8); });
+            await new Promise(function (r) { setTimeout(r, findLkPreset.lite ? 24 : 8); });
         }
         if (findLkStop)
             mark("LK-FIND", "stopped");

