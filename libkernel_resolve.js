@@ -1074,7 +1074,7 @@ export function formatPsfreeStats(st) {
     return psfreeStatsLine(st);
 }
 
-/** cal / vtable ext ptr → candidate module bases (page + k__error). */
+/** cal / vtable ext ptr → candidate bases via Suchi RVA math only (0 reads). */
 export function extPtrToLkCandidates(p, fnPtr, off, webkitBase) {
     const out = [];
     const seen = new Set();
@@ -1086,10 +1086,9 @@ export function extPtrToLkCandidates(p, fnPtr, off, webkitBase) {
         out.push(lk);
     }
     if (!fnPtr) return out;
-    add(pageAlignDown(fnPtr, 0x4000));
-    add(pageAlignDown(fnPtr, 0x4000).sub32(0x4000));
-    const hit = lkFromFnPtrPsfree(p, fnPtr, off, null, webkitBase);
-    if (hit && hit.lk) add(hit.lk);
+    const zero = calcLkFromFnPtrZeroRead(fnPtr, off);
+    for (let i = 0; i < zero.length; i++)
+        add(zero[i].lk);
     return out;
 }
 
@@ -1999,6 +1998,86 @@ export function probeLibkernelGuesses(p, webkitBase, nativeFn, log) {
     return showLibkernelGuesses(webkitBase, nativeFn, log);
 }
 
+/** Suchi libkernel export RVAs from offset table — for fnPtr−RVA base calc. */
+const LK_RVA_PRI = {
+    k_usleep: 0,
+    k__error: 1,
+    k_open: 2,
+    k_read: 3,
+    k_write: 4,
+    k_close: 5,
+    k_stat: 6,
+    k_notify: 7,
+    k_socket: 8,
+    k_connect: 9,
+    k_mmap: 10,
+};
+
+export function libkernelRvaTable(off) {
+    off = off || {};
+    const out = [];
+    for (const key of Object.keys(off)) {
+        if (!key.startsWith("k_") || key === "k_stubs") continue;
+        const rva = off[key];
+        if (typeof rva !== "number" || rva <= 0) continue;
+        out.push({
+            key,
+            rva,
+            pri: LK_RVA_PRI[key] != null ? LK_RVA_PRI[key] : 40,
+        });
+    }
+    out.sort(function (a, b) {
+        return a.pri - b.pri || a.rva - b.rva;
+    });
+    return out;
+}
+
+function lkBaseTag(off) {
+    return off && off.lk_base_tag != null ? (off.lk_base_tag & 0xfff) : null;
+}
+
+/** 13.52 lk_base ends in …c30 — not always 16KB page aligned. */
+function looksLikeLkBase(lk, off) {
+    if (!lk || lk.hi < 0x8) return false;
+    const tag = lkBaseTag(off);
+    if (tag != null) return ((lk.low >>> 0) & 0xfff) === tag;
+    return lkAligned(lk);
+}
+
+/**
+ * lk = fnPtr − RVA — pure math, 0 reads.
+ * Filters by 13.52 lk_base …c30 tag when off.lk_base_tag is set.
+ */
+export function calcLkFromFnPtrZeroRead(fnPtr, off) {
+    if (!fnPtr || fnPtr.hi < 0x8) return [];
+    const table = libkernelRvaTable(off);
+    const out = [];
+    const seen = new Set();
+    for (let i = 0; i < table.length; i++) {
+        const row = table[i];
+        const lk = fnPtr.sub32(row.rva);
+        if (!looksLikeLkBase(lk, off)) continue;
+        const k = String(lk);
+        if (seen.has(k)) continue;
+        seen.add(k);
+        out.push({
+            lk,
+            rva: row.rva,
+            key: row.key,
+            via: "rva-" + row.key,
+            pri: row.pri,
+        });
+    }
+    out.sort(function (a, b) { return a.pri - b.pri; });
+    return out;
+}
+
+/** Single best lk guess from ext code ptr — 0 reads. */
+export function calcLkBestFromFnPtr(fnPtr, off) {
+    const cands = calcLkFromFnPtrZeroRead(fnPtr, off);
+    return cands.length ? cands[0] : null;
+}
+
 /**
  * lk = fnPtr − k_usleep when Suchi prologue @ fnPtr (no sprx / no decrypt).
  * Returns null if fnPtr is not usleep entry.
@@ -2544,10 +2623,24 @@ function discoverTextareaVtables(p, opts) {
     return { cells: cells.length, vtables: vtables, cellDbg: cellDbg };
 }
 
-/** Resolve ext import ptr → libkernel base — no fnPtr read, k__error then page walk. */
+/** Resolve ext import ptr → libkernel base — Suchi RVA subtract first (0 reads). */
 export function resolveExtPtrSafe(p, fnPtr, off, webkitBase, opts) {
     opts = opts || {};
     if (!fnPtr || fnPtr.hi < 0x8) return null;
+    const zero = calcLkFromFnPtrZeroRead(fnPtr, off);
+    if (zero.length) {
+        const hit = zero[0];
+        return {
+            lk: hit.lk,
+            iatRva: null,
+            fnPtr,
+            via: hit.via,
+            k__error: hit.key === "k__error" ? hit.rva : null,
+            rvaKey: hit.key,
+            rva: hit.rva,
+        };
+    }
+    if (opts.allowWalk === false) return null;
     const ctx = { fnPtr, webkitBase, off };
     const errs = kErrorCandidates(off);
     for (let i = 0; i < errs.length; i++) {
@@ -2565,10 +2658,26 @@ export function resolveExtPtrSafe(p, fnPtr, off, webkitBase, opts) {
     return resolveExtPtrPageWalk(p, fnPtr, webkitBase, off, opts.walkPages != null ? opts.walkPages : 64);
 }
 
-/** Resolve ext code ptr → libkernel base — never reads fnPtr (code page OOM on poops). */
+/** Resolve ext code ptr → libkernel base — Suchi RVA subtract first (0 reads on poops). */
 function resolveExtPtrToLibkernel(p, fnPtr, off, webkitBase, iatRva, opts) {
     opts = opts || {};
     if (!fnPtr || fnPtr.hi < 0x8) return null;
+
+    const zero = calcLkFromFnPtrZeroRead(fnPtr, off);
+    if (zero.length) {
+        const hit = zero[0];
+        return {
+            lk: hit.lk,
+            iatRva,
+            fnPtr,
+            strong: false,
+            via: hit.via,
+            rvaKey: hit.key,
+            rva: hit.rva,
+        };
+    }
+
+    if (opts.zeroReadOnly) return null;
 
     const errs = kErrorCandidates(off);
     const errMax = opts.errMax != null ? opts.errMax

@@ -81,8 +81,16 @@ const LIBKERNEL_1352 = {
     k__error:                           0x1bb0,
     k_usleep:                           0x13b20,
     k_open:                             0x148d0,
+    k_close:                            0x14900,
     k_read:                             0x14870,
     k_write:                            0x148a0,
+    k_stat:                             0x15310,
+    k_notify:                           0x19320,
+    k_socket:                           0x45f0,
+    k_connect:                          0xc990,
+    k_mmap:                             0x114e0,
+    /** Okage HW — lk_base low 12 bits on 13.52 retail */
+    lk_base_tag:                        0xc30,
     /** BillZaiD game process — trial only, verify before use */
     billzai_lk_base:                    "0x80a67c000",
     k_stubs: {
