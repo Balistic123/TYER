@@ -52,7 +52,7 @@ import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, fireGetpid } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250831i";
+const BUILD_ID = "rw-20250831j";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const SCAN_PIVOT_MIN = 0x10000;
@@ -472,20 +472,24 @@ const FIND_LK_LITE = {
     lite: true,
     safeOnly: true,
     maxWalkPages: 0,
-    knownMax: 7,
-    knownWalkPages: 16,
+    knownMax: 0,
+    knownWalkPages: 0,
     knownBatch: 1,
-    vtableEntries: 16,
+    vtableEntries: 8,
+    vtBatch: 1,
+    cellMax: 2,
 };
 const FIND_LK_NORM = {
     label: "norm",
     lite: false,
     safeOnly: true,
     maxWalkPages: 0,
-    knownMax: 7,
-    knownWalkPages: 24,
+    knownMax: 0,
+    knownWalkPages: 0,
     knownBatch: 1,
-    vtableEntries: 32,
+    vtableEntries: 12,
+    vtBatch: 2,
+    cellMax: 3,
 };
 
 function parseCalPtr(raw) {
@@ -2111,12 +2115,9 @@ async function runFindLkAuto(preset) {
                 mark("LK-GOT", "lite=safe-only known+vtable (no blind scan) build=" + BUILD_ID);
             else if (chunk.phase === "known-start")
                 mark("LK-GOT", "known ext ptrs n=" + chunk.n);
-            else if (chunk.phase === "known-done") {
-                mark("LK-GOT", "known miss tried=" + (chunk.tried || 0) + " — vtable scan");
-                const kp = knownExtPtrsForLk().slice(0, chunk.tried || 7);
-                for (let ki = 0; ki < kp.length; ki++)
-                    mark("LK-KNOWN", kp[ki] + " miss (k__error+walk)");
-            }
+            else if (chunk.phase === "known-skip" || chunk.phase === "known-done")
+                mark("LK-GOT", (chunk.phase === "known-skip" ? "known skipped (OOM-safe)" : "known miss tried=" + (chunk.tried || 0))
+                    + " — vtable scan");
             else if (chunk.phase === "vt-ready")
                 mark("LK-GOT", "vtable " + chunk.vtable
                     + " n=" + (chunk.vtCount || 1) + " cells=" + (chunk.cells || "?")
@@ -2173,7 +2174,7 @@ async function runFindLkAuto(preset) {
                 crashLog.flushSync();
                 renderOut();
             }
-            await new Promise(function (r) { setTimeout(r, findLkPreset.lite ? 24 : 8); });
+            await new Promise(function (r) { setTimeout(r, findLkPreset.lite ? 48 : 24); });
         }
         if (findLkStop)
             mark("LK-FIND", "stopped");

