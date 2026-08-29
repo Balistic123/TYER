@@ -89,7 +89,10 @@ const LIBKERNEL_1300 = {
 };
 
 PS4["13.52"] = Object.assign({}, PS4["13.50"], LIBKERNEL_1300, {
-    fw_status: "13.52 HW pop + pivot G0-G5 (7/7). libkernel via PSFree PLT — NOT wk___imp___error",
+    fw_status: "13.52 HW pop + pivot G0-G5 (7/7). libkernel via PSFree low PLT — NOT wk___imp___error",
+    /** Low .text PLT stub RVAs — fill from ghidra_analysis/scripts/find_webkit_plt.py on poops dump */
+    wk_plt_stack_chk_fail: null,
+    wk_plt___error: null,
     wk_expm1_builtin:                 0xeb6350,
     wk_POP_RDI_RET:                     0x4be55,
     wk_POP_RSI_RET:                     0x7acb3,

@@ -603,7 +603,7 @@ function findModuleBaseBackward(p, addr, maxPages) {
 }
 
 /** PLT stub @ webkit+pltRva — ff 25 or ff 15 → GOT slot → target fn ptr. */
-function resolvePltImportAt(p, webkitBase, pltRva) {
+export function resolvePltImportAt(p, webkitBase, pltRva) {
     if (pltRva == null) return null;
     const base = moduleLoadBase(p, webkitBase);
     const stub = base.add32(pltRva);
@@ -614,11 +614,172 @@ function resolvePltImportAt(p, webkitBase, pltRva) {
     return read8p(p, stub.add32(6 + disp));
 }
 
+/** Walk back ≤maxPages×16KB from code ptr looking for ELF/SCE header (≤maxPages reads). */
+function findBaseLite(p, codePtr, maxPages) {
+    maxPages = maxPages || 12;
+    if (!codePtr || codePtr.hi < 0x8) return null;
+    let page = pageAlignDown(codePtr, 0x4000);
+    for (let i = 0; i < maxPages; i++) {
+        const w = read4p(p, page);
+        if (w === ELF_MAGIC) return { lk: page, kind: "elf" };
+        if (w === SCE_MAGIC) return { lk: page, kind: "sce" };
+        page = page.sub32(0x4000);
+        if (page.hi < 0x8) break;
+    }
+    return null;
+}
+
+/** PSFree resolve: PLT → fn ptr → findBaseLite (no 256-page walk). */
+function lkFromFnPtrPsfree(p, fnPtr, off, pltRva) {
+    if (!fnPtr || fnPtr.hi < 0x8) return null;
+    const got = findBaseLite(p, fnPtr, 12);
+    if (got)
+        return { lk: got.lk, iatRva: pltRva, via: got.kind, fnPtr };
+    if (isGetpidStub(fnPtr)) {
+        const hit = lkFromStubAddrLite(p, fnPtr, off);
+        if (hit)
+            return { lk: hit.lk, iatRva: pltRva, via: "getpid-stub", fnPtr };
+    }
+    return null;
+}
+
+function tryOnePsfreePlt(p, webkitBase, off, pltRva) {
+    const fn = resolvePltImportAt(p, webkitBase, pltRva);
+    if (!fn) return null;
+    const hit = lkFromFnPtrPsfree(p, fn, off, pltRva);
+    if (!hit) return null;
+    const stubOff = (off.k_stubs && off.k_stubs[20]) || 0x2cb70;
+    const stub = read8p(p, hit.lk.add32(stubOff));
+    if (stub && !isGetpidStub(stub))
+        return null;
+    saveLibkernelSession(hit.lk, hit.iatRva);
+    return {
+        lk: hit.lk,
+        pltRva,
+        fnPtr: fn,
+        via: hit.via,
+        stubOk: !!stub,
+    };
+}
+
+/**
+ * One UI tap — try next PLT candidates (bounded reads).
+ * Phase 1: known PSFree RVAs. Phase 2: low .text ff25/ff15 scan.
+ */
+export function tryPsfreePltBatch(p, webkitBase, off, state) {
+    const MAX_READS = 28;
+    let reads = 0;
+
+    if (!state) {
+        state = {
+            phase: "cand",
+            candIdx: 0,
+            cands: importPltCandidates(off),
+            base: moduleLoadBase(p, webkitBase),
+            cursor: 0x1000,
+            end: LK_LOW_TEXT_MAX,
+            tried: 0,
+        };
+    }
+
+    if (state.phase === "cand") {
+        const cands = state.cands || IMPORT_PLT_CANDS;
+        while (state.candIdx < cands.length && reads + 4 <= MAX_READS) {
+            const pltRva = cands[state.candIdx++];
+            state.tried++;
+            reads += 4;
+            const hit = tryOnePsfreePlt(p, webkitBase, off, pltRva);
+            if (hit) {
+                return {
+                    done: true,
+                    ok: true,
+                    lk: hit.lk,
+                    pltRva: hit.pltRva,
+                    fnPtr: hit.fnPtr,
+                    via: hit.via,
+                    stubOk: hit.stubOk,
+                    source: "psfree+" + hit.pltRva.toString(16),
+                    state,
+                    phase: "hit",
+                    tried: state.tried,
+                };
+            }
+        }
+        state.phase = "scan";
+    }
+
+    while (state.cursor < state.end && reads + 4 <= MAX_READS) {
+        const rva = state.cursor;
+        state.cursor += 4;
+        reads += 1;
+        const op = read2p(p, state.base.add32(rva));
+        if (op !== 0x25ff && op !== 0x15ff) continue;
+        state.tried++;
+        reads += 3;
+        const hit = tryOnePsfreePlt(p, webkitBase, off, rva);
+        if (hit) {
+            return {
+                done: true,
+                ok: true,
+                lk: hit.lk,
+                pltRva: hit.pltRva,
+                fnPtr: hit.fnPtr,
+                via: hit.via,
+                stubOk: hit.stubOk,
+                source: "psfree-scan+" + hit.pltRva.toString(16),
+                state,
+                phase: "hit",
+                tried: state.tried,
+            };
+        }
+    }
+
+    if (state.cursor >= state.end) {
+        return {
+            done: true,
+            ok: false,
+            error: "PSFree PLT exhausted",
+            state: null,
+            phase: "miss",
+            tried: state.tried,
+        };
+    }
+
+    return {
+        done: false,
+        ok: false,
+        state,
+        phase: "scan",
+        cursor: state.cursor,
+        tried: state.tried,
+    };
+}
+
 /** Known __stack_chk_fail / early PLT stub RVAs from PSFree ports (low .text, NOT high IAT). */
 const IMPORT_PLT_CANDS = [
     0x178, 0x188, 0x8d8, 0x918, 0x2438, 0x500, 0x600, 0x800, 0xa00, 0xc00,
     0x1000, 0x1200, 0x1400, 0x1600, 0x2000,
 ];
+
+function importPltCandidates(off) {
+    const out = [];
+    const seen = new Set();
+    function add(rva) {
+        if (rva == null || rva < 0x100) return;
+        const k = rva >>> 0;
+        if (seen.has(k)) return;
+        seen.add(k);
+        out.push(k);
+    }
+    if (off) {
+        add(off.wk_plt_stack_chk_fail);
+        add(off.wk_plt___error);
+        add(off.wk_plt_memcpy);
+    }
+    for (let i = 0; i < IMPORT_PLT_CANDS.length; i++)
+        add(IMPORT_PLT_CANDS[i]);
+    return out;
+}
 
 function moduleBaseIsLibkernel(p, base) {
     if (!base) return false;
@@ -1797,20 +1958,18 @@ export function resolveLibkernelPsfree(p, webkitBase, off, opts) {
     const log = opts.log || (() => {});
     const cap = iatCap(off);
 
-    for (let i = 0; i < IMPORT_PLT_CANDS.length; i++) {
-        const pltRva = IMPORT_PLT_CANDS[i];
+    const cands = importPltCandidates(off);
+    for (let i = 0; i < cands.length; i++) {
+        const pltRva = cands[i];
         if (pltRva >= cap) continue;
-        const fn = resolvePltImportAt(p, webkitBase, pltRva);
-        if (!fn) continue;
-        const hit = lkFromFnPtr(p, fn, off, null);
+        const hit = tryOnePsfreePlt(p, webkitBase, off, pltRva);
         if (hit) {
-            saveLibkernelSession(hit.lk, hit.iatRva);
             log("LK-PSFREE", "plt+0x" + pltRva.toString(16) + " → " + hit.lk
                 + " (" + hit.via + ")");
             return {
                 ok: true,
                 lk: hit.lk,
-                iatRva: hit.iatRva,
+                iatRva: pltRva,
                 source: "psfree+" + pltRva.toString(16),
                 pltRva,
             };
@@ -2013,7 +2172,7 @@ function scanPsfreePltChunk(p, webkitBase, off, state) {
                 state.tried++;
                 const fn = resolvePltImportAt(p, webkitBase, rva);
                 if (fn) {
-                    const hit = lkFromFnPtr(p, fn, off, null);
+                    const hit = lkFromFnPtrPsfree(p, fn, off, rva);
                     if (hit) {
                         saveLibkernelSession(hit.lk, hit.iatRva);
                         return {

