@@ -2211,49 +2211,199 @@ export function resolveExtModuleHunt(p, fnPtr, webkitBase, off, maxPages) {
     return d.hit || null;
 }
 
-/** Chunked scan below webkit for SCE + syscall stubs (no ext ptr, no dump). */
-export function huntLibkernelBelowWebkit(p, webkitBase, off, pageOffset, batchPages) {
-    if (!p || !webkitBase) return { miss: true, error: "no webkitBase" };
-    pageOffset = pageOffset != null ? pageOffset : 0;
-    batchPages = batchPages != null ? batchPages : 8;
+/** Chunked scan below webkitBase for libkernel (SCE magic + stub score). */
+export function huntLibkernelBelowWebkitChunk(p, webkitBase, off, state, opts) {
+    opts = opts || {};
     const step = 0x4000n;
-    const wb = ptrBig(webkitBase) & ~0x3fffn;
-    const lo = wb - BigInt((pageOffset + batchPages)) * step;
-    const hi = wb - BigInt(pageOffset) * step;
-    let cursor = lo;
-    let scanned = 0;
-    let best = null;
+    const maxPages = opts.maxPages != null ? opts.maxPages : 2048;
+    const batchN = opts.batchPages != null ? opts.batchPages : 6;
 
-    while (cursor < hi && scanned < batchPages) {
-        const addr = bigToPtr(cursor);
-        cursor += step;
-        scanned++;
+    if (!p || !webkitBase)
+        return { done: true, ok: false, error: "no webkitBase", phase: "hunt-skip" };
+
+    if (!state) {
+        const wb = ptrBig(webkitBase) & ~0x3fffn;
+        const end = wb > BigInt(maxPages) * step ? wb - BigInt(maxPages) * step : 0n;
+        state = {
+            wb,
+            cursor: wb - step,
+            end,
+            pages: 0,
+            modules: 0,
+            best: null,
+        };
+        return {
+            done: false,
+            state,
+            phase: "hunt-start",
+            wk: String(webkitBase),
+            maxPages,
+            depthMb: (maxPages * 0x4000 / (1024 * 1024)).toFixed(1),
+        };
+    }
+
+    let batch = 0;
+    while (state.cursor > state.end && batch < batchN && state.pages < maxPages) {
+        const addr = bigToPtr(state.cursor);
+        state.cursor -= step;
+        state.pages++;
+        batch++;
         if (!addr || addr.hi < 0x8 || (addr.low & 0x3fff) !== 0) continue;
         const magic = read4p(p, addr);
         if (magic == null) continue;
-        if (isModuleMagic(magic) && !isSameWebkitModule(addr, webkitBase, off)) {
-            const stubs = liteSyscallStubScore(p, addr);
-            if (stubs >= 2)
-                return { lk: addr, via: "below-wk+sce", stubs, offset: pageOffset + scanned };
-            if (!best || stubs > best.stubs)
-                best = { lk: addr, via: "below-wk+sce", stubs, offset: pageOffset + scanned };
-        }
-        if (checkPrologueAt(p, addr)) {
-            const stubs = liteSyscallStubScore(p, addr);
-            if (stubs >= 2)
-                return { lk: addr, via: "below-wk+pro", stubs, offset: pageOffset + scanned };
-            if (!best || stubs > best.stubs)
-                best = { lk: addr, via: "below-wk+pro", stubs, offset: pageOffset + scanned };
+        if (!isModuleMagic(magic) || isSameWebkitModule(addr, webkitBase, off)) continue;
+        state.modules++;
+        const stubs = liteSyscallStubScore(p, addr);
+        const pro = checkPrologueAt(p, addr) ? 10 : 0;
+        const sc = stubs + pro;
+        if (!state.best || sc > state.best.sc)
+            state.best = { lk: addr, stubs, sc, magic: magic >>> 0 };
+        if (stubs >= 3) {
+            saveLibkernelSession(addr, null);
+            return {
+                done: true,
+                ok: true,
+                lk: addr,
+                stubs,
+                source: "hunt-below-wk",
+                state,
+                phase: "hunt-hit",
+                pages: state.pages,
+                modules: state.modules,
+            };
         }
     }
 
-    if (best && best.stubs >= 1)
-        return Object.assign({ weak: true }, best);
+    if (state.cursor <= state.end || state.pages >= maxPages) {
+        if (state.best && state.best.stubs >= 1) {
+            saveLibkernelSession(state.best.lk, null);
+            return {
+                done: true,
+                ok: true,
+                lk: state.best.lk,
+                stubs: state.best.stubs,
+                weak: true,
+                source: "hunt-below-best",
+                state,
+                phase: "hunt-best",
+                pages: state.pages,
+                modules: state.modules,
+                bestSc: state.best.sc,
+            };
+        }
+        return {
+            done: true,
+            ok: false,
+            state,
+            phase: "hunt-miss",
+            pages: state.pages,
+            modules: state.modules,
+        };
+    }
+
     return {
-        miss: true,
-        offset: pageOffset + batchPages,
-        scanned,
-        bestStubs: best ? best.stubs : 0,
+        done: false,
+        state,
+        phase: "hunt",
+        pages: state.pages,
+        modules: state.modules,
+        at: bigToPtr(state.cursor) ? String(bigToPtr(state.cursor)) : "?",
+    };
+}
+
+/** Poops RELRO import slots @ webkit+RVA → module stub score (uses webkitBase only). */
+export function scanPoopsImportChunk(p, webkitBase, off, state, opts) {
+    opts = opts || {};
+    if (!p || !webkitBase)
+        return { done: true, ok: false, phase: "imp-skip" };
+
+    if (!state) {
+        const w0 = read4p(p, webkitBase);
+        const ranges = (w0 === POOPS_TEXT_MAGIC || isPoopsTextBase(p, webkitBase))
+            ? poopsRelroRanges(off, true) : [];
+        if (!ranges.length)
+            return { done: true, ok: false, phase: "imp-skip", error: "no poops RELRO" };
+        const base = moduleLoadBase(p, webkitBase);
+        state = {
+            loadBase: base,
+            ranges,
+            rangeIdx: 0,
+            cursor: ranges[0].lo,
+            endRva: ranges[0].hi,
+            tried: 0,
+            best: null,
+        };
+        return {
+            done: false,
+            state,
+            phase: "imp-start",
+            span: ranges.map(function (r) {
+                return r.tag + ":0x" + r.lo.toString(16);
+            }).join(" "),
+        };
+    }
+
+    const batchMax = opts.impBatch != null ? opts.impBatch : 6;
+    const walkPages = opts.impWalkPages != null ? opts.impWalkPages : 24;
+    let batch = 0;
+    while (state.cursor < state.endRva && batch < batchMax) {
+        const rva = state.cursor;
+        state.cursor += 8;
+        state.tried++;
+        batch++;
+        const fnPtr = read8p(p, state.loadBase.add32(rva));
+        if (!fnPtr || !plausibleExtPtr(fnPtr, state.loadBase, off)) continue;
+        const hdr = findModuleBaseBeforeCode(p, fnPtr, webkitBase, off, walkPages);
+        if (!hdr) continue;
+        const stubs = liteSyscallStubScore(p, hdr);
+        if (!state.best || stubs > state.best.stubs)
+            state.best = { lk: hdr, stubs, rva, fn: String(fnPtr) };
+        if (stubs >= 2) {
+            saveLibkernelSession(hdr, null);
+            return {
+                done: true,
+                ok: true,
+                lk: hdr,
+                stubs,
+                source: "poops-imp+" + rva.toString(16),
+                state,
+                phase: "imp-hit",
+                tried: state.tried,
+            };
+        }
+    }
+
+    if (state.cursor >= state.endRva) {
+        const next = state.rangeIdx + 1;
+        if (next < state.ranges.length) {
+            state.rangeIdx = next;
+            state.cursor = state.ranges[next].lo;
+            state.endRva = state.ranges[next].hi;
+            return { done: false, state, phase: "imp-region", tried: state.tried };
+        }
+        if (state.best && state.best.stubs >= 1) {
+            saveLibkernelSession(state.best.lk, null);
+            return {
+                done: true,
+                ok: true,
+                lk: state.best.lk,
+                stubs: state.best.stubs,
+                weak: true,
+                source: "poops-imp-best+" + state.best.rva.toString(16),
+                state,
+                phase: "imp-best",
+                tried: state.tried,
+            };
+        }
+        return { done: true, ok: false, state, phase: "imp-miss", tried: state.tried };
+    }
+
+    return {
+        done: false,
+        state,
+        phase: "imp",
+        cursor: state.cursor,
+        tried: state.tried,
     };
 }
 

