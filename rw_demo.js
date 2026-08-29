@@ -55,8 +55,9 @@ import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, fireGetpid } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250832b";
+const BUILD_ID = "rw-20250832c";
 const SS_HUNT_TRACE = "wk-hunt-trace";
+const SS_HUNT_STATE = "wk-hunt-state";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const SCAN_PIVOT_MIN = 0x10000;
@@ -2380,6 +2381,38 @@ function huntTracePush(line) {
     } catch (_) { }
 }
 
+function saveHuntState(webkitBase, st) {
+    try {
+        sessionStorage.setItem(SS_HUNT_STATE, JSON.stringify({
+            build: BUILD_ID,
+            webkitBase: String(webkitBase),
+            state: st,
+        }));
+    } catch (_) { }
+}
+
+function loadHuntState() {
+    try {
+        const raw = sessionStorage.getItem(SS_HUNT_STATE);
+        return raw ? JSON.parse(raw) : null;
+    } catch (_) {
+        return null;
+    }
+}
+
+function clearHuntState() {
+    try { sessionStorage.removeItem(SS_HUNT_STATE); } catch (_) { }
+}
+
+function replayHuntTrace() {
+    try {
+        const arr = JSON.parse(sessionStorage.getItem(SS_HUNT_TRACE + "-log") || "[]");
+        if (!arr.length) return;
+        for (let i = 0; i < arr.length; i++)
+            mark("LK-HUNT-TRACE", arr[i]);
+    } catch (_) { }
+}
+
 function huntProbePreLine(st) {
     if (!st || !st.addrs || st.idx >= st.addrs.length) return null;
     const c = st.addrs[st.idx];
@@ -2407,9 +2440,20 @@ async function runHuntLkBelow() {
     huntLkStage = "cand";
     busy = true;
     setUi();
-    try { sessionStorage.removeItem(SS_HUNT_TRACE + "-log"); } catch (_) { }
-    mark("LK-HUNT", "webkit=" + webkitBase + " 8×1read build=" + BUILD_ID);
-    huntTracePush("START wk=" + webkitBase);
+
+    const saved = loadHuntState();
+    if (saved && saved.build === BUILD_ID && saved.webkitBase === String(webkitBase) && saved.state
+        && saved.state.idx < saved.state.addrs.length) {
+        huntLkState = saved.state;
+        mark("LK-HUNT", "resume @" + (saved.state.idx + 1) + "/" + saved.state.addrs.length
+            + " build=" + BUILD_ID);
+        huntTracePush("RESUME @" + (saved.state.idx + 1));
+    } else {
+        clearHuntState();
+        try { sessionStorage.removeItem(SS_HUNT_TRACE + "-log"); } catch (_) { }
+        mark("LK-HUNT", "webkit=" + webkitBase + " 8×1read build=" + BUILD_ID);
+        huntTracePush("START wk=" + webkitBase);
+    }
     renderOut();
     crashLog.flushSync();
 
@@ -2440,26 +2484,27 @@ async function runHuntLkBelow() {
 
             if (chunk.probe) {
                 const post = huntProbePostLine(chunk.probe);
-                mark("LK-HUNT-READ", post);
-                huntTracePush("READ " + post);
+                if (chunk.phase === "cand-skip-probe") {
+                    mark("LK-HUNT-SKIP", post);
+                    huntTracePush("SKIP " + post);
+                } else {
+                    mark("LK-HUNT-READ", post);
+                    huntTracePush("READ " + post);
+                }
+                if (huntLkState && !chunk.done)
+                    saveHuntState(webkitBase, huntLkState);
                 renderOut();
                 crashLog.flushSync();
             }
 
-            if (chunk.phase === "cand-budget") {
-                mark("LK-HUNT", "read budget " + chunk.reads + " — stop");
-                huntTracePush("BUDGET " + chunk.reads);
-            } else if (chunk.phase === "cand-null-cliff") {
-                mark("LK-HUNT", "null cliff after " + (chunk.nulls || 0) + " unmapped — stop");
-                huntTracePush("CLIFF nulls=" + (chunk.nulls || 0));
-            }
-
             if (chunk.done && chunk.ok) {
+                clearHuntState();
                 finishHuntLkHit(chunk);
                 return;
             }
 
             if (chunk.done) {
+                clearHuntState();
                 let summary = "reads=" + (chunk.reads || 0) + " nulls=" + (chunk.nulls != null ? chunk.nulls : "?");
                 if (chunk.log && chunk.log.length) {
                     const bits = [];
@@ -2471,11 +2516,19 @@ async function runHuntLkBelow() {
                 }
                 mark("LK-HUNT-MISS", summary);
                 huntTracePush("MISS " + summary);
-                state("hunt miss — see LK-HUNT-READ lines", "bad");
+                state("hunt miss — mapped≠SCE; re-click Hunt lk to resume if partial", "bad");
                 break;
             }
 
-            await new Promise(function (r) { setTimeout(r, 48); });
+            if (chunk.phase === "cand-budget") {
+                mark("LK-HUNT", "read budget " + chunk.reads + " — stop");
+                huntTracePush("BUDGET " + chunk.reads);
+            } else if (chunk.phase === "cand-null-cliff") {
+                mark("LK-HUNT", "null cliff after " + (chunk.nulls || 0) + " unmapped — stop");
+                huntTracePush("CLIFF nulls=" + (chunk.nulls || 0));
+            }
+
+            await new Promise(function (r) { setTimeout(r, 96); });
         }
     } catch (err) {
         mark("LK-HUNT-ERR", err.message || String(err));
@@ -3438,6 +3491,7 @@ function init() {
     mark("BOOT", "build=" + BUILD_ID + " — logs persist across reload/crash");
     mark("BOOT", "LK-PROBE line shows dynamic parse status");
     mark("BOOT", groomBootLine(params));
+    replayHuntTrace();
     window.addEventListener("beforeunload", function () {
         stopPivotScanQuiet();
         if (stateEl) crashLog.persistState(stateEl.textContent, stateEl.className, true);
