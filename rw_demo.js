@@ -46,7 +46,7 @@ import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, fireGetpid } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830k";
+const BUILD_ID = "rw-20250830l";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const SCAN_PIVOT_MIN = 0x10000;
@@ -219,7 +219,10 @@ function setUi() {
     if (btnLoadCal) btnLoadCal.disabled = busy || !ready;
     if (btnForceLk) btnForceLk.disabled = busy || !ready;
     if (btnGuessLk) btnGuessLk.disabled = busy || !ready;
-    if (btnPsfreeLk) btnPsfreeLk.disabled = busy || !ready;
+    if (btnPsfreeLk) {
+        btnPsfreeLk.disabled = !ready || (busy && !psfreeAutoScan);
+        btnPsfreeLk.textContent = psfreeAutoScan ? "Stop PSFree" : "PSFree lk";
+    }
     if (btnPeek) btnPeek.disabled = busy || !ready;
     if (pickPtr) pickPtr.disabled = busy || !ready;
     if (addrIn) addrIn.disabled = busy || !ready;
@@ -363,6 +366,10 @@ let calPtrIdx = 0;
 let guessLkIdx = 0;
 let calLkCands = null;
 let psfreePltState = null;
+let psfreeAutoScan = false;
+let psfreeAutoStop = false;
+const PSFREE_READS_BATCH = parseInt(params.get("psfreereads") || "768", 10);
+const PSFREE_YIELD_BATCHES = parseInt(params.get("psfreeyield") || "4", 10);
 
 function parseCalPtr(raw) {
     const s = String(raw).replace(/^0x/i, "").trim();
@@ -1860,9 +1867,40 @@ function runGuessLk() {
     renderOut();
 }
 
-/** One tap — bounded PSFree PLT probe (~28 reads). Tap until LK-PSFREE-OK or miss. */
-function runPsfreeLkStep() {
-    if (!ready || busy || !window.p) return;
+function finishPsfreeChunk(chunk) {
+    if (chunk.ok && chunk.lk) {
+        psfreePltState = null;
+        psfreeAutoScan = false;
+        psfreeAutoStop = false;
+        if (addrIn) addrIn.value = String(chunk.lk);
+        mark("LK-PSFREE-OK", chunk.source + " → " + chunk.lk
+            + " plt+0x" + chunk.pltRva.toString(16)
+            + (chunk.stubOk ? " stub20=OK" : "")
+            + " build=" + BUILD_ID);
+        state("PSFree lk OK — Force lk → Arm → Fire", "ok");
+        crashLog.append("LK-PSFREE-OK " + chunk.lk + " plt=" + chunk.pltRva, "LK-PSFREE");
+        crashLog.flushSync();
+        return true;
+    }
+    if (chunk.done && !chunk.ok) {
+        psfreePltState = null;
+        psfreeAutoScan = false;
+        psfreeAutoStop = false;
+        mark("LK-PSFREE-MISS", chunk.error || "no PLT hit tried=" + chunk.tried);
+        state("PSFree miss — Load cal ptr or Guess lk", "bad");
+        return true;
+    }
+    return false;
+}
+
+/** Auto PSFree PLT scan — runs until hit/miss/stop. */
+async function runPsfreeLkAuto() {
+    if (!ready || !window.p) return;
+    if (psfreeAutoScan) {
+        psfreeAutoStop = true;
+        state("PSFree stopping…", "warn");
+        return;
+    }
     const p = window.p;
     const off = loadEffectiveOff();
     const { webkitBase } = basesFromSession(off);
@@ -1870,44 +1908,66 @@ function runPsfreeLkStep() {
         mark("LK-SKIP", "no webkitBase — Start first");
         return;
     }
+
+    psfreeAutoScan = true;
+    psfreeAutoStop = false;
     busy = true;
     setUi();
+    mark("LK-PSFREE", "auto scan reads/batch=" + PSFREE_READS_BATCH
+        + " build=" + BUILD_ID);
+    renderOut();
+
+    const batchOpts = { maxReads: PSFREE_READS_BATCH };
+    let loops = 0;
+    let lastLog = 0;
+
     try {
-        const chunk = tryPsfreePltBatch(p, webkitBase, off, psfreePltState);
-        psfreePltState = chunk.state;
-        if (chunk.ok && chunk.lk) {
-            psfreePltState = null;
-            if (addrIn) addrIn.value = String(chunk.lk);
-            mark("LK-PSFREE-OK", chunk.source + " → " + chunk.lk
-                + " plt+0x" + chunk.pltRva.toString(16)
-                + (chunk.stubOk ? " stub20=OK" : "")
-                + " build=" + BUILD_ID);
-            state("PSFree lk OK — Force lk → Arm → Fire", "ok");
-            crashLog.append("LK-PSFREE-OK " + chunk.lk + " plt=" + chunk.pltRva, "LK-PSFREE");
-            crashLog.flushSync();
-        } else if (chunk.done && !chunk.ok) {
-            psfreePltState = null;
-            mark("LK-PSFREE-MISS", chunk.error || "no PLT hit tried=" + chunk.tried);
-            state("PSFree miss — Load cal ptr or Guess lk", "bad");
-        } else {
-            const prog = "phase=" + chunk.phase
-                + " cursor=+0x" + (chunk.cursor || 0).toString(16)
-                + " tried=" + chunk.tried;
-            if (chunk.lastPlt != null)
-                mark("LK-PSFREE", prog + " last=plt+0x" + chunk.lastPlt.toString(16)
-                    + (chunk.lastFn ? " fn=" + chunk.lastFn : " (no import)"));
-            else
-                mark("LK-PSFREE", prog + " — tap again");
-            state("PSFree scan… tried=" + chunk.tried, "warn");
+        while (psfreeAutoScan && !psfreeAutoStop) {
+            let inner = 0;
+            while (inner < PSFREE_YIELD_BATCHES && !psfreeAutoStop) {
+                const chunk = tryPsfreePltBatch(p, webkitBase, off, psfreePltState, batchOpts);
+                psfreePltState = chunk.state;
+                if (finishPsfreeChunk(chunk)) {
+                    renderOut();
+                    return;
+                }
+                inner++;
+                loops++;
+            }
+            const cur = psfreePltState;
+            const cursor = cur ? cur.cursor : 0;
+            const tried = cur ? cur.tried : 0;
+            const phase = cur ? cur.phase : "?";
+            if (loops - lastLog >= 1) {
+                lastLog = loops;
+                state("PSFree auto " + phase + " +0x" + cursor.toString(16)
+                    + " tried=" + tried, "warn");
+                if (lines.length > 12) lines.splice(0, lines.length - 12);
+                mark("LK-PSFREE", "auto +" + cursor.toString(16) + " tried=" + tried
+                    + " phase=" + phase);
+                renderOut();
+            }
+            await new Promise(function (r) { setTimeout(r, 0); });
+        }
+        if (psfreeAutoStop) {
+            mark("LK-PSFREE", "auto stopped tried="
+                + (psfreePltState ? psfreePltState.tried : 0));
+            state("PSFree stopped", "warn");
         }
     } catch (err) {
         mark("LK-PSFREE-FAIL", err.message || String(err));
         state("PSFree error", "bad");
     } finally {
+        psfreeAutoScan = false;
+        psfreeAutoStop = false;
         busy = false;
         setUi();
         renderOut();
     }
+}
+
+function runPsfreeLkStep() {
+    runPsfreeLkAuto();
 }
 
 async function runLeakLkScan() {
@@ -2633,7 +2693,7 @@ function init() {
     wireClick(btnLoadCal, function () { runTryCalPtrs(); });
     wireClick(btnForceLk, function () { runManualTest("force-lk"); });
     wireClick(btnGuessLk, function () { runGuessLk(); });
-    wireClick(btnPsfreeLk, function () { runPsfreeLkStep(); });
+    wireClick(btnPsfreeLk, function () { return runPsfreeLkAuto(); });
     wireClick(btnClear, function () {
         lines.length = 0;
         clearPersistedLog();

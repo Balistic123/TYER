@@ -666,8 +666,9 @@ function tryOnePsfreePlt(p, webkitBase, off, pltRva) {
  * One UI tap — try next PLT candidates (bounded reads).
  * Phase 1: known PSFree RVAs. Phase 2: low .text ff25/ff15 scan.
  */
-export function tryPsfreePltBatch(p, webkitBase, off, state) {
-    const MAX_READS = 28;
+export function tryPsfreePltBatch(p, webkitBase, off, state, opts) {
+    opts = opts || {};
+    const MAX_READS = opts.maxReads || 28;
     let reads = 0;
 
     if (!state) {
