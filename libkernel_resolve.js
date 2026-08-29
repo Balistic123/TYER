@@ -2224,6 +2224,8 @@ function microStubScore(p, base) {
 
 /** Poops HW: wk-1800000 read OOMs even when neighboring probes map. */
 const LK_HUNT_TOXIC_DELTAS = new Set([0x1800000]);
+
+function classifyProbeMagic(w, addr, webkitBase, off) {
     if (w == null) return "UNMAPPED";
     if (webkitBase && isSameWebkitModule(addr, webkitBase, off)) return "webkit";
     if (w === SCE_MAGIC) return "SCE";
