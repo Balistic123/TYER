@@ -68,7 +68,7 @@
     <button type="button" class="secondary" id="btn-rw-proof" disabled>RW proof map</button>
     <button type="button" class="secondary" id="btn-scan-pivot" disabled>Scan pivot (auto)</button>
     <button type="button" class="secondary" id="btn-verify-pivot" disabled>Verify pivot</button>
-    <button type="button" class="secondary" id="btn-native" disabled>Native call</button>
+    <button type="button" class="secondary" id="btn-native" disabled>Quick getpid</button>
     <button type="button" class="secondary" id="btn-clear">Clear log</button>
   </div>
   <div class="gadget-bar" id="gadget-base">
@@ -83,8 +83,8 @@
   <div class="gadget-bar" id="gadget-pivot">
     <span class="bar-label">pivot G0-G5 HW — Verify pivot then Native call</span>
   </div>
-  <p id="hint"><b>13.52 flow:</b> Start → <b>Force lk</b> → <b>Save bases</b> (auto getpid if lk set).
-    Fallback: tap <b>Native</b> twice (stage, then fire). Reload fresh each try.</p>
+  <p id="hint"><b>13.52:</b> Start → <b>Force lk</b> → <b>Quick getpid</b>.
+    Skip Verify pivot / scans (OOM after PIVOT-READY). Save bases optional.</p>
   <h2>Known pointers (this process)</h2>
   <table id="map">
     <thead><tr><th>label</th><th>address</th><th>note</th></tr></thead>
@@ -128,6 +128,6 @@ window.addEventListener("unhandledrejection", function (e) {
   persistCrashLine("wk-rw-log", msg);
 });
 </script>
-<script type="module" src="./rw_demo.js?v=20250830a"></script>
+<script type="module" src="./rw_demo.js?v=20250830b"></script>
 </body>
 </html>

