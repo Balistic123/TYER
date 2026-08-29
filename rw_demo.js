@@ -41,12 +41,13 @@ import {
     verifyManualLibkernel,
     tryPsfreePltBatch,
     resolveLibkernelPsfree,
+    formatPsfreeStats,
 } from "./libkernel_resolve.js";
 import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, fireGetpid } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830p";
+const BUILD_ID = "rw-20250830q";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const SCAN_PIVOT_MIN = 0x10000;
@@ -370,8 +371,8 @@ let psfreeAutoScan = false;
 let psfreeAutoStop = false;
 let psfreePreset = null;
 
-const PSFREE_LITE = { maxReads: 24, yieldBatches: 1, scanEnd: 0x500000, label: "lite" };
-const PSFREE_NORM = { maxReads: 48, yieldBatches: 1, scanEnd: null, label: "norm" };
+const PSFREE_LITE = { maxReads: 12, yieldBatches: 1, cluster: true, label: "lite" };
+const PSFREE_NORM = { maxReads: 20, yieldBatches: 1, cluster: true, label: "norm" };
 
 function parseCalPtr(raw) {
     const s = String(raw).replace(/^0x/i, "").trim();
@@ -1906,8 +1907,10 @@ function logPsfreeProbe(probe) {
     if (!probe) return;
     mark("LK-PSFREE-PROBE", "build=" + BUILD_ID
         + (probe.poops ? " poops=1" : "")
+        + " islands=" + (probe.ranges || 1)
         + " scan=0x" + (probe.scanLo || 0).toString(16)
-        + "..0x" + (probe.scanHi || 0).toString(16));
+        + "..0x" + (probe.scanHi || 0).toString(16)
+        + " (skips OOM hole 0x2f000..0x34000)");
     mark("LK-PSFREE-PROBE", probe.sanity
         + " rdOk=" + (probe.rdOk || 0) + " rdFail=" + (probe.rdFail || 0)
         + " ff25sample=" + (probe.stubs || 0));
@@ -1942,14 +1945,12 @@ async function runPsfreeLkAuto(preset) {
     setUi();
     mark("LK-PSFREE", "auto " + psfreePreset.label
         + " reads=" + psfreePreset.maxReads
-        + " cap=" + (psfreePreset.scanEnd != null
-            ? "+0x" + psfreePreset.scanEnd.toString(16) : "rva-max")
-        + " build=" + BUILD_ID);
+        + " cluster=1 build=" + BUILD_ID);
     renderOut();
 
     const batchOpts = {
         maxReads: psfreePreset.maxReads,
-        scanEnd: psfreePreset.scanEnd,
+        cluster: psfreePreset.cluster !== false,
     };
     let loops = 0;
 
@@ -1963,6 +1964,13 @@ async function runPsfreeLkAuto(preset) {
                     logPsfreeProbe(chunk.probe);
                     renderOut();
                 }
+                if (chunk.phase === "range" && chunk.rangeTag) {
+                    mark("LK-PSFREE", "island " + chunk.rangeTag
+                        + " +0x" + chunk.cursor.toString(16)
+                        + " stubs=" + (chunk.stubsSeen || 0));
+                    crashLog.append("RANGE " + chunk.rangeTag + " +0x"
+                        + chunk.cursor.toString(16), "LK-PSFREE");
+                }
                 if (finishPsfreeChunk(chunk)) {
                     renderOut();
                     return;
@@ -1975,14 +1983,16 @@ async function runPsfreeLkAuto(preset) {
             const tried = cur ? cur.tried : 0;
             const stubs = cur ? (cur.stubsSeen || 0) : 0;
             const fnExt = cur ? (cur.fnExt || 0) : 0;
-            const phase = cur ? cur.phase : "?";
-            if (loops % 4 === 0) {
-                state("PSFree " + psfreePreset.label + " +0x" + cursor.toString(16)
-                    + " tried=" + tried + " stubs=" + stubs + " fnExt=" + fnExt, "warn");
-                mark("LK-PSFREE", psfreePreset.label + " +" + cursor.toString(16)
-                    + " tried=" + tried + " stubs=" + stubs
-                    + " fnExt=" + fnExt + " lkFail=" + (cur ? (cur.fnLkFails || 0) : 0)
-                    + " phase=" + phase);
+            const rng = cur ? (cur.rangeTag || "?") : "?";
+            if (loops % 2 === 0) {
+                state("PSFree " + psfreePreset.label + " " + rng + " +0x"
+                    + cursor.toString(16) + " stubs=" + stubs, "warn");
+                mark("LK-PSFREE", psfreePreset.label + " " + rng + " +0x"
+                    + cursor.toString(16) + " tried=" + tried + " stubs=" + stubs
+                    + " fnExt=" + fnExt);
+                crashLog.append("PROG " + rng + " +0x" + cursor.toString(16)
+                    + " stubs=" + stubs + " tried=" + tried, "LK-PSFREE");
+                crashLog.flushSync();
                 renderOut();
             }
             await new Promise(function (r) { setTimeout(r, 1); });
@@ -1995,8 +2005,16 @@ async function runPsfreeLkAuto(preset) {
         }
     } catch (err) {
         mark("LK-PSFREE-FAIL", err.message || String(err));
-        state("PSFree error", "bad");
+        if (psfreePltState)
+            mark("LK-PSFREE-PARTIAL", formatPsfreeStats(psfreePltState)
+                + " @+0x" + psfreePltState.cursor.toString(16));
+        state("PSFree error/OOM — see LK-PSFREE-PARTIAL", "bad");
     } finally {
+        if (psfreePltState && psfreeAutoScan) {
+            crashLog.append("PARTIAL " + formatPsfreeStats(psfreePltState)
+                + " @+0x" + psfreePltState.cursor.toString(16), "LK-PSFREE");
+            crashLog.flushSync();
+        }
         psfreeAutoScan = false;
         psfreeAutoStop = false;
         psfreePreset = null;
