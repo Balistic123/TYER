@@ -745,15 +745,22 @@ function discoverTextareaVtableLite(p, carrier) {
 
 function logVtableExtPtrs(p, hit) {
     if (!hit || !hit.vtable) return 0;
+    const saved = [];
     let n = 0;
     for (let i = 0; i < 12; i++) {
         const ei = read8p(p, hit.vtable.add32(i * 8));
         if (!ei || ei.hi < 0x8) continue;
         const code = read4p(p, ei);
         if (isBadRead(code)) continue;
+        const ptrHex = ptrNum(ei).toString(16);
         mark("EXT-PTR", "vtable[" + i + "]=" + ei + " code=" + fmtMagic(code));
+        saved.push({ label: "vtable[" + i + "]", ptr: ptrHex, code: fmtMagic(code) });
         n++;
     }
+    try {
+        if (saved.length)
+            sessionStorage.setItem("wk-cal-ext-ptrs", JSON.stringify(saved));
+    } catch (_) { }
     return n;
 }
 
