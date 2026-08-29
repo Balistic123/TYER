@@ -91,6 +91,8 @@ const LIBKERNEL_1352 = {
     k_mmap:                             0x114e0,
     /** Okage HW — lk_base low 12 bits on 13.52 retail */
     lk_base_tag:                        0xc30,
+    /** Suchi dump: mov rax,20 @ +0x4f0 — fire ROP at +0xa (mov r10,rcx;syscall) */
+    k_getpid_syscall:                   0x4fa,
     /** BillZaiD game process — trial only, verify before use */
     billzai_lk_base:                    "0x80a67c000",
     k_stubs: {

