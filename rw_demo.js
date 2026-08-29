@@ -46,7 +46,7 @@ import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, fireGetpid } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830o";
+const BUILD_ID = "rw-20250830p";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const SCAN_PIVOT_MIN = 0x10000;
@@ -370,8 +370,8 @@ let psfreeAutoScan = false;
 let psfreeAutoStop = false;
 let psfreePreset = null;
 
-const PSFREE_LITE = { maxReads: 24, yieldBatches: 1, scanEnd: 0x20000, label: "lite" };
-const PSFREE_NORM = { maxReads: 48, yieldBatches: 1, scanEnd: 0x28000, label: "norm" };
+const PSFREE_LITE = { maxReads: 24, yieldBatches: 1, scanEnd: 0x500000, label: "lite" };
+const PSFREE_NORM = { maxReads: 48, yieldBatches: 1, scanEnd: null, label: "norm" };
 
 function parseCalPtr(raw) {
     const s = String(raw).replace(/^0x/i, "").trim();
@@ -1904,13 +1904,16 @@ function finishPsfreeChunk(chunk) {
 
 function logPsfreeProbe(probe) {
     if (!probe) return;
-    mark("LK-PSFREE-PROBE", "wk=" + probe.wk
-        + " base=" + probe.base
-        + " magic=" + probe.magic
-        + " ff25/15=" + probe.stubs + " in " + probe.cap);
+    mark("LK-PSFREE-PROBE", "build=" + BUILD_ID
+        + (probe.poops ? " poops=1" : "")
+        + " scan=0x" + (probe.scanLo || 0).toString(16)
+        + "..0x" + (probe.scanHi || 0).toString(16));
+    mark("LK-PSFREE-PROBE", probe.sanity
+        + " rdOk=" + (probe.rdOk || 0) + " rdFail=" + (probe.rdFail || 0)
+        + " ff25sample=" + (probe.stubs || 0));
     if (probe.samples)
         mark("LK-PSFREE-PROBE", probe.samples);
-    crashLog.append("PROBE magic=" + probe.magic + " stubs=" + probe.stubs
+    crashLog.append("PROBE " + probe.sanity + " stubs=" + probe.stubs
         + " " + probe.samples, "LK-PSFREE");
 }
 
@@ -1939,7 +1942,8 @@ async function runPsfreeLkAuto(preset) {
     setUi();
     mark("LK-PSFREE", "auto " + psfreePreset.label
         + " reads=" + psfreePreset.maxReads
-        + " cap=+0x" + psfreePreset.scanEnd.toString(16)
+        + " cap=" + (psfreePreset.scanEnd != null
+            ? "+0x" + psfreePreset.scanEnd.toString(16) : "rva-max")
         + " build=" + BUILD_ID);
     renderOut();
 

