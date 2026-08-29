@@ -2211,12 +2211,101 @@ export function resolveExtModuleHunt(p, fnPtr, webkitBase, off, maxPages) {
     return d.hit || null;
 }
 
-/** Chunked scan below webkitBase for libkernel (SCE magic + stub score). */
+/** Fixed offsets below webkit — 1 read each, no linear unmapped scan. */
+export function huntLibkernelCandidatesChunk(p, webkitBase, off, state, opts) {
+    opts = opts || {};
+    if (!p || !webkitBase)
+        return { done: true, ok: false, phase: "cand-skip" };
+
+    if (!state) {
+        const wb = ptrBig(webkitBase) & ~0x3fffn;
+        const deltas = [
+            0x400000, 0x800000, 0x1000000, 0x1400000, 0x1800000,
+            0x2000000, 0x2800000, 0x3000000,
+        ];
+        const addrs = [];
+        for (let i = 0; i < deltas.length; i++)
+            addrs.push({ hex: "0x" + (wb - BigInt(deltas[i])).toString(16), why: "wk-" + deltas[i].toString(16) });
+        state = { addrs, idx: 0, probed: 0, nulls: 0 };
+        return { done: false, state, phase: "cand-start", total: addrs.length };
+    }
+
+    const batchMax = opts.candBatch != null ? opts.candBatch : 2;
+    let batch = 0;
+    while (state.idx < state.addrs.length && batch < batchMax) {
+        const c = state.addrs[state.idx++];
+        batch++;
+        state.probed++;
+        let addr;
+        try {
+            addr = parseAddrSync(c.hex.replace(/^0x/i, ""));
+        } catch (_) {
+            addr = null;
+        }
+        if (!addr) continue;
+        const magic = read4p(p, addr);
+        if (magic == null) {
+            state.nulls++;
+            continue;
+        }
+        if (!isModuleMagic(magic) || isSameWebkitModule(addr, webkitBase, off)) continue;
+        const stubs = liteSyscallStubScore(p, addr);
+        if (stubs >= 2) {
+            saveLibkernelSession(addr, null);
+            return {
+                done: true,
+                ok: true,
+                lk: addr,
+                stubs,
+                source: "hunt-cand+" + c.why,
+                state,
+                phase: "cand-hit",
+                tried: state.probed,
+            };
+        }
+        if (stubs >= 1 && checkPrologueAt(p, addr)) {
+            saveLibkernelSession(addr, null);
+            return {
+                done: true,
+                ok: true,
+                lk: addr,
+                stubs,
+                weak: true,
+                source: "hunt-cand-weak+" + c.why,
+                state,
+                phase: "cand-hit",
+                tried: state.probed,
+            };
+        }
+    }
+
+    if (state.idx >= state.addrs.length) {
+        return {
+            done: true,
+            ok: false,
+            state,
+            phase: "cand-miss",
+            tried: state.probed,
+            nulls: state.nulls,
+        };
+    }
+
+    return {
+        done: false,
+        state,
+        phase: "cand",
+        tried: state.probed,
+        total: state.addrs.length,
+    };
+}
+
+/** Short scan below webkit — aborts on null cliff (unmapped reads OOM on HW). */
 export function huntLibkernelBelowWebkitChunk(p, webkitBase, off, state, opts) {
     opts = opts || {};
     const step = 0x4000n;
-    const maxPages = opts.maxPages != null ? opts.maxPages : 2048;
-    const batchN = opts.batchPages != null ? opts.batchPages : 6;
+    const maxPages = opts.maxPages != null ? opts.maxPages : 48;
+    const batchN = opts.batchPages != null ? opts.batchPages : 2;
+    const nullMax = opts.nullMax != null ? opts.nullMax : 8;
 
     if (!p || !webkitBase)
         return { done: true, ok: false, error: "no webkitBase", phase: "hunt-skip" };
@@ -2229,6 +2318,8 @@ export function huntLibkernelBelowWebkitChunk(p, webkitBase, off, state, opts) {
             cursor: wb - step,
             end,
             pages: 0,
+            reads: 0,
+            nullRun: 0,
             modules: 0,
             best: null,
         };
@@ -2238,7 +2329,6 @@ export function huntLibkernelBelowWebkitChunk(p, webkitBase, off, state, opts) {
             phase: "hunt-start",
             wk: String(webkitBase),
             maxPages,
-            depthMb: (maxPages * 0x4000 / (1024 * 1024)).toFixed(1),
         };
     }
 
@@ -2249,16 +2339,31 @@ export function huntLibkernelBelowWebkitChunk(p, webkitBase, off, state, opts) {
         state.pages++;
         batch++;
         if (!addr || addr.hi < 0x8 || (addr.low & 0x3fff) !== 0) continue;
+        state.reads++;
         const magic = read4p(p, addr);
-        if (magic == null) continue;
+        if (magic == null) {
+            state.nullRun++;
+            if (state.nullRun >= nullMax) {
+                return {
+                    done: true,
+                    ok: false,
+                    state,
+                    phase: "hunt-null-cliff",
+                    pages: state.pages,
+                    reads: state.reads,
+                    modules: state.modules,
+                    nullRun: state.nullRun,
+                };
+            }
+            continue;
+        }
+        state.nullRun = 0;
         if (!isModuleMagic(magic) || isSameWebkitModule(addr, webkitBase, off)) continue;
         state.modules++;
         const stubs = liteSyscallStubScore(p, addr);
-        const pro = checkPrologueAt(p, addr) ? 10 : 0;
-        const sc = stubs + pro;
-        if (!state.best || sc > state.best.sc)
-            state.best = { lk: addr, stubs, sc, magic: magic >>> 0 };
-        if (stubs >= 3) {
+        if (!state.best || stubs > state.best.stubs)
+            state.best = { lk: addr, stubs, magic: magic >>> 0 };
+        if (stubs >= 2) {
             saveLibkernelSession(addr, null);
             return {
                 done: true,
@@ -2269,6 +2374,7 @@ export function huntLibkernelBelowWebkitChunk(p, webkitBase, off, state, opts) {
                 state,
                 phase: "hunt-hit",
                 pages: state.pages,
+                reads: state.reads,
                 modules: state.modules,
             };
         }
@@ -2287,8 +2393,8 @@ export function huntLibkernelBelowWebkitChunk(p, webkitBase, off, state, opts) {
                 state,
                 phase: "hunt-best",
                 pages: state.pages,
+                reads: state.reads,
                 modules: state.modules,
-                bestSc: state.best.sc,
             };
         }
         return {
@@ -2297,6 +2403,7 @@ export function huntLibkernelBelowWebkitChunk(p, webkitBase, off, state, opts) {
             state,
             phase: "hunt-miss",
             pages: state.pages,
+            reads: state.reads,
             modules: state.modules,
         };
     }
@@ -2306,8 +2413,8 @@ export function huntLibkernelBelowWebkitChunk(p, webkitBase, off, state, opts) {
         state,
         phase: "hunt",
         pages: state.pages,
+        reads: state.reads,
         modules: state.modules,
-        at: bigToPtr(state.cursor) ? String(bigToPtr(state.cursor)) : "?",
     };
 }
 
@@ -2343,8 +2450,8 @@ export function scanPoopsImportChunk(p, webkitBase, off, state, opts) {
         };
     }
 
-    const batchMax = opts.impBatch != null ? opts.impBatch : 6;
-    const walkPages = opts.impWalkPages != null ? opts.impWalkPages : 24;
+    const batchMax = opts.impBatch != null ? opts.impBatch : 4;
+    const walkPages = opts.impWalkPages != null ? opts.impWalkPages : 12;
     let batch = 0;
     while (state.cursor < state.endRva && batch < batchMax) {
         const rva = state.cursor;

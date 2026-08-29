@@ -50,13 +50,14 @@ import {
     resolveExtModuleHunt,
     resolveExtModuleHuntDiag,
     huntLibkernelBelowWebkitChunk,
+    huntLibkernelCandidatesChunk,
     scanPoopsImportChunk,
 } from "./libkernel_resolve.js";
 import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, fireGetpid } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250831y";
+const BUILD_ID = "rw-20250831z";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const SCAN_PIVOT_MIN = 0x10000;
@@ -462,7 +463,7 @@ let calPtrIdx = 0;
 let guessLkIdx = 0;
 let huntLkState = null;
 let huntLkAuto = false;
-let huntLkStage = "below";
+let huntLkStage = "imp";
 let calLkCands = null;
 let psfreePltState = null;
 let psfreeAutoScan = false;
@@ -2212,7 +2213,7 @@ function finishFindLkChunk(chunk) {
             crashLog.flushSync();
 
             if (addrIn && hexes[0]) addrIn.value = hexes[0];
-            mark("LK-HINT", "tap Hunt lk (webkitBase → 32MB below + poops imports)");
+            mark("LK-HINT", "tap Hunt lk — poops imports + 8 wk offsets (OOM-safe)");
             mark("LK-MISS", "ext saved — zero finish reads build=" + BUILD_ID);
         } else if (chunk.cells === 0) {
             mark("LK-HINT", "no cells — re-run Start");
@@ -2381,7 +2382,7 @@ async function runHuntLkBelow() {
     }
     huntLkAuto = true;
     huntLkState = null;
-    huntLkStage = "below";
+    huntLkStage = "imp";
     busy = true;
     setUi();
     mark("LK-HUNT", "webkit=" + webkitBase + " build=" + BUILD_ID);
@@ -2389,60 +2390,81 @@ async function runHuntLkBelow() {
 
     let ticks = 0;
     try {
-        while (huntLkAuto && ticks++ < 5000) {
+        while (huntLkAuto && ticks++ < 600) {
             let chunk;
-            if (huntLkStage === "below") {
-                chunk = huntLibkernelBelowWebkitChunk(p, webkitBase, off, huntLkState, {
-                    maxPages: 2048,
-                    batchPages: 6,
-                });
-                huntLkState = chunk.state;
-                if (chunk.phase === "hunt-start") {
-                    mark("LK-HUNT", "≤32MB below webkit SCE/stub scan");
-                } else if (chunk.phase === "hunt") {
-                    state("Hunt lk p=" + chunk.pages + " mods=" + chunk.modules, "warn");
-                }
-                if (chunk.done && chunk.ok) {
-                    finishHuntLkHit(chunk);
-                    return;
-                }
-                if (chunk.done) {
-                    mark("LK-HUNT", "below miss p=" + (chunk.pages || 0)
-                        + " mods=" + (chunk.modules || 0) + " — poops RELRO");
-                    huntLkStage = "imp";
-                    huntLkState = null;
-                }
-            } else {
+            if (huntLkStage === "imp") {
                 chunk = scanPoopsImportChunk(p, webkitBase, off, huntLkState, {});
                 huntLkState = chunk.state;
                 if (chunk.phase === "imp-start") {
-                    mark("LK-HUNT", "poops imports " + (chunk.span || ""));
+                    mark("LK-HUNT", "poops RELRO imports (mapped)");
                 } else if (chunk.phase === "imp" || chunk.phase === "imp-region") {
                     state("Hunt lk imp tried=" + (chunk.tried || 0), "warn");
                 } else if (chunk.phase === "imp-skip") {
-                    mark("LK-HUNT-MISS", "all paths miss — paste lk base if you have one");
-                    state("hunt miss", "bad");
-                    break;
+                    mark("LK-HUNT", "no poops RELRO — wk offset probes");
+                    huntLkStage = "cand";
+                    huntLkState = null;
+                    continue;
                 }
                 if (chunk.done && chunk.ok) {
                     finishHuntLkHit(chunk);
                     return;
                 }
                 if (chunk.done) {
-                    mark("LK-HUNT-MISS", "pages=" + (chunk.pages || "?")
-                        + " — libkernel not found from webkitBase alone");
-                    state("hunt miss — need dump or manual base", "bad");
+                    mark("LK-HUNT", "imports miss tried=" + (chunk.tried || 0) + " — wk probes");
+                    huntLkStage = "cand";
+                    huntLkState = null;
+                }
+            } else if (huntLkStage === "cand") {
+                chunk = huntLibkernelCandidatesChunk(p, webkitBase, off, huntLkState, {});
+                huntLkState = chunk.state;
+                if (chunk.phase === "cand-start") {
+                    mark("LK-HUNT", "8 offsets below webkit (≤16 reads)");
+                } else if (chunk.phase === "cand") {
+                    state("Hunt lk cand " + (chunk.tried || 0) + "/" + (chunk.total || 8), "warn");
+                }
+                if (chunk.done && chunk.ok) {
+                    finishHuntLkHit(chunk);
+                    return;
+                }
+                if (chunk.done) {
+                    mark("LK-HUNT", "cand miss nulls=" + (chunk.nulls || 0) + " — short below scan");
+                    huntLkStage = "below";
+                    huntLkState = null;
+                }
+            } else {
+                chunk = huntLibkernelBelowWebkitChunk(p, webkitBase, off, huntLkState, {
+                    maxPages: 48,
+                    batchPages: 2,
+                    nullMax: 8,
+                });
+                huntLkState = chunk.state;
+                if (chunk.phase === "hunt-start") {
+                    mark("LK-HUNT", "≤192KB below webkit (null-cliff abort)");
+                } else if (chunk.phase === "hunt") {
+                    state("Hunt lk r=" + (chunk.reads || 0) + " mods=" + chunk.modules, "warn");
+                } else if (chunk.phase === "hunt-null-cliff") {
+                    mark("LK-HUNT", "null cliff @ p=" + chunk.pages + " — unmapped below webkit");
+                }
+                if (chunk.done && chunk.ok) {
+                    finishHuntLkHit(chunk);
+                    return;
+                }
+                if (chunk.done) {
+                    mark("LK-HUNT-MISS", "reads=" + (chunk.reads || chunk.pages || 0)
+                        + " mods=" + (chunk.modules || 0)
+                        + " — paste lk base manually");
+                    state("hunt miss", "bad");
                     break;
                 }
             }
-            if (ticks % 6 === 0) {
+            if (ticks % 4 === 0) {
                 renderOut();
                 crashLog.flushSync();
             }
-            await new Promise(function (r) { setTimeout(r, 20); });
+            await new Promise(function (r) { setTimeout(r, 48); });
         }
-        if (ticks >= 5000)
-            mark("LK-HUNT-ABORT", "tick cap — re-tap Hunt lk");
+        if (ticks >= 600)
+            mark("LK-HUNT-ABORT", "tick cap");
     } catch (err) {
         mark("LK-HUNT-ERR", err.message || String(err));
         state("hunt error", "bad");
