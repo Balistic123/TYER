@@ -46,7 +46,7 @@ import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, fireGetpid } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830n";
+const BUILD_ID = "rw-20250830o";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const SCAN_PIVOT_MIN = 0x10000;
@@ -1888,14 +1888,30 @@ function finishPsfreeChunk(chunk) {
         psfreePltState = null;
         psfreeAutoScan = false;
         psfreeAutoStop = false;
-        let miss = chunk.error || "no PLT hit tried=" + chunk.tried;
-        if (chunk.fnLkFails)
-            miss += " fnLkFails=" + chunk.fnLkFails;
+        const miss = (chunk.error || "no PLT hit tried=" + (chunk.tried || 0))
+            + " build=" + BUILD_ID;
         mark("LK-PSFREE-MISS", miss);
-        state("PSFree miss — Load cal ptr or Guess lk", "bad");
+        if (chunk.probe && chunk.probe.samples)
+            mark("LK-PSFREE-PROBE", chunk.probe.samples);
+        state("PSFree miss — see LK-PSFREE-MISS in log", "bad");
+        crashLog.append(miss, "LK-PSFREE");
+        if (chunk.probe) crashLog.append("PROBE " + chunk.probe.samples, "LK-PSFREE");
+        crashLog.flushSync();
         return true;
     }
     return false;
+}
+
+function logPsfreeProbe(probe) {
+    if (!probe) return;
+    mark("LK-PSFREE-PROBE", "wk=" + probe.wk
+        + " base=" + probe.base
+        + " magic=" + probe.magic
+        + " ff25/15=" + probe.stubs + " in " + probe.cap);
+    if (probe.samples)
+        mark("LK-PSFREE-PROBE", probe.samples);
+    crashLog.append("PROBE magic=" + probe.magic + " stubs=" + probe.stubs
+        + " " + probe.samples, "LK-PSFREE");
 }
 
 function stopPsfreeScan() {
@@ -1939,6 +1955,10 @@ async function runPsfreeLkAuto(preset) {
             while (inner < psfreePreset.yieldBatches && !psfreeAutoStop) {
                 const chunk = tryPsfreePltBatch(p, webkitBase, off, psfreePltState, batchOpts);
                 psfreePltState = chunk.state;
+                if (chunk.phase === "probe" && chunk.probe) {
+                    logPsfreeProbe(chunk.probe);
+                    renderOut();
+                }
                 if (finishPsfreeChunk(chunk)) {
                     renderOut();
                     return;
@@ -1949,13 +1969,16 @@ async function runPsfreeLkAuto(preset) {
             const cur = psfreePltState;
             const cursor = cur ? cur.cursor : 0;
             const tried = cur ? cur.tried : 0;
+            const stubs = cur ? (cur.stubsSeen || 0) : 0;
+            const fnExt = cur ? (cur.fnExt || 0) : 0;
             const phase = cur ? cur.phase : "?";
             if (loops % 4 === 0) {
                 state("PSFree " + psfreePreset.label + " +0x" + cursor.toString(16)
-                    + " tried=" + tried, "warn");
+                    + " tried=" + tried + " stubs=" + stubs + " fnExt=" + fnExt, "warn");
                 mark("LK-PSFREE", psfreePreset.label + " +" + cursor.toString(16)
-                    + " tried=" + tried + " phase=" + phase);
-                if (lines.length > 16) lines.splice(0, lines.length - 16);
+                    + " tried=" + tried + " stubs=" + stubs
+                    + " fnExt=" + fnExt + " lkFail=" + (cur ? (cur.fnLkFails || 0) : 0)
+                    + " phase=" + phase);
                 renderOut();
             }
             await new Promise(function (r) { setTimeout(r, 1); });
