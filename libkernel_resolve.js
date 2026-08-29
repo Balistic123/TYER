@@ -668,7 +668,8 @@ function tryOnePsfreePlt(p, webkitBase, off, pltRva) {
  */
 export function tryPsfreePltBatch(p, webkitBase, off, state, opts) {
     opts = opts || {};
-    const MAX_READS = opts.maxReads || 28;
+    const MAX_READS = opts.maxReads || 32;
+    const scanEnd = opts.scanEnd || 0x28000;
     let reads = 0;
 
     if (!state) {
@@ -678,7 +679,7 @@ export function tryPsfreePltBatch(p, webkitBase, off, state, opts) {
             cands: importPltCandidates(off),
             base: moduleLoadBase(p, webkitBase),
             cursor: 0x1000,
-            end: LK_LOW_TEXT_MAX,
+            end: scanEnd,
             tried: 0,
         };
     }

