@@ -49,12 +49,15 @@ import {
     plausibleHeapCell,
     resolveExtPtrSafe,
     resolveExtListVote,
+    resolveMinExtDeepWalk,
+    tryWebkitNearLibkernel,
+    resolveExtAlignedKError,
 } from "./libkernel_resolve.js";
 import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, fireGetpid } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250831p";
+const BUILD_ID = "rw-20250831q";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const SCAN_PIVOT_MIN = 0x10000;
@@ -154,7 +157,7 @@ function clearPersistedLog() {
 function mark(tag, detail) {
     const line = tag + (detail == null || detail === "" ? "" : "  " + detail);
     if (lkQuiet) {
-        if (/^LK-(OK|FAIL|SKIP|CAL|HINT|CAL-MISS|CAL-DONE|GUESS|PSFREE|GOT|FIND|TRACE|MISS|EXT|CELL|FINISH|VERIFY)/.test(tag)) {
+        if (/^LK-(OK|FAIL|SKIP|CAL|HINT|CAL-MISS|CAL-DONE|GUESS|PSFREE|GOT|FIND|TRACE|MISS|EXT|CELL|FINISH|VERIFY|VOTE|MIN-WALK|RESOLVE)/.test(tag)) {
             lines.push(line);
             if (lines.length > 40) lines.splice(0, lines.length - 40);
             renderOut();
@@ -481,6 +484,7 @@ const FIND_LK_LITE = {
     knownBatch: 1,
     vtableEntries: 8,
     vtBatch: 1,
+    minWalkPages: 128,
     walkPages: 64,
     cellMax: 2,
 };
@@ -496,7 +500,8 @@ const FIND_LK_NORM = {
     knownBatch: 1,
     vtableEntries: 12,
     vtBatch: 1,
-    walkPages: 96,
+    minWalkPages: 160,
+    walkPages: 64,
     cellMax: 3,
 };
 
@@ -2039,6 +2044,21 @@ function tryResolveExtList(p, off, webkitBase, ext, opts) {
         const h = extPtrHex(ext[i]);
         if (h) hexes.push(h);
     }
+    if (!hexes.length) return null;
+
+    if (webkitBase) {
+        const near = tryWebkitNearLibkernel(p, webkitBase, off);
+        if (near) return { hit: near, from: "wk-near", idx: -1 };
+    }
+
+    const deep = resolveMinExtDeepWalk(p, hexes, off, webkitBase, opts.minWalkPages || 128);
+    if (deep && deep.lk) return { hit: deep, from: deep.from || "min", idx: -1 };
+    if (deep && deep.miss) {
+        mark("LK-MIN-WALK", "from=" + (deep.from || "?").slice(-9)
+            + " pages=" + (deep.pages || 0)
+            + (deep.magSeen && deep.magSeen.length ? " mag=" + deep.magSeen.join(",") : " mag=none"));
+    }
+
     if (hexes.length >= 2) {
         const voteOpts = Object.assign({ walkPages: opts.walkPages || 64 }, opts);
         const voted = resolveExtListVote(p, hexes, off, webkitBase, voteOpts);
@@ -2054,8 +2074,18 @@ function tryResolveExtList(p, off, webkitBase, ext, opts) {
             mark("LK-VOTE", voteOpts._voteRank.map(function (r) {
                 return r.key.slice(-9) + "x" + r.count;
             }).join(" "));
+        } else {
+            mark("LK-VOTE-EMPTY", voteOpts._voteDiag || "no SCE/ELF hdr");
         }
     }
+
+    for (let i = 0; i < hexes.length; i++) {
+        const fn = parseAddr(hexes[i]);
+        if (!fn) continue;
+        const ak = resolveExtAlignedKError(p, fn, off, webkitBase);
+        if (ak) return { hit: ak, from: hexes[i], idx: i };
+    }
+
     for (let i = 0; i < ext.length; i++) {
         const fn = parseAddr(extPtrHex(ext[i]));
         if (!fn) continue;
@@ -2146,6 +2176,7 @@ function finishFindLkChunk(chunk) {
             const { webkitBase } = basesFromSession(off);
             const resolved = tryResolveExtList(p, off, webkitBase, ext, {
                 walkPages: findLkPreset ? findLkPreset.walkPages : 64,
+                minWalkPages: findLkPreset ? findLkPreset.minWalkPages : 128,
             });
             if (resolved) {
                 saveLibkernelSession(resolved.hit.lk, resolved.hit.iatRva);
@@ -2160,7 +2191,7 @@ function finishFindLkChunk(chunk) {
                 crashLog.flushSync();
                 return true;
             }
-            mark("LK-RESOLVE-MISS", ext.length + " ext × k__error cands");
+            mark("LK-RESOLVE-MISS", "no lk from ext/wk-near/min-walk — paste hex → Verify lk");
             if (addrIn && hexes[0]) addrIn.value = hexes[0];
             mark("LK-HINT", "hex=ext ptr — Verify lk or Force lk");
         } else if (chunk.cells === 0) {

