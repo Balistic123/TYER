@@ -47,7 +47,7 @@ import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, fireGetpid } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830q";
+const BUILD_ID = "rw-20250830r";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const SCAN_PIVOT_MIN = 0x10000;
@@ -1903,21 +1903,22 @@ function finishPsfreeChunk(chunk) {
     return false;
 }
 
-function logPsfreeProbe(probe) {
+function logPsfreeProbe(probe, rangeText) {
     if (!probe) return;
     mark("LK-PSFREE-PROBE", "build=" + BUILD_ID
         + (probe.poops ? " poops=1" : "")
-        + " islands=" + (probe.ranges || 1)
-        + " scan=0x" + (probe.scanLo || 0).toString(16)
-        + "..0x" + (probe.scanHi || 0).toString(16)
-        + " (skips OOM hole 0x2f000..0x34000)");
+        + " islands=" + (probe.ranges || 0));
+    if (rangeText)
+        mark("LK-PSFREE-PROBE", rangeText);
     mark("LK-PSFREE-PROBE", probe.sanity
         + " rdOk=" + (probe.rdOk || 0) + " rdFail=" + (probe.rdFail || 0)
         + " ff25sample=" + (probe.stubs || 0));
     if (probe.samples)
         mark("LK-PSFREE-PROBE", probe.samples);
+    if (probe.stubs === 0 && probe.rdOk >= 3)
+        mark("LK-PSFREE-HINT", "no ff25/15 in low sample — poops may lack PLT stubs; use cal Force lk");
     crashLog.append("PROBE " + probe.sanity + " stubs=" + probe.stubs
-        + " " + probe.samples, "LK-PSFREE");
+        + " " + (rangeText || ""), "LK-PSFREE");
 }
 
 function stopPsfreeScan() {
@@ -1961,15 +1962,19 @@ async function runPsfreeLkAuto(preset) {
                 const chunk = tryPsfreePltBatch(p, webkitBase, off, psfreePltState, batchOpts);
                 psfreePltState = chunk.state;
                 if (chunk.phase === "probe" && chunk.probe) {
-                    logPsfreeProbe(chunk.probe);
+                    logPsfreeProbe(chunk.probe, chunk.rangeText);
+                    if (chunk.rangeTag)
+                        mark("LK-PSFREE", "START island " + chunk.rangeTag
+                            + " +0x" + chunk.cursor.toString(16));
                     renderOut();
                 }
                 if (chunk.phase === "range" && chunk.rangeTag) {
-                    mark("LK-PSFREE", "island " + chunk.rangeTag
+                    mark("LK-PSFREE", "JUMP island " + chunk.rangeTag
                         + " +0x" + chunk.cursor.toString(16)
                         + " stubs=" + (chunk.stubsSeen || 0));
-                    crashLog.append("RANGE " + chunk.rangeTag + " +0x"
+                    crashLog.append("JUMP " + chunk.rangeTag + " +0x"
                         + chunk.cursor.toString(16), "LK-PSFREE");
+                    crashLog.flushSync();
                 }
                 if (finishPsfreeChunk(chunk)) {
                     renderOut();

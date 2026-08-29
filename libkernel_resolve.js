@@ -675,32 +675,13 @@ const POOPS_SCAN_LO = 0x10000;
 const POOPS_OOM_LO = 0x2f000;
 const POOPS_OOM_HI = 0x34000;
 
-function mergeScanRanges(ranges) {
-    const out = [];
-    for (let i = 0; i < ranges.length; i++) {
-        const r = ranges[i];
-        if (r.hi <= r.lo) continue;
-        if (r.lo < POOPS_OOM_HI && r.hi > POOPS_OOM_LO) {
-            if (r.lo < POOPS_OOM_LO)
-                out.push({ lo: r.lo, hi: POOPS_OOM_LO, tag: r.tag + "-a" });
-            if (r.hi > POOPS_OOM_HI)
-                out.push({ lo: POOPS_OOM_HI, hi: r.hi, tag: r.tag + "-b" });
-        } else {
-            out.push(r);
-        }
-    }
-    out.sort((a, b) => a.lo - b.lo);
-    return out;
-}
-
 /** Poops: skip OOM hole; scan only around HW-mapped code islands. */
 function psfreePoopsRanges(off) {
     const expm1 = (off && off.wk_expm1_builtin) || 0xeb6350;
     const cap = webkitRvaMaxFromOff(off);
     const raw = [
         { lo: POOPS_SCAN_LO, hi: POOPS_OOM_LO, tag: "low" },
-        { lo: 0xe0000, hi: 0xf8000, tag: "g0" },
-        { lo: expm1 - 0x50000, hi: expm1 + 0x50000, tag: "expm1" },
+        { lo: 0xe0000, hi: 0xf8000, tag: "mid" },
         { lo: 0x1360000, hi: Math.min(cap, 0x1480000), tag: "g5" },
     ];
     const out = [];
@@ -709,17 +690,32 @@ function psfreePoopsRanges(off) {
         const hi = Math.min(cap, raw[i].hi);
         if (hi > lo) out.push({ lo, hi, tag: raw[i].tag });
     }
-    return mergeScanRanges(out);
+    return out;
+}
+
+function psfreeRangesText(ranges) {
+    if (!ranges || !ranges.length) return "?";
+    return ranges.map(function (r) {
+        return r.tag + ":0x" + r.lo.toString(16) + "-0x" + r.hi.toString(16);
+    }).join(" ");
 }
 
 function psfreeScanPlan(p, webkitBase, off, opts) {
     opts = opts || {};
-    const poops = isPoopsTextBase(p, webkitBase);
+    const w0 = read4p(p, webkitBase);
+    const poopsMagic = w0 === POOPS_TEXT_MAGIC;
+    const poops = poopsMagic || isPoopsTextBase(p, webkitBase);
     const cap = webkitRvaMaxFromOff(off);
     if (poops || opts.cluster) {
         const ranges = psfreePoopsRanges(off);
-        return { poops, cap, ranges, lo: ranges[0] ? ranges[0].lo : POOPS_SCAN_LO,
-            hi: ranges.length ? ranges[ranges.length - 1].hi : POOPS_OOM_LO };
+        return {
+            poops,
+            cap,
+            ranges,
+            rangeText: psfreeRangesText(ranges),
+            lo: ranges[0] ? ranges[0].lo : POOPS_SCAN_LO,
+            hi: ranges.length ? ranges[ranges.length - 1].hi : POOPS_OOM_LO,
+        };
     }
     const lo = 0x1000;
     let hi = opts.scanEnd != null ? opts.scanEnd : cap;
@@ -741,6 +737,13 @@ function psfreeAdvanceRange(state) {
     state.end = state.ranges[next].hi;
     state.rangeTag = state.ranges[next].tag;
     return true;
+}
+
+/** Leave current island — never linear-scan the OOM gap or past range end. */
+function psfreeFinishRange(state) {
+    if (psfreeAdvanceRange(state))
+        return { advanced: true, rangeTag: state.rangeTag, cursor: state.cursor };
+    return { advanced: false };
 }
 
 function psfreeMissChunk(state) {
@@ -831,6 +834,7 @@ function psfreeProbeBase(p, webkitBase, off, bounds) {
         base: String(base),
         poops: bounds.poops,
         ranges: bounds.ranges ? bounds.ranges.length : 1,
+        rangeText: bounds.rangeText || "",
         scanLo: bounds.lo,
         scanHi: bounds.hi,
         magic: sanity[0] ? sanity[0].split("=")[1] : "?",
@@ -916,8 +920,10 @@ export function tryPsfreePltBatch(p, webkitBase, off, state, opts) {
             cursor: r0 ? r0.lo : plan.lo,
             end: r0 ? r0.hi : plan.hi,
             rangeTag: r0 ? r0.tag : "?",
+            step: 0x10,
             scanLo: plan.lo,
             scanHi: plan.hi,
+            rangeText: plan.rangeText || "",
             poops: plan.poops,
             tried: 0,
             stubsSeen: 0,
@@ -934,7 +940,28 @@ export function tryPsfreePltBatch(p, webkitBase, off, state, opts) {
             state,
             phase: "probe",
             probe,
+            rangeTag: state.rangeTag,
+            cursor: state.cursor,
+            rangeText: plan.rangeText,
         };
+    }
+
+    function psfreeRangeDoneChunk() {
+        const fin = psfreeFinishRange(state);
+        if (fin.advanced) {
+            return {
+                done: false,
+                ok: false,
+                state,
+                phase: "range",
+                rangeTag: fin.rangeTag,
+                cursor: fin.cursor,
+                tried: state.tried,
+                stubsSeen: state.stubsSeen || 0,
+                rangeText: state.rangeText,
+            };
+        }
+        return psfreeMissChunk(state);
     }
 
     function notePsfreeTry(pltRva, res) {
@@ -992,18 +1019,27 @@ export function tryPsfreePltBatch(p, webkitBase, off, state, opts) {
         state.phase = "scan";
     }
 
-    while (state.cursor < state.end && reads + 8 <= MAX_READS) {
+    const step = state.step || 4;
+
+    while (reads + 8 <= MAX_READS) {
+        if (state.cursor >= state.end)
+            return psfreeRangeDoneChunk();
+
         const rva = state.cursor;
-        if (state.poops && rva >= POOPS_OOM_LO && rva < POOPS_OOM_HI) {
-            state.cursor = POOPS_OOM_HI;
-            continue;
-        }
-        state.cursor += 4;
+        if (state.poops && rva >= POOPS_OOM_LO && rva < 0xe0000)
+            return psfreeRangeDoneChunk();
+
+        state.cursor += step;
         const w0 = read4p(p, state.base.add32(rva));
         reads += 1;
         if (w0 == null) {
             state.nullSkips = (state.nullSkips || 0) + 1;
-            state.cursor = Math.max(state.cursor, ((rva + 0x4000) >>> 0) & ~0x3fff);
+            const nextPage = ((rva + 0x4000) >>> 0) & ~0x3fff;
+            if (nextPage >= state.end) {
+                state.cursor = state.end;
+                continue;
+            }
+            state.cursor = Math.max(state.cursor, nextPage);
             continue;
         }
         const w1 = read4p(p, state.base.add32(rva + 4));
@@ -1065,22 +1101,6 @@ export function tryPsfreePltBatch(p, webkitBase, off, state, opts) {
                 };
             }
         }
-    }
-
-    if (state.cursor >= state.end) {
-        if (psfreeAdvanceRange(state)) {
-            return {
-                done: false,
-                ok: false,
-                state,
-                phase: "range",
-                rangeTag: state.rangeTag,
-                cursor: state.cursor,
-                tried: state.tried,
-                stubsSeen: state.stubsSeen || 0,
-            };
-        }
-        return psfreeMissChunk(state);
     }
 
     return {
