@@ -55,7 +55,7 @@ import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, fireGetpid } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250832d";
+const BUILD_ID = "rw-20250832e";
 const SS_HUNT_TRACE = "wk-hunt-trace";
 const SS_HUNT_STATE = "wk-hunt-state";
 /** opt-in only — release triggers JSC GC */
@@ -2425,6 +2425,21 @@ function huntProbePostLine(probe) {
         + (probe.raw ? " (" + probe.raw + ")" : "");
 }
 
+function huntProbeVerdict(probe) {
+    if (!probe) return "?";
+    if (probe.magic === "TOXIC-OOM" || probe.magic === "SKIP") return "SKIP";
+    if (probe.magic === "SCE" || probe.magic === "ELF") return "HIT";
+    return "MISS";
+}
+
+function huntRunLine(probe) {
+    const v = huntProbeVerdict(probe);
+    let s = v + " " + probe.n + "/" + probe.total + " " + probe.why;
+    if (probe.magic && probe.magic !== v) s += " " + probe.magic;
+    if (probe.raw && probe.raw !== "-") s += " raw=" + probe.raw;
+    return s;
+}
+
 async function runHuntLkBelow() {
     if (!ready || !window.p || huntLkAuto) return;
     const p = window.p;
@@ -2487,6 +2502,7 @@ async function runHuntLkBelow() {
 
             if (chunk.probe) {
                 const post = huntProbePostLine(chunk.probe);
+                const runLine = huntRunLine(chunk.probe);
                 if (chunk.phase === "cand-skip-probe") {
                     mark("LK-HUNT-SKIP", post);
                     huntTracePush("SKIP " + post);
@@ -2494,6 +2510,9 @@ async function runHuntLkBelow() {
                     mark("LK-HUNT-READ", post);
                     huntTracePush("READ " + post);
                 }
+                mark("LK-HUNT-RUN", runLine);
+                huntTracePush("RUN " + runLine);
+                crashLog.append("LK-HUNT-RUN " + runLine, "LK-HUNT");
                 if (huntLkState && !chunk.done)
                     saveHuntState(webkitBase, huntLkState);
                 renderOut();
@@ -2502,24 +2521,38 @@ async function runHuntLkBelow() {
 
             if (chunk.done && chunk.ok) {
                 clearHuntState();
+                if (chunk.probe) {
+                    const hitLine = "HIT " + chunk.probe.n + "/" + chunk.probe.total
+                        + " " + chunk.probe.why + " lk=" + chunk.lk;
+                    mark("LK-HUNT-RUN", hitLine);
+                    huntTracePush("RUN " + hitLine);
+                    crashLog.append("LK-HUNT-RUN " + hitLine, "LK-HUNT");
+                }
                 finishHuntLkHit(chunk);
                 return;
             }
 
             if (chunk.done) {
                 clearHuntState();
+                let hits = 0;
+                let misses = 0;
                 let summary = "reads=" + (chunk.reads || 0) + " nulls=" + (chunk.nulls != null ? chunk.nulls : "?");
                 if (chunk.log && chunk.log.length) {
                     const bits = [];
                     for (let li = 0; li < chunk.log.length; li++) {
                         const pr = chunk.log[li];
-                        bits.push(pr.why + "=" + pr.magic);
+                        const v = huntProbeVerdict(pr);
+                        if (v === "HIT") hits++;
+                        else if (v === "MISS") misses++;
+                        bits.push(pr.why + "=" + v + "(" + pr.magic + ")");
                     }
-                    summary += " | " + bits.join(" ");
+                    summary += " hits=" + hits + " miss=" + misses + " | " + bits.join(" ");
                 }
+                mark("LK-HUNT-RUN", "DONE ALL-MISS reads=" + (chunk.reads || 0));
                 mark("LK-HUNT-MISS", summary);
+                huntTracePush("RUN DONE ALL-MISS");
                 huntTracePush("MISS " + summary);
-                state("hunt miss — mapped≠SCE", "bad");
+                state("hunt ALL-MISS — no SCE in 8 probes", "bad");
                 break;
             }
 
