@@ -46,7 +46,7 @@ import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, fireGetpid } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830j";
+const BUILD_ID = "rw-20250830k";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const SCAN_PIVOT_MIN = 0x10000;
@@ -145,9 +145,10 @@ function clearPersistedLog() {
 function mark(tag, detail) {
     const line = tag + (detail == null || detail === "" ? "" : "  " + detail);
     if (lkQuiet) {
-        if (/^LK-(OK|FAIL|SKIP|CAL|HINT|CAL-MISS|CAL-DONE)/.test(tag)) {
+        if (/^LK-(OK|FAIL|SKIP|CAL|HINT|CAL-MISS|CAL-DONE|GUESS|PSFREE)/.test(tag)) {
             lines.push(line);
             if (lines.length > 40) lines.splice(0, lines.length - 40);
+            renderOut();
         }
         return;
     }
@@ -1871,7 +1872,6 @@ function runPsfreeLkStep() {
     }
     busy = true;
     setUi();
-    lkQuiet = true;
     try {
         const chunk = tryPsfreePltBatch(p, webkitBase, off, psfreePltState);
         psfreePltState = chunk.state;
@@ -1890,16 +1890,20 @@ function runPsfreeLkStep() {
             mark("LK-PSFREE-MISS", chunk.error || "no PLT hit tried=" + chunk.tried);
             state("PSFree miss — Load cal ptr or Guess lk", "bad");
         } else {
-            mark("LK-PSFREE", "phase=" + chunk.phase + " +0x"
-                + (chunk.cursor || 0).toString(16)
-                + " tried=" + chunk.tried + " — tap again");
+            const prog = "phase=" + chunk.phase
+                + " cursor=+0x" + (chunk.cursor || 0).toString(16)
+                + " tried=" + chunk.tried;
+            if (chunk.lastPlt != null)
+                mark("LK-PSFREE", prog + " last=plt+0x" + chunk.lastPlt.toString(16)
+                    + (chunk.lastFn ? " fn=" + chunk.lastFn : " (no import)"));
+            else
+                mark("LK-PSFREE", prog + " — tap again");
             state("PSFree scan… tried=" + chunk.tried, "warn");
         }
     } catch (err) {
         mark("LK-PSFREE-FAIL", err.message || String(err));
         state("PSFree error", "bad");
     } finally {
-        lkQuiet = false;
         busy = false;
         setUi();
         renderOut();

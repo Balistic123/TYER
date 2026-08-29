@@ -702,8 +702,12 @@ export function tryPsfreePltBatch(p, webkitBase, off, state) {
                     state,
                     phase: "hit",
                     tried: state.tried,
+                    lastPlt: pltRva,
+                    lastFn: hit.fnPtr,
                 };
             }
+            state.lastPlt = pltRva;
+            state.lastFn = resolvePltImportAt(p, webkitBase, pltRva);
         }
         state.phase = "scan";
     }
@@ -730,8 +734,12 @@ export function tryPsfreePltBatch(p, webkitBase, off, state) {
                 state,
                 phase: "hit",
                 tried: state.tried,
+                lastPlt: rva,
+                lastFn: hit.fnPtr,
             };
         }
+        state.lastPlt = rva;
+        state.lastFn = resolvePltImportAt(p, webkitBase, rva);
     }
 
     if (state.cursor >= state.end) {
@@ -752,6 +760,8 @@ export function tryPsfreePltBatch(p, webkitBase, off, state) {
         phase: "scan",
         cursor: state.cursor,
         tried: state.tried,
+        lastPlt: state.lastPlt,
+        lastFn: state.lastFn,
     };
 }
 
