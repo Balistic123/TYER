@@ -369,13 +369,15 @@ export function tryWebkitNearLibkernel(p, webkitBase, off) {
 }
 
 /** k__error subtract then page-align — 13.52 imports rarely land aligned raw. */
-export function resolveExtAlignedKError(p, fnPtr, off, webkitBase) {
+export function resolveExtAlignedKError(p, fnPtr, off, webkitBase, opts) {
+    opts = opts || {};
     if (!fnPtr || fnPtr.hi < 0x8) return null;
     const ctx = { fnPtr, webkitBase, off };
     const errs = kErrorCandidates(off);
-    for (let i = 0; i < errs.length; i++) {
+    const maxN = opts.maxKErrors != null ? Math.min(opts.maxKErrors, errs.length) : errs.length;
+    for (let i = 0; i < maxN; i++) {
         const raw = fnPtr.sub32(errs[i]);
-        const tries = [raw, pageAlignDown(raw, 0x4000)];
+        const tries = opts.pageAlignOnly ? [pageAlignDown(raw, 0x4000)] : [raw, pageAlignDown(raw, 0x4000)];
         for (let t = 0; t < tries.length; t++) {
             const lk = tries[t];
             if (!plausibleLkBeforeRead(lk, fnPtr, webkitBase, off)) continue;
@@ -384,6 +386,7 @@ export function resolveExtAlignedKError(p, fnPtr, off, webkitBase) {
             const v = verifyLibkernelBase(p, lk, off, ctx);
             if (v.ok && v.strong)
                 return { lk, via: "align-k+" + errs[i].toString(16), k__error: errs[i], fnPtr };
+            if (opts.strongOnly) continue;
             if (v.ok || weakLibkernelBaseHit(p, lk, mag, ctx))
                 return { lk, via: "align-k-weak+" + errs[i].toString(16), k__error: errs[i], fnPtr, weak: true };
         }
