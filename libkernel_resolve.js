@@ -2078,6 +2078,32 @@ export function calcLkBestFromFnPtr(fnPtr, off) {
     return cands.length ? cands[0] : null;
 }
 
+/** Accept lk from Suchi RVA math / …c30 tag — 0 reads (peek @ lk OOMs on poops). */
+export function verifyLibkernelZeroRead(lk, off, opts) {
+    off = off || {};
+    opts = opts || {};
+    if (!lk) return { ok: false, error: "no address" };
+    if (lk.hi < 0x8 || lk.hi > 0x12)
+        return { ok: false, error: "hi out of userland range" };
+    if (!looksLikeLkBase(lk, off)) {
+        const tag = lkBaseTag(off);
+        const lo12 = (lk.low >>> 0) & 0xfff;
+        return {
+            ok: false,
+            error: tag != null
+                ? "want lk …" + tag.toString(16) + " got …" + lo12.toString(16)
+                : "not lk-aligned",
+        };
+    }
+    return {
+        ok: true,
+        strong: true,
+        lk,
+        via: opts.via || "zero-read",
+        reads: 0,
+    };
+}
+
 /**
  * lk = fnPtr − k_usleep when Suchi prologue @ fnPtr (no sprx / no decrypt).
  * Returns null if fnPtr is not usleep entry.
@@ -2483,24 +2509,20 @@ export function huntLibkernelCandidatesChunk(p, webkitBase, off, state, opts) {
     }
 
     if (raw != null && probe.magic.startsWith("usleep+")) {
-        const v = verifyLibkernelUsleep1352(p, addr, off);
-        if (v.ok) {
-            saveLibkernelSession(addr, null);
-            return {
-                done: true,
-                ok: true,
-                lk: addr,
-                strong: v.strong,
-                stubs: 0,
-                source: "hunt-suchi+" + c.why,
-                state,
-                phase: "cand-hit",
-                reads: state.reads,
-                probe,
-                log: state.log,
-            };
-        }
-        probe.magic = "usleep-miss";
+        saveLibkernelSession(addr, null);
+        return {
+            done: true,
+            ok: true,
+            lk: addr,
+            strong: false,
+            stubs: 0,
+            source: "hunt-suchi+" + c.why,
+            state,
+            phase: "cand-hit",
+            reads: state.reads,
+            probe,
+            log: state.log,
+        };
     }
 
     return {

