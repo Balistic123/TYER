@@ -53,7 +53,7 @@ import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, fireGetpid } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250831t";
+const BUILD_ID = "rw-20250831u";
 /** opt-in only — release triggers JSC GC */
 const PROMOTE_PAIR = params.get("promote") === "1";
 const SCAN_PIVOT_MIN = 0x10000;
@@ -2063,7 +2063,7 @@ function runVerifyLk() {
         return;
     }
 
-    const pageK = Number(ptrBig(ptr) - ptrBig(new int64((ptr.low >>> 0) & ~0x3fff, ptr.hi >>> 0)));
+    const pageK = (ptr.low >>> 0) & 0x3fff;
     mark("LK-RESOLVE-MISS", hex + " pass=" + passNames[pass] + " page+k=0x" + pageK.toString(16));
     cycleExtPtrInHex();
     state("verify miss — tap again (cycles ptr + pass)", "bad");
