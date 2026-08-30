@@ -110,7 +110,7 @@ const LIBKERNEL_1352 = {
 };
 
 PS4["13.52"] = Object.assign({}, PS4["13.50"], LIBKERNEL_1352, {
-    fw_status: "13.52 HW pop + pivot G0-G5 (7/7). lk RVAs HW-confirmed 13.52 libkernel_sys",
+    fw_status: "13.52 HW pop + pivot G0-G5 full poops (7/7). lk RVAs HW-confirmed 13.52 libkernel_sys",
     /** Low .text PLT stub RVAs — fill from ghidra_analysis/scripts/find_webkit_plt.py on poops dump */
     wk_plt_stack_chk_fail: null,
     wk_plt___error: null,
@@ -124,11 +124,11 @@ PS4["13.52"] = Object.assign({}, PS4["13.50"], LIBKERNEL_1352, {
     wk_POP_R9_RET:                      0x9b288b,
     wk_LEAVE_RET:                       0xf195b,
     wk_MOV_QWORD_PTR_RDI_RAX_RET:       0x1f9bb,
-    wk_MOV_RDI_RSI_30_CALL:             0xe3e4a,
-    wk_POP_RAX_MOV_RAX_JMP_18:          0x4b330,
-    wk_PUSH_RBP_MOV_RBP_RSP_10:         0x1ff70,
-    wk_MOV_RDI_RAX_8_CALL_20:           0x16e02,
-    wk_MOV_RDX_RAX_18_CALL_10:          0x589c1,
+    wk_MOV_RDI_RSI_30_CALL:             0x128f418,
+    wk_POP_RAX_MOV_RAX_JMP_18:          0x6c84b3,
+    wk_PUSH_RBP_MOV_RBP_RSP_10:         0x246750,
+    wk_MOV_RDI_RAX_8_CALL_20:           0x487d2,
+    wk_MOV_RDX_RAX_18_CALL_10:          0x7f35aa,
     wk_PUSH_RDX_POP_RSP_RET:            0x13ec77a,
     pivot_view_sp:                      0x38,
     /** G0 reads [rsi+0x30] — poops uses leakval+0; try ?hookoff=30 or N4 multi */

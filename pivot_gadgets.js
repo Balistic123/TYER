@@ -15,15 +15,15 @@ export const PIVOT_HINTS_1300 = {
     pivot_view_sp:                0x38,
 };
 
-/** 13.52 retail — HW-confirmed pivot RVAs */
+/** 13.52 retail — HW full poops gadgets (Aug 30: expm1 probe G0/G1/G4, scan G2/G3) */
 export const PIVOT_HW_1352 = {
     wk_MOV_QWORD_PTR_RDI_RAX_RET: 0x1f9bb,
-    wk_MOV_RDI_RSI_30_CALL:       0xe3e4a,
-    wk_POP_RAX_MOV_RAX_JMP_18:    0x4b330,
-    wk_PUSH_RBP_MOV_RBP_RSP_10:   0x1ff70,
-    wk_MOV_RDI_RAX_8_CALL_20:     0x16e02,
-    wk_MOV_RDX_RAX_18_CALL_10:    0x589c1,
-    wk_PUSH_RDX_POP_RSP_RET:      0x13ec77a,
+    wk_MOV_RDI_RSI_30_CALL:       0x128f418,  /* expm1+0x3d90c8, full 9-byte */
+    wk_POP_RAX_MOV_RAX_JMP_18:    0x6c84b3,   /* expm1+delta, full 7-byte */
+    wk_PUSH_RBP_MOV_RBP_RSP_10:   0x246750,   /* low .text full scan */
+    wk_MOV_RDI_RAX_8_CALL_20:     0x487d2,    /* low .text full scan */
+    wk_MOV_RDX_RAX_18_CALL_10:    0x7f35aa,   /* expm1+delta, full 10-byte */
+    wk_PUSH_RDX_POP_RSP_RET:      0x13ec77a,  /* expm1+0x53642a */
 };
 
 /** Stable G5−G0 offset in libSceNKWebKit (11.50–13.00 decrypted modules) */

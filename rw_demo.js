@@ -78,7 +78,7 @@ import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, 
     CHAIN_POP_ROWS } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830al";
+const BUILD_ID = "rw-20250830am";
 
 const NATIVE_BISECT_STEPS = [
     { id: "smoke-now", label: "N0 smoke", title: "atomic layout+fire @ prep (chain_poops callAddr)" },
