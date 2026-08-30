@@ -131,6 +131,8 @@ PS4["13.52"] = Object.assign({}, PS4["13.50"], LIBKERNEL_1352, {
     wk_MOV_RDX_RAX_18_CALL_10:          0x589c1,
     wk_PUSH_RDX_POP_RSP_RET:            0x13ec77a,
     pivot_view_sp:                      0x38,
+    /** G0=mov rdi,[rsi+0x30] — 13.52 HW needs write @ leakval+0x30 not leakval+0 */
+    pivot_hook_off:                     0x30,
     k_jmp_rsi: 0x4d6d0,
     k_kl_lock: 0xe6c60,
 });
