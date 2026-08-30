@@ -79,7 +79,7 @@
     <button type="button" class="secondary" id="btn-one-read-lk" disabled>1-read lk</button>
     <button type="button" class="secondary" id="btn-force-lk">Accept lk</button>
     <button type="button" class="secondary" id="btn-accept-fn">Accept fn</button>
-    <button type="button" class="secondary" id="btn-native" disabled>Fire native</button>
+    <button type="button" class="secondary" id="btn-native" disabled>Fire notify</button>
     <button type="button" class="secondary" id="btn-clear">Clear log</button>
   </div>
   <div class="gadget-bar" id="gadget-base">
@@ -97,9 +97,8 @@
   <div class="gadget-bar" id="native-bisect">
     <span class="bar-label">native bisect — tap one step at a time (N1→N5 finds OOM point; N6 restore if N5 survives)</span>
   </div>
-  <p id="hint"><b>13.52:</b> Button is <b>Fire native</b> (label changes: Fire smoke / Fire getpid).
-    <b>Bisect OOM:</b> Start → Verify → <b>Probe expm1</b> or <b>Scan full (auto)</b> (G5 method, not low prefix) → N1→N5.
-    <b>getpid:</b> N1 → 2e lk in hex → <b>N8 stage lk</b> → N3 → N4 → N5, or <b>N10 getpid</b> full.</p>
+  <p id="hint"><b>13.52 notify:</b> Start → <b>2e Leak+lk</b> → paste <b>k_usleep fn</b> in hex → <b>Accept fn</b> (or Accept lk — same if fn ptr) → <b>Fire notify</b>.
+    Lk base only (…000): Accept lk. Fn ptr from 2e: Accept fn. Override: <code>?gd=0x…&amp;gps=0x…</code>.</p>
   <h2>Known pointers (this process)</h2>
   <table id="map">
     <thead><tr><th>label</th><th>address</th><th>note</th></tr></thead>
@@ -107,8 +106,9 @@
   </table>
   <h2>Hex peek</h2>
   <div id="peek-bar">
-    <select id="native-mode" title="Pick mode — tap Fire native button (no auto @ Start)">
-      <option value="off" selected>native: off</option>
+    <select id="native-mode" title="notify = Collator toast; smoke/getpid = expm1 pivot (OOM on 13.52)">
+      <option value="notify" selected>native: notify (Collator)</option>
+      <option value="off">native: off</option>
       <option value="usleep">native: usleep</option>
       <option value="smoke">native: smoke (pivot only)</option>
       <option value="getpid">native: getpid</option>
@@ -149,6 +149,6 @@ window.addEventListener("unhandledrejection", function (e) {
   persistCrashLine("wk-rw-log", msg);
 });
 </script>
-<script type="module" src="./rw_demo.js?v=20250830bi"></script>
+<script type="module" src="./rw_demo.js?v=20250830bj"></script>
 </body>
 </html>

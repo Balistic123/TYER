@@ -109,7 +109,20 @@ const LIBKERNEL_1352 = {
     },
 };
 
-PS4["13.52"] = Object.assign({}, PS4["13.50"], LIBKERNEL_1352, {
+/** slopkit Collator.notify — 13.00 PS4 table + 13.52 k_notify; RE gd/gps on HW (?gd=&gps=) */
+const NOTIFY_1352 = {
+    wk_notify_hc: [0x56a58, 0x56ca0, 0x57ce8],
+    wk_notify_gd: 0x1d6fa,
+    wk_gps: 0x3352238,
+    wk_gpe: 0x1b860,
+    wk_cls: 0x3352228,
+    wk_cle: 0x274e0,
+    wk_ers: 0x3352230,
+    wk_ere: 0xf7d0,
+    wk_parseint_native: 0x1ea18,
+};
+
+PS4["13.52"] = Object.assign({}, PS4["13.50"], LIBKERNEL_1352, NOTIFY_1352, {
     fw_status: "13.52 HW pop + pivot G0-G5 full poops (7/7). lk RVAs HW-confirmed 13.52 libkernel_sys",
     /** Low .text PLT stub RVAs — fill from ghidra_analysis/scripts/find_webkit_plt.py on poops dump */
     wk_plt_stack_chk_fail: null,

