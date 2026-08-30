@@ -95,7 +95,7 @@
     <span class="bar-label">native bisect — tap one step at a time (N1→N5 finds OOM point; N6 restore if N5 survives)</span>
   </div>
   <p id="hint"><b>13.52:</b> Button is <b>Fire native</b> (label changes: Fire smoke / Fire getpid).
-    <b>Bisect OOM:</b> Start → Verify pivot → <b>N1 prep</b> → <b>N2 layout</b> → <b>N3 arm G0</b> → <b>N4 hook</b> → <b>N5 expm1</b> (OOM = bad pivot/G5).
+    <b>Bisect OOM:</b> Start → <b>Verify pivot</b> (prefix-only G0 = auto full-scan) → <b>N1 prep</b> → <b>N2 layout</b> → <b>N3 arm G0</b> → <b>N4 hook</b> → <b>N5 expm1</b>.
     <b>getpid:</b> N1 → 2e lk in hex → <b>N8 stage lk</b> → N3 → N4 → N5, or <b>N10 getpid</b> full.</p>
   <h2>Known pointers (this process)</h2>
   <table id="map">
@@ -146,6 +146,6 @@ window.addEventListener("unhandledrejection", function (e) {
   persistCrashLine("wk-rw-log", msg);
 });
 </script>
-<script type="module" src="./rw_demo.js?v=20250830ad"></script>
+<script type="module" src="./rw_demo.js?v=20250830ae"></script>
 </body>
 </html>
