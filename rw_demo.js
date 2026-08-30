@@ -90,7 +90,7 @@ import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, 
 import { runCollatorNotify } from "./slopkit_notify.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830bj";
+const BUILD_ID = "rw-20250830bk";
 
 const NATIVE_BISECT_STEPS = [
     { id: "smoke-now", label: "N0 getpid", title: "getpid — hook cell+0x30 default (13.52; ?hook=cell for poops +0)" },
@@ -306,9 +306,11 @@ function clearPersistedLog() {
 function mark(tag, detail) {
     const line = tag + (detail == null || detail === "" ? "" : "  " + detail);
     if (lkQuiet) {
-        if (/^LK-(OK|FAIL|SKIP|CAL|HINT|CAL-MISS|CAL-DONE|GUESS|PSFREE|GOT|FIND|TRACE|MISS|EXT|CELL|FINISH|VERIFY|VOTE|MIN-WALK|RESOLVE|HUNT)/.test(tag)) {
+        if (/^LK-(OK|FAIL|SKIP|CAL|HINT|CAL-MISS|CAL-DONE|GUESS|PSFREE|GOT|FIND|TRACE|MISS|EXT|CELL|FINISH|VERIFY|VOTE|MIN-WALK|RESOLVE|HUNT)/.test(tag)
+            || /^NOTIFY-|^ERROR/.test(tag)) {
             lines.push(line);
             if (lines.length > 40) lines.splice(0, lines.length - 40);
+            crashLog.append(line, tag);
             renderOut();
         }
         return;
@@ -5113,22 +5115,41 @@ function wireNativeBisectBar() {
 }
 
 function runFireNotify() {
-    if (busy || !ready || !window.p || !nativeAllowed) return;
+    if (busy) {
+        mark("NOTIFY-SKIP", "busy");
+        renderOut();
+        return;
+    }
+    if (!ready || !window.p) {
+        mark("NOTIFY-SKIP", "Start first — need PRIMITIVE-OK");
+        state("Start first", "warn");
+        renderOut();
+        return;
+    }
+    if (!nativeAllowed) {
+        mark("NOTIFY-SKIP", "pair broken — reload + Start (?promote=1 if needed)");
+        state("primitive broken", "bad");
+        renderOut();
+        return;
+    }
     const p = window.p;
     const off = loadEffectiveOff();
     const lk = lkFromUi();
     if (!lk) {
         mark("NOTIFY-SKIP", "2e → paste k_usleep fn → Accept fn → Fire notify");
+        state("need lk — Accept fn", "warn");
         renderOut();
         return;
     }
 
     busy = true;
     nativeQuiet = true;
-    lkQuiet = true;
     const bases = basesFromSession(off);
     mark("NOTIFY-FIRE", "Collator path build=" + BUILD_ID + " lk=" + lk);
+    mark("NOTIFY-BEGIN", "wk=" + (bases.webkitBase || chainWebkitBase(off) || "?")
+        + " fn=" + (bases.nativeFn || "?"));
     renderOut();
+    try { crashLog.flushSync(); } catch (_) { }
 
     try {
         for (let i = 0; i < notifyRetain.length; i++)
@@ -5143,6 +5164,7 @@ function runFireNotify() {
             retain: notifyRetain,
             params,
             log: mark,
+            gdScan: params.get("gdscan") === "1",
         });
         if (out.sent) {
             mark("NOTIFY-OK", "system toast result=0 build=" + BUILD_ID);
@@ -5159,12 +5181,15 @@ function runFireNotify() {
             state("notify failed", "bad");
         }
     } catch (err) {
-        mark("NOTIFY-FAIL", (err.message || String(err)) + " build=" + BUILD_ID);
-        mark("NOTIFY-HINT", "RE gd/gps on 13.52 — ?gd=0x…&gps=0x… or fix lk via 2e");
-        state("notify failed", "bad");
+        const em = err && err.message ? err.message : String(err);
+        mark("NOTIFY-FAIL", em + " build=" + BUILD_ID);
+        mark("NOTIFY-HINT", "RE gd on 13.52 — ?gd=0x… or ?gdscan=1 to hunt (OOM risk)");
+        state("notify failed: " + em.slice(0, 60), "bad");
+        try {
+            crashLog.append("NOTIFY-FAIL " + em, "NOTIFY-FAIL");
+        } catch (_) { }
     } finally {
         nativeQuiet = false;
-        lkQuiet = false;
         busy = false;
         setUi();
         renderOut();
