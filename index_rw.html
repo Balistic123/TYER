@@ -91,7 +91,8 @@
   <div class="gadget-bar" id="gadget-pivot">
     <span class="bar-label">pivot G0-G5 HW — Verify pivot then Native call</span>
   </div>
-  <p id="hint"><b>13.52 (build 32o):</b> Okage lk is <b>ps2emu</b> — wrong for WebKit (usleep OOMs).
+  <p id="hint"><b>13.52:</b> WebKit libkernel base is <b>16KB-aligned</b> (…000).
+    Game (Okage/ps2emu) …c30 bases are a different process — do not paste those here.
     After Start tap <b>1-read lk</b> (one webkit PLT per tap) → reload → set native <b>usleep</b> → Start.
     Default native <b>off</b> so Start alone won't fire. Smoke tests pivot (OOM = chain bug, not lk).</p>
   <h2>Known pointers (this process)</h2>
@@ -108,7 +109,7 @@
       <option value="getpid">native: getpid</option>
     </select>
     <select id="pick-ptr" disabled><option value="">pick known ptr…</option></select>
-    <input type="text" id="addr-in" placeholder="83f33ac30 Okage lk …c30" autocomplete="off">
+    <input type="text" id="addr-in" placeholder="80a67c000 lk base or fn ptr" autocomplete="off">
     <button type="button" class="secondary" id="btn-peek" disabled>peek 64 bytes</button>
   </div>
   <div id="hex">—</div>

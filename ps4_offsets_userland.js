@@ -79,7 +79,7 @@ PS4["12.52"] = Object.assign({}, PS4["12.50"], {
 // 13.52 libkernel_sys.sprx — firmware 13.52 (HW-confirmed via eboot GOT usleep anchor).
 // lk_base = DEREF(GOT_usleep) - 0x013b20  (same RVAs in WebKit process)
 const LIBKERNEL_1352 = {
-    /** Primary anchor — Okage/mast1c0re use this */
+    /** Primary anchor — libkernel_sys usleep entry RVA (13.52) */
     k_usleep:                           0x13b20,
     k__error:                           0x1bb0,
     k_open:                             0x148d0,
@@ -98,8 +98,7 @@ const LIBKERNEL_1352 = {
     k_mmap:                             0x114e0,
     k_jitshm_create:                    0x510,
     k_jitshm_alias:                     0x530,
-    /** Okage HW — lk_base low 12 bits on 13.52 retail */
-    lk_base_tag:                        0xc30,
+    /** WebKit libkernel_sys load base is 16KB-aligned (…000). Okage ps2emu …c30 is a different process. */
     /** Suchi dump: mov rax,20 @ +0x4f0 — fire ROP at +0xa (mov r10,rcx;syscall) */
     k_getpid_syscall:                   0x4fa,
     /** BillZaiD game process — trial only, verify before use */

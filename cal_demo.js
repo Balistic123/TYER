@@ -33,7 +33,7 @@ let walkQuiet = false;
 const calRetain = [];
 
 const LOG_MAX = 300;
-const BUILD_ID = "cal-20250830f";
+const BUILD_ID = "cal-20250830g";
 const WEBKIT_CODE_PROLOGUE = 0xe5894855;
 const VTABLE_EXT_SLOTS = 48;
 /** 2e lite — fewer vtable slot reads (OOM-safe on 13.52 HW) */

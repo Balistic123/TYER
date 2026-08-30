@@ -252,7 +252,7 @@ function setUi() {
             btnNative.title = "prefer reload+Start for fresh heap";
         } else {
             btnNative.textContent = nm === "smoke" ? "Fire smoke" : (nm === "usleep" ? "Fire usleep" : "Fire getpid");
-            btnNative.title = "Okage: Accept lk → reload → Start auto-fires";
+            btnNative.title = "Accept lk → reload → Start auto-fires";
         }
     }
     if (btnLoadCal) {
@@ -725,7 +725,7 @@ async function runScanExtToLk() {
         if (hit.hint)
             mark("LK-HINT", hit.hint);
         else if (hit.zeroRank && hit.zeroRank.length)
-            mark("LK-HINT", "need 2+ ext fn ptrs → same …c30 (no lk peek)");
+            mark("LK-HINT", "need 2+ ext fn ptrs → same 16KB lk (no lk peek)");
         else
             mark("LK-HINT", "ext ptrs may be libc/webkit — re-run cal 2e after groom");
         state("ext scan miss", "bad");
@@ -851,7 +851,7 @@ function runManualTest(testId) {
         if (testId === "paste-lk") {
             const raw = addrIn && addrIn.value ? addrIn.value.trim() : "";
             if (!raw) {
-                mark("LK-SKIP", "paste lk …c30 OR cal ext fn ptr — Accept lk (0 read)");
+                mark("LK-SKIP", "paste 16KB lk base or cal ext fn ptr — Accept lk (0 read)");
                 return;
             }
             const parsed = parseAddr(raw.replace(/^0x/i, ""));
@@ -871,7 +871,7 @@ function runManualTest(testId) {
                 const v = verifyLibkernelZeroRead(parsed, offL, { via: "paste" });
                 if (v.ok) {
                     saveLibkernelSession(parsed, null);
-                    mark("LK-OK", String(parsed) + " (0 reads, …c30)");
+                    mark("LK-OK", String(parsed) + " (0 reads, 16KB lk)");
                     state("lk accepted — Arm → Fire", "ok");
                 } else {
                     mark("LK-FAIL", v.error || "not lk — Calc lk from cal ext ptr");
@@ -2204,12 +2204,12 @@ let leakScanState = null;
 let calLkHits = [];
 let calLkHitIdx = 0;
 
-/** Calc lk from hex box — Okage base or fn ptr − Suchi RVA. No cal session needed. */
+/** Calc lk from hex box — lk base or fn ptr − Suchi RVA. No cal session needed. */
 function calcLkFromHex() {
     const off = loadEffectiveOff();
     let hex = addrIn && addrIn.value ? addrIn.value.trim().replace(/^0x/i, "") : "";
     if (!hex) {
-        mark("LK-SKIP", "paste Okage base (83f33ac30) or libkernel fn ptr in hex box");
+        mark("LK-SKIP", "paste libkernel base (16KB …000) or fn ptr in hex box");
         state("paste hex first", "bad");
         renderOut();
         return;
@@ -2224,15 +2224,15 @@ function calcLkFromHex() {
     const asBase = verifyLibkernelZeroRead(ptr, off, { via: "calc-base" });
     if (asBase.ok) {
         if (addrIn) addrIn.value = String(ptr);
-        mark("LK-CAL", "already lk base " + ptr + " (…c30) — tap Accept lk");
+        mark("LK-CAL", "already lk base " + ptr + " (16KB) — tap Accept lk");
         state("base OK — Accept lk", "ok");
         renderOut();
         return;
     }
     const hits = calcLkFromFnPtrZeroRead(ptr, off);
     if (!hits.length) {
-        mark("LK-CAL-MISS", hex + " — not …c30 base and no Suchi RVA match");
-        mark("LK-HINT", "Okage: paste full base ending c30 (e.g. 83f33ac30)");
+        mark("LK-CAL-MISS", hex + " — not 16KB lk base and no Suchi RVA match");
+        mark("LK-HINT", "paste fn ptr from cal LK-PTR lines, or 16KB base like 80a67c000");
         state("calc miss", "bad");
         renderOut();
         return;
@@ -2281,7 +2281,7 @@ function runOneReadLk() {
             saveLibkernelSession(r.lk, r.pltRva, { forced: true });
             if (addrIn) addrIn.value = String(r.lk);
             mark("LK-OK", "WebKit 1-read plt+0x" + r.pltRva.toString(16)
-                + " → " + r.lk + " (" + r.via + ") — NOT Okage");
+                + " → " + r.lk + " (" + r.via + ")");
             mark("LK-HINT", "reload → native mode usleep → Start");
             state("WebKit lk OK — reload + Start", "ok");
             crashLog.append("LK-1READ " + r.lk + " plt=" + r.pltRva.toString(16), "LK-OK");
@@ -2306,8 +2306,8 @@ function acceptLkFromHex(hexOverride) {
     if (!hex && addrIn && addrIn.value)
         hex = addrIn.value.trim().replace(/^0x/i, "");
     if (!hex) {
-        mark("LK-SKIP", "paste Okage lk in hex (e.g. 83f33ac30) — prefer 1-read lk after Start");
-        state("paste lk …c30 in hex box", "bad");
+        mark("LK-SKIP", "paste libkernel base (16KB) or fn ptr — or Scan ext→lk after Start");
+        state("paste lk base in hex box", "bad");
         renderOut();
         return false;
     }
@@ -2319,11 +2319,11 @@ function acceptLkFromHex(hexOverride) {
         return false;
     }
 
-    const asBase = verifyLibkernelZeroRead(ptr, off, { via: "okage" });
+    const asBase = verifyLibkernelZeroRead(ptr, off, { via: "manual-base" });
     if (asBase.ok) {
         saveLibkernelSession(ptr, null, { forced: true });
         if (addrIn) addrIn.value = String(ptr);
-        mark("LK-OK", String(ptr) + " Okage accepted (0 reads) — reload → Start");
+        mark("LK-OK", String(ptr) + " lk base accepted (0 reads) — reload → Start");
         state("lk saved — reload then Start", "ok");
         renderOut();
         try {
@@ -2350,7 +2350,7 @@ function acceptLkFromHex(hexOverride) {
     }
 
     mark("LK-VERIFY-MISS", hex + " — " + (asBase.error || "?"));
-    mark("LK-HINT", "Okage base must end …c30 (e.g. 83f33ac30)");
+    mark("LK-HINT", "lk must be 16KB-aligned (…000) — from cal LK-PTR or Scan ext→lk");
     state("accept failed", "bad");
     renderOut();
     try { crashLog.append("ACCEPT FAIL " + hex, "LK-VERIFY"); crashLog.flushSync(); } catch (_) { }
@@ -3394,7 +3394,7 @@ function tryNativeFireAtStart(p, off) {
             })()
             || (addrIn && addrIn.value ? parseAddr(addrIn.value.replace(/^0x/i, "")) : null);
         if (!lk) {
-            mark("NATIVE-SKIP", "paste Okage lk → Accept lk → reload → Start");
+            mark("NATIVE-SKIP", "Accept lk → reload → Start");
             return;
         }
         if (addrIn) addrIn.value = String(lk);
@@ -3417,7 +3417,7 @@ function tryNativeFireAtStart(p, off) {
         if (nm === "smoke")
             mark("NATIVE-HINT", "smoke failed = pivot/gadget issue (not lk)");
         else
-            mark("NATIVE-HINT", "wrong lk for WebKit? try same-boot Okage");
+            mark("NATIVE-HINT", "wrong lk? re-run cal 2e or Scan ext→lk");
         state("native fire failed @ Start", "bad");
     } finally {
         nativeQuiet = false;
@@ -3470,7 +3470,7 @@ function runTryBillZaiLk() {
     renderOut();
 }
 
-/** Force lk — 0 reads, session only. Works before Start (Okage paste). */
+/** Force lk — 0 reads, session only. Works before Start (manual paste). */
 function runForceLkOnly(lk) {
     if (busy) return;
     if (lk) acceptLkFromHex(String(lk).replace(/^0x/i, ""));
@@ -3952,7 +3952,7 @@ function init() {
     wireGroomBar(() => busy);
     setUi();
     renderOut();
-    state("Start → 1-read lk (WebKit) — Okage lk is wrong process", "");
+    state("Start → Scan ext→lk or cal 2e for WebKit libkernel", "");
 }
 
 function bootUi() {
