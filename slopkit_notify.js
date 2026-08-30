@@ -412,6 +412,7 @@ export function stageCollatorNotify(ctx) {
     let realCollatorAddr;
     let compareFnAddr;
     let arenaBacking;
+    let prewarm = null;
 
     if (ctx.pinned) {
         log("NOTIFY-STAGE", "reuse pinned collator+arena");
@@ -435,9 +436,10 @@ export function stageCollatorNotify(ctx) {
         if (notificationRequest.length !== NOTIFICATION_REQUEST_SIZE)
             throw new Error("notify: bad request layout");
 
-        const prewarm = compareFn(notificationRequest, "b");
-        if (!Number.isFinite(prewarm))
+        const prewarmResult = compareFn(notificationRequest, "b");
+        if (!Number.isFinite(prewarmResult))
             throw new Error("notify: request prewarm failed");
+        prewarm = prewarmResult;
         log("NOTIFY-PREWARM", "result=" + prewarm + " (1 is normal before fake UCollator)");
 
         arenaBuffer = new ArrayBuffer(ARENA_BYTES);
