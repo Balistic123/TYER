@@ -88,7 +88,7 @@ import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, 
     prepGadgetRvaStale, refreshPrepSlabGadgets,
     CHAIN_POP_ROWS } from "./native_call.js";
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830bp";
+const BUILD_ID = "rw-20250830bq";
 
 const NATIVE_BISECT_STEPS = [
     { id: "smoke-now", label: "N0 getpid", title: "getpid — hook cell+0x30 default (13.52; ?hook=cell for poops +0)" },
@@ -256,7 +256,7 @@ const crashLog = createCrashLog({
     ssBuild: "wk-rw-log-build",
     buildId: BUILD_ID,
     maxLines: 200,
-    critical: /^(FAIL|ERROR|OOM|GIVE-UP|PRIMITIVE|NATIVE|BISECT|SMOKE|PREP-PIN|LK-|PASS|WARN|BOOT|LOG-CLEAR|ATTEMPT|READ-PRIMITIVE|TRIM|HINT)/,
+    critical: /^(FAIL|ERROR|OOM|GIVE-UP|PRIMITIVE|NATIVE|BISECT|SMOKE|PREP-PIN|LK-|PASS|WARN|BOOT|LOG-CLEAR|ATTEMPT|READ-PRIMITIVE|TRIM|HINT|NOTIFY-[SF])/,
 });
 const CORE_LOG = /ADDROF|FAIL|ERROR|PRIMITIVE|PASS|GIVE-UP|ATTEMPT|SETUP|CARRIER|PAIR|SSV-|TRIM-DEBRIS|ADDROF-RELEASE|FAKE-ADDRESS|READ-PRIMITIVE|PLACEMENT|COMPOSITION|NORMAL-CLONE|ZERO-HEADER|VALIDATION|LOAD-THREW|NO-RESULT|PRIMITIVE-OK|AUTO-RETRY|CORE-GIVE-UP|HINT-GROOM/i;
 
@@ -296,6 +296,16 @@ function renderOut() {
     if (!outEl) return;
     outEl.textContent = lines.join("\n");
     outEl.scrollTop = outEl.scrollHeight;
+}
+
+/** Log + render + sync flush — last stage survives notify OOM. */
+function notifyStage(tag, detail) {
+    mark(tag, detail);
+    renderOut();
+    try { crashLog.flushSync(); } catch (_) { }
+    try {
+        crashLog.persistState(tag + (detail ? " " + detail : ""), "warn", true);
+    } catch (_) { }
 }
 
 function clearPersistedLog() {
@@ -4319,23 +4329,30 @@ function resolveWebkitBase(off, nativeFn) {
     return null;
 }
 
-/** Lazy pin @ Fire only — avoids OOM right after PRIMITIVE-OK. */
+/** Lazy pin @ Fire only — staged for OOM bisect. */
 async function ensureNotifyPrep(p, off) {
     if (notifyPrep) return notifyPrep;
+    notifyStage("NOTIFY-F03", "dynamic import slopkit_notify");
     const sk = await import("./slopkit_notify.js?v=" + BUILD_ID);
+    notifyStage("NOTIFY-F04", "read session bases");
     let nativeFn = parseAddr(sessionStorage.getItem("wk-nativeFn"));
     let webkitBase = parseAddr(sessionStorage.getItem("wk-webkitBase"));
     if (!nativeFn || !webkitBase) {
+        notifyStage("NOTIFY-F05", "captureMainMfForPrep (heavy — OOM risk)");
         try {
             const cap = captureMainMfForPrep(p, off);
             nativeFn = cap.nativeFn;
             webkitBase = nativeFn.sub32(off.wk_expm1_builtin);
             persistSessionBases(nativeFn, webkitBase, { trust: "rw" });
+            notifyStage("NOTIFY-F05-OK", "nativeFn=" + nativeFn);
         } catch (err) {
             mark("NOTIFY-PREP-SKIP", "base: " + (err.message || String(err)));
             return null;
         }
+    } else {
+        notifyStage("NOTIFY-F05-SKIP", "bases cached fn=" + nativeFn);
     }
+    notifyStage("NOTIFY-F06", "pinNotifyHeap");
     notifyPrep = sk.pinNotifyHeap({
         p,
         off,
@@ -4344,12 +4361,16 @@ async function ensureNotifyPrep(p, off) {
         nativeFn,
         retain: notifyRetain,
         params,
-        log: mark,
+        log: notifyStage,
+        flush: function () {
+            renderOut();
+            try { crashLog.flushSync(); } catch (_) { }
+        },
         bufAddrOff: null,
     });
     for (let i = 0; i < notifyRetain.length; i++)
         retained.push(notifyRetain[i]);
-    mark("NOTIFY-PIN-OK", "lazy pin @ fire — Accept fn then retry if needed");
+    notifyStage("NOTIFY-F07", "pin complete");
     return notifyPrep;
 }
 
@@ -5177,34 +5198,36 @@ async function runFireNotify() {
 
     busy = true;
     nativeQuiet = true;
-    mark("NOTIFY-FIRE", "Collator path build=" + BUILD_ID + " lk=" + lk);
-    renderOut();
-    try { crashLog.flushSync(); } catch (_) { }
+    notifyStage("NOTIFY-F01", "Fire tap build=" + BUILD_ID + " lk=" + lk);
 
     try {
+        notifyStage("NOTIFY-F02", "trimExploitDebris");
         try {
             const coreMod = await import("./core.js");
             coreMod.trimExploitDebris();
-            mark("NOTIFY-TRIM", "groom freed before pin");
-            renderOut();
-        } catch (_) { }
+            notifyStage("NOTIFY-F02-OK", "groom freed");
+        } catch (trimErr) {
+            notifyStage("NOTIFY-F02-SKIP", trimErr && trimErr.message ? trimErr.message : "trim skip");
+        }
 
         if (!notifyPrep) {
-            mark("NOTIFY-PIN", "lazy pin @ fire");
-            renderOut();
-            try { crashLog.flushSync(); } catch (_) { }
             await ensureNotifyPrep(p, off);
             if (!notifyPrep) {
-                mark("NOTIFY-FAIL", "pin failed — try index_notify.html (lite)");
-                state("pin failed", "bad");
+                mark("NOTIFY-FAIL", "pin failed before S14");
+                state("pin failed — check last NOTIFY-S* stage", "bad");
                 return;
             }
+        } else {
+            notifyStage("NOTIFY-F06-SKIP", "reuse pinned prep");
         }
 
         const sk = await import("./slopkit_notify.js?v=" + BUILD_ID);
-        mark("NOTIFY-BEGIN", "pinned fire — 0 stage alloc");
-        renderOut();
-        const out = sk.fireNotifyPinned(p, notifyPrep, lk, off, mark);
+        notifyStage("NOTIFY-F08", "fireNotifyPinned");
+        const fireFlush = function () {
+            renderOut();
+            try { crashLog.flushSync(); } catch (_) { }
+        };
+        const out = sk.fireNotifyPinned(p, notifyPrep, lk, off, notifyStage, { flush: fireFlush });
         if (out.sent) {
             mark("NOTIFY-OK", "system toast result=0 build=" + BUILD_ID);
             state("notification sent — check PS4 toast", "ok");

