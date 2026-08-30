@@ -90,7 +90,7 @@ import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, 
 import { runCollatorNotify } from "./slopkit_notify.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830bk";
+const BUILD_ID = "rw-20250830bl";
 
 const NATIVE_BISECT_STEPS = [
     { id: "smoke-now", label: "N0 getpid", title: "getpid — hook cell+0x30 default (13.52; ?hook=cell for poops +0)" },
