@@ -93,7 +93,8 @@
   </div>
   <p id="hint"><b>13.52:</b> <b>Start</b> → <b>2e Leak+lk</b> (cal-style vtable probe) → <b>Arm getpid</b> on same page.
     libkernel rotates each browser load — no reload between 2e and getpid.
-    Set native <code>getpid</code> first; optional auto-fire: <code>?hotfire=1</code>.
+    Set native <code>getpid</code> → Start → 2e → Arm getpid (same page).
+    If getpid OOMs but peek works: try native <code>smoke</code> first (pivot-only).
     Manual paste still works in hex box + Accept lk.</p>
   <h2>Known pointers (this process)</h2>
   <table id="map">
@@ -144,6 +145,6 @@ window.addEventListener("unhandledrejection", function (e) {
   persistCrashLine("wk-rw-log", msg);
 });
 </script>
-<script type="module" src="./rw_demo.js?v=20250830u"></script>
+<script type="module" src="./rw_demo.js?v=20250830v"></script>
 </body>
 </html>

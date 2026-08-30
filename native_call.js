@@ -169,16 +169,17 @@ export function layoutGetpidSlab(M, G, stub) {
     layoutNativeCall(M, G, stub, []);
 }
 
-export function stageGetpid(p, prep, libkernelBase, off) {
+export function stageGetpid(p, prep, libkernelBase, off, stubOffOverride) {
     if (!prep || !prep.M || !prep.G)
         throw new Error("stageGetpid: no prep");
-    let stubOff = off.k_getpid_syscall;
+    let stubOff = stubOffOverride;
     if (stubOff == null && off.k_stubs && off.k_stubs[SYS.getpid] != null)
         stubOff = off.k_stubs[SYS.getpid];
     if (stubOff == null)
-        stubOff = 0x4fa;
+        stubOff = off.k_getpid_syscall != null ? off.k_getpid_syscall : 0x4fa;
     layoutNativeCall(prep.M, prep.G, libkernelBase.add32(stubOff), []);
     prep.staged = true;
+    prep.stubOff = stubOff;
 }
 
 export function stageUsleep(p, prep, libkernelBase, off, usec) {

