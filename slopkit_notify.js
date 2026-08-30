@@ -793,5 +793,4 @@ export {
     buildNotificationRequest,
     writeNotificationRequestToView,
     useArenaRequest,
-    runNotifyAtomic,
 };
