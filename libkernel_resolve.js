@@ -253,8 +253,10 @@ export function resolveGetpidStub(p, lk, off, opts) {
         return { addr, tag, verified: true, off: offHint != null ? offHint : null };
     }
 
+    const skipLk = !!opts.skipLkOffs;
+
     const cached = loadGetpidStubOff();
-    if (cached != null) {
+    if (!skipLk && cached != null) {
         const hit = tryAt(lk.add32(cached), "cached+0x" + cached.toString(16), cached);
         if (hit) return hit;
     }
@@ -274,25 +276,27 @@ export function resolveGetpidStub(p, lk, off, opts) {
         }
     }
 
-    const offs = getpidStubOffsets(off);
-    for (let i = 0; i < offs.length; i++) {
-        const o = offs[i];
-        const hit = tryAt(lk.add32(o), "lk+0x" + o.toString(16), o);
-        if (hit) {
-            saveGetpidStubOff(o);
-            return hit;
+    if (!skipLk) {
+        const offs = getpidStubOffsets(off);
+        for (let i = 0; i < offs.length; i++) {
+            const o = offs[i];
+            const hit = tryAt(lk.add32(o), "lk+0x" + o.toString(16), o);
+            if (hit) {
+                saveGetpidStubOff(o);
+                return hit;
+            }
         }
-    }
 
-    const scanMax = opts.scanMax != null ? opts.scanMax : 0x40000;
-    const maxProbes = opts.maxProbes != null ? opts.maxProbes : 4096;
-    let probes = 0;
-    for (let o = 0; o < scanMax && probes < maxProbes; o += 16) {
-        probes++;
-        const hit = tryAt(lk.add32(o), "scan+0x" + o.toString(16), o);
-        if (hit) {
-            saveGetpidStubOff(o);
-            return hit;
+        const scanMax = opts.scanMax != null ? opts.scanMax : 0x40000;
+        const maxProbes = opts.maxProbes != null ? opts.maxProbes : 4096;
+        let probes = 0;
+        for (let o = 0; o < scanMax && probes < maxProbes; o += 16) {
+            probes++;
+            const hit = tryAt(lk.add32(o), "scan+0x" + o.toString(16), o);
+            if (hit) {
+                saveGetpidStubOff(o);
+                return hit;
+            }
         }
     }
 

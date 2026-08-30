@@ -77,6 +77,7 @@
     <button type="button" class="secondary" id="btn-try-billzai-lk" disabled>Try BillZai lk</button>
     <button type="button" class="secondary" id="btn-one-read-lk" disabled>1-read lk</button>
     <button type="button" class="secondary" id="btn-force-lk">Accept lk</button>
+    <button type="button" class="secondary" id="btn-accept-fn">Accept fn</button>
     <button type="button" class="secondary" id="btn-native" disabled>Fire native</button>
     <button type="button" class="secondary" id="btn-clear">Clear log</button>
   </div>
@@ -112,7 +113,7 @@
       <option value="getpid">native: getpid</option>
     </select>
     <select id="pick-ptr" disabled><option value="">pick known ptr…</option></select>
-    <input type="text" id="addr-in" placeholder="paste lk from cal (16KB …000)" autocomplete="off">
+    <input type="text" id="addr-in" placeholder="lk base …000 or k_usleep fn ptr" autocomplete="off">
     <button type="button" class="secondary" id="btn-peek" disabled>peek 64 bytes</button>
   </div>
   <div id="hex">—</div>
@@ -147,6 +148,6 @@ window.addEventListener("unhandledrejection", function (e) {
   persistCrashLine("wk-rw-log", msg);
 });
 </script>
-<script type="module" src="./rw_demo.js?v=20250830be"></script>
+<script type="module" src="./rw_demo.js?v=20250830bf"></script>
 </body>
 </html>
