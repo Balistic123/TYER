@@ -28,7 +28,7 @@ let walkQuiet = false;
 const calRetain = [];
 
 const LOG_MAX = 300;
-const BUILD_ID = "cal-20250830a";
+const BUILD_ID = "cal-20250830b";
 const crashLog = createCrashLog({
     ssLog: "wk-cal-log",
     ssState: "wk-cal-state",
@@ -1938,18 +1938,19 @@ async function walkVtableForBase() {
 
         if (merged.length) {
             const hit = resolveLibkernelFromExtList(p, webkitBase, off, merged, {
-                minVotes: 1,
-                verify: true,
-                walkPages: 48,
+                minVotes: 2,
+                minDistinctFn: 2,
             });
             if (hit.ok && hit.lk) {
                 saveLibkernelSession(hit.lk, hit.iatRva || null);
-                mark("LK-OK", hit.lk + " (" + hit.method + "/" + hit.via + ")");
+                mark("LK-OK", hit.lk + " (" + hit.method + "/" + hit.via + ") reads=0");
                 mark("HINT", "index_rw → Accept lk → reload → Arm getpid");
-                state("libkernel auto OK", "ok");
+                state("libkernel auto OK (0-read)", "ok");
                 return true;
             }
             mark("LK-EXT-MISS", hit.error || "no lk consensus");
+            if (hit.hint)
+                mark("LK-HINT", hit.hint);
             if (hit.zeroRank && hit.zeroRank.length) {
                 for (let ri = 0; ri < hit.zeroRank.length && ri < 3; ri++) {
                     const r = hit.zeroRank[ri];
