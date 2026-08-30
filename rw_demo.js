@@ -82,7 +82,7 @@ import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, 
     CHAIN_POP_ROWS } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830at";
+const BUILD_ID = "rw-20250830au";
 
 const NATIVE_BISECT_STEPS = [
     { id: "smoke-now", label: "N0 smoke", title: "atomic layout+fire @ prep (chain_poops callAddr)" },
@@ -4307,13 +4307,18 @@ function bisectHookVerifyLog(p, prep, hookOffs, tag) {
     return bisectHookVerifyLogFrom(verifyPivotHookWrites(p, prep, hookOffs), hookOffs, tag);
 }
 
+function bisectHookPendingCount(prep) {
+    if (!prep || !prep._bisect) return 0;
+    const bis = prep._bisect;
+    if (bis.multiSaved && bis.multiSaved.length) return bis.multiSaved.length;
+    if (bis.pivotSaved != null) return 1;
+    return 0;
+}
+
 function bisectPrepIsHot(prep) {
     if (!prep) return false;
     if (prep.mainArmed) return true;
-    const bis = prep._bisect;
-    if (bis && bis.multiSaved && bis.multiSaved.length) return true;
-    if (bis && bis.pivotSaved != null) return true;
-    return false;
+    return bisectHookPendingCount(prep) > 0;
 }
 
 function bisectLogHookPost(p, prep, hookOffs) {
@@ -4449,15 +4454,18 @@ function runNativeBisectStep(stepId) {
 
     /* renderOut/bisectLog before disarm OOMs if G0 armed + pivot poisoned */
     let untangle = null;
+    let hookPending = 0;
     if (nativePrep && (stepId === "disarm" || stepId === "restore"
             || (bisectPrepIsHot(nativePrep) && stepId === "peek-pivot"))) {
+        hookPending = bisectHookPendingCount(nativePrep);
         try { untangle = bisectEmergencyUntangle(p, nativePrep); } catch (_) { }
     }
 
     setUi();
     bisectLog("BISECT", "step " + stepId + " build=" + BUILD_ID
         + (untangle ? " pre-untangle disarmed=" + untangle.disarmed
-            + " pivotRestored=" + untangle.restored : ""));
+            + " pivotRestored=" + untangle.restored
+            + " hookPending=" + hookPending : ""));
     let pid = -1;
     try {
         switch (stepId) {
