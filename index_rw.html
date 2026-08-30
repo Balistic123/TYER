@@ -91,10 +91,9 @@
   <div class="gadget-bar" id="gadget-pivot">
     <span class="bar-label">pivot G0-G5 HW — Verify pivot then Native call</span>
   </div>
-  <p id="hint"><b>13.52:</b> WebKit libkernel base is <b>16KB-aligned</b> (…000).
-    Game (Okage/ps2emu) …c30 bases are a different process — do not paste those here.
-    After Start tap <b>1-read lk</b> (one webkit PLT per tap) → reload → set native <b>usleep</b> → Start.
-    Default native <b>off</b> so Start alone won't fire. Smoke tests pivot (OOM = chain bug, not lk).</p>
+  <p id="hint"><b>13.52:</b> libkernel base <b>rotates each browser load</b> (ASLR) — get fresh hex from
+    <b>index_cal → 2e</b>, paste here, tap <b>Accept lk</b>, then <b>Start</b>.
+    Peek / native on <b>same page</b> (do not reload — reload needs new lk). Override: <code>?lk=…</code></p>
   <h2>Known pointers (this process)</h2>
   <table id="map">
     <thead><tr><th>label</th><th>address</th><th>note</th></tr></thead>
@@ -109,7 +108,7 @@
       <option value="getpid">native: getpid</option>
     </select>
     <select id="pick-ptr" disabled><option value="">pick known ptr…</option></select>
-    <input type="text" id="addr-in" placeholder="80a67c000 lk base or fn ptr" autocomplete="off">
+    <input type="text" id="addr-in" placeholder="paste lk from cal (16KB …000)" autocomplete="off">
     <button type="button" class="secondary" id="btn-peek" disabled>peek 64 bytes</button>
   </div>
   <div id="hex">—</div>
@@ -144,6 +143,6 @@ window.addEventListener("unhandledrejection", function (e) {
   persistCrashLine("wk-rw-log", msg);
 });
 </script>
-<script type="module" src="./rw_demo.js?v=20250832o"></script>
+<script type="module" src="./rw_demo.js?v=20250830t"></script>
 </body>
 </html>

