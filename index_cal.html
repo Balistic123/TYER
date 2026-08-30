@@ -106,7 +106,7 @@
     Use <code>?full=1</code> only if lite misses (heavy — may OOM). <code>?vtslots=24</code> for more slots.
     Base matches <b>index_rw</b> (nativeFn − expm1).
     Ext ptrs are auto-scanned across all vtable chains (48 slots each).
-    Accept if <b>2 ext fn ptrs</b> agree on same <b>16KB-aligned</b> lk, or <b>1 ptr</b> via k_usleep/k__error (LK-PTR lines).
+    Accept if <b>1 fn</b> hits lk via <b>rev-k_usleep</b> / <b>rev-k__error</b>, or <b>2 fn ptrs</b> agree on same lk.
     Or use index_rw → <b>Leak+vtable LK</b> directly (no cal needed).
     Logs auto-restore after reload/crash. <code>?clearlog=1</code> to wipe.
   </p>

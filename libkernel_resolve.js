@@ -713,7 +713,10 @@ export function resolveLibkernelFromExtList(p, webkitBase, off, entries, opts) {
         zeroRank.push(ent);
     });
     zeroRank.sort(function (a, b) {
+        const aPri = (a.hasUsleep ? 2 : 0) + (a.hasError ? 1 : 0);
+        const bPri = (b.hasUsleep ? 2 : 0) + (b.hasError ? 1 : 0);
         return b.crossRva - a.crossRva
+            || bPri - aPri
             || b.distinctFn - a.distinctFn
             || b.count - a.count
             || b.vias.length - a.vias.length;
@@ -723,22 +726,19 @@ export function resolveLibkernelFromExtList(p, webkitBase, off, entries, opts) {
         const cand = zeroRank[ri];
         const crossRvaOk = cand.crossRva >= 1;
         const distinctOk = cand.distinctFn >= minDistinctFn;
-        const singlePriOk = allowSinglePriRva && cand.distinctFn >= 1
-            && cand.vias.some(function (v) {
-                return v === "rva-k_usleep" || v === "rva-k__error";
-            });
+        const priHit = cand.hasUsleep || cand.hasError;
+        const singlePriOk = allowSinglePriRva && cand.distinctFn >= 1 && priHit;
         if (!crossRvaOk && !distinctOk && !singlePriOk) continue;
         if (cand.count < minVotes && !crossRvaOk && !singlePriOk) continue;
         const v = verifyLibkernelZeroRead(cand.lk, off, { via: "zero-vote" });
         if (!v.ok) continue;
         const method = crossRvaOk ? "cross-rva"
-            : (singlePriOk ? "single-pri-rva" : "zero-vote");
+            : (singlePriOk ? "single-rev" : "zero-vote");
         const via = crossRvaOk
             ? "usleep+error→" + String(cand.lk) + "+" + cand.distinctFn + "fn"
             : (singlePriOk
-                ? cand.vias.filter(function (x) {
-                    return x === "rva-k_usleep" || x === "rva-k__error";
-                }).join("+") + "→" + String(cand.lk)
+                ? (cand.vias ? cand.vias.slice(0, 3).join("+") : "")
+                    + "→" + String(cand.lk)
                 : "zero-vote+" + cand.distinctFn + "fn+" + cand.count + "x");
         return {
             ok: true,
@@ -808,7 +808,7 @@ export function resolveLibkernelFromExtList(p, webkitBase, off, entries, opts) {
         }
     }
 
-    let hint = "need 2+ distinct ext fn ptrs → same 16KB-aligned lk (0 reads)";
+    let hint = "need 2 fn ptrs → same lk, OR 1 fn with rev/rva k_usleep/k__error (0 reads)";
     const matchedPtrs = ptrDiag.filter(function (d) { return !d.skipped && d.matches.length; });
     if (matchedPtrs.length === 1) {
         const m = matchedPtrs[0];

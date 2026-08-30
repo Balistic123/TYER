@@ -622,6 +622,8 @@ function logExtScanRank(tag, rank) {
             + " fn=" + (r.distinctFn != null ? r.distinctFn : "?")
             + " cross=" + (r.crossRva != null ? r.crossRva : (r.dualRva != null ? r.dualRva : 0))
             + " votes=" + r.count
+            + " usleep=" + (r.hasUsleep ? "y" : "n")
+            + " error=" + (r.hasError ? "y" : "n")
             + " via=" + (r.vias ? r.vias.join(",") : "?")
             + refLine);
     }
@@ -692,7 +694,7 @@ async function runScanExtToLk() {
         renderOut();
 
         const hit = resolveLibkernelFromExtList(p, webkitBase, off, merged, {
-            minVotes: 2,
+            minVotes: 1,
             minDistinctFn: 2,
             allowSinglePriRva: true,
         });
@@ -2473,7 +2475,7 @@ function finishFindLkChunk(chunk) {
             const wb = basesFromSession(off).webkitBase;
             if (p && wb && merged.length) {
                 const hit = resolveLibkernelFromExtList(p, wb, off, merged, {
-                    minVotes: 2,
+                    minVotes: 1,
                     minDistinctFn: 2,
                     allowSinglePriRva: true,
                 });

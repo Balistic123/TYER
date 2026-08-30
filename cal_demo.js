@@ -33,7 +33,7 @@ let walkQuiet = false;
 const calRetain = [];
 
 const LOG_MAX = 300;
-const BUILD_ID = "cal-20250830i";
+const BUILD_ID = "cal-20250830j";
 const WEBKIT_CODE_PROLOGUE = 0xe5894855;
 const VTABLE_EXT_SLOTS = 48;
 /** 2e lite — fewer vtable slot reads (OOM-safe on 13.52 HW) */
@@ -2111,7 +2111,7 @@ async function runExtLkAutoScan(p, hits, best, webkitBase, off) {
     if (!merged.length) return { ok: false, error: "no ext ptrs" };
 
     const hit = resolveLibkernelFromExtList(p, webkitBase, off, merged, {
-        minVotes: 2,
+        minVotes: 1,
         minDistinctFn: 2,
         allowSinglePriRva: true,
     });
@@ -2157,7 +2157,11 @@ async function runExtLkAutoScan(p, hits, best, webkitBase, off) {
             mark("LK-ZERO-RANK", (ri + 1) + " lk=" + String(r.lk)
                 + " fn=" + (r.distinctFn != null ? r.distinctFn : "?")
                 + " cross=" + (r.crossRva != null ? r.crossRva : 0)
-                + " votes=" + r.count + refLine);
+                + " votes=" + r.count
+                + " usleep=" + (r.hasUsleep ? "y" : "n")
+                + " error=" + (r.hasError ? "y" : "n")
+                + " via=" + (r.vias ? r.vias.join(",") : "?")
+                + refLine);
         }
     }
     return { ok: false, hit: hit };
