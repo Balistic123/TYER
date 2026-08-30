@@ -555,9 +555,29 @@ export function bisectFireExpm1(p, prep) {
     Math.expm1(prep.pivotObj);
 }
 
-/** Bisect step 6 — restore pivot hook site(s) + main m_function. */
+/** Drop G0 from main m_function — call before touching poisoned pivot (GC may re-enter expm1). */
+export function bisectDisarmG0(p, prep) {
+    if (!prep || !prep.mainMf || prep.mainOrig == null)
+        return false;
+    let looksG0 = false;
+    try {
+        if (prep.G && prep.G.G0) {
+            const cur = p.read8(prep.mainMf);
+            if (cur && String(cur) === String(prep.G.G0))
+                looksG0 = true;
+        }
+    } catch (_) { looksG0 = !!prep.mainArmed; }
+    const wasArmed = !!(prep.mainArmed || looksG0);
+    if (wasArmed)
+        p.write8(prep.mainMf, prep.mainOrig);
+    prep.mainArmed = false;
+    return wasArmed;
+}
+
+/** Bisect step 6 — disarm G0 first, then restore pivot hook site(s). */
 export function bisectRestore(p, prep) {
     if (!prep) return;
+    bisectDisarmG0(p, prep);
     if (prep._bisect && prep._bisect.multiSaved) {
         for (let i = 0; i < prep._bisect.multiSaved.length; i++) {
             const e = prep._bisect.multiSaved[i];
