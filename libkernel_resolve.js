@@ -61,10 +61,19 @@ function read1p(p, addr) {
 
 function parseAddrSync(raw) {
     if (!raw) return null;
-    const s = String(raw).replace(/^0x/i, "").trim();
-    if (!s) return null;
-    const n = BigInt("0x" + s);
-    return new int64(Number(n & 0xffffffffn), Number((n >> 32n) & 0xffffffffn));
+    if (typeof raw === "object" && raw != null && "low" in raw)
+        return new int64(raw.low >>> 0, raw.hi >>> 0);
+    let s = String(raw).replace(/^0x/i, "").trim().toLowerCase();
+    if (!s || !/^[0-9a-f]+$/.test(s)) return null;
+    if (s.length <= 8) return new int64(parseInt(s, 16) >>> 0, 0);
+    if (s.length < 16) s = s.padStart(16, "0");
+    return new int64(parseInt(s.slice(-8), 16) >>> 0, parseInt(s.slice(0, -8), 16) >>> 0);
+}
+
+/** PS4 userland pointer — 0x800000000+ (handles unpadded 9–11 digit hex). */
+function userlandPtrOk(p) {
+    if (!p) return false;
+    return ptrBig(p) >= 0x800000000n;
 }
 
 const SS_NATIVE_FN = "wk-nativeFn";
@@ -241,9 +250,7 @@ function ptrInWebkitImage(fnPtr, webkitBase, off) {
 
 /** External userland code pointer — not null, not webkit interior. */
 function plausibleExtPtr(fnPtr, webkitBase, off) {
-    if (!fnPtr) return false;
-    if (fnPtr.hi < 0x8) return false;
-    if (fnPtr.hi === 0 && fnPtr.low < 0x100000) return false;
+    if (!userlandPtrOk(fnPtr)) return false;
     if (ptrInWebkitImage(fnPtr, webkitBase, off)) return false;
     return true;
 }
@@ -414,6 +421,23 @@ function extEntryCodeNum(entry) {
     return Number.isFinite(n) ? (n >>> 0) : null;
 }
 
+function lkRvaAttempts(fnPtr, off) {
+    const table = libkernelRvaTable(off);
+    const out = [];
+    for (let i = 0; i < table.length; i++) {
+        const row = table[i];
+        const lk = fnPtr.sub32(row.rva);
+        out.push({
+            key: row.key,
+            rva: row.rva,
+            lk: String(lk),
+            aligned: lkAligned(lk),
+            ok: looksLikeLkBase(lk, off),
+        });
+    }
+    return out;
+}
+
 function lkLoSuffix(lk) {
     if (!lk) return "????";
     if ((lk.low & 0x3fff) === 0) return "16K";
@@ -436,6 +460,7 @@ export function diagnoseExtPtrLkMatches(entries, off, webkitBase) {
             skipReason: null,
             code: code != null ? fmtMagic(code) : (entry.code || null),
             matches: [],
+            near: [],
         };
         if (code === WEBKIT_CODE_PROLOGUE) {
             row.skipped = true;
@@ -468,6 +493,10 @@ export function diagnoseExtPtrLkMatches(entries, off, webkitBase) {
                 via: z.via,
             });
         }
+        if (!row.matches.length)
+            row.near = lkRvaAttempts(fnPtr, off).filter(function (a) {
+                return a.key === "k_usleep" || a.key === "k__error" || a.aligned;
+            }).slice(0, 4);
         out.push(row);
     }
     return out;
@@ -477,8 +506,15 @@ export function formatExtPtrDiagLine(d) {
     if (!d) return "";
     if (d.skipped)
         return d.label + " fn=0x" + (d.hex || "?") + " SKIP " + (d.skipReason || "?");
-    if (!d.matches.length)
+    if (!d.matches.length) {
+        if (d.near && d.near.length) {
+            const bits = d.near.map(function (m) {
+                return m.key + "→0x" + m.lk + (m.ok ? " OK" : (m.aligned ? " align" : " off"));
+            });
+            return d.label + " fn=0x" + d.hex + " — " + bits.join(" ");
+        }
         return d.label + " fn=0x" + d.hex + " — no RVA → 16KB lk";
+    }
     const parts = [];
     for (let i = 0; i < d.matches.length && i < 6; i++) {
         const m = d.matches[i];
@@ -922,8 +958,7 @@ function lkAligned(lk) {
 
 /** Never read prologue/walk unless lk sits just below fn in same module band. */
 function plausibleLkBeforeRead(lk, fnPtr, webkitBase, off) {
-    if (!lkAligned(lk)) return false;
-    if (lk.hi > 0x12) return false;
+    if (!lkAligned(lk) || !userlandPtrOk(lk)) return false;
     if (fnPtr) {
         const lkB = ptrBig(lk);
         const fnB = ptrBig(fnPtr);
@@ -2437,7 +2472,7 @@ export function libkernelRvaTable(off) {
 }
 
 function looksLikeLkBase(lk, off) {
-    if (!lk || lk.hi < 0x8 || lk.hi > 0x12) return false;
+    if (!userlandPtrOk(lk)) return false;
     return lkAligned(lk);
 }
 
@@ -2446,7 +2481,7 @@ function looksLikeLkBase(lk, off) {
  * Keeps candidates that are 16KB-aligned (WebKit libkernel_sys mapping).
  */
 export function calcLkFromFnPtrZeroRead(fnPtr, off) {
-    if (!fnPtr || fnPtr.hi < 0x8) return [];
+    if (!userlandPtrOk(fnPtr)) return [];
     const table = libkernelRvaTable(off);
     const out = [];
     const seen = new Set();
@@ -2541,13 +2576,13 @@ export function verifyLibkernelZeroRead(lk, off, opts) {
     off = off || {};
     opts = opts || {};
     if (!lk) return { ok: false, error: "no address" };
-    if (lk.hi < 0x8 || lk.hi > 0x12)
-        return { ok: false, error: "hi out of userland range" };
+    if (!userlandPtrOk(lk))
+        return { ok: false, error: "not userland ptr" };
     if (!looksLikeLkBase(lk, off)) {
-        const lo12 = (lk.low >>> 0) & 0xfff;
+        const lo14 = (lk.low >>> 0) & 0x3fff;
         return {
             ok: false,
-            error: "want 16KB-aligned lk (…000), got …" + lo12.toString(16),
+            error: "want 16KB-aligned lk (…000), got …" + lo14.toString(16),
         };
     }
     return {
@@ -3010,7 +3045,7 @@ function addrFromNum(n) {
 }
 
 function plausibleCodePtr(p) {
-    return p && p.hi >= 0x8 && p.hi <= 0x12;
+    return userlandPtrOk(p);
 }
 
 function looksLikeNativeCodeMagic(w) {

@@ -33,7 +33,7 @@ let walkQuiet = false;
 const calRetain = [];
 
 const LOG_MAX = 300;
-const BUILD_ID = "cal-20250830g";
+const BUILD_ID = "cal-20250830h";
 const WEBKIT_CODE_PROLOGUE = 0xe5894855;
 const VTABLE_EXT_SLOTS = 48;
 /** 2e lite — fewer vtable slot reads (OOM-safe on 13.52 HW) */
@@ -187,6 +187,16 @@ function $(id) { return document.getElementById(id); }
 
 function ptrNum(fn) {
     return (fn.hi >>> 0) * 0x100000000 + (fn.low >>> 0);
+}
+
+function ptrBigLocal(fn) {
+    return (BigInt(fn.hi >>> 0) << 32n) | BigInt(fn.low >>> 0);
+}
+
+function ptrHexPad(fn) {
+    if (!fn) return "";
+    const s = ptrBigLocal(fn).toString(16);
+    return s.length < 16 ? s.padStart(16, "0") : s;
 }
 
 function state(msg, cls) {
@@ -909,11 +919,11 @@ async function collectExtPtrsFromVtableHits(p, hits, webkitBase, opts) {
             if (yieldEvery > 0 && i > 0 && i % yieldEvery === 0)
                 await yieldCal(16);
             const ei = read8p(p, hit.vtable.add32(i * 8));
-            if (!ei || ei.hi < 0x8) continue;
+            if (!ei || (ei.hi < 0x8 && (ei.low >>> 0) < 0x80000000)) continue;
             if (webkitBase && ptrLooksWebkitInterior(ei, webkitBase)) continue;
             const code = read4p(p, ei);
             if (code == null || isBadRead(code) || isWebkitExtCode(code)) continue;
-            const hex = ptrNum(ei).toString(16);
+            const hex = ptrHexPad(ei);
             if (seen.has(hex)) continue;
             seen.add(hex);
             out.push({
@@ -936,11 +946,11 @@ function logVtableExtPtrs(p, hit, opts) {
     let n = 0;
     for (let i = 0; i < slots; i++) {
         const ei = read8p(p, hit.vtable.add32(i * 8));
-        if (!ei || ei.hi < 0x8) continue;
+        if (!ei || (ei.hi < 0x8 && (ei.low >>> 0) < 0x80000000)) continue;
         const code = read4p(p, ei);
         if (isBadRead(code)) continue;
         if (isWebkitExtCode(code >>> 0)) continue;
-        const ptrHex = ptrNum(ei).toString(16);
+        const ptrHex = ptrHexPad(ei);
         if (!quiet)
             mark("EXT-PTR", "vtable[" + i + "]=" + ei + " code=" + fmtMagic(code));
         saved.push({ label: "vtable[" + i + "]", ptr: ptrHex, code: fmtMagic(code) });
