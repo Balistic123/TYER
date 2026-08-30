@@ -68,7 +68,7 @@
     <button type="button" class="secondary" id="btn-rw-proof" disabled>RW proof map</button>
     <button type="button" class="secondary" id="btn-scan-pivot" disabled>Scan pivot (auto)</button>
     <button type="button" class="secondary" id="btn-verify-pivot" disabled>Verify pivot</button>
-    <button type="button" class="secondary" id="btn-load-cal">Scan ext→lk</button>
+    <button type="button" class="secondary" id="btn-load-cal" disabled>2e Leak+lk</button>
     <button type="button" class="secondary" id="btn-psfree-lite" disabled>Scan GOT lite</button>
     <button type="button" class="secondary" id="btn-psfree-lk" disabled>Scan GOT</button>
     <button type="button" class="secondary" id="btn-psfree-stop" disabled>Stop PSFree</button>
@@ -91,9 +91,10 @@
   <div class="gadget-bar" id="gadget-pivot">
     <span class="bar-label">pivot G0-G5 HW — Verify pivot then Native call</span>
   </div>
-  <p id="hint"><b>13.52:</b> libkernel base <b>rotates each browser load</b> (ASLR) — get fresh hex from
-    <b>index_cal → 2e</b>, paste here, tap <b>Accept lk</b>, then <b>Start</b>.
-    Peek / native on <b>same page</b> (do not reload — reload needs new lk). Override: <code>?lk=…</code></p>
+  <p id="hint"><b>13.52:</b> <b>Start</b> → <b>2e Leak+lk</b> (cal-style vtable probe) → <b>Arm getpid</b> on same page.
+    libkernel rotates each browser load — no reload between 2e and getpid.
+    Set native <code>getpid</code> first; optional auto-fire: <code>?hotfire=1</code>.
+    Manual paste still works in hex box + Accept lk.</p>
   <h2>Known pointers (this process)</h2>
   <table id="map">
     <thead><tr><th>label</th><th>address</th><th>note</th></tr></thead>
@@ -143,6 +144,6 @@ window.addEventListener("unhandledrejection", function (e) {
   persistCrashLine("wk-rw-log", msg);
 });
 </script>
-<script type="module" src="./rw_demo.js?v=20250830t"></script>
+<script type="module" src="./rw_demo.js?v=20250830u"></script>
 </body>
 </html>

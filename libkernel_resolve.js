@@ -78,6 +78,7 @@ function userlandPtrOk(p) {
 
 const SS_NATIVE_FN = "wk-nativeFn";
 const SS_WEBKIT_BASE = "wk-webkitBase";
+export const SS_WEBKIT_TRUST = "wk-webkitBase-trust";
 const SS_CALIBRATED = "wk-calibrated";
 const SS_CAL_CANDIDATE = "wk-cal-candidate";
 
@@ -101,16 +102,25 @@ export function loadSessionOffsets(baseOff) {
     return off;
 }
 
+export function loadSessionWebkitBase() {
+    return parseAddrSync(sessionStorage.getItem(SS_WEBKIT_BASE));
+}
+
+export function sessionWebkitFromRw() {
+    try { return sessionStorage.getItem(SS_WEBKIT_TRUST) === "rw"; } catch (_) { return false; }
+}
+
 /** Same webkit base derivation as index_rw basesFromSession — no leakval reads. */
 export function sessionBasesFromStorage(off, opts) {
     opts = opts || {};
     off = off || {};
+    const preferSession = opts.preferSessionWebkit === true;
     const nativeFn = opts.nativeFn || parseAddrSync(sessionStorage.getItem(SS_NATIVE_FN));
     let webkitBase = parseAddrSync(sessionStorage.getItem(SS_WEBKIT_BASE));
     let derived = null;
     if (nativeFn && off.wk_expm1_builtin)
         derived = nativeFn.sub32(off.wk_expm1_builtin);
-    if (derived) {
+    if (derived && !preferSession) {
         if (!webkitBase || !same64Ptr(webkitBase, derived))
             webkitBase = derived;
     }
@@ -118,10 +128,14 @@ export function sessionBasesFromStorage(off, opts) {
     return { nativeFn, webkitBase, libkernelBase, derived };
 }
 
-export function persistSessionBases(nativeFn, webkitBase) {
+export function persistSessionBases(nativeFn, webkitBase, opts) {
+    opts = opts || {};
     try {
         if (nativeFn) sessionStorage.setItem(SS_NATIVE_FN, String(nativeFn));
-        if (webkitBase) sessionStorage.setItem(SS_WEBKIT_BASE, String(webkitBase));
+        if (webkitBase) {
+            sessionStorage.setItem(SS_WEBKIT_BASE, String(webkitBase));
+            if (opts.trust) sessionStorage.setItem(SS_WEBKIT_TRUST, opts.trust);
+        }
     } catch (_) { }
 }
 
