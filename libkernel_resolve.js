@@ -174,6 +174,7 @@ const SS_GETPID_STUB = "wk-getpidStubOff";
 export function saveLastFnPtr(fnPtr) {
     try {
         if (fnPtr) sessionStorage.setItem(SS_LAST_FN, String(fnPtr));
+        else sessionStorage.removeItem(SS_LAST_FN);
     } catch (_) { }
 }
 
