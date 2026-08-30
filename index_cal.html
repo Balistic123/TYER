@@ -105,7 +105,7 @@
     Tap <b>2e Leak vtable ptrs</b> <b>once</b> after Start — runs vtable leak, ext scan, and lk resolve automatically.
     Base matches <b>index_rw</b> (nativeFn − expm1).
     Ext ptrs are auto-scanned across all vtable chains (48 slots each).
-    Accept if <b>2 ext fn ptrs</b> agree, or <b>1 ptr</b> where fn−usleep AND fn−error → same …c30 (0 reads @ lk).
+    Accept if <b>2 ext fn ptrs</b> agree, or <b>1 ptr</b> via k_usleep/k__error → …c30 (logged as LK-PTR lines).
     Or use index_rw → <b>Leak+vtable LK</b> directly (no cal needed).
     Logs auto-restore after reload/crash. <code>?clearlog=1</code> to wipe.
   </p>

@@ -10,6 +10,7 @@ import {
     sessionBasesFromStorage,
     persistSessionBases,
     same64Ptr,
+    formatExtPtrDiagLine,
 } from "./libkernel_resolve.js";
 
 const params = new URLSearchParams(location.search);
@@ -32,7 +33,7 @@ let walkQuiet = false;
 const calRetain = [];
 
 const LOG_MAX = 300;
-const BUILD_ID = "cal-20250830d";
+const BUILD_ID = "cal-20250830e";
 const WEBKIT_CODE_PROLOGUE = 0xe5894855;
 const VTABLE_EXT_SLOTS = 48;
 const crashLog = createCrashLog({
@@ -1998,12 +1999,19 @@ async function runExtLkAutoScan(p, hits, best, webkitBase, off) {
     const hit = resolveLibkernelFromExtList(p, webkitBase, off, merged, {
         minVotes: 2,
         minDistinctFn: 2,
+        allowSinglePriRva: true,
     });
     if (hit.ok && hit.lk) {
         saveLibkernelSession(hit.lk, hit.iatRva || null);
         const expm1 = off.wk_expm1_builtin || 0;
         if (expm1 > 0)
             applyCalibration(expm1, webkitBase, hit.lk, 0, { accept: true });
+        if (hit.fnRefs && hit.fnRefs.length) {
+            for (let fi = 0; fi < hit.fnRefs.length && fi < 4; fi++) {
+                const fr = hit.fnRefs[fi];
+                mark("LK-PTR-OK", fr.label + " fn=0x" + fr.hex + " via " + fr.key);
+            }
+        }
         mark("LK-OK", hit.lk + " (" + hit.method + "/" + hit.via + ") reads=0");
         mark("HINT", "index_rw → Accept lk → reload → Arm getpid");
         state("libkernel auto OK (0-read)", "ok");
@@ -2012,13 +2020,30 @@ async function runExtLkAutoScan(p, hits, best, webkitBase, off) {
     mark("LK-EXT-MISS", hit.error || "no lk consensus");
     if (hit.hint)
         mark("LK-HINT", hit.hint);
+    if (hit.ptrDiag && hit.ptrDiag.length) {
+        let shown = 0;
+        for (let pi = 0; pi < hit.ptrDiag.length && shown < 12; pi++) {
+            const line = formatExtPtrDiagLine(hit.ptrDiag[pi]);
+            if (!line) continue;
+            mark(hit.ptrDiag[pi].skipped ? "LK-PTR-SKIP" : "LK-PTR", line);
+            shown++;
+        }
+    }
     if (hit.zeroRank && hit.zeroRank.length) {
         for (let ri = 0; ri < hit.zeroRank.length && ri < 4; ri++) {
             const r = hit.zeroRank[ri];
-            mark("LK-ZERO-RANK", (ri + 1) + " " + String(r.lk)
+            let refLine = "";
+            if (r.fnRefs && r.fnRefs.length) {
+                refLine = " refs=" + r.fnRefs.map(function (fr) {
+                    return fr.label + ":0x" + fr.hex + "/" + fr.key;
+                }).join(" ");
+            } else if (r.refs && r.refs.length) {
+                refLine = " refs=" + r.refs.join(" ");
+            }
+            mark("LK-ZERO-RANK", (ri + 1) + " lk=" + String(r.lk)
                 + " fn=" + (r.distinctFn != null ? r.distinctFn : "?")
-                + " dual=" + (r.dualRva != null ? r.dualRva : 0)
-                + " votes=" + r.count);
+                + " cross=" + (r.crossRva != null ? r.crossRva : 0)
+                + " votes=" + r.count + refLine);
         }
     }
     return { ok: false, hit: hit };

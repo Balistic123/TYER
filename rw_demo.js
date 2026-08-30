@@ -55,6 +55,7 @@ import {
     huntLibkernelCandidatesChunk,
     collectLiveVtableExtPtrs,
     resolveLibkernelFromExtList,
+    formatExtPtrDiagLine,
 } from "./libkernel_resolve.js";
 import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, firePivotSmoke } from "./native_call.js";
@@ -609,11 +610,31 @@ function logExtScanRank(tag, rank) {
     if (!rank || !rank.length) return;
     for (let i = 0; i < rank.length && i < 4; i++) {
         const r = rank[i];
-        mark(tag, (i + 1) + " " + String(r.lk)
+        let refLine = "";
+        if (r.fnRefs && r.fnRefs.length) {
+            refLine = " refs=" + r.fnRefs.map(function (fr) {
+                return fr.label + ":0x" + fr.hex + "/" + fr.key;
+            }).join(" ");
+        } else if (r.refs && r.refs.length) {
+            refLine = " refs=" + r.refs.join(" ");
+        }
+        mark(tag, (i + 1) + " lk=" + String(r.lk)
             + " fn=" + (r.distinctFn != null ? r.distinctFn : "?")
-            + " dual=" + (r.dualRva != null ? r.dualRva : 0)
+            + " cross=" + (r.crossRva != null ? r.crossRva : (r.dualRva != null ? r.dualRva : 0))
             + " votes=" + r.count
-            + " via=" + (r.vias ? r.vias.join(",") : "?"));
+            + " via=" + (r.vias ? r.vias.join(",") : "?")
+            + refLine);
+    }
+}
+
+function logExtPtrDiag(ptrDiag) {
+    if (!ptrDiag || !ptrDiag.length) return;
+    let shown = 0;
+    for (let pi = 0; pi < ptrDiag.length && shown < 12; pi++) {
+        const line = formatExtPtrDiagLine(ptrDiag[pi]);
+        if (!line) continue;
+        mark(ptrDiag[pi].skipped ? "LK-PTR-SKIP" : "LK-PTR", line);
+        shown++;
     }
 }
 
@@ -673,14 +694,23 @@ async function runScanExtToLk() {
         const hit = resolveLibkernelFromExtList(p, webkitBase, off, merged, {
             minVotes: 2,
             minDistinctFn: 2,
+            allowSinglePriRva: true,
         });
 
         if (hit.zeroRank && hit.zeroRank.length)
             logExtScanRank("LK-ZERO-RANK", hit.zeroRank);
+        if (!hit.ok && hit.ptrDiag)
+            logExtPtrDiag(hit.ptrDiag);
 
         if (hit.ok && hit.lk) {
             saveLibkernelSession(hit.lk, hit.iatRva || null);
             if (addrIn) addrIn.value = String(hit.lk);
+            if (hit.fnRefs && hit.fnRefs.length) {
+                for (let fi = 0; fi < hit.fnRefs.length && fi < 4; fi++) {
+                    const fr = hit.fnRefs[fi];
+                    mark("LK-PTR-OK", fr.label + " fn=0x" + fr.hex + " via " + fr.key);
+                }
+            }
             mark("LK-OK", hit.lk + " (" + hit.method + "/" + hit.via + ")"
                 + " reads=0 distinctFn=" + (hit.distinctFn != null ? hit.distinctFn : "?"));
             mark("LK-HINT", "Accept lk → reload → pivot smoke → Arm getpid");
@@ -2445,6 +2475,7 @@ function finishFindLkChunk(chunk) {
                 const hit = resolveLibkernelFromExtList(p, wb, off, merged, {
                     minVotes: 2,
                     minDistinctFn: 2,
+                    allowSinglePriRva: true,
                 });
                 if (hit.ok && hit.lk) {
                     saveLibkernelSession(hit.lk, hit.iatRva || null);
@@ -2458,6 +2489,10 @@ function finishFindLkChunk(chunk) {
                 }
                 if (hit.zeroRank && hit.zeroRank.length)
                     logExtScanRank("LK-ZERO-RANK", hit.zeroRank);
+                if (hit.ptrDiag)
+                    logExtPtrDiag(hit.ptrDiag);
+                if (hit.hint)
+                    mark("LK-HINT", hit.hint);
                 mark("LK-EXT-MISS", hit.error || "auto-resolve failed");
             }
             mark("LK-HINT", "tap Scan ext→lk or re-run cal 2e");
