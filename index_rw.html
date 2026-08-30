@@ -76,7 +76,7 @@
     <button type="button" class="secondary" id="btn-try-billzai-lk" disabled>Try BillZai lk</button>
     <button type="button" class="secondary" id="btn-one-read-lk" disabled>1-read lk</button>
     <button type="button" class="secondary" id="btn-force-lk">Accept lk</button>
-    <button type="button" class="secondary" id="btn-native" disabled>Arm getpid</button>
+    <button type="button" class="secondary" id="btn-native" disabled>Fire native</button>
     <button type="button" class="secondary" id="btn-clear">Clear log</button>
   </div>
   <div class="gadget-bar" id="gadget-base">
@@ -91,11 +91,10 @@
   <div class="gadget-bar" id="gadget-pivot">
     <span class="bar-label">pivot G0-G5 HW — Verify pivot then Native call</span>
   </div>
-  <p id="hint"><b>13.52:</b> <b>Start</b> → <b>2e Leak+lk</b> (cal-style vtable probe) → <b>Arm getpid</b> on same page.
-    libkernel rotates each browser load — no reload between 2e and getpid.
-    Set native <code>getpid</code> → Start → 2e → Arm getpid (same page).
-    If getpid OOMs but peek works: try native <code>smoke</code> first (pivot-only).
-    Manual paste still works in hex box + Accept lk.</p>
+  <p id="hint"><b>13.52:</b> Button is <b>Fire native</b> (label changes: Fire smoke / Fire getpid).
+    <b>Smoke:</b> Start → <b>Verify pivot</b> (PIVOT-OK on G0-G5) → set native <code>smoke</code> → <b>Fire smoke</b>.
+    <b>getpid:</b> Start → <b>2e Leak+lk</b> → set native <code>getpid</code> → <b>Fire getpid</b> (same page, no reload).
+    Native does <b>not</b> auto-fire at Start (prevents OOM). Peek lk with hex box anytime.</p>
   <h2>Known pointers (this process)</h2>
   <table id="map">
     <thead><tr><th>label</th><th>address</th><th>note</th></tr></thead>
@@ -103,7 +102,7 @@
   </table>
   <h2>Hex peek</h2>
   <div id="peek-bar">
-    <select id="native-mode" title="Auto-fire at PRIMITIVE-OK after Start">
+    <select id="native-mode" title="Pick mode — tap Fire native button (no auto @ Start)">
       <option value="off" selected>native: off</option>
       <option value="usleep">native: usleep</option>
       <option value="smoke">native: smoke (pivot only)</option>
@@ -145,6 +144,6 @@ window.addEventListener("unhandledrejection", function (e) {
   persistCrashLine("wk-rw-log", msg);
 });
 </script>
-<script type="module" src="./rw_demo.js?v=20250830v"></script>
+<script type="module" src="./rw_demo.js?v=20250830x"></script>
 </body>
 </html>

