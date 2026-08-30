@@ -91,10 +91,12 @@
   <div class="gadget-bar" id="gadget-pivot">
     <span class="bar-label">pivot G0-G5 HW — Verify pivot then Native call</span>
   </div>
+  <div class="gadget-bar" id="native-bisect">
+    <span class="bar-label">native bisect — tap one step at a time (N1→N5 finds OOM point; N6 restore if N5 survives)</span>
+  </div>
   <p id="hint"><b>13.52:</b> Button is <b>Fire native</b> (label changes: Fire smoke / Fire getpid).
-    <b>Smoke:</b> Start → <b>Verify pivot</b> (PIVOT-OK on G0-G5) → set native <code>smoke</code> → <b>Fire smoke</b>.
-    <b>getpid:</b> Start → <b>2e Leak+lk</b> → set native <code>getpid</code> → <b>Fire getpid</b> (same page, no reload).
-    Native does <b>not</b> auto-fire at Start (prevents OOM). Peek lk with hex box anytime.</p>
+    <b>Bisect OOM:</b> Start → Verify pivot → <b>N1 prep</b> → <b>N2 layout</b> → <b>N3 arm G0</b> → <b>N4 hook</b> → <b>N5 expm1</b> (OOM = bad pivot/G5).
+    <b>getpid:</b> N1 → 2e lk in hex → <b>N8 stage lk</b> → N3 → N4 → N5, or <b>N10 getpid</b> full.</p>
   <h2>Known pointers (this process)</h2>
   <table id="map">
     <thead><tr><th>label</th><th>address</th><th>note</th></tr></thead>
@@ -144,6 +146,6 @@ window.addEventListener("unhandledrejection", function (e) {
   persistCrashLine("wk-rw-log", msg);
 });
 </script>
-<script type="module" src="./rw_demo.js?v=20250830x"></script>
+<script type="module" src="./rw_demo.js?v=20250830y"></script>
 </body>
 </html>

