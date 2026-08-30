@@ -286,7 +286,7 @@ export function prepNativeChain(p, off, webkitBase, cap) {
     if (!slabOk.ok)
         throw new Error("prepNativeChain: slab content: " + slabOk.reasons.join("; "));
     let mainMf, mainOrig, pivotObj, pivotCell;
-    if (cap && cap.mainMf && cap.mainOrig != null && cap.pivotCell) {
+    if (cap && cap.mainMf && cap.mainOrig != null) {
         mainMf = cap.mainMf;
         mainOrig = cap.mainOrig;
         pivotObj = cap.pivotObj;
@@ -296,6 +296,10 @@ export function prepNativeChain(p, off, webkitBase, cap) {
         const jfn = p.read8(cell.add32(0x18));
         mainMf = jfn.add32(off.wk_JSFunction_m_function || 0x28);
         mainOrig = p.read8(mainMf);
+        pivotObj = null;
+        pivotCell = null;
+    }
+    if (!pivotObj) {
         pivotObj = {};
         pivotCell = p.leakval(pivotObj);
     }
