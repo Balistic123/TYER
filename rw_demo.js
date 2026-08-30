@@ -60,7 +60,7 @@ import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, firePivotSmoke } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250832q";
+const BUILD_ID = "rw-20250832r";
 const SS_NATIVE_MODE = "wk-native-mode";
 /** Auto-fire at PRIMITIVE-OK — #native-mode dropdown. Default off (fire kills tab if lk/pivot wrong). */
 function getNativeMode() {
@@ -611,6 +611,7 @@ function logExtScanRank(tag, rank) {
         const r = rank[i];
         mark(tag, (i + 1) + " " + String(r.lk)
             + " fn=" + (r.distinctFn != null ? r.distinctFn : "?")
+            + " dual=" + (r.dualRva != null ? r.dualRva : 0)
             + " votes=" + r.count
             + " via=" + (r.vias ? r.vias.join(",") : "?"));
     }

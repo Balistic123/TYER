@@ -102,8 +102,10 @@
   <p id="hint">
     <b>If you already have base+expm1</b>, use
     <code>?base=805018530&amp;expm1=eb6350</code> then <b>4b Accept offsets (0 reads)</b>.
-    Vtable leak is <b>chunked</b> — tap <b>2e Leak vtable ptrs</b> once after Start.
-    Ext ptrs are <b>auto-scanned</b> for libkernel — 0 reads @ lk (vote + …c30 tag only).
+    Tap <b>2e Leak vtable ptrs</b> <b>once</b> after Start — runs vtable leak, ext scan, and lk resolve automatically.
+    Base matches <b>index_rw</b> (nativeFn − expm1).
+    Ext ptrs are auto-scanned across all vtable chains (48 slots each).
+    Accept if <b>2 ext fn ptrs</b> agree, or <b>1 ptr</b> where fn−usleep AND fn−error → same …c30 (0 reads @ lk).
     Or use index_rw → <b>Leak+vtable LK</b> directly (no cal needed).
     Logs auto-restore after reload/crash. <code>?clearlog=1</code> to wipe.
   </p>

