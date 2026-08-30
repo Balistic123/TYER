@@ -74,7 +74,7 @@ import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, 
     CHAIN_POP_ROWS } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830ag";
+const BUILD_ID = "rw-20250830ah";
 
 const NATIVE_BISECT_STEPS = [
     { id: "smoke-now", label: "N0 smoke", title: "atomic layout+fire @ prep (chain_poops callAddr)" },
@@ -2455,7 +2455,7 @@ async function scanPivotChunk() {
 function verifyPivotManual(fromScan) {
     if (!ready || !window.p || busy) return;
     const p = window.p;
-    const off = loadEffectiveOff();
+    let off = loadEffectiveOff();
     const webkitBase = chainWebkitBase(off);
     if (!webkitBase) {
         mark("PIVOT-SKIP", "no webkitBase — Save bases first");
