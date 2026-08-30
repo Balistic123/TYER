@@ -78,7 +78,7 @@ import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, 
     CHAIN_POP_ROWS } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830ak";
+const BUILD_ID = "rw-20250830al";
 
 const NATIVE_BISECT_STEPS = [
     { id: "smoke-now", label: "N0 smoke", title: "atomic layout+fire @ prep (chain_poops callAddr)" },
@@ -2646,7 +2646,8 @@ function preparePivotFullScan(webkitBase, p) {
 }
 
 /** Chunked full-pattern scan — 16-byte window, step 4 (finds 9-byte poops G0-G4). */
-async function scanPivotFullRowPhase(p, webkitBase, off) {
+async function scanPivotFullRowPhase(p, webkitBase) {
+    const off = loadEffectiveOff();
     if (!pivotFullScan || String(pivotFullScan.base) !== String(webkitBase))
         preparePivotFullScan(webkitBase, p);
 
@@ -2772,8 +2773,8 @@ async function scanPivotFullRowPhase(p, webkitBase, off) {
 
 async function runPivotFullScanLoop() {
     const p = window.p;
-    const off = loadEffectiveOff();
-    const { webkitBase } = basesFromSession(off);
+    const off0 = loadEffectiveOff();
+    const { webkitBase } = basesFromSession(off0);
     if (!webkitBase) return;
 
     scanFullAuto = true;
@@ -2784,7 +2785,7 @@ async function runPivotFullScanLoop() {
 
     try {
         while (scanFullAuto && !scanPivotStop) {
-            const st = await scanPivotFullRowPhase(p, webkitBase, off);
+            const st = await scanPivotFullRowPhase(p, webkitBase);
             if (st === "stopped") break;
             if (st === "done") break;
         }
@@ -2815,7 +2816,7 @@ async function runPivotFullScanAuto() {
     }
 
     const p = window.p;
-    const off = loadEffectiveOff();
+    let off = loadEffectiveOff();
     const { webkitBase } = basesFromSession(off);
     if (!webkitBase) {
         mark("FULL-SCAN-SKIP", "no webkitBase — Save bases first");
