@@ -87,7 +87,7 @@ import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, 
     CHAIN_POP_ROWS } from "./native_call.js";
 
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830bc";
+const BUILD_ID = "rw-20250830bd";
 
 const NATIVE_BISECT_STEPS = [
     { id: "smoke-now", label: "N0 getpid", title: "getpid @ lk (chain_poops) — needs lk in box" },
@@ -158,9 +158,16 @@ if (params.has("hookoff")) {
     } catch (_) { }
 }
 
+/** Lk/fn parse only — must NOT call loadEffectiveOff (recurses via basesFromSession→lkFromUi). */
+function lkCalcOff() {
+    const detected = offsetsFor(navigator.userAgent);
+    const key = detected.key || "13.52";
+    return Object.assign({}, offsetsForKey(key).off || {}, HW_GADGETS_1352);
+}
+
 /** Fn ptr in hex box or session — used for getpid stub fn+delta resolve. */
 function fnFromUi() {
-    const off = loadEffectiveOff();
+    const off = lkCalcOff();
     if (addrIn && addrIn.value) {
         const live = parseAddr(String(addrIn.value).trim().replace(/^0x/i, ""));
         if (live && calcLkFromFnPtrZeroRead(live, off).length)
@@ -171,7 +178,7 @@ function fnFromUi() {
 
 /** Lk base — from fn ptr (derived), 16KB hex box, or session. */
 function lkFromUi() {
-    const off = loadEffectiveOff();
+    const off = lkCalcOff();
     if (addrIn && addrIn.value) {
         const live = parseAddr(String(addrIn.value).trim().replace(/^0x/i, ""));
         if (live) {
