@@ -3082,11 +3082,13 @@ function discoverTextareaVtables(p, opts) {
         const expCell = p.leakval(Math.expm1);
         addCell("expm1.cell", expCell);
     } catch (_) { }
-    try {
-        const ta = document.createElement("textarea");
-        if (opts.retain) opts.retain.push(ta);
-        addCell("fresh.ta", p.leakval(ta));
-    } catch (_) { }
+    if (!opts.noFresh) {
+        try {
+            const ta = document.createElement("textarea");
+            if (opts.retain) opts.retain.push(ta);
+            addCell("fresh.ta", p.leakval(ta));
+        } catch (_) { }
+    }
 
     const vtables = [];
     const seenVt = new Set();

