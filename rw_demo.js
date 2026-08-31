@@ -88,7 +88,7 @@ import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, 
     prepGadgetRvaStale, refreshPrepSlabGadgets,
     CHAIN_POP_ROWS } from "./native_call.js";
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250831b";
+const BUILD_ID = "rw-20250831c";
 
 /** Notify bisect URL profiles — applied by Reload profile button. */
 const NOTIFY_PROFILES = {
@@ -107,6 +107,22 @@ const NOTIFY_PROFILES = {
     "test-ab": {
         label: "Test A+B",
         qs: { freshprep: "1", native: "notify", notifysmoke: "usleep", notifybisect: "1" },
+    },
+    "test-d": {
+        label: "Test D direct usleep",
+        qs: { freshprep: "1", native: "notify", notifysmoke: "usleep", notifydirect: "1" },
+    },
+    "test-e": {
+        label: "Test E unhooked only",
+        qs: { freshprep: "1", native: "notify", notifyunhooked: "1" },
+    },
+    "test-f": {
+        label: "Test F hook no compare",
+        qs: { freshprep: "1", native: "notify", notifynocompare: "1" },
+    },
+    "test-gdcheck": {
+        label: "Test gd bytes (no fire)",
+        qs: { freshprep: "1", native: "notify", notifygdcheck: "1", notifygdfire: "0" },
     },
     "test-c": {
         label: "Test C gd",
@@ -129,6 +145,7 @@ const NOTIFY_PROFILES = {
 
 const NOTIFY_PROFILE_KEYS = [
     "notifysmoke", "notifybisect", "notifydirect", "notifystr", "gd",
+    "notifyunhooked", "notifynocompare", "notifygdcheck", "notifygdfire",
 ];
 
 const NATIVE_BISECT_STEPS = [
@@ -5726,6 +5743,11 @@ function wireNotifyProfileBar() {
         if (nat === "smoke" && params.get("freshprep") === "1" && !smoke && !bisect)
             return "smoke-prep";
         if (smoke === "usleep" && bisect === "1") return "test-ab";
+        if (params.get("notifydirect") === "1" && smoke === "usleep") return "test-d";
+        if (params.get("notifyunhooked") === "1") return "test-e";
+        if (params.get("notifynocompare") === "1") return "test-f";
+        if (params.get("notifygdcheck") === "1" && params.get("notifygdfire") === "0")
+            return "test-gdcheck";
         if (smoke === "usleep") return "test-a";
         if (bisect === "1") return "test-b";
         if (gd) return "test-c";

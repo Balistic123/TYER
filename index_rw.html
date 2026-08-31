@@ -108,6 +108,10 @@
       <option value="test-a">Test A — notifysmoke=usleep (gd hook smoke)</option>
       <option value="test-b">Test B — notifybisect=1 (S24u before S25)</option>
       <option value="test-ab">Test A+B — usleep + bisect</option>
+      <option value="test-d">Test D — direct vtable→usleep (skip gd)</option>
+      <option value="test-e">Test E — unhooked only (heap check, no S25)</option>
+      <option value="test-f">Test F — hook+restore only (no compareFn)</option>
+      <option value="test-gdcheck">Test gd — verify bytes @ 0x1d6fa (no fire)</option>
       <option value="test-c">Test C — custom gd RVA (use box →)</option>
       <option value="notifydirect">notifydirect=1 (skip gd trampoline)</option>
       <option value="notifystr">notifystr=1 (legacy 0xc30 JS string @ fire)</option>
@@ -116,8 +120,8 @@
     <input type="text" id="notify-gd" placeholder="gd 0x1d6fa" title="Test C: libkernel trampoline RVA" autocomplete="off">
     <button type="button" class="secondary" id="btn-notify-reload">Reload profile</button>
   </div>
-  <p id="hint"><b>Notify:</b> default profile → Start → Accept fn → Fire. Bisect N0 needs <b>smoke-prep</b> profile first.
-    Test A/B/C sets flags automatically on Reload.</p>
+  <p id="hint"><b>A/B/AB OOM @ S25</b> = gd trampoline (0x1d6fa) likely wrong on 13.52. Try <b>Test E</b> (unhooked),
+    <b>Test gd</b> (byte check), <b>Test D</b> (skip gd). <b>smoke-prep</b> = expm1 N0 bisect.</p>
   <h2>Known pointers (this process)</h2>
   <table id="map">
     <thead><tr><th>label</th><th>address</th><th>note</th></tr></thead>
@@ -168,6 +172,6 @@ window.addEventListener("unhandledrejection", function (e) {
   persistCrashLine("wk-rw-log", msg);
 });
 </script>
-<script type="module" src="./rw_demo.js?v=20250831b"></script>
+<script type="module" src="./rw_demo.js?v=20250831c"></script>
 </body>
 </html>
