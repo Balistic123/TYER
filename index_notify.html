@@ -17,7 +17,7 @@
 </head>
 <body>
 <div id="state">loading…</div>
-<p><b>Lite notify</b> — only core+mem (no rw_demo). Start → Pin → paste k_usleep fn → Fire.</p>
+<p><b>Lite notify</b> — minimal heap (no rw_demo). Default <b>arena</b> mode. Paste k_usleep fn → Start → Pin → Fire. One-shot: <code>?oneshot=1</code></p>
 <button type="button" id="btn-start">Start</button>
 <button type="button" id="btn-pin" disabled>Pin notify</button>
 <button type="button" id="btn-fire" disabled>Fire notify</button>
@@ -32,7 +32,7 @@ window.addEventListener("error", function (e) {
 });
 </script>
 <script type="module">
-import "./notify_lite.js?v=notify-lite-2";
+import "./notify_lite.js?v=notify-lite-3";
 </script>
 </body>
 </html>

@@ -88,7 +88,7 @@ import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, 
     prepGadgetRvaStale, refreshPrepSlabGadgets,
     CHAIN_POP_ROWS } from "./native_call.js";
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250831d";
+const BUILD_ID = "rw-20250831f";
 
 /** Notify bisect URL profiles — applied by Reload profile button. */
 const NOTIFY_PROFILES = {
@@ -122,7 +122,11 @@ const NOTIFY_PROFILES = {
     },
     "test-gd1352": {
         label: "13.52 gd fixed",
-        qs: { freshprep: "1", native: "notify", gd: "1aca", notifygdcheck: "1", notifygdfire: "0" },
+        qs: { freshprep: "1", native: "notify", gd: "1aca", notifygdfire: "0" },
+    },
+    "test-gdcheck": {
+        label: "Test gd verify only",
+        qs: { freshprep: "1", native: "notify", notifygdfire: "0" },
     },
     "test-c": {
         label: "Test C gd",
@@ -314,7 +318,7 @@ const crashLog = createCrashLog({
     ssBuild: "wk-rw-log-build",
     buildId: BUILD_ID,
     maxLines: 200,
-    critical: /^(FAIL|ERROR|OOM|GIVE-UP|PRIMITIVE|NATIVE|BISECT|SMOKE|PREP-PIN|LK-|PASS|WARN|BOOT|LOG-CLEAR|ATTEMPT|READ-PRIMITIVE|TRIM|HINT|NOTIFY-[SF])/,
+    critical: /^(FAIL|ERROR|OOM|GIVE-UP|PRIMITIVE|NATIVE|BISECT|SMOKE|PREP-PIN|LK-|PASS|WARN|BOOT|LOG-CLEAR|ATTEMPT|READ-PRIMITIVE|TRIM|HINT|NOTIFY-)/,
 });
 const CORE_LOG = /ADDROF|FAIL|ERROR|PRIMITIVE|PASS|GIVE-UP|ATTEMPT|SETUP|CARRIER|PAIR|SSV-|TRIM-DEBRIS|ADDROF-RELEASE|FAKE-ADDRESS|READ-PRIMITIVE|PLACEMENT|COMPOSITION|NORMAL-CLONE|ZERO-HEADER|VALIDATION|LOAD-THREW|NO-RESULT|PRIMITIVE-OK|AUTO-RETRY|CORE-GIVE-UP|HINT-GROOM/i;
 
@@ -5219,6 +5223,65 @@ function wireNativeBisectBar() {
     }
 }
 
+function notifyParamsWithGd() {
+    const q = new URLSearchParams(params);
+    const gdEl = $("notify-gd");
+    if (gdEl && gdEl.value.trim())
+        q.set("gd", gdEl.value.trim().replace(/^0x/i, ""));
+    return q;
+}
+
+async function runNotifyGdCheckOnly() {
+    if (busy) {
+        mark("NOTIFY-GD-SKIP", "busy");
+        renderOut();
+        return;
+    }
+    if (!ready || !window.p) {
+        mark("NOTIFY-GD-SKIP", "Start first — need PRIMITIVE-OK");
+        state("Start first", "warn");
+        renderOut();
+        return;
+    }
+    const lk = lkFromUi();
+    if (!lk) {
+        mark("NOTIFY-GD-SKIP", "Accept fn first — need lk");
+        state("need lk — Accept fn", "warn");
+        renderOut();
+        return;
+    }
+    busy = true;
+    nativeQuiet = true;
+    const fireParams = notifyParamsWithGd();
+    const gdRva = fireParams.get("gd") || "table";
+    notifyStage("NOTIFY-GD-RUN", "verify only rva=" + gdRva + " lk=" + lk);
+    try {
+        const sk = await loadNotifySk();
+        const flush = function () {
+            renderOut();
+            try { crashLog.flushSync(); } catch (_) { }
+        };
+        const gd = sk.checkNotifyGd(window.p, lk, loadEffectiveOff(), fireParams, notifyStage, { flush });
+        if (gd.ok) {
+            mark("NOTIFY-GD-PASS", "gd=0x" + gd.gdRva.toString(16));
+            state("gd OK @ 0x" + gd.gdRva.toString(16), "ok");
+        } else {
+            mark("NOTIFY-GD-FAIL", "gd=0x" + gd.gdRva.toString(16));
+            state("gd BAD @ 0x" + gd.gdRva.toString(16), "bad");
+        }
+    } catch (err) {
+        const em = err && err.message ? err.message : String(err);
+        mark("NOTIFY-GD-FAIL", em);
+        state("gd check failed", "bad");
+    } finally {
+        nativeQuiet = false;
+        busy = false;
+        setUi();
+        renderOut();
+        try { crashLog.flushSync(); } catch (_) { }
+    }
+}
+
 async function runFireNotify() {
     if (busy) {
         mark("NOTIFY-SKIP", "busy");
@@ -5279,6 +5342,7 @@ async function runFireNotify() {
             try { crashLog.flushSync(); } catch (_) { }
         };
         notifyStage("NOTIFY-F09", "runNotifyAtomic sync pin+fire");
+        const fireParams = notifyParamsWithGd();
         const out = sk.runNotifyAtomic({
             p,
             off,
@@ -5287,11 +5351,16 @@ async function runFireNotify() {
             webkitBase: bases.webkitBase,
             nativeFn: bases.nativeFn,
             retain: notifyRetain,
-            params,
+            params: fireParams,
             log: notifyStage,
             flush: fireFlush,
             carrier: window._wkCarrier || null,
         });
+        if (out.gdCheckOnly) {
+            mark("NOTIFY-GD-DONE", out.ok ? "PASS" : "FAIL");
+            state(out.ok ? "gd OK" : "gd BAD", out.ok ? "ok" : "bad");
+            return;
+        }
         for (let i = 0; i < notifyRetain.length; i++)
             retained.push(notifyRetain[i]);
         notifyPrep = { arenaMode: true };
@@ -5761,10 +5830,10 @@ function wireNotifyProfileBar() {
     function syncGdField() {
         if (!gdIn) return;
         const fromUrl = params.get("gd");
-        if (fromUrl && !gdIn.value)
+        if (fromUrl)
             gdIn.value = "0x" + String(fromUrl).replace(/^0x/i, "");
-        if (!gdIn.value) gdIn.value = "0x1aca";
-        gdIn.style.display = sel.value === "test-c" ? "" : "none";
+        else if (!gdIn.value)
+            gdIn.value = "0x1aca";
     }
 
     sel.value = detectProfileFromUrl();
@@ -5787,9 +5856,8 @@ function wireNotifyProfileBar() {
             if (!(pk in qs) && pk !== "gd")
                 u.searchParams.delete(pk);
         }
-        if (prof.needsGd && gdIn && gdIn.value.trim()) {
+        if (gdIn && gdIn.value.trim())
             u.searchParams.set("gd", gdIn.value.trim().replace(/^0x/i, ""));
-        }
         mark("NOTIFY-RELOAD", u.pathname + "?" + u.searchParams.toString());
         renderOut();
         try { crashLog.flushSync(); } catch (_) { }
@@ -5834,6 +5902,7 @@ function init() {
     wireG5Bar();
     wireNativeBisectBar();
     wireNotifyProfileBar();
+    wireClick($("btn-notify-gdcheck"), function () { return runNotifyGdCheckOnly(); });
     ensureUiVisible();
     wireClick(btnStart, function () { return runStart(); });
     wireClick(btnSaveBases, saveBasesManual);
