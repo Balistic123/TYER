@@ -4,6 +4,10 @@ export const GROOM_PRESETS = {
         label: "lite",
         g: ["drain:256", "drainsz:32768", "slab:2097152"],
     },
+    "96": {
+        label: "96",
+        g: ["drain:96"],
+    },
     "384": {
         label: "384",
         g: ["drain:384", "drainsz:32768", "slab:2097152"],

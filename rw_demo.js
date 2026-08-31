@@ -1,7 +1,7 @@
 import { int64 } from "./int64.js";
 import { offsetsFor, offsetsForKey } from "./ps4_offsets_userland.js";
 import { installWindowP, pairStatus } from "./mem.js";
-import { groomBootLine, wireGroomBar } from "./groom_presets.js";
+import { groomBootLine, wireGroomBar, GROOM_PRESETS, currentGroomKey } from "./groom_presets.js";
 import {
     PIVOT_HINTS_1300,
     PIVOT_HW_1352,
@@ -90,7 +90,7 @@ import { prepNativeChain, stageGetpid, stageUsleep, stageNotify, fireNativeCall,
     prepGadgetRvaStale, refreshPrepSlabGadgets,
     CHAIN_POP_ROWS } from "./native_call.js";
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250831m";
+const BUILD_ID = "rw-20250831n";
 
 function usePoopsNativePath() {
     return params.get("nativepath") === "poops";
@@ -5832,6 +5832,137 @@ function wireClick(el, fn) {
     });
 }
 
+const NATIVE_OPTION_PRESETS = {
+    "core-smoke-96": {
+        groom: "96",
+        nativepath: "core",
+        native: "smoke",
+        freshprep: true,
+        nativeprep: false,
+    },
+    "core-smoke": {
+        groom: null,
+        nativepath: "core",
+        native: "smoke",
+        freshprep: true,
+        nativeprep: false,
+    },
+    "2e-default": {
+        groom: "384",
+        nativepath: "",
+        native: "off",
+        freshprep: false,
+        nativeprep: false,
+    },
+    "poops-smoke": {
+        groom: null,
+        nativepath: "poops",
+        native: "smoke",
+        freshprep: true,
+        nativeprep: false,
+    },
+};
+
+function detectNativePresetFromUrl() {
+    const np = params.get("nativepath") || "";
+    const nat = params.get("native") || getNativeMode();
+    const fp = params.get("freshprep") === "1";
+    const nprep = params.get("nativeprep") === "1";
+    const gkey = currentGroomKey(params);
+    if ((np === "core" || np === "parseint") && nat === "smoke" && fp && !nprep && gkey === "96")
+        return "core-smoke-96";
+    if ((np === "core" || np === "parseint") && nat === "smoke" && fp && !nprep)
+        return "core-smoke";
+    if (!np && (nat === "off" || !params.get("native")) && !fp && !nprep
+        && (gkey === "384" || gkey === "default"))
+        return "2e-default";
+    if (np === "poops" && nat === "smoke" && fp && !nprep)
+        return "poops-smoke";
+    return "";
+}
+
+function syncNativeOptionsFromUrl() {
+    const pathSel = $("native-path");
+    const fresh = $("opt-freshprep");
+    const prep = $("opt-nativeprep");
+    const preset = $("native-preset");
+    if (pathSel) {
+        const np = params.get("nativepath") || "";
+        pathSel.value = (np === "parseint") ? "core" : np;
+    }
+    if (fresh) fresh.checked = params.get("freshprep") === "1";
+    if (prep) prep.checked = params.get("nativeprep") === "1";
+    if (preset) preset.value = detectNativePresetFromUrl() || "";
+}
+
+function applyNativeOptionsReload() {
+    const presetKey = ($("native-preset") && $("native-preset").value) || "";
+    const prof = NATIVE_OPTION_PRESETS[presetKey];
+    const u = new URL(location.href);
+
+    let groomKey = undefined;
+    let path = ($("native-path") && $("native-path").value) || "";
+    let native = (nativeModeSel && nativeModeSel.value) || "off";
+    let freshprep = $("opt-freshprep") && $("opt-freshprep").checked;
+    let nativeprep = $("opt-nativeprep") && $("opt-nativeprep").checked;
+
+    if (prof) {
+        groomKey = prof.groom;
+        path = prof.nativepath;
+        native = prof.native;
+        freshprep = prof.freshprep;
+        nativeprep = prof.nativeprep;
+    }
+
+    u.searchParams.set("v", BUILD_ID);
+
+    if (groomKey !== undefined) {
+        u.searchParams.delete("g");
+        u.searchParams.delete("slots");
+        if (groomKey && GROOM_PRESETS[groomKey]) {
+            for (let i = 0; i < GROOM_PRESETS[groomKey].g.length; i++)
+                u.searchParams.append("g", GROOM_PRESETS[groomKey].g[i]);
+        }
+    }
+
+    if (path) u.searchParams.set("nativepath", path);
+    else u.searchParams.delete("nativepath");
+
+    if (native && native !== "off") u.searchParams.set("native", native);
+    else u.searchParams.delete("native");
+
+    if (freshprep) u.searchParams.set("freshprep", "1");
+    else u.searchParams.delete("freshprep");
+
+    if (nativeprep) u.searchParams.set("nativeprep", "1");
+    else u.searchParams.delete("nativeprep");
+
+    mark("NATIVE-RELOAD", u.pathname + "?" + u.searchParams.toString());
+    renderOut();
+    try { crashLog.flushSync(); } catch (_) { }
+    location.href = u.pathname + "?" + u.searchParams.toString();
+}
+
+function wireNativeOptionsBar() {
+    syncNativeOptionsFromUrl();
+    const btn = $("btn-native-reload");
+    if (btn) btn.addEventListener("click", applyNativeOptionsReload);
+    const presetSel = $("native-preset");
+    if (presetSel) {
+        presetSel.addEventListener("change", function () {
+            const p = NATIVE_OPTION_PRESETS[presetSel.value];
+            if (!p) return;
+            const pathSel = $("native-path");
+            const fresh = $("opt-freshprep");
+            const prep = $("opt-nativeprep");
+            if (pathSel) pathSel.value = p.nativepath || "";
+            if (fresh) fresh.checked = !!p.freshprep;
+            if (prep) prep.checked = !!p.nativeprep;
+            if (nativeModeSel && p.native) setNativeMode(p.native);
+        });
+    }
+}
+
 function wireNotifyProfileBar() {
     const sel = $("notify-profile");
     const gdIn = $("notify-gd");
@@ -5937,6 +6068,7 @@ function init() {
     wireGadgetBars();
     wireG5Bar();
     wireNativeBisectBar();
+    wireNativeOptionsBar();
     wireNotifyProfileBar();
     wireClick($("btn-notify-gdcheck"), function () { return runNotifyGdCheckOnly(); });
     ensureUiVisible();
