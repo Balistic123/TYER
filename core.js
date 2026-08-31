@@ -1242,6 +1242,16 @@ function buildCarrier() {
         attempts: attemptNumber,
         validate: plausibleAddress,
 
+        /** Addresses validated @ READ-PRIMITIVE-PASS — parseInt + textarea anchor (not expm1). */
+        native: {
+            target: nativeTarget,
+            targetCell: nativeTargetAddress,
+            executable: executableAddress,
+            nativeFn: nativeFunctionAddress,
+            textareaCell: anchorElementAddress,
+            holderCell: targetAddress,
+        },
+
         hostAddress,
         fakeAddress,
 

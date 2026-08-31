@@ -1,5 +1,6 @@
 /**
- * PS4 port of slopkit notify native-call (Intl.Collator.compare → lk trampoline).
+ * DEPRECATED PS5 slopkit Collator port — PS4 13.52 uses expm1 ROP in native_call.js.
+ * Kept for ?notifycollator=1 experiments only.
  * Runs post slopkit-core-1 primitive — no Math.expm1 pivot.
  */
 import { int64 } from "./int64.js";

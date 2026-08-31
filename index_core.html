@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PS4 core native</title>
+<style>
+  html,body{margin:0;padding:12px;background:#0b0d10;color:#c8ced8;font:15px system-ui}
+  #state{font-size:18px;font-weight:700;margin:0 0 10px}
+  button{background:#1e3a2f;color:#eee;border:1px solid #3a6b54;border-radius:4px;padding:10px 16px;font:inherit;margin:4px 8px 4px 0}
+  button:disabled{opacity:.4}
+  #fn-in{width:300px;background:#111;border:1px solid #333;color:#eee;padding:8px;font:12px monospace;margin:8px 0;display:block}
+  #out{white-space:pre-wrap;font:11px monospace;background:#111;padding:10px;max-height:55vh;overflow:auto;margin-top:10px}
+  .ok{color:#7fd0a0}.bad{color:#d08a7f}.warn{color:#d8c07f}
+  p{font-size:12px;color:#9aa3b2;max-width:760px;line-height:1.45}
+  code{font:12px monospace;color:#b8c4e0}
+</style>
+</head>
+<body>
+<script>if(!location.search)location.replace(location.pathname+"?g=drain:96&freshprep=1");</script>
+<div id="state">core native</div>
+<p>
+  <b>Our path</b> — slopkit-core validates <code>parseInt</code> + carrier <code>textarea</code> @ PRIMITIVE-OK.
+  No expm1 / poops / PS5 Collator. Log should say <code>NATIVE-PREP CORE parseInt+textarea</code>.
+</p>
+<button type="button" id="btn-start">Start</button>
+<button type="button" id="btn-n5a" disabled>N5a trigger(1)</button>
+<button type="button" id="btn-smoke" disabled>Fire smoke</button>
+<button type="button" id="btn-getpid" disabled>Fire getpid</button>
+<input id="fn-in" placeholder="k_usleep fn ptr" autocomplete="off">
+<button type="button" id="btn-accept" disabled>Accept + getpid</button>
+<div id="out"></div>
+<script type="module" src="./core_page.js?v=core-1"></script>
+</body>
+</html>

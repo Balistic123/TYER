@@ -128,6 +128,8 @@ PS4["13.52"] = Object.assign({}, PS4["13.50"], LIBKERNEL_1352, NOTIFY_1352, {
     wk_plt_stack_chk_fail: null,
     wk_plt___error: null,
     wk_expm1_builtin:                 0xeb6350,
+    wk_parseint_native:               0x1ea18,  /* slopkit-core nativeTarget — not expm1 */
+    wk_JSFunction_m_function:         0x28,
     wk_POP_RDI_RET:                     0x4be55,
     wk_POP_RSI_RET:                     0x7acb3,
     wk_POP_RDX_RET:                     0x30b1e9,
