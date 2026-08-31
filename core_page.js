@@ -2,7 +2,7 @@
 import { int64 } from "./int64.js";
 import { offsetsFor } from "./ps4_offsets_userland.js";
 import { installWindowP, pairStatus } from "./mem.js";
-import { establishPrimitive, trimExploitDebris, getCoreNative } from "./core.js?v=core-3";
+import { establishPrimitive, trimExploitDebris, getCoreNative } from "./core.js?v=core-4";
 import {
     prepCoreNative, fireCoreSmoke, fireCoreGetpid, bisectCoreTriggerLite,
 } from "./core_native.js";
