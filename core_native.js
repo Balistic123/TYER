@@ -7,7 +7,7 @@ import {
     prepNativeChain, layoutSmokeStack, fireNativeCall, firePivotSmoke,
     stageGetpid, stageNotify, firePivotTrigger,
     verifySlabContent, verifyBisectChainSet,
-} from "./native_call.js";
+} from "./native_call.js?v=nc-20250831r";
 
 const M_FUNCTION_OFF = 0x28;
 const JSFUNC_EXECUTABLE_OFF = 0x18;

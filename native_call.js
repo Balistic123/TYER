@@ -7,6 +7,7 @@ import { PIVOT_ROWS, verifyPivotSet, verifyPivotSetPrefix, checkPivotBytes } fro
 
 /** Builtin used to enter native path after G0→m_function hook. ?pivotfn=parseInt if expm1 OOMs. */
 const PIVOT_BUILTIN_MAP = {
+    expm: function () { return Math.expm1; },
     expm1: function () { return Math.expm1; },
     parseint: function () { return parseInt; },
     parsefloat: function () { return parseFloat; },

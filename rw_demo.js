@@ -72,7 +72,7 @@ import {
 } from "./libkernel_resolve.js";
 import { probeLibkernelViaVtable } from "./vtable_lk_probe.js";
 import { createCrashLog } from "./log_persist.js";
-import { prepCoreNative, captureFromCarrier, fireCoreGetpid, fireCoreNotify, bisectCoreTriggerLite } from "./core_native.js?v=core-5";
+import { prepCoreNative, captureFromCarrier, fireCoreGetpid, fireCoreNotify, bisectCoreTriggerLite } from "./core_native.js?v=core-6";
 import { prepNativeChain, stageGetpid, stageUsleep, stageNotify, fireNativeCall, fireUsleep, fireNotify, firePivotSmoke,
     resolvePivotBuiltin, firePivotTrigger,
     firePivotGetpid,
@@ -88,9 +88,9 @@ import { prepNativeChain, stageGetpid, stageUsleep, stageNotify, fireNativeCall,
     readPivotButterfly, ensurePivotButterfly, formatPivotBfDiag,
     applyPivotHookForFire,
     prepGadgetRvaStale, refreshPrepSlabGadgets,
-    CHAIN_POP_ROWS } from "./native_call.js";
+    CHAIN_POP_ROWS } from "./native_call.js?v=nc-20250831r";
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250831q";
+const BUILD_ID = "rw-20250831r";
 
 function usePoopsNativePath() {
     return params.get("nativepath") === "poops";
@@ -105,11 +105,20 @@ function nativePrepAtStart() {
     return params.get("nativeprep") === "1";
 }
 
+function pivotExpm1() {
+    return { fn: Math.expm1, name: "expm1" };
+}
+
 function pivotBuiltinFromParams() {
+    const raw = params.get("pivotfn") || "expm1";
+    const norm = String(raw).toLowerCase().replace(/[^a-z0-9]/g, "");
+    if (norm === "expm1" || norm === "expm") return pivotExpm1();
+    if (norm === "parseint") return { fn: parseInt, name: "parseint" };
     try {
-        return resolvePivotBuiltin(params.get("pivotfn") || "expm1");
+        return resolvePivotBuiltin(raw);
     } catch (e) {
-        return { fn: Math.expm1, name: "expm1" };
+        if (norm === "expm1" || norm === "expm") return pivotExpm1();
+        throw e;
     }
 }
 
@@ -4465,7 +4474,7 @@ function ensureNativePrep(p, off) {
 
     const pivot = usePoopsNativePath()
         ? pivotBuiltinFromParams()
-        : resolvePivotBuiltin("expm1");
+        : pivotExpm1();
     const cap = captureMainMfForPrep(p, off, pivot.fn);
     cap.pivotTrigger = pivot.fn;
     cap.pivotBuiltinName = pivot.name;
