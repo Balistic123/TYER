@@ -1218,17 +1218,31 @@ function coreNativeSnapshot() {
     };
 }
 
+function parseStoredHex(v) {
+    if (v == null) return NaN;
+    if (typeof v === "number" && Number.isFinite(v)) return v;
+    if (typeof v === "string") {
+        const s = v.replace(/^0x/i, "").trim();
+        if (!s || !/^[0-9a-f]+$/i.test(s)) return NaN;
+        if (s.length <= 8) return parseInt(s, 16) >>> 0;
+        const lo = parseInt(s.slice(-8), 16) >>> 0;
+        const hi = parseInt(s.slice(0, -8), 16) >>> 0;
+        return lo + hi * 0x100000000;
+    }
+    return NaN;
+}
+
 function persistCoreNativeSnapshot() {
     const snap = coreNativeSnapshot();
     if (!Number.isFinite(snap.executable) || !Number.isFinite(snap.targetCell))
         return snap;
     try {
         sessionStorage.setItem(CORE_NATIVE_SS, JSON.stringify({
-            targetCell: snap.targetCell,
-            executable: snap.executable,
-            nativeFn: snap.nativeFn,
-            textareaCell: snap.textareaCell,
-            holderCell: snap.holderCell,
+            targetCell: "0x" + snap.targetCell.toString(16),
+            executable: "0x" + snap.executable.toString(16),
+            nativeFn: "0x" + snap.nativeFn.toString(16),
+            textareaCell: "0x" + snap.textareaCell.toString(16),
+            holderCell: "0x" + snap.holderCell.toString(16),
         }));
     } catch (_) { }
     return snap;
@@ -1236,10 +1250,12 @@ function persistCoreNativeSnapshot() {
 
 /** parseInt+textarea anchors — module vars, sessionStorage, or carrier.native */
 export function getCoreNative(carrier) {
-    if (carrier && carrier.native
-        && Number.isFinite(carrier.native.executable)
-        && Number.isFinite(carrier.native.targetCell))
-        return carrier.native;
+    if (carrier && carrier.native) {
+        const exec = parseStoredHex(carrier.native.executable);
+        const tc = parseStoredHex(carrier.native.targetCell);
+        if (Number.isFinite(exec) && Number.isFinite(tc))
+            return Object.assign({}, carrier.native, { executable: exec, targetCell: tc });
+    }
     const snap = coreNativeSnapshot();
     if (Number.isFinite(snap.executable) && Number.isFinite(snap.targetCell))
         return snap;
@@ -1247,8 +1263,18 @@ export function getCoreNative(carrier) {
         const raw = sessionStorage.getItem(CORE_NATIVE_SS);
         if (raw) {
             const j = JSON.parse(raw);
-            if (j && Number.isFinite(j.executable) && Number.isFinite(j.targetCell))
-                return Object.assign({ target: nativeTarget }, j);
+            const exec = parseStoredHex(j.executable);
+            const tc = parseStoredHex(j.targetCell);
+            if (Number.isFinite(exec) && Number.isFinite(tc)) {
+                return {
+                    target: nativeTarget,
+                    targetCell: tc,
+                    executable: exec,
+                    nativeFn: parseStoredHex(j.nativeFn),
+                    textareaCell: parseStoredHex(j.textareaCell),
+                    holderCell: parseStoredHex(j.holderCell),
+                };
+            }
         }
     } catch (_) { }
     return null;

