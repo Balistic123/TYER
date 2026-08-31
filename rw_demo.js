@@ -90,7 +90,7 @@ import { prepNativeChain, stageGetpid, stageUsleep, stageNotify, fireNativeCall,
     prepGadgetRvaStale, refreshPrepSlabGadgets,
     CHAIN_POP_ROWS } from "./native_call.js";
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250831i";
+const BUILD_ID = "rw-20250831j";
 
 function usePoopsNativePath() {
     return params.get("nativepath") === "poops";
@@ -5560,7 +5560,7 @@ async function runNativeCall() {
 async function loadExploit() {
     if (exploit) return exploit;
     mark("LOAD", "core.js + mem.js");
-    const core = await import("./core.js");
+    const core = await import("./core.js?v=" + BUILD_ID);
     exploit = {
         establishPrimitive: core.establishPrimitive,
         trimExploitDebris: core.trimExploitDebris,
@@ -5726,6 +5726,10 @@ async function runStart() {
             },
         });
         window._wkCarrier = carrier;
+        if (carrier && !carrier.native) {
+            const nat = (await import("./core.js?v=" + BUILD_ID)).getCoreNative(carrier);
+            if (nat) carrier.native = nat;
+        }
         const p = window.p;
         if (!p) throw new Error("window.p missing");
         saveTextareaSession(p, carrier);

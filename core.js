@@ -1199,8 +1199,59 @@ function reportComposition() {
     const resolve = settleResolve;
     settleResolve = null;
     settleReject = null;
-    if (resolve !== null)
+    if (resolve !== null) {
+        persistCoreNativeSnapshot();
         resolve(buildCarrier());
+    }
+}
+
+const CORE_NATIVE_SS = "wk-core-native";
+
+function coreNativeSnapshot() {
+    return {
+        target: nativeTarget,
+        targetCell: nativeTargetAddress,
+        executable: executableAddress,
+        nativeFn: nativeFunctionAddress,
+        textareaCell: anchorElementAddress,
+        holderCell: targetAddress,
+    };
+}
+
+function persistCoreNativeSnapshot() {
+    const snap = coreNativeSnapshot();
+    if (!Number.isFinite(snap.executable) || !Number.isFinite(snap.targetCell))
+        return snap;
+    try {
+        sessionStorage.setItem(CORE_NATIVE_SS, JSON.stringify({
+            targetCell: snap.targetCell,
+            executable: snap.executable,
+            nativeFn: snap.nativeFn,
+            textareaCell: snap.textareaCell,
+            holderCell: snap.holderCell,
+        }));
+    } catch (_) { }
+    return snap;
+}
+
+/** parseInt+textarea anchors — module vars, sessionStorage, or carrier.native */
+export function getCoreNative(carrier) {
+    if (carrier && carrier.native
+        && Number.isFinite(carrier.native.executable)
+        && Number.isFinite(carrier.native.targetCell))
+        return carrier.native;
+    const snap = coreNativeSnapshot();
+    if (Number.isFinite(snap.executable) && Number.isFinite(snap.targetCell))
+        return snap;
+    try {
+        const raw = sessionStorage.getItem(CORE_NATIVE_SS);
+        if (raw) {
+            const j = JSON.parse(raw);
+            if (j && Number.isFinite(j.executable) && Number.isFinite(j.targetCell))
+                return Object.assign({ target: nativeTarget }, j);
+        }
+    } catch (_) { }
+    return null;
 }
 
 function buildCarrier() {
@@ -1243,14 +1294,7 @@ function buildCarrier() {
         validate: plausibleAddress,
 
         /** Addresses validated @ READ-PRIMITIVE-PASS — parseInt + textarea anchor (not expm1). */
-        native: {
-            target: nativeTarget,
-            targetCell: nativeTargetAddress,
-            executable: executableAddress,
-            nativeFn: nativeFunctionAddress,
-            textareaCell: anchorElementAddress,
-            holderCell: targetAddress,
-        },
+        native: persistCoreNativeSnapshot(),
 
         hostAddress,
         fakeAddress,

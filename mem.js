@@ -353,6 +353,7 @@ function buildPairCarrier(fake) {
         anchorObjectAddress: fake.anchorObjectAddress,
         textarea: fake.textarea,
         textareaAddress: fake.textareaAddress,
+        native: fake.native || null,
 
         profile: fake.profile,
         attempts: fake.attempts,

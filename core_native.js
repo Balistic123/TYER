@@ -2,6 +2,7 @@
  * PS4 13.52 native call — built from slopkit-core anchors (parseInt + carrier textarea).
  * NOT chain_poops / expm1 / PS5 Collator — uses addresses validated @ PRIMITIVE-OK.
  */
+import { getCoreNative } from "./core.js";
 import { int64 } from "./int64.js";
 import {
     prepNativeChain, layoutSmokeStack, fireNativeCall, firePivotSmoke,
@@ -23,8 +24,8 @@ function numToI64(n) {
  * @returns {object|null} cap for prepNativeChain
  */
 export function captureFromCarrier(p, carrier, off) {
-    if (!p || !carrier || !carrier.native) return null;
-    const nat = carrier.native;
+    const nat = getCoreNative(carrier);
+    if (!nat) return null;
     const exec = numToI64(nat.executable);
     const targetCell = numToI64(nat.targetCell);
     if (!exec || !targetCell) return null;
@@ -66,7 +67,7 @@ export function webkitBaseFromCap(cap, off) {
 export function prepCoreNative(p, off, carrier, opts) {
     opts = opts || {};
     const cap = captureFromCarrier(p, carrier, off);
-    if (!cap) throw new Error("core_native: carrier.native missing — Start first");
+    if (!cap) throw new Error("core_native: parseInt anchors missing — hard-reload (core.js cache?) then Start");
     if (!cap.pivotObj) throw new Error("core_native: carrier textarea missing");
 
     const webkitBase = webkitBaseFromCap(cap, off);
