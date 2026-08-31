@@ -90,7 +90,7 @@ import { prepNativeChain, stageGetpid, stageUsleep, stageNotify, fireNativeCall,
     prepGadgetRvaStale, refreshPrepSlabGadgets,
     CHAIN_POP_ROWS } from "./native_call.js";
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250831n";
+const BUILD_ID = "rw-20250831o";
 
 function usePoopsNativePath() {
     return params.get("nativepath") === "poops";
@@ -191,7 +191,7 @@ const NATIVE_BISECT_STEPS = [
     { id: "hook-poops", label: "N4b +0", title: "hook @ leakval+0" },
     { id: "hook-multi", label: "N4m multi", title: "hook @ +0 +20 +28 +30 +38 at once" },
     { id: "hook-verify", label: "N4v hook", title: "multi-hook + verify readback + snap (NO expm1)" },
-    { id: "expm1-lite", label: "N5a exp1", title: "expm1(1) G0 armed — OOM expected (no hook)" },
+    { id: "expm1-lite", label: "N5a trig1", title: "parseInt(1) or expm1(1) — G0 armed, NO hook (OOM test)" },
     { id: "expm1-nohook", label: "N5c obj", title: "expm1(pivotObj) G0 armed NO hook" },
     { id: "expm1", label: "N5 expm1", title: "chain_poops atomic: sync+layout+fireNativeCall hook+0" },
     { id: "expm1-multi", label: "N5m multi", title: "multi-hook pivotCell (old N5 — may corrupt object)" },
@@ -5120,7 +5120,7 @@ function runNativeBisectStep(stepId) {
                 bisectCoreTriggerLite(p, nativePrep);
             else
                 firePivotTrigger(nativePrep, 1);
-            bisectLog("BISECT-OK", "N5a expm1(1) survived (unexpected — G0 may not have run)");
+            bisectLog("BISECT-OK", "N5a " + (nativePrep.pivotBuiltinName || "trigger") + "(1) survived");
             state("N5a OK", "ok");
             break;
         case "expm1-nohook":
