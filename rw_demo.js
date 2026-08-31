@@ -90,7 +90,7 @@ import { prepNativeChain, stageGetpid, stageUsleep, stageNotify, fireNativeCall,
     prepGadgetRvaStale, refreshPrepSlabGadgets,
     CHAIN_POP_ROWS } from "./native_call.js";
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250831p";
+const BUILD_ID = "rw-20250831q";
 
 function usePoopsNativePath() {
     return params.get("nativepath") === "poops";

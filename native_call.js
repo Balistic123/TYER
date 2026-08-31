@@ -16,7 +16,7 @@ const PIVOT_BUILTIN_MAP = {
 };
 
 export function resolvePivotBuiltin(name) {
-    const key = (name || "expm1").toLowerCase().replace(/[^a-z]/g, "");
+    const key = (name || "expm1").toLowerCase().replace(/[^a-z0-9]/g, "");
     const get = PIVOT_BUILTIN_MAP[key];
     if (!get) throw new Error("unknown pivotfn: " + name + " (try parseint|expm1|sin)");
     const fn = get();
