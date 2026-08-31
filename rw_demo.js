@@ -88,13 +88,13 @@ import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, 
     prepGadgetRvaStale, refreshPrepSlabGadgets,
     CHAIN_POP_ROWS } from "./native_call.js";
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250831c";
+const BUILD_ID = "rw-20250831d";
 
 /** Notify bisect URL profiles — applied by Reload profile button. */
 const NOTIFY_PROFILES = {
     default: {
         label: "default",
-        qs: { freshprep: "1", native: "notify" },
+        qs: { freshprep: "1", native: "notify", gd: "1aca" },
     },
     "test-a": {
         label: "Test A usleep",
@@ -120,9 +120,9 @@ const NOTIFY_PROFILES = {
         label: "Test F hook no compare",
         qs: { freshprep: "1", native: "notify", notifynocompare: "1" },
     },
-    "test-gdcheck": {
-        label: "Test gd bytes (no fire)",
-        qs: { freshprep: "1", native: "notify", notifygdcheck: "1", notifygdfire: "0" },
+    "test-gd1352": {
+        label: "13.52 gd fixed",
+        qs: { freshprep: "1", native: "notify", gd: "1aca", notifygdcheck: "1", notifygdfire: "0" },
     },
     "test-c": {
         label: "Test C gd",
@@ -5746,8 +5746,10 @@ function wireNotifyProfileBar() {
         if (params.get("notifydirect") === "1" && smoke === "usleep") return "test-d";
         if (params.get("notifyunhooked") === "1") return "test-e";
         if (params.get("notifynocompare") === "1") return "test-f";
-        if (params.get("notifygdcheck") === "1" && params.get("notifygdfire") === "0")
+        if (params.get("notifygdcheck") === "1" && params.get("notifygdfire") === "0") {
+            if (gd === "1aca" || gd === "0x1aca") return "test-gd1352";
             return "test-gdcheck";
+        }
         if (smoke === "usleep") return "test-a";
         if (bisect === "1") return "test-b";
         if (gd) return "test-c";
@@ -5761,7 +5763,7 @@ function wireNotifyProfileBar() {
         const fromUrl = params.get("gd");
         if (fromUrl && !gdIn.value)
             gdIn.value = "0x" + String(fromUrl).replace(/^0x/i, "");
-        if (!gdIn.value) gdIn.value = "0x1d6fa";
+        if (!gdIn.value) gdIn.value = "0x1aca";
         gdIn.style.display = sel.value === "test-c" ? "" : "none";
     }
 

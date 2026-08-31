@@ -128,7 +128,7 @@ function doPin(p, off) {
     return {
         collator, compareFn, req, view, backing, fakeUC, fakeVT,
         field: collCell.add32(COLLATOR_OFF),
-        gd: off.wk_notify_gd || 0x1d6fa,
+        gd: off.wk_notify_gd || 0x1aca,
         nt: off.k_notify || 0x19320,
     };
 }

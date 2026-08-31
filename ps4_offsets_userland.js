@@ -112,7 +112,7 @@ const LIBKERNEL_1352 = {
 /** slopkit Collator.notify — 13.00 PS4 table + 13.52 k_notify; RE gd/gps on HW (?gd=&gps=) */
 const NOTIFY_1352 = {
     wk_notify_hc: [0x56a58, 0x56ca0, 0x57ce8],
-    wk_notify_gd: 0x1d6fa,
+    wk_notify_gd: 0x1aca,  /* 13.52 dump — was 13.00 0x1d6fa (NOTIFY-GD-BAD on HW) */
     wk_gps: 0x3352238,
     wk_gpe: 0x1b860,
     wk_cls: 0x3352228,

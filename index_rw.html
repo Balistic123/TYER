@@ -111,7 +111,8 @@
       <option value="test-d">Test D — direct vtable→usleep (skip gd)</option>
       <option value="test-e">Test E — unhooked only (heap check, no S25)</option>
       <option value="test-f">Test F — hook+restore only (no compareFn)</option>
-      <option value="test-gdcheck">Test gd — verify bytes @ 0x1d6fa (no fire)</option>
+      <option value="test-gd1352">13.52 gd=0x1aca (dump-verified) — gdcheck</option>
+      <option value="test-gdcheck">Test gd — verify bytes (no fire)</option>
       <option value="test-c">Test C — custom gd RVA (use box →)</option>
       <option value="notifydirect">notifydirect=1 (skip gd trampoline)</option>
       <option value="notifystr">notifystr=1 (legacy 0xc30 JS string @ fire)</option>
@@ -120,8 +121,7 @@
     <input type="text" id="notify-gd" placeholder="gd 0x1d6fa" title="Test C: libkernel trampoline RVA" autocomplete="off">
     <button type="button" class="secondary" id="btn-notify-reload">Reload profile</button>
   </div>
-  <p id="hint"><b>A/B/AB OOM @ S25</b> = gd trampoline (0x1d6fa) likely wrong on 13.52. Try <b>Test E</b> (unhooked),
-    <b>Test gd</b> (byte check), <b>Test D</b> (skip gd). <b>smoke-prep</b> = expm1 N0 bisect.</p>
+  <p id="hint"><b>gd fixed 13.52:</b> <code>0x1aca</code> (dump) not <code>0x1d6fa</code> (13.00). Reload default → gdcheck should say NOTIFY-GD-OK → Fire notify.</p>
   <h2>Known pointers (this process)</h2>
   <table id="map">
     <thead><tr><th>label</th><th>address</th><th>note</th></tr></thead>
@@ -172,6 +172,6 @@ window.addEventListener("unhandledrejection", function (e) {
   persistCrashLine("wk-rw-log", msg);
 });
 </script>
-<script type="module" src="./rw_demo.js?v=20250831c"></script>
+<script type="module" src="./rw_demo.js?v=20250831d"></script>
 </body>
 </html>
