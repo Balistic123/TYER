@@ -33,6 +33,10 @@
   #peek-bar input, #peek-bar select { background:#0b0d10; color:#c8ced8;
               border:1px solid #2a3544; border-radius:4px; padding:6px 8px;
               font:12px Consolas, monospace; }
+  #notify-gd { width:100px; }
+  #notify-bisect-bar select, #notify-bisect-bar input { background:#0b0d10; color:#c8ced8;
+              border:1px solid #2a3544; border-radius:4px; padding:6px 8px;
+              font:12px Consolas, monospace; }
   #addr-in { width:180px; }
   #hint { font-size:12px; color:#9aa3b2; margin:0 0 10px; line-height:1.45; }
   h2 { font-size:13px; color:#9aa3b2; margin:14px 0 6px; font-weight:600; }
@@ -97,8 +101,23 @@
   <div class="gadget-bar" id="native-bisect">
     <span class="bar-label">native bisect — tap one step at a time (N1→N5 finds OOM point; N6 restore if N5 survives)</span>
   </div>
-  <p id="hint"><b>13.52 notify:</b> Start → Accept fn → Fire (atomic pin+fire). S25 OOM bisect:
-    <code>?notifybisect=1</code> <code>?notifysmoke=usleep</code> <code>?gd=0x…</code></p>
+  <div class="gadget-bar" id="notify-bisect-bar">
+    <span class="bar-label">notify bisect profile — pick then Reload (fresh tab load with URL flags)</span>
+    <select id="notify-profile" title="Sets ?freshprep=1 &amp; notify flags on reload">
+      <option value="default">default — freshprep + notify</option>
+      <option value="test-a">Test A — notifysmoke=usleep (gd hook smoke)</option>
+      <option value="test-b">Test B — notifybisect=1 (S24u before S25)</option>
+      <option value="test-ab">Test A+B — usleep + bisect</option>
+      <option value="test-c">Test C — custom gd RVA (use box →)</option>
+      <option value="notifydirect">notifydirect=1 (skip gd trampoline)</option>
+      <option value="notifystr">notifystr=1 (legacy 0xc30 JS string @ fire)</option>
+      <option value="smoke-prep">expm1 bisect — native=smoke + freshprep</option>
+    </select>
+    <input type="text" id="notify-gd" placeholder="gd 0x1d6fa" title="Test C: libkernel trampoline RVA" autocomplete="off">
+    <button type="button" class="secondary" id="btn-notify-reload">Reload profile</button>
+  </div>
+  <p id="hint"><b>Notify:</b> default profile → Start → Accept fn → Fire. Bisect N0 needs <b>smoke-prep</b> profile first.
+    Test A/B/C sets flags automatically on Reload.</p>
   <h2>Known pointers (this process)</h2>
   <table id="map">
     <thead><tr><th>label</th><th>address</th><th>note</th></tr></thead>
@@ -149,6 +168,6 @@ window.addEventListener("unhandledrejection", function (e) {
   persistCrashLine("wk-rw-log", msg);
 });
 </script>
-<script type="module" src="./rw_demo.js?v=20250830bs"></script>
+<script type="module" src="./rw_demo.js?v=20250831b"></script>
 </body>
 </html>

