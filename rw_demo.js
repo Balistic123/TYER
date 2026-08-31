@@ -72,7 +72,7 @@ import {
 } from "./libkernel_resolve.js";
 import { probeLibkernelViaVtable } from "./vtable_lk_probe.js";
 import { createCrashLog } from "./log_persist.js";
-import { prepCoreNative, captureFromCarrier, fireCoreGetpid, fireCoreNotify, bisectCoreTriggerLite } from "./core_native.js?v=core-4";
+import { prepCoreNative, captureFromCarrier, fireCoreGetpid, fireCoreNotify, bisectCoreTriggerLite } from "./core_native.js?v=core-5";
 import { prepNativeChain, stageGetpid, stageUsleep, stageNotify, fireNativeCall, fireUsleep, fireNotify, firePivotSmoke,
     resolvePivotBuiltin, firePivotTrigger,
     firePivotGetpid,
@@ -90,7 +90,7 @@ import { prepNativeChain, stageGetpid, stageUsleep, stageNotify, fireNativeCall,
     prepGadgetRvaStale, refreshPrepSlabGadgets,
     CHAIN_POP_ROWS } from "./native_call.js";
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250831o";
+const BUILD_ID = "rw-20250831p";
 
 function usePoopsNativePath() {
     return params.get("nativepath") === "poops";
@@ -4742,7 +4742,15 @@ function bisectRunPoopsFire(p, off, hookOffs, tag) {
 
 function requireNativePrep() {
     if (nativePrep) return;
-    throw new Error("no prep — Start first (PREP-PIN @ Start) or tap N1");
+    if (!ready || !window.p)
+        throw new Error("no prep — Start first");
+    try {
+        ensureNativePrep(window.p, loadEffectiveOff());
+    } catch (err) {
+        throw new Error("prep failed: " + (err.message || String(err)));
+    }
+    if (!nativePrep)
+        throw new Error("no prep after ensureNativePrep");
 }
 
 function pivotObjForPrep(carrier, prep) {
