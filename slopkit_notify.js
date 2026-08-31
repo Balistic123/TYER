@@ -865,8 +865,6 @@ export {
     DEFAULT_MESSAGE,
     REQ_ARENA_OFFSET,
     resolveNotifyConfig,
-    resolveNotifyGd,
-    checkNotifyGd,
     verifyGdBytes,
     buildNotificationRequest,
     writeNotificationRequestToView,
