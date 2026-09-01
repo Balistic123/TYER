@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PS4 stub native (no ROP slab)</title>
+<style>
+  html,body{margin:0;padding:12px;background:#0b0d10;color:#c8ced8;font:15px system-ui}
+  #state{font-size:18px;font-weight:700;margin:0 0 10px}
+  button{background:#1e3a2f;color:#eee;border:1px solid #3a6b54;border-radius:4px;padding:10px 16px;font:inherit;margin:4px 8px 4px 0}
+  button:disabled{opacity:.4}
+  #lk-in{width:280px;background:#111;border:1px solid #333;color:#eee;padding:8px;font:12px monospace;margin:8px 0;display:block}
+  #out{white-space:pre-wrap;font:11px monospace;background:#111;padding:10px;max-height:55vh;overflow:auto;margin-top:10px}
+  .ok{color:#7fd0a0}.bad{color:#d08a7f}.warn{color:#d8c07f}
+  p{font-size:12px;color:#9aa3b2;max-width:760px;line-height:1.45}
+  code{font:12px monospace;color:#b8c4e0}
+  label{font-size:12px;color:#9aa3b2;margin-right:12px}
+</style>
+</head>
+<body>
+<script>if(!location.search)location.replace(location.pathname+"?g=drain:96&stub=parseint");</script>
+<div id="state">stub native — no ROP slab</div>
+<p>
+  <b>New paths</b> (never use G0–G5 / expm1 pivot chain):<br>
+  <b>A stub-swap</b> — patch parseInt <code>m_function</code> → lk+getpid stub, call <code>parseInt(textarea)</code>, restore.<br>
+  <b>B collator-stub</b> — fake Collator vtable points at getpid stub, one <code>compare()</code>.<br>
+  Need lk from rw_demo <b>2e Leak+lk</b> first (same session).
+</p>
+<label><input type="radio" name="stub" value="parseint" checked> A parseInt stub-swap</label>
+<label><input type="radio" name="stub" value="collator"> B collator direct</label>
+<label><input type="radio" name="stub" value="arm"> verify arm only (no fire)</label>
+<br>
+<button type="button" id="btn-start">Start</button>
+<button type="button" id="btn-fire" disabled>Fire getpid stub</button>
+<input id="lk-in" placeholder="lk base or k_usleep fn ptr" autocomplete="off">
+<div id="out"></div>
+<script type="module" src="./stub_page.js?v=stub-1"></script>
+</body>
+</html>

