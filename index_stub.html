@@ -18,22 +18,45 @@
 </style>
 </head>
 <body>
-<script>if(!location.search)location.replace(location.pathname+"?g=drain:96&stub=parseint");</script>
+<script>
+if(!location.search)location.replace(location.pathname+"?g=drain:96&stub=arm");
+(function(){
+  function persist(line){
+    try{
+      var k="wk-stub-log",p=sessionStorage.getItem(k)||"";
+      sessionStorage.setItem(k,(p?p+"\n":"")+line);
+    }catch(e){}
+  }
+  window.addEventListener("error",function(e){
+    var m="ERROR  "+(e.message||e);
+    persist(m);
+    var s=document.getElementById("state"),o=document.getElementById("out");
+    if(s){s.textContent=m;s.className="bad";}
+    if(o){o.textContent=(o.textContent?o.textContent+"\n":"")+m;}
+  });
+  window.addEventListener("unhandledrejection",function(e){
+    var r=e.reason,m="REJECT  "+(r&&r.message?r.message:r);
+    persist(m);
+    var s=document.getElementById("state"),o=document.getElementById("out");
+    if(s){s.textContent=m;s.className="bad";}
+    if(o){o.textContent=(o.textContent?o.textContent+"\n":"")+m;}
+  });
+})();
+</script>
 <div id="state">stub native — no ROP slab</div>
 <p>
-  <b>New paths</b> (never use G0–G5 / expm1 pivot chain):<br>
-  <b>A stub-swap</b> — patch parseInt <code>m_function</code> → lk+getpid stub, call <code>parseInt(textarea)</code>, restore.<br>
-  <b>B collator-stub</b> — fake Collator vtable points at getpid stub, one <code>compare()</code>.<br>
-  Need lk from rw_demo <b>2e Leak+lk</b> first (same session).
+  Logs survive crash in <code>sessionStorage wk-stub-log</code>. After crash: reload — see <code>LAST-CRASH-STEP</code>.<br>
+  <b>1 Start</b> → <b>2 Arm</b> (verify write, no fire) → <b>3 Fire</b>. Get lk from rw_demo 2e first.
 </p>
-<label><input type="radio" name="stub" value="parseint" checked> A parseInt stub-swap</label>
-<label><input type="radio" name="stub" value="collator"> B collator direct</label>
-<label><input type="radio" name="stub" value="arm"> verify arm only (no fire)</label>
+<label><input type="radio" name="stub" value="arm" checked> arm only</label>
+<label><input type="radio" name="stub" value="parseint"> parseInt fire</label>
+<label><input type="radio" name="stub" value="collator"> collator fire</label>
 <br>
 <button type="button" id="btn-start">Start</button>
-<button type="button" id="btn-fire" disabled>Fire getpid stub</button>
+<button type="button" id="btn-arm" disabled>Arm (no fire)</button>
+<button type="button" id="btn-fire" disabled>Fire stub</button>
 <input id="lk-in" placeholder="lk base or k_usleep fn ptr" autocomplete="off">
-<div id="out"></div>
-<script type="module" src="./stub_page.js?v=stub-1"></script>
+<div id="out">—</div>
+<script type="module" src="./stub_page.js?v=stub-3"></script>
 </body>
 </html>

