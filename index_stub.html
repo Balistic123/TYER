@@ -19,7 +19,7 @@
 </head>
 <body>
 <script>
-if(!location.search)location.replace(location.pathname+"?g=drain:96&stub=arm");
+if(!location.search)location.replace(location.pathname+"?g=drain:96&stub=arm&stubfire=g0getpid");
 (function(){
   function persist(line){
     try{
@@ -46,8 +46,13 @@ if(!location.search)location.replace(location.pathname+"?g=drain:96&stub=arm");
 <div id="state">stub native — no ROP slab</div>
 <p>
   Logs survive crash in <code>sessionStorage wk-stub-log</code>. Arm restores parseInt — safe to reload.<br>
-  <b>1 Start</b> (auto 2e) → <b>2 Arm</b> → <b>3 Fire</b>. Lk autofills from 2e. Use <code>?noauto2e=1</code> to skip auto.
+  <b>1 Start</b> (auto 2e) → <b>2 Arm</b> → <b>3 Fire</b>. Direct stub OOMs @ STUB-FIRE — use <b>G0 getpid</b> (default).<br>
+  Bisect: try <b>G0 smoke</b> first (parseInt(1), no hook).
 </p>
+<label><input type="radio" name="stubfire" value="g0getpid" checked> G0 getpid</label>
+<label><input type="radio" name="stubfire" value="g0"> G0 smoke</label>
+<label><input type="radio" name="stubfire" value="direct"> direct stub (OOM)</label>
+<br>
 <label><input type="radio" name="stub" value="arm" checked> arm only</label>
 <label><input type="radio" name="stub" value="parseint"> parseInt fire</label>
 <label><input type="radio" name="stub" value="collator"> collator fire</label>
@@ -58,6 +63,6 @@ if(!location.search)location.replace(location.pathname+"?g=drain:96&stub=arm");
 <button type="button" id="btn-fire" disabled>Fire stub</button>
 <input id="lk-in" placeholder="lk base or k_usleep fn ptr" autocomplete="off">
 <div id="out">—</div>
-<script type="module" src="./stub_page.js?v=stub-6"></script>
+<script type="module" src="./stub_page.js?v=stub-7"></script>
 </body>
 </html>
