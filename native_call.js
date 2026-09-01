@@ -426,13 +426,21 @@ function writeNotifyStruct(p, addr, message, iconUri) {
     p.write1(addr.add32(NOTIFY_ICON_OFF + iconUri.length), 0);
 }
 
-function allocNotifyBuffer(p, addrOff, keepAlive) {
+function allocNotifyBuffer(p, addrOff, keepAlive, off) {
     const ab = new ArrayBuffer(NOTIFY_REQ_SIZE + 0x10);
     keepAlive.push(ab);
-    const native = bufAddr(p, addrOff, ab);
-    if (!native || native.hi < 0x80 || native.hi > 0x8f)
+    let chain = addrOff;
+    if (!bufAddrRoundtrip(p, ab, chain.implOff, chain.dataOff)) {
+        const rescanned = off ? resolveBufAddrOff(p, off) : null;
+        if (rescanned && bufAddrRoundtrip(p, ab, rescanned.implOff, rescanned.dataOff))
+            chain = rescanned;
+        else
+            throw new Error("notify buffer: bufAddr failed");
+    }
+    const native = bufAddr(p, chain, ab);
+    if (!native || (native.hi === 0 && native.low === 0))
         throw new Error("notify buffer: bufAddr failed");
-    return native;
+    return { native, addrOff: chain };
 }
 
 export function stageNotify(p, prep, libkernelBase, off, opts) {
@@ -447,7 +455,9 @@ export function stageNotify(p, prep, libkernelBase, off, opts) {
         throw new Error("stageNotify: bufAddr chain missing");
     prep._bufAddrOff = addrOff;
     if (!prep.keepAlive) prep.keepAlive = [];
-    const buf = allocNotifyBuffer(p, addrOff, prep.keepAlive);
+    const nb = allocNotifyBuffer(p, addrOff, prep.keepAlive, off);
+    const buf = nb.native;
+    if (nb.addrOff) prep._bufAddrOff = nb.addrOff;
     writeNotifyStruct(p, buf, message, iconUri);
     prep.notifyBuf = buf;
     prep._layout = layoutNativeCall4(
