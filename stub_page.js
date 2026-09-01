@@ -7,9 +7,9 @@ import { createCrashLog } from "./log_persist.js";
 import {
     fireStubSwapParseInt, fireCollatorStub, pinCollatorStub,
     STUB_LAST_STEP_KEY,
-} from "./stub_call.js?v=stub-4";
+} from "./stub_call.js?v=stub-5";
 
-const BUILD = "stub-page-4";
+const BUILD = "stub-page-5";
 const params = new URLSearchParams(location.search);
 let lines = [], ready = false, busy = false, collatorPin = null;
 const retain = [];
@@ -82,9 +82,12 @@ function stubOpts() {
     return {
         log: log,
         flush: flushLog,
-        stubKind: params.get("stubkind") || "all",
-        useTextarea: params.get("arg") !== "1",
+        stubKind: params.get("stubkind") || "syscall",
+        useTextarea: params.get("arg") === "ta",
         carrier: window._wkCarrier || null,
+        preTrim: function () {
+            try { trimExploitDebris(); } catch (_) { }
+        },
     };
 }
 
@@ -167,8 +170,8 @@ function runArm() {
         const off = loadEffectiveOff();
         log("ARM-TAP", "lk=" + lk);
         const r = fireStubSwapParseInt(window.p, off, lk, Object.assign({}, stubOpts(), { armOnly: true }));
-        log("ARM-OK", r.stubTag + " mainMf=" + r.mainMf);
-        state("arm OK — try Fire", "ok");
+        log("ARM-OK", r.stubTag + " mainMf=" + r.mainMf + " — parseInt restored");
+        state("arm OK — Fire uses parseInt(1)", "ok");
     } catch (e) {
         log("ARM-FAIL", e.message || String(e));
         state("arm failed", "bad");

