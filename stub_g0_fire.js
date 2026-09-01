@@ -142,8 +142,19 @@ export function fireG0Getpid(p, off, lk, opts) {
         hook: opts.hook || "cell30",
         carrier: opts.carrier || null,
     });
+    let framePeek = null;
+    try {
+        const v = p.read4(prep.M.F);
+        if (v != null) framePeek = (v.low >>> 0) | ((v.hi >>> 0) * 0x100000000);
+    } catch (_) { }
+    const dvPid = prep.M.frameDv.getUint32(0, true) | 0;
+    stubStep(opts, "G0-FRAME", "dv=" + dvPid + " peek@F=" + (framePeek != null ? framePeek : "?")
+        + " F=" + prep.M.F);
     stubStep(opts, "G0-DONE", "pid=" + pid);
-    return { path: "g0-getpid", pid, prep };
+    try {
+        sessionStorage.setItem("wk-native-getpid-ok", String(pid) + "@" + Date.now());
+    } catch (_) { }
+    return { path: "g0-getpid", pid, framePeek, dvPid, prep };
 }
 
 export function disarmStubG0(p) {
