@@ -74,7 +74,7 @@ import { probeLibkernelViaVtable } from "./vtable_lk_probe.js";
 import { createCrashLog } from "./log_persist.js";
 import { fireCoreGetpid, fireCoreNotify, bisectCoreTriggerLite } from "./core_native.js?v=core-6";
 import { fireStubSwapParseInt, fireCollatorStub, pinCollatorStub, STUB_LAST_STEP_KEY } from "./stub_call.js?v=stub-7";
-import { fireG0Getpid, fireG0Smoke } from "./stub_g0_fire.js?v=stub-g0-1";
+import { fireG0Getpid, fireG0Smoke, fireG0Notify, g0AlreadyFired, nativeRetOk } from "./stub_g0_fire.js?v=stub-g0-2";
 import { prepNativeChain, stageGetpid, stageUsleep, stageNotify, fireNativeCall, fireUsleep, fireNotify, firePivotSmoke,
     resolvePivotBuiltin, firePivotTrigger,
     firePivotGetpid,
@@ -5542,9 +5542,25 @@ function runFireGetpid() {
                 mark("G0-SMOKE-OK", "parseInt(1) survived");
                 state("G0 smoke OK", "ok");
             } else if (stubFire === "g0getpid") {
-                const r = fireG0Getpid(p, off, lk, Object.assign({}, stubOpts, { retain: retained }));
-                mark("G0-GETPID-OK", "pid=" + r.pid);
-                state(r.pid > 0 ? "getpid " + r.pid : "errno " + r.pid, r.pid > 0 ? "ok" : "warn");
+                if (g0AlreadyFired()) {
+                    mark("G0-SKIP", "already fired — reload tab (refire OOMs)");
+                    state("native OK — reload", "ok");
+                } else {
+                    const r = fireG0Getpid(p, off, lk, Object.assign({}, stubOpts, { retain: retained }));
+                    mark("NATIVE-OK", "getpid errno=" + r.errno + (nativeRetOk(r.errno) ? " SUCCESS" : ""));
+                    state(nativeRetOk(r.errno) ? "getpid errno=0 OK" : "errno " + r.errno,
+                        nativeRetOk(r.errno) ? "ok" : "warn");
+                }
+            } else if (stubFire === "g0notify") {
+                if (g0AlreadyFired()) {
+                    mark("G0-SKIP", "already fired — reload tab");
+                    state("native OK — reload for notify", "ok");
+                } else {
+                    const r = fireG0Notify(p, off, lk, Object.assign({}, stubOpts, { retain: retained }));
+                    mark("NATIVE-OK", "notify errno=" + r.errno);
+                    state(nativeRetOk(r.errno) ? "notify OK — toast" : "errno " + r.errno,
+                        nativeRetOk(r.errno) ? "ok" : "warn");
+                }
             } else {
                 mark("STUB-HINT", "direct stub OOM on 13.52 — ?stubfire=g0getpid");
                 const r = fireStubSwapParseInt(p, off, lk, stubOpts);

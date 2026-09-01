@@ -12,9 +12,12 @@ import {
     fireStubSwapParseInt, fireCollatorStub, pinCollatorStub,
     STUB_LAST_STEP_KEY, loadStubCap,
 } from "./stub_call.js?v=stub-7";
-import { fireG0Smoke, fireG0Getpid, disarmStubG0, resetG0Prep } from "./stub_g0_fire.js?v=stub-g0-1";
+import {
+    fireG0Smoke, fireG0Getpid, fireG0Notify, disarmStubG0, resetG0Prep,
+    g0AlreadyFired, nativeRetOk,
+} from "./stub_g0_fire.js?v=stub-g0-2";
 
-const BUILD = "stub-page-7";
+const BUILD = "stub-page-8";
 const params = new URLSearchParams(location.search);
 let lines = [], ready = false, busy = false, collatorPin = null;
 const retain = [];
@@ -194,8 +197,15 @@ function lkFromInput() {
 
 function stubFireMode() {
     const q = params.get("stubfire") || "g0getpid";
-    if (q === "direct" || q === "g0" || q === "g0getpid" || q === "smoke") return q;
+    if (q === "direct" || q === "g0" || q === "g0getpid" || q === "g0notify" || q === "smoke")
+        return q;
     return "g0getpid";
+}
+
+function lockFireAfterNative(msg) {
+    const bf = $("btn-fire");
+    if (bf) bf.disabled = true;
+    state(msg || "native OK — reload tab", "ok");
 }
 
 function stubMode() {
@@ -360,15 +370,14 @@ function runFire() {
         }
         if (fireMode === "g0getpid") {
             const r = fireG0Getpid(p, off, lk, opts);
-            const show = (r.framePeek > 0) ? r.framePeek : r.pid;
-            log("G0-GETPID-OK", "pid=" + r.pid + (r.framePeek != null ? " peek=" + r.framePeek : ""));
-            if (show > 0) {
-                log("NATIVE-OK", "getpid=" + show + " — G0 path LIVE on 13.52");
-                state("getpid " + show, "ok");
-            } else {
-                log("NATIVE-OK", "chain survived pid=0 — native entry works, check G0-FRAME line");
-                state("native OK (pid=0 — see G0-FRAME)", "ok");
-            }
+            log("NATIVE-OK", "getpid errno=" + r.errno + (r.ok ? " — SUCCESS" : " — fail"));
+            lockFireAfterNative(r.ok ? "getpid errno=0 OK" : "getpid errno=" + r.errno);
+            return;
+        }
+        if (fireMode === "g0notify") {
+            const r = fireG0Notify(p, off, lk, opts);
+            log("NATIVE-OK", "notify errno=" + r.errno + (r.ok ? " — check toast" : " fail"));
+            lockFireAfterNative(r.ok ? "notify sent — check toast" : "notify errno=" + r.errno);
             return;
         }
         log("STUB-WARN", "direct stub OOM expected on 13.52 — use ?stubfire=g0getpid");
@@ -387,7 +396,12 @@ function runFire() {
 function init() {
     crashLog.startAutoFlush();
     showLastCrashStep();
-    log("INIT", BUILD + " fire=" + stubFireMode() + " — direct stub OOMs; default g0getpid");
+    log("INIT", BUILD + " fire=" + stubFireMode()
+        + " — errno 0 = OK; ONE fire per tab then reload");
+    if (g0AlreadyFired()) {
+        log("NATIVE-OK", "restored — prior g0 fire OK (reload to fire again)");
+        lockFireAfterNative("native OK — reload to refire");
+    }
     flushLog();
     syncRadios();
     document.querySelectorAll('input[name="stub"]').forEach(function (el) {

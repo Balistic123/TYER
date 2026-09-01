@@ -1128,9 +1128,11 @@ export function firePivotGetpid(p, prep, libkernelBase, off, stubOffOverride, op
         throw new Error("firePivotGetpid: no prep");
     opts = opts || {};
     stageGetpid(p, prep, libkernelBase, off, stubOffOverride, opts);
-    const content = verifySlabContent(p, prep);
-    if (!content.ok)
-        throw new Error("firePivotGetpid: slab content: " + content.reasons.join("; "));
+    if (!opts.skipVerify) {
+        const content = verifySlabContent(p, prep);
+        if (!content.ok)
+            throw new Error("firePivotGetpid: slab content: " + content.reasons.join("; "));
+    }
     return fireNativeCall(p, prep, off, opts);
 }
 
