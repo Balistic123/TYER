@@ -5,7 +5,7 @@ import { int64 } from "./int64.js";
 import {
     prepNativeChain, firePivotGetpid, fireNativeCall,
     stageNotify, bisectDisarmG0, bisectRestorePivotOnly,
-} from "./native_call.js?v=nc-20250901a";
+} from "./native_call.js?v=nc-20250901b";
 import { captureParseIntMainMf, loadStubCap } from "./stub_call.js?v=stub-7";
 
 let g0Prep = null;
@@ -201,7 +201,11 @@ export function fireG0Notify(p, off, lk, opts) {
         throw new Error("g0: already fired — reload tab before notify");
     const prep = ensureG0Prep(p, off, lk, opts);
     stubStep(opts, "G0-NOTIFY-FIRE", "lk=" + lk);
-    stageNotify(p, prep, lk, off, { message: opts.message });
+    stageNotify(p, prep, lk, off, {
+        message: opts.message,
+        iconUri: opts.iconUri,
+        log: opts.log,
+    });
     const ret = fireNativeCall(p, prep, off, {
         hook: opts.hook || "cell30",
         carrier: opts.carrier || null,

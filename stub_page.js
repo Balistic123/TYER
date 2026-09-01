@@ -15,7 +15,7 @@ import {
 import {
     fireG0Smoke, fireG0Getpid, fireG0Notify, disarmStubG0, resetG0Prep,
     g0AlreadyFired, nativeRetOk,
-} from "./stub_g0_fire.js?v=stub-g0-2";
+} from "./stub_g0_fire.js?v=stub-g0-3";
 
 const BUILD = "stub-page-10";
 const params = new URLSearchParams(location.search);
@@ -235,6 +235,7 @@ function stubOpts() {
         carrier: window._wkCarrier || null,
         retain: retain,
         reuseCap: cached,
+        message: params.get("msg") || undefined,
         preTrim: function () {
             try { trimExploitDebris(); } catch (_) { }
         },
