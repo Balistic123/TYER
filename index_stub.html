@@ -46,8 +46,8 @@ if(!location.search)location.replace(location.pathname+"?g=drain:96&stub=arm&stu
 <div id="state">stub native — no ROP slab</div>
 <p>
   Logs survive crash in <code>sessionStorage wk-stub-log</code>. Arm restores parseInt — safe to reload.<br>
-  <b>1 Start</b> → <b>2e</b> → <b>Fire once</b>. Return <b>errno=0</b> = SUCCESS. Notify default: direct <code>k_notify</code> (BDJ struct). Dev write only post-breakout.<br>
-  Optional: <code>?stubfire=g0notify&amp;notifyfmt=osm&amp;msg=hello</code> — dev node: <code>?notifypath=dev</code> (usually blocked in WebKit).
+  <b>1 Start</b> → <b>2e</b> → <b>Fire once</b>. Getpid default: raw syscall — want <b>pid&gt;0</b>. Legacy wrap: <code>?getpid=wrap</code> (ret=0). Notify: direct <code>k_notify</code>.<br>
+  Optional: <code>?stubfire=g0notify&amp;msg=hello</code> · <code>?getpid=wrap</code> · <code>?notifypath=dev</code>
 </p>
 <label><input type="radio" name="stubfire" value="g0getpid" checked> G0 getpid</label>
 <label><input type="radio" name="stubfire" value="g0notify"> G0 notify</label>
@@ -64,6 +64,6 @@ if(!location.search)location.replace(location.pathname+"?g=drain:96&stub=arm&stu
 <button type="button" id="btn-fire" disabled>Fire stub</button>
 <input id="lk-in" placeholder="lk base or k_usleep fn ptr" autocomplete="off">
 <div id="out">—</div>
-<script type="module" src="./stub_page.js?v=stub-11"></script>
+<script type="module" src="./stub_page.js?v=stub-12"></script>
 </body>
 </html>

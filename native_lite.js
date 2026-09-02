@@ -10,6 +10,9 @@ import {
     stageGetpid, resolvePivotBuiltin, firePivotTrigger,
     verifySlabContent, verifyBisectChainSet,
 } from "./native_call.js";
+import {
+    resolveG0GetpidStubOff, getpidRetOk,
+} from "./stub_g0_fire.js?v=stub-g0-8";
 
 const BUILD = "native-lite-1";
 const params = new URLSearchParams(location.search);
@@ -156,11 +159,17 @@ function runGetpid() {
     try {
         const p = window.p;
         const off = offsetsFor(navigator.userAgent).off;
-        const stubOff = off.k_stubs && off.k_stubs[20] != null ? off.k_stubs[20] : 0x2cb70;
-        stageGetpid(p, prep, lk, off, stubOff, { hook: "cell30", carrier: window._wkCarrier });
-        const pid = fireNativeCall(p, prep, off, { hook: "cell30", carrier: window._wkCarrier });
-        log("DONE", "pid=" + pid);
-        state(pid > 0 ? "getpid OK pid=" + pid : "errno " + pid, pid > 0 ? "ok" : "warn");
+        const stub = resolveG0GetpidStubOff(off, {
+            getpidMode: params.get("getpid") || "raw",
+        });
+        log("GETPID-STUB", stub.tag);
+        stageGetpid(p, prep, lk, off, stub.stubOff, { hook: "cell30", carrier: window._wkCarrier });
+        const ret = fireNativeCall(p, prep, off, { hook: "cell30", carrier: window._wkCarrier });
+        const ok = getpidRetOk(ret, stub.mode);
+        log("DONE", stub.mode === "raw" ? "pid=" + ret : "wrap-ret=" + ret);
+        state(ok
+            ? (stub.mode === "raw" ? "getpid pid=" + ret : "getpid wrap OK")
+            : "getpid ret=" + ret, ok ? "ok" : "warn");
     } catch (e) {
         log("FAIL", e.message || String(e));
         state("fire failed", "bad");

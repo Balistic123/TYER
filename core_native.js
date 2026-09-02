@@ -8,6 +8,7 @@ import {
     stageGetpid, stageNotify, firePivotTrigger,
     verifySlabContent, verifyBisectChainSet,
 } from "./native_call.js?v=nc-20250831r";
+import { resolveG0GetpidStubOff, getpidRetOk } from "./stub_g0_fire.js?v=stub-g0-8";
 
 const M_FUNCTION_OFF = 0x28;
 const JSFUNC_EXECUTABLE_OFF = 0x18;
@@ -295,11 +296,19 @@ export function fireCoreSmoke(p, prep, off, hookMode) {
     });
 }
 
-export function fireCoreGetpid(p, prep, lk, off, hookMode) {
-    const stubOff = off.k_stubs && off.k_stubs[20] != null ? off.k_stubs[20] : 0x2cb70;
-    const opts = { hook: hookMode || "cell30", carrier: window._wkCarrier || null };
-    stageGetpid(p, prep, lk, off, stubOff, opts);
-    return fireNativeCall(p, prep, off, opts);
+export function fireCoreGetpid(p, prep, lk, off, hookMode, opts) {
+    opts = opts || {};
+    const stub = resolveG0GetpidStubOff(off, opts);
+    const fireOpts = { hook: hookMode || "cell30", carrier: window._wkCarrier || null };
+    stageGetpid(p, prep, lk, off, stub.stubOff, fireOpts);
+    const ret = fireNativeCall(p, prep, off, fireOpts);
+    return {
+        ret,
+        pid: stub.mode === "raw" ? ret : null,
+        mode: stub.mode,
+        ok: getpidRetOk(ret, stub.mode),
+        stubOff: stub.stubOff,
+    };
 }
 
 export function fireCoreNotify(p, prep, lk, off, hookMode, message) {

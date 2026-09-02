@@ -126,9 +126,15 @@ function runGetpid() {
     busy = true;
     try {
         const off = offsetsFor(navigator.userAgent).off;
-        const pid = fireCoreGetpid(window.p, prep, lk, off, "cell30");
-        log("GETPID", "pid=" + pid);
-        state(pid > 0 ? "getpid " + pid : "errno " + pid, pid > 0 ? "ok" : "warn");
+        const r = fireCoreGetpid(window.p, prep, lk, off, "cell30", {
+            getpidMode: new URLSearchParams(location.search).get("getpid") || "raw",
+        });
+        log("GETPID", r.mode === "raw"
+            ? "pid=" + r.ret + " stub+0x" + r.stubOff.toString(16)
+            : "wrap-ret=" + r.ret);
+        state(r.ok
+            ? (r.mode === "raw" ? "getpid pid=" + r.ret : "getpid wrap OK")
+            : "getpid ret=" + r.ret, r.ok ? "ok" : "warn");
     } catch (e) {
         log("FAIL", e.message || String(e));
         state("fail", "bad");

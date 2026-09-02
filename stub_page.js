@@ -14,10 +14,10 @@ import {
 } from "./stub_call.js?v=stub-7";
 import {
     fireG0Smoke, fireG0Getpid, fireG0Notify, disarmStubG0, resetG0Prep,
-    g0AlreadyFired, nativeRetOk,
-} from "./stub_g0_fire.js?v=stub-g0-7";
+    g0AlreadyFired, nativeRetOk, getpidRetOk,
+} from "./stub_g0_fire.js?v=stub-g0-8";
 
-const BUILD = "stub-page-11";
+const BUILD = "stub-page-12";
 const params = new URLSearchParams(location.search);
 let lines = [], ready = false, busy = false, collatorPin = null;
 let selectedFireMode = null;
@@ -238,6 +238,7 @@ function stubOpts() {
         message: params.get("msg") || undefined,
         format: params.get("notifyfmt") || "plain",
         notifyPath: params.get("notifypath") || "direct",
+        getpidMode: params.get("getpid") || "raw",
         preTrim: function () {
             try { trimExploitDebris(); } catch (_) { }
         },
@@ -384,8 +385,13 @@ function runFire() {
         }
         if (fireMode === "g0getpid") {
             const r = fireG0Getpid(p, off, lk, opts);
-            log("NATIVE-OK", "getpid errno=" + r.errno + (r.ok ? " — SUCCESS" : " — fail"));
-            lockFireAfterNative(r.ok ? "getpid errno=0 OK" : "getpid errno=" + r.errno);
+            const msg = r.mode === "raw"
+                ? "getpid pid=" + r.ret + (r.ok ? " — SUCCESS" : " — fail")
+                : "getpid wrap-ret=" + r.ret + (r.ok ? " — SUCCESS" : " — fail");
+            log("NATIVE-OK", msg);
+            lockFireAfterNative(r.ok
+                ? (r.mode === "raw" ? "getpid pid=" + r.ret : "getpid wrap OK")
+                : "getpid ret=" + r.ret);
             return;
         }
         if (fireMode === "g0notify") {
@@ -414,7 +420,8 @@ function init() {
     crashLog.startAutoFlush();
     showLastCrashStep();
     log("INIT", BUILD + " fire=" + stubFireMode()
-        + " — errno 0 = OK; ONE fire per tab then reload");
+        + " getpid=" + (params.get("getpid") || "raw")
+        + " — ONE fire per tab then reload");
     if (g0AlreadyFired()) {
         log("NATIVE-OK", "restored — prior g0 fire OK (reload to fire again)");
         lockFireAfterNative("native OK — reload to refire");

