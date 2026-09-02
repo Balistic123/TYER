@@ -15,7 +15,7 @@ import {
 import {
     fireG0Smoke, fireG0Getpid, fireG0Notify, disarmStubG0, resetG0Prep,
     g0AlreadyFired, nativeRetOk,
-} from "./stub_g0_fire.js?v=stub-g0-5";
+} from "./stub_g0_fire.js?v=stub-g0-6";
 
 const BUILD = "stub-page-10";
 const params = new URLSearchParams(location.search);

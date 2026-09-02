@@ -531,10 +531,22 @@ function peekNotifyMsg(p, addr) {
 function peekNotifyTargetId(p, addr) {
     try {
         const v = p.read4(addr.add32(0x10));
-        return v != null ? ((v.low >>> 0) | 0) : null;
+        if (v == null) return null;
+        return (v | 0);
     } catch (_) {
         return null;
     }
+}
+
+function verifyNotifyStruct(p, addr, message) {
+    const tid = peekNotifyTargetId(p, addr);
+    const msg = peekNotifyMsg(p, addr);
+    const want = message || DEFAULT_NOTIFY_MSG;
+    if (tid !== -1)
+        throw new Error("notify struct: targetId=" + tid + " want -1 @ " + addr);
+    if (!msg || msg.slice(0, want.length) !== want.slice(0, msg.length))
+        throw new Error("notify struct: msg=\"" + msg + "\" want=\"" + want.slice(0, 32) + "\"");
+    return { tid, msg };
 }
 
 function allocNotifyBuffer(p, addrOff, keepAlive, off) {
@@ -581,18 +593,18 @@ function prepareNotifyBuffer(p, prep, off, message, iconUri, fmt) {
     prep._bufAddrOff = addrOff;
     if (!prep.keepAlive) prep.keepAlive = [];
     const nb = allocNotifyBuffer(p, addrOff, prep.keepAlive, off);
-    if (nb.ab) writeNotifyStructAb(nb.ab, message, iconUri, fmt);
-    else writeNotifyStruct(p, nb.native, message, iconUri, fmt);
+    writeNotifyStruct(p, nb.native, message, iconUri, fmt);
+    verifyNotifyStruct(p, nb.native, message);
     prep.notifyBuf = nb.native;
     return nb.native;
 }
 
-function logNotifyStruct(p, buf, message, fmt, useStack, opts) {
+function logNotifyStruct(p, buf, message, fmt, opts) {
     if (!opts || !opts.log) return;
-    const peek = peekNotifyMsg(p, buf);
     const tid = peekNotifyTargetId(p, buf);
-    opts.log("NOTIFY-FMT", fmt + " ab buf=" + buf
-        + " targetId=" + tid + (tid === -1 ? "" : " (want -1)"));
+    const peek = peekNotifyMsg(p, buf);
+    opts.log("NOTIFY-FMT", fmt + " buf=" + buf + " targetId=" + tid
+        + (tid === -1 ? "" : " BAD"));
     opts.log("NOTIFY-STRUCT", "msg=\"" + peek + "\""
         + (peek === (message || DEFAULT_NOTIFY_MSG).slice(0, 48) ? "" : " MISMATCH"));
 }
@@ -615,7 +627,7 @@ export function stageNotify(p, prep, libkernelBase, off, opts) {
         new int64(0, 0));
     prep.staged = true;
     prep.stagedKind = "notify";
-    logNotifyStruct(p, buf, message, fmt, false, opts);
+    logNotifyStruct(p, buf, message, fmt, opts);
 }
 
 /**
@@ -636,7 +648,12 @@ export function fireNotifyDevWrite(p, prep, libkernelBase, off, opts) {
     const O_WRONLY = 1;
 
     const buf = prepareNotifyBuffer(p, prep, off, message, iconUri, fmt);
-    logNotifyStruct(p, buf, message, fmt, false, opts);
+    try {
+        logNotifyStruct(p, buf, message, fmt, opts);
+    } catch (e) {
+        if (opts.log) opts.log("NOTIFY-VERIFY-FAIL", e.message || String(e));
+        throw e;
+    }
 
     const path = allocCString(p, prep._bufAddrOff, prep.keepAlive, "/dev/notification0", off);
     if (opts.log) opts.log("NOTIFY-DEV", "open " + path.native);

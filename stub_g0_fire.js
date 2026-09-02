@@ -5,7 +5,7 @@ import { int64 } from "./int64.js";
 import {
     prepNativeChain, firePivotGetpid, fireNativeCall,
     stageNotify, fireNotifyDevWrite, bisectDisarmG0, bisectRestorePivotOnly,
-} from "./native_call.js?v=nc-20250901d";
+} from "./native_call.js?v=nc-20250901e";
 import { captureParseIntMainMf, loadStubCap } from "./stub_call.js?v=stub-7";
 
 let g0Prep = null;
