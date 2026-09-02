@@ -74,7 +74,7 @@ import { probeLibkernelViaVtable } from "./vtable_lk_probe.js";
 import { createCrashLog } from "./log_persist.js";
 import { fireCoreGetpid, fireCoreNotify, bisectCoreTriggerLite } from "./core_native.js?v=core-6";
 import { fireStubSwapParseInt, fireCollatorStub, pinCollatorStub, STUB_LAST_STEP_KEY } from "./stub_call.js?v=stub-7";
-import { fireG0Getpid, fireG0Smoke, fireG0Notify, g0AlreadyFired, nativeRetOk } from "./stub_g0_fire.js?v=stub-g0-8";
+import { fireG0Getpid, fireG0Smoke, fireG0Notify, g0AlreadyFired, nativeRetOk } from "./stub_g0_fire.js?v=stub-g0-9";
 import { prepNativeChain, stageGetpid, stageUsleep, stageNotify, fireNativeCall, fireUsleep, fireNotify, firePivotSmoke,
     resolvePivotBuiltin, firePivotTrigger,
     firePivotGetpid,
@@ -5548,11 +5548,13 @@ function runFireGetpid() {
                 } else {
                     const r = fireG0Getpid(p, off, lk, Object.assign({}, stubOpts, {
                         retain: retained,
-                        getpidMode: params.get("getpid") || "raw",
+                        getpidMode: params.get("getpid") || "auto",
                     }));
-                    const gpMsg = r.mode === "raw"
-                        ? "getpid pid=" + r.ret + (r.ok ? " SUCCESS" : "")
-                        : "getpid wrap-ret=" + r.ret + (r.ok ? " SUCCESS" : "");
+                    const gpMsg = r.storeMiss
+                        ? "getpid STORE-MISS frame not updated"
+                        : (r.mode === "raw"
+                            ? "getpid pid=" + r.ret + (r.ok ? " SUCCESS" : "")
+                            : "getpid wrap-ret=" + r.ret + (r.ok ? " SUCCESS" : ""));
                     mark("NATIVE-OK", gpMsg);
                     state(r.ok
                         ? (r.mode === "raw" ? "getpid pid=" + r.ret : "getpid wrap OK")

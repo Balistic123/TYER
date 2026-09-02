@@ -8,7 +8,7 @@ import {
     stageGetpid, stageNotify, firePivotTrigger,
     verifySlabContent, verifyBisectChainSet,
 } from "./native_call.js?v=nc-20250831r";
-import { resolveG0GetpidStubOff, getpidRetOk } from "./stub_g0_fire.js?v=stub-g0-8";
+import { resolveG0GetpidStubOff, getpidRetOk } from "./stub_g0_fire.js?v=stub-g0-9";
 
 const M_FUNCTION_OFF = 0x28;
 const JSFUNC_EXECUTABLE_OFF = 0x18;
@@ -298,7 +298,7 @@ export function fireCoreSmoke(p, prep, off, hookMode) {
 
 export function fireCoreGetpid(p, prep, lk, off, hookMode, opts) {
     opts = opts || {};
-    const stub = resolveG0GetpidStubOff(off, opts);
+    const stub = resolveG0GetpidStubOff(p, lk, off, opts);
     const fireOpts = { hook: hookMode || "cell30", carrier: window._wkCarrier || null };
     stageGetpid(p, prep, lk, off, stub.stubOff, fireOpts);
     const ret = fireNativeCall(p, prep, off, fireOpts);

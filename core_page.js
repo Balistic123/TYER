@@ -127,7 +127,7 @@ function runGetpid() {
     try {
         const off = offsetsFor(navigator.userAgent).off;
         const r = fireCoreGetpid(window.p, prep, lk, off, "cell30", {
-            getpidMode: new URLSearchParams(location.search).get("getpid") || "raw",
+            getpidMode: new URLSearchParams(location.search).get("getpid") || "auto",
         });
         log("GETPID", r.mode === "raw"
             ? "pid=" + r.ret + " stub+0x" + r.stubOff.toString(16)

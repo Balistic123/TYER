@@ -12,7 +12,7 @@ import {
 } from "./native_call.js";
 import {
     resolveG0GetpidStubOff, getpidRetOk,
-} from "./stub_g0_fire.js?v=stub-g0-8";
+} from "./stub_g0_fire.js?v=stub-g0-9";
 
 const BUILD = "native-lite-1";
 const params = new URLSearchParams(location.search);
@@ -159,8 +159,8 @@ function runGetpid() {
     try {
         const p = window.p;
         const off = offsetsFor(navigator.userAgent).off;
-        const stub = resolveG0GetpidStubOff(off, {
-            getpidMode: params.get("getpid") || "raw",
+        const stub = resolveG0GetpidStubOff(p, lk, off, {
+            getpidMode: params.get("getpid") || "auto",
         });
         log("GETPID-STUB", stub.tag);
         stageGetpid(p, prep, lk, off, stub.stubOff, { hook: "cell30", carrier: window._wkCarrier });
