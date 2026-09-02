@@ -15,9 +15,9 @@ import {
 import {
     fireG0Smoke, fireG0Getpid, fireG0Notify, disarmStubG0, resetG0Prep,
     g0AlreadyFired, nativeRetOk,
-} from "./stub_g0_fire.js?v=stub-g0-6";
+} from "./stub_g0_fire.js?v=stub-g0-7";
 
-const BUILD = "stub-page-10";
+const BUILD = "stub-page-11";
 const params = new URLSearchParams(location.search);
 let lines = [], ready = false, busy = false, collatorPin = null;
 let selectedFireMode = null;
@@ -236,8 +236,8 @@ function stubOpts() {
         retain: retain,
         reuseCap: cached,
         message: params.get("msg") || undefined,
-        format: params.get("notifyfmt") || "osm",
-        notifyPath: params.get("notifypath") || "dev",
+        format: params.get("notifyfmt") || "plain",
+        notifyPath: params.get("notifypath") || "direct",
         preTrim: function () {
             try { trimExploitDebris(); } catch (_) { }
         },
@@ -390,6 +390,9 @@ function runFire() {
         }
         if (fireMode === "g0notify") {
             const r = fireG0Notify(p, off, lk, opts);
+            if (r.path === "g0-notify-dev") {
+                log("NOTIFY-DEV", "fd=" + r.fd + " wr=" + r.wr + " close=" + r.close);
+            }
             log("NATIVE-OK", "notify errno=" + r.errno + (r.ok ? " — check toast" : " fail"));
             lockFireAfterNative(r.ok ? "notify sent — check toast" : "notify errno=" + r.errno);
             return;

