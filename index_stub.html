@@ -46,8 +46,8 @@ if(!location.search)location.replace(location.pathname+"?g=drain:96&stub=arm&stu
 <div id="state">stub native — no ROP slab</div>
 <p>
   Logs survive crash in <code>sessionStorage wk-stub-log</code>. Arm restores parseInt — safe to reload.<br>
-  <b>1 Start</b> → <b>2e</b> → <b>Fire once</b>. Getpid: <code>auto</code> verifies syscall stub @ lk — want <b>pid&gt;0</b>. <code>?getpid=scan</code> if pid=0.<br>
-  Optional: <code>?getpid=wrap</code> · <code>?stubfire=g0notify</code> · <code>?notifypath=dev</code>
+  <b>1 Start</b> → <b>2e</b> → <b>Fire once</b>. Getpid: <code>auto</code> verifies syscall stub @ lk — want <b>pid&gt;0</b> (pid=0 is not swapper; means capture/stub miss). <code>?getpid=scan</code> widens hunt.<br>
+  Optional: <code>?getpid=wrap</code> · <code>?getpid=raw&force=1</code> blind · <code>?stubfire=g0notify</code>
 </p>
 <label><input type="radio" name="stubfire" value="g0getpid" checked> G0 getpid</label>
 <label><input type="radio" name="stubfire" value="g0notify"> G0 notify</label>
@@ -64,6 +64,6 @@ if(!location.search)location.replace(location.pathname+"?g=drain:96&stub=arm&stu
 <button type="button" id="btn-fire" disabled>Fire stub</button>
 <input id="lk-in" placeholder="lk base or k_usleep fn ptr" autocomplete="off">
 <div id="out">—</div>
-<script type="module" src="./stub_page.js?v=stub-15"></script>
+<script type="module" src="./stub_page.js?v=stub-16"></script>
 </body>
 </html>

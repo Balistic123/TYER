@@ -15,7 +15,7 @@ import {
 import {
     fireG0Smoke, fireG0Getpid, fireG0Notify, disarmStubG0, resetG0Prep,
     g0AlreadyFired, nativeRetOk, getpidRetOk,
-} from "./stub_g0_fire.js?v=stub-g0-11";
+} from "./stub_g0_fire.js?v=stub-g0-12";
 
 const BUILD = "stub-page-15";
 const params = new URLSearchParams(location.search);
@@ -385,14 +385,22 @@ function runFire() {
         }
         if (fireMode === "g0getpid") {
             const r = fireG0Getpid(p, off, lk, opts);
-            const msg = r.storeMiss
-                ? "getpid STORE-MISS — rax not written to frame (check MOV [rdi],rax gadget)"
-                : (r.mode === "raw"
-                    ? "getpid pid=" + r.ret + (r.ok ? " — SUCCESS" : " — fail")
-                    : "getpid wrap-ret=" + r.ret + (r.ok ? " — SUCCESS" : " — fail"));
+            let msg;
+            if (r.storeMiss) {
+                msg = "getpid STORE-MISS — frame still canary; rax never stored";
+            } else if (r.mode === "raw" && r.ret === 0) {
+                msg = "getpid pid=0 — NOT swapper (kernel idle); stub miss or wrong lk";
+            } else if (r.mode === "raw") {
+                msg = "getpid pid=" + r.ret + (r.ok ? " — SUCCESS" : " — fail");
+            } else {
+                msg = "getpid wrap-ret=" + r.ret + (r.ok ? " — SUCCESS" : " — fail");
+            }
             log("NATIVE-OK", msg);
-            if (r.verified === false && r.mode === "raw")
-                log("GETPID-HINT", "stub unverified — try ?getpid=scan or fix lk base");
+            if (r.capture)
+                log("GETPID-CAP", "rax=0x" + r.capture.memHi.toString(16)
+                    + r.capture.memLo.toString(16).padStart(8, "0"));
+            if (!r.ok && r.mode === "raw" && !r.storeMiss)
+                log("GETPID-HINT", "pid=0 is frame zero or bad stub — re-2e lk or ?getpid=scan");
             lockFireAfterNative(r.ok
                 ? (r.mode === "raw" ? "getpid pid=" + r.ret : "getpid wrap OK")
                 : "getpid ret=" + r.ret);
