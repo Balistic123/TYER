@@ -15,7 +15,7 @@ import {
 import {
     fireG0Smoke, fireG0Getpid, fireG0Notify, disarmStubG0, resetG0Prep,
     g0AlreadyFired, nativeRetOk,
-} from "./stub_g0_fire.js?v=stub-g0-3";
+} from "./stub_g0_fire.js?v=stub-g0-4";
 
 const BUILD = "stub-page-10";
 const params = new URLSearchParams(location.search);
@@ -236,6 +236,7 @@ function stubOpts() {
         retain: retain,
         reuseCap: cached,
         message: params.get("msg") || undefined,
+        format: params.get("notifyfmt") || "plain",
         preTrim: function () {
             try { trimExploitDebris(); } catch (_) { }
         },

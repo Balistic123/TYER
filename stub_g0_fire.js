@@ -5,7 +5,7 @@ import { int64 } from "./int64.js";
 import {
     prepNativeChain, firePivotGetpid, fireNativeCall,
     stageNotify, bisectDisarmG0, bisectRestorePivotOnly,
-} from "./native_call.js?v=nc-20250901b";
+} from "./native_call.js?v=nc-20250901c";
 import { captureParseIntMainMf, loadStubCap } from "./stub_call.js?v=stub-7";
 
 let g0Prep = null;
@@ -204,6 +204,7 @@ export function fireG0Notify(p, off, lk, opts) {
     stageNotify(p, prep, lk, off, {
         message: opts.message,
         iconUri: opts.iconUri,
+        format: opts.format,
         log: opts.log,
     });
     const ret = fireNativeCall(p, prep, off, {
