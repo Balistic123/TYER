@@ -486,7 +486,7 @@ function resolveNotifyPath(opts) {
 }
 
 /** Return value captured at slab frame F — prefer native read8 over DataView. */
-function readCallRetDetailed(p, prep) {
+export function readCallRetDetailed(p, prep) {
     const dvLo = prep.M.frameDv.getUint32(0, true);
     const dvHi = prep.M.frameDv.getUint32(4, true);
     let memLo = dvLo;
