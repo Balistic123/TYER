@@ -74,7 +74,7 @@ import { probeLibkernelViaVtable } from "./vtable_lk_probe.js";
 import { createCrashLog } from "./log_persist.js";
 import { fireCoreGetpid, fireCoreNotify, bisectCoreTriggerLite } from "./core_native.js?v=core-6";
 import { fireStubSwapParseInt, fireCollatorStub, pinCollatorStub, STUB_LAST_STEP_KEY } from "./stub_call.js?v=stub-7";
-import { fireG0Getpid, fireG0Smoke, fireG0Notify, g0AlreadyFired, nativeRetOk } from "./stub_g0_fire.js?v=stub-g0-10";
+import { fireG0Getpid, fireG0Smoke, fireG0Notify, g0AlreadyFired, nativeRetOk } from "./stub_g0_fire.js?v=stub-g0-11";
 import { prepNativeChain, stageGetpid, stageUsleep, stageNotify, fireNativeCall, fireUsleep, fireNotify, firePivotSmoke,
     resolvePivotBuiltin, firePivotTrigger,
     firePivotGetpid,

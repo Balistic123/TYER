@@ -12,7 +12,7 @@ import {
 } from "./native_call.js";
 import {
     resolveG0GetpidStubOff, getpidRetOk,
-} from "./stub_g0_fire.js?v=stub-g0-10";
+} from "./stub_g0_fire.js?v=stub-g0-11";
 
 const BUILD = "native-lite-1";
 const params = new URLSearchParams(location.search);

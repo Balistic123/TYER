@@ -8,7 +8,7 @@ import {
     stageGetpid, stageNotify, firePivotTrigger,
     verifySlabContent, verifyBisectChainSet,
 } from "./native_call.js?v=nc-20250831r";
-import { resolveG0GetpidStubOff, getpidRetOk } from "./stub_g0_fire.js?v=stub-g0-10";
+import { resolveG0GetpidStubOff, getpidRetOk } from "./stub_g0_fire.js?v=stub-g0-11";
 
 const M_FUNCTION_OFF = 0x28;
 const JSFUNC_EXECUTABLE_OFF = 0x18;

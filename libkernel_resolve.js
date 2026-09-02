@@ -251,6 +251,7 @@ function loadGetpidStubOff() {
 /** Verified getpid syscall stub — fn+delta, lk+off, or scan. Never blind. */
 export function resolveGetpidStub(p, lk, off, opts) {
     opts = opts || {};
+    let probes = 0;
     if (!p || !lk)
         return { verified: false, tag: "no-lk", addr: null, off: null };
 
@@ -296,7 +297,7 @@ export function resolveGetpidStub(p, lk, off, opts) {
 
         const scanMax = opts.scanMax != null ? opts.scanMax : 0x40000;
         const maxProbes = opts.maxProbes != null ? opts.maxProbes : 4096;
-        let probes = 0;
+        probes = 0;
         for (let o = 0; o < scanMax && probes < maxProbes; o += 16) {
             probes++;
             const hit = tryAt(lk.add32(o), "scan+0x" + o.toString(16), o);

@@ -8,7 +8,7 @@ import {
     primeCallFrame, readCallRetDetailed,
 } from "./native_call.js?v=nc-20250901h";
 import { captureParseIntMainMf, loadStubCap } from "./stub_call.js?v=stub-7";
-import { isGetpidStubAt, resolveGetpidStub } from "./libkernel_resolve.js";
+import { isGetpidStubAt, resolveGetpidStub } from "./libkernel_resolve.js?v=lk-probes-fix";
 
 let g0Prep = null;
 const SS_G0_FIRED = "wk-g0-fired";
